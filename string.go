@@ -39,5 +39,13 @@ func (s String) AsciiOnly() bool {
 func (s String) Capitalize() String {
 	return NewString(
 		xstrings.FirstRuneToUpper(
-			strings.ToLower(s.str)))
+			s.Downcase().str))
+}
+
+//func (s String) Casecmp(otherStr String) Integer {
+//	return NewInteger(1)
+//}
+
+func (s String) Downcase() String {
+	return NewString(strings.ToLower(s.str))
 }

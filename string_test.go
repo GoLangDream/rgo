@@ -28,4 +28,18 @@ var _ = Describe("String", func() {
 				Equal(NewString("Abc test word")))
 		})
 	})
+
+	When("第一个字母是大写，其他字母有大小写的情况下", func() {
+		It("能把第一个字母大写，其他的全部小写", func() {
+			var str = NewString("ABc Test WORD")
+			Expect(str.Capitalize()).To(
+				Equal(NewString("Abc test word")))
+		})
+	})
+
+	It("能把字符串的字母都变成小写", func() {
+		var str = NewString("ABc Test WORD")
+		Expect(str.Downcase()).To(
+			Equal(NewString("abc test word")))
+	})
 })
