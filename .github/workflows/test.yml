@@ -22,7 +22,7 @@ jobs:
       run: go build -v ./...
 
     - name: Test
-      run: go test -v -coverprofile=covprofile.cov ./...
+      run: go test -race -covermode atomic -coverprofile=covprofile ./...
 
     - name: Send coverage
       env:
@@ -30,4 +30,4 @@ jobs:
       run: |
         go get github.com/mattn/goveralls
         go install github.com/mattn/goveralls
-        goveralls -coverprofile=covprofile.cov -service=github
+        goveralls -coverprofile=covprofile -service=github
