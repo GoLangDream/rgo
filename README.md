@@ -1,4 +1,4 @@
-# goby
+# rgo
 
 [![Go](https://github.com/GoLangDream/goby/actions/workflows/test.yml/badge.svg)](https://github.com/GoLangDream/goby/actions/workflows/test.yml)
 
