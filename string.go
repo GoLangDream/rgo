@@ -42,10 +42,14 @@ func (s String) Capitalize() String {
 			s.Downcase().str))
 }
 
-//func (s String) Casecmp(otherStr String) Integer {
-//	return NewInteger(1)
-//}
-
 func (s String) Downcase() String {
 	return NewString(strings.ToLower(s.str))
+}
+
+func (s String) Center(width int, pad string) String {
+	return NewString(xstrings.Center(s.str, width, pad))
+}
+
+func (s String) CenterWithSpacePad(width int) String {
+	return NewString(xstrings.Center(s.str, width, " "))
 }

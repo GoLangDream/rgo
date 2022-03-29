@@ -1,7 +1,7 @@
 package goby_test
 
 import (
-	. "github.com/GoLangDream/goby"
+	. "github.com/GoLangDream/rgo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -41,5 +41,34 @@ var _ = Describe("String", func() {
 		var str = NewString("ABc Test WORD")
 		Expect(str.Downcase()).To(
 			Equal(NewString("abc test word")))
+	})
+
+	When("当有需要把一个长度是5的字符串放在中间的时候", func() {
+		var str = NewString("12345")
+		Context("如果需要放的宽度小于等于5", func() {
+			It("无论填充是什么，都返回字符串本身", func() {
+				Expect(str.Center(3, " ")).To(
+					Equal(str))
+				Expect(str.Center(4, "123")).To(
+					Equal(str))
+				Expect(str.Center(5, "abc")).To(
+					Equal(str))
+			})
+		})
+
+		Context("如果需要放的宽度大于5", func() {
+			It("会使用填充，填充两端并把字符串放在中间", func() {
+				Expect(str.CenterWithSpacePad(6)).To(
+					Equal(NewString("12345 ")))
+				Expect(str.Center(6, " ")).To(
+					Equal(NewString("12345 ")))
+				Expect(str.Center(7, "ab")).To(
+					Equal(NewString("a12345a")))
+				Expect(str.Center(8, "ab")).To(
+					Equal(NewString("a12345ab")))
+				Expect(str.Center(9, "ab")).To(
+					Equal(NewString("ab12345ab")))
+			})
+		})
 	})
 })

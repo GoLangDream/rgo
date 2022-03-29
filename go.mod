@@ -1,4 +1,4 @@
-module github.com/GoLangDream/goby
+module github.com/GoLangDream/rgo
 
 go 1.18
 
