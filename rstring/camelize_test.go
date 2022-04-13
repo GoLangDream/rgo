@@ -11,9 +11,4 @@ var _ = Describe("Camelize", func() {
 		str := rstring.Camelize("abc_def")
 		Expect(str).To(Equal("AbcDef"))
 	})
-
-	It("包含大小写的单词的时候，能返回正确的值", func() {
-		str := rstring.Camelize("abcDef")
-		Expect(str).To(Equal("AbcDef"))
-	})
 })
