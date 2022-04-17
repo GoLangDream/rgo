@@ -21,7 +21,6 @@ var _ = Describe("option.Merge", func() {
 		opt2 := Option{
 			"name":     "gin_cookie_2",
 			"value":    "test_2",
-			"maxAge":   3602,
 			"path":     "/2",
 			"domain":   "localhost_2",
 			"secure":   true,
