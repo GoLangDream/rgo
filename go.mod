@@ -9,6 +9,8 @@ require (
 )
 
 require (
+	github.com/elliotchance/orderedmap/v2 v2.0.1 // indirect
+	golang.org/x/exp v0.0.0-20220321173239-a90fa8a75705 // indirect
 	golang.org/x/net v0.0.0-20220225172249-27dd8689420f // indirect
 	golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 	golang.org/x/text v0.3.7 // indirect
