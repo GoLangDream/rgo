@@ -1,10 +1,10 @@
 module github.com/GoLangDream/rgo
 
-go 1.18
+go 1.20
 
 require (
-	github.com/gertd/go-pluralize v0.2.0
-	github.com/huandu/xstrings v1.3.2
+	github.com/gertd/go-pluralize v0.2.1
+	github.com/huandu/xstrings v1.4.0
 	github.com/onsi/ginkgo/v2 v2.1.3
 	github.com/onsi/gomega v1.19.0
 )
