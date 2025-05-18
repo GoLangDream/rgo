@@ -1,6 +1,8 @@
 package goby_test
 
 import (
+	"fmt"
+
 	. "github.com/GoLangDream/rgo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -152,6 +154,200 @@ var _ = Describe("RArray", func() {
 			Expect(strArr.Include(NewRString("z"))).To(BeFalse())
 			Expect(mixedArr.Include(NewRInteger(42))).To(BeTrue())
 			Expect(mixedArr.Include(NewRInteger(100))).To(BeFalse())
+		})
+	})
+
+	Context("数组操作", func() {
+		It("应该正确移除nil元素", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				nil,
+				NewRString("b"),
+				nil,
+				NewRString("c"),
+			})
+			compacted := arr.Compact()
+			Expect(compacted.Length()).To(Equal(3))
+			Expect(compacted.Get(0).ToString()).To(Equal("a"))
+			Expect(compacted.Get(1).ToString()).To(Equal("b"))
+			Expect(compacted.Get(2).ToString()).To(Equal("c"))
+		})
+
+		It("应该正确展平嵌套数组", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRArray([]Object{
+					NewRString("b"),
+					NewRString("c"),
+				}),
+				NewRString("d"),
+			})
+			flattened := arr.Flatten()
+			Expect(flattened.Length()).To(Equal(4))
+			Expect(flattened.Get(0).ToString()).To(Equal("a"))
+			Expect(flattened.Get(1).ToString()).To(Equal("b"))
+			Expect(flattened.Get(2).ToString()).To(Equal("c"))
+			Expect(flattened.Get(3).ToString()).To(Equal("d"))
+		})
+	})
+
+	Context("数组查询", func() {
+		It("应该正确查找元素位置", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("a"),
+				NewRString("c"),
+			})
+			Expect(arr.Index(NewRString("a"))).To(Equal(0))
+			Expect(arr.Index(NewRString("b"))).To(Equal(1))
+			Expect(arr.Index(NewRString("d"))).To(Equal(-1))
+			Expect(arr.RIndex(NewRString("a"))).To(Equal(2))
+			Expect(arr.RIndex(NewRString("b"))).To(Equal(1))
+			Expect(arr.RIndex(NewRString("d"))).To(Equal(-1))
+		})
+
+		It("应该正确计算元素出现次数", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("a"),
+				NewRString("c"),
+				NewRString("a"),
+			})
+			Expect(arr.Count(NewRString("a"))).To(Equal(3))
+			Expect(arr.Count(NewRString("b"))).To(Equal(1))
+			Expect(arr.Count(NewRString("d"))).To(Equal(0))
+		})
+
+		It("应该正确检查元素条件", func() {
+			arr := NewRArray([]Object{
+				NewRInteger(1),
+				NewRInteger(2),
+				NewRInteger(3),
+				NewRInteger(4),
+			})
+			Expect(arr.Any(func(obj Object) bool {
+				return obj.(RInteger).Value() > 3
+			})).To(BeTrue())
+			Expect(arr.All(func(obj Object) bool {
+				return obj.(RInteger).Value() > 0
+			})).To(BeTrue())
+			Expect(arr.None(func(obj Object) bool {
+				return obj.(RInteger).Value() > 5
+			})).To(BeTrue())
+		})
+	})
+
+	Context("数组切片", func() {
+		It("应该正确返回子数组", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("c"),
+				NewRString("d"),
+				NewRString("e"),
+			})
+			Expect(arr.Slice(1, 3).Length()).To(Equal(2))
+			Expect(arr.Slice(1, 3).Get(0).ToString()).To(Equal("b"))
+			Expect(arr.Slice(1, 3).Get(1).ToString()).To(Equal("c"))
+			Expect(arr.SliceFrom(2).Length()).To(Equal(3))
+			Expect(arr.SliceFrom(2).Get(0).ToString()).To(Equal("c"))
+			Expect(arr.Take(2).Length()).To(Equal(2))
+			Expect(arr.Take(2).Get(0).ToString()).To(Equal("a"))
+			Expect(arr.Drop(2).Length()).To(Equal(3))
+			Expect(arr.Drop(2).Get(0).ToString()).To(Equal("c"))
+		})
+	})
+
+	Context("数组分组", func() {
+		It("应该正确按条件分组", func() {
+			arr := NewRArray([]Object{
+				NewRInteger(1),
+				NewRInteger(2),
+				NewRInteger(3),
+				NewRInteger(4),
+				NewRInteger(5),
+			})
+			groups := arr.GroupBy(func(obj Object) Object {
+				if obj.(RInteger).Value()%2 == 0 {
+					return NewRString("even")
+				}
+				return NewRString("odd")
+			})
+			Expect(groups["even"].Length()).To(Equal(2))
+			Expect(groups["odd"].Length()).To(Equal(3))
+		})
+
+		It("应该正确分区", func() {
+			arr := NewRArray([]Object{
+				NewRInteger(1),
+				NewRInteger(2),
+				NewRInteger(3),
+				NewRInteger(4),
+				NewRInteger(5),
+			})
+			even, odd := arr.Partition(func(obj Object) bool {
+				return obj.(RInteger).Value()%2 == 0
+			})
+			Expect(even.Length()).To(Equal(2))
+			Expect(odd.Length()).To(Equal(3))
+		})
+	})
+
+	Context("数组迭代", func() {
+		It("应该正确执行Each操作", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("c"),
+			})
+			var result []string
+			arr.Each(func(obj Object) {
+				result = append(result, obj.ToString())
+			})
+			Expect(result).To(Equal([]string{"a", "b", "c"}))
+		})
+
+		It("应该正确执行EachWithIndex操作", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("c"),
+			})
+			var result []string
+			arr.EachWithIndex(func(obj Object, index int) {
+				result = append(result, fmt.Sprintf("%s:%d", obj.ToString(), index))
+			})
+			Expect(result).To(Equal([]string{"a:0", "b:1", "c:2"}))
+		})
+
+		It("应该正确执行EachCons操作", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("c"),
+				NewRString("d"),
+			})
+			var result []string
+			arr.EachCons(2, func(subArr RArray) {
+				result = append(result, subArr.Join("").ToString())
+			})
+			Expect(result).To(Equal([]string{"ab", "bc", "cd"}))
+		})
+
+		It("应该正确执行EachSlice操作", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRString("b"),
+				NewRString("c"),
+				NewRString("d"),
+			})
+			var result []string
+			arr.EachSlice(2, func(subArr RArray) {
+				result = append(result, subArr.Join("").ToString())
+			})
+			Expect(result).To(Equal([]string{"ab", "cd"}))
 		})
 	})
 })

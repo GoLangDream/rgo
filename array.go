@@ -210,3 +210,195 @@ func (a RArray) Get(index int) Object {
 func (a RArray) ToArray() []Object {
 	return a.elements
 }
+
+// Compact 移除所有nil元素
+func (a RArray) Compact() RArray {
+	var result []Object
+	for _, elem := range a.elements {
+		if elem != nil {
+			result = append(result, elem)
+		}
+	}
+	return NewRArray(result)
+}
+
+// Flatten 展平嵌套数组
+func (a RArray) Flatten() RArray {
+	var result []Object
+	for _, elem := range a.elements {
+		if arr, ok := elem.(RArray); ok {
+			result = append(result, arr.Flatten().elements...)
+		} else {
+			result = append(result, elem)
+		}
+	}
+	return NewRArray(result)
+}
+
+// Index 返回元素首次出现的位置，不存在则返回-1
+func (a RArray) Index(obj Object) int {
+	for i, elem := range a.elements {
+		if elem.Equal(obj) {
+			return i
+		}
+	}
+	return -1
+}
+
+// RIndex 返回元素最后出现的位置，不存在则返回-1
+func (a RArray) RIndex(obj Object) int {
+	for i := len(a.elements) - 1; i >= 0; i-- {
+		if a.elements[i].Equal(obj) {
+			return i
+		}
+	}
+	return -1
+}
+
+// Count 计算元素出现次数
+func (a RArray) Count(obj Object) int {
+	count := 0
+	for _, elem := range a.elements {
+		if elem.Equal(obj) {
+			count++
+		}
+	}
+	return count
+}
+
+// Any 检查是否有元素满足条件
+func (a RArray) Any(fn func(Object) bool) bool {
+	for _, elem := range a.elements {
+		if fn(elem) {
+			return true
+		}
+	}
+	return false
+}
+
+// All 检查是否所有元素都满足条件
+func (a RArray) All(fn func(Object) bool) bool {
+	for _, elem := range a.elements {
+		if !fn(elem) {
+			return false
+		}
+	}
+	return true
+}
+
+// None 检查是否没有元素满足条件
+func (a RArray) None(fn func(Object) bool) bool {
+	return !a.Any(fn)
+}
+
+// Slice 返回指定范围的子数组
+func (a RArray) Slice(start, end int) RArray {
+	if start < 0 {
+		start = len(a.elements) + start
+	}
+	if end < 0 {
+		end = len(a.elements) + end
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(a.elements) {
+		end = len(a.elements)
+	}
+	if start >= end {
+		return NewRArray([]Object{})
+	}
+	return NewRArray(a.elements[start:end])
+}
+
+// SliceFrom 返回从指定位置到结尾的子数组
+func (a RArray) SliceFrom(start int) RArray {
+	return a.Slice(start, len(a.elements))
+}
+
+// Take 返回前n个元素
+func (a RArray) Take(n int) RArray {
+	if n <= 0 {
+		return NewRArray([]Object{})
+	}
+	if n > len(a.elements) {
+		n = len(a.elements)
+	}
+	return NewRArray(a.elements[:n])
+}
+
+// Drop 返回除前n个元素外的所有元素
+func (a RArray) Drop(n int) RArray {
+	if n <= 0 {
+		return a
+	}
+	if n >= len(a.elements) {
+		return NewRArray([]Object{})
+	}
+	return NewRArray(a.elements[n:])
+}
+
+// GroupBy 按指定条件分组
+func (a RArray) GroupBy(fn func(Object) Object) map[string]RArray {
+	groups := make(map[string]RArray)
+	for _, elem := range a.elements {
+		key := fn(elem).ToString()
+		if group, exists := groups[key]; exists {
+			groups[key] = NewRArray(append(group.elements, elem))
+		} else {
+			groups[key] = NewRArray([]Object{elem})
+		}
+	}
+	return groups
+}
+
+// Partition 将数组分为满足条件和不满足条件的两部分
+func (a RArray) Partition(fn func(Object) bool) (RArray, RArray) {
+	var truePart, falsePart []Object
+	for _, elem := range a.elements {
+		if fn(elem) {
+			truePart = append(truePart, elem)
+		} else {
+			falsePart = append(falsePart, elem)
+		}
+	}
+	return NewRArray(truePart), NewRArray(falsePart)
+}
+
+// Each 对每个元素执行操作
+func (a RArray) Each(fn func(Object)) {
+	for _, elem := range a.elements {
+		fn(elem)
+	}
+}
+
+// EachWithIndex 对每个元素及其索引执行操作
+func (a RArray) EachWithIndex(fn func(Object, int)) {
+	for i, elem := range a.elements {
+		fn(elem, i)
+	}
+}
+
+// EachCons 对每个连续n个元素执行操作
+func (a RArray) EachCons(n int, fn func(RArray)) {
+	if n <= 0 || n > len(a.elements) {
+		return
+	}
+	for i := 0; i <= len(a.elements)-n; i++ {
+		fn(NewRArray(a.elements[i : i+n]))
+	}
+}
+
+// EachSlice 将数组分成n个元素的切片并执行操作
+func (a RArray) EachSlice(n int, fn func(RArray)) {
+	if n <= 0 {
+		return
+	}
+	for i := 0; i < len(a.elements); i += n {
+		end := i + n
+		if end > len(a.elements) {
+			end = len(a.elements)
+		}
+		fn(NewRArray(a.elements[i:end]))
+	}
+}

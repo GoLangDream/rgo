@@ -28,13 +28,13 @@ arr := NewRArray([]Object{
 - `Reverse()`: 反转数组
 - `Sort()`: 排序数组
 - `Uniq()`: 去除重复元素
+- `Compact()`: 移除所有nil元素
+- `Flatten()`: 展平嵌套数组
 
 ### 数组变换
 - `Map(fn)`: 对每个元素应用函数并返回新数组
 - `Select(fn)`: 选择满足条件的元素
 - `Reject(fn)`: 排除满足条件的元素
-- `Compact()`: 移除所有nil元素
-- `Flatten()`: 展平嵌套数组
 - `Shuffle()`: 随机打乱数组
 
 ### 数组查询
@@ -95,8 +95,77 @@ count := arr.Count(goby.NewRString("a"))   // 返回 1
 // 数组切片
 subArr := arr.Slice(0, 2)  // 返回 ["a", "b"]
 
+// 数组分组
+groups := arr.GroupBy(func(obj goby.Object) goby.Object {
+    if _, ok := obj.(goby.RString); ok {
+        return goby.NewRString("string")
+    }
+    return goby.NewRString("integer")
+})
+// groups 包含 {"string": ["a", "b"], "integer": [1]}
+
 // 数组迭代
 arr.Each(func(obj goby.Object) {
     fmt.Println(obj.ToString())
 })
+
+// 使用EachWithIndex
+arr.EachWithIndex(func(obj goby.Object, index int) {
+    fmt.Printf("%d: %s\n", index, obj.ToString())
+})
+
+// 使用EachCons
+arr.EachCons(2, func(subArr goby.RArray) {
+    fmt.Println(subArr.Join("").ToString())
+})
+
+// 使用EachSlice
+arr.EachSlice(2, func(subArr goby.RArray) {
+    fmt.Println(subArr.Join("").ToString())
+})
 ```
+
+## 完整方法列表
+
+以下是RArray提供的所有方法：
+
+| 方法名 | 功能描述 |
+|--------|----------|
+| `ToString()` | 返回数组的字符串表示 |
+| `Equal(other)` | 比较两个对象是否相等 |
+| `Length()` | 返回数组长度 |
+| `Size()` | Length的别名 |
+| `Empty()` | 检查数组是否为空 |
+| `First()` | 返回第一个元素 |
+| `Last()` | 返回最后一个元素 |
+| `Include(obj)` | 检查是否包含指定元素 |
+| `Push(obj)` | 将元素添加到数组末尾 |
+| `Pop()` | 移除并返回最后一个元素 |
+| `Join(sep)` | 使用指定分隔符连接数组元素 |
+| `Map(fn)` | 对每个元素应用函数并返回新数组 |
+| `Select(fn)` | 选择满足条件的元素 |
+| `Reject(fn)` | 排除满足条件的元素 |
+| `Reverse()` | 反转数组 |
+| `Shuffle()` | 随机打乱数组 |
+| `Sort()` | 排序数组 |
+| `Uniq()` | 去除重复元素 |
+| `Get(index)` | 获取指定索引的元素 |
+| `ToArray()` | 返回底层数组 |
+| `Compact()` | 移除所有nil元素 |
+| `Flatten()` | 展平嵌套数组 |
+| `Index(obj)` | 返回元素首次出现的位置 |
+| `RIndex(obj)` | 返回元素最后出现的位置 |
+| `Count(obj)` | 计算元素出现次数 |
+| `Any(fn)` | 检查是否有元素满足条件 |
+| `All(fn)` | 检查是否所有元素都满足条件 |
+| `None(fn)` | 检查是否没有元素满足条件 |
+| `Slice(start, end)` | 返回指定范围的子数组 |
+| `SliceFrom(start)` | 返回从指定位置到结尾的子数组 |
+| `Take(n)` | 返回前n个元素 |
+| `Drop(n)` | 返回除前n个元素外的所有元素 |
+| `GroupBy(fn)` | 按指定条件分组 |
+| `Partition(fn)` | 将数组分为满足条件和不满足条件的两部分 |
+| `Each(fn)` | 对每个元素执行操作 |
+| `EachWithIndex(fn)` | 对每个元素及其索引执行操作 |
+| `EachCons(n, fn)` | 对每个连续n个元素执行操作 |
+| `EachSlice(n, fn)` | 将数组分成n个元素的切片并执行操作 |

@@ -7,6 +7,14 @@ RGo 是一个 Golang 库，提供类似 Ruby 中常用类的功能。它实现�
 - 通过嵌入结构体和接口模拟继承，确保公共方法不用重复编写
 - 实现了 Ruby 中 String、Integer 和 Array 类常用的方法
 - 使用 Ginkgo 和 Gomega 进行完整的测试
+- 支持链式调用和函数式编程风格
+- 提供丰富的数组操作方法，包括：
+  - 数组操作（Compact、Flatten等）
+  - 数组变换（Map、Select、Reject等）
+  - 数组查询（Index、Count、Any等）
+  - 数组切片（Slice、Take、Drop等）
+  - 数组分组（GroupBy、Partition等）
+  - 数组迭代（Each、EachWithIndex等）
 
 ## 安装
 
@@ -59,6 +67,41 @@ arr := goby.NewRArray([]goby.Object{
 first := arr.First()                  // 返回 "a"
 length := arr.Length()                // 返回 3
 joined := arr.Join(", ")              // 返回 "a, b, 1"
+
+// 数组变换
+mapped := arr.Map(func(obj goby.Object) goby.Object {
+    if str, ok := obj.(goby.RString); ok {
+        return goby.NewRString(str.ToString() + "!")
+    }
+    return obj
+})
+// mapped 包含 ["a!", "b!", 1]
+
+// 数组查询
+hasA := arr.Include(goby.NewRString("a"))  // 返回 true
+count := arr.Count(goby.NewRString("a"))   // 返回 1
+
+// 数组切片
+subArr := arr.Slice(0, 2)  // 返回 ["a", "b"]
+
+// 数组分组
+groups := arr.GroupBy(func(obj goby.Object) goby.Object {
+    if _, ok := obj.(goby.RString); ok {
+        return goby.NewRString("string")
+    }
+    return goby.NewRString("integer")
+})
+// groups 包含 {"string": ["a", "b"], "integer": [1]}
+
+// 数组迭代
+arr.Each(func(obj goby.Object) {
+    fmt.Println(obj.ToString())
+})
+
+// 使用EachWithIndex
+arr.EachWithIndex(func(obj goby.Object, index int) {
+    fmt.Printf("%d: %s\n", index, obj.ToString())
+})
 ```
 
 更多 RArray 的详细文档请参考 [RArray.md](RArray.md)
@@ -72,4 +115,8 @@ go test -v
 ## 贡献
 
 欢迎提交 Pull Request 和 Issue！
+
+## 许可证
+
+MIT License
 
