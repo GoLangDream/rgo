@@ -3,12 +3,12 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/GoLangDream/rgo)](https://goreportcard.com/report/github.com/GoLangDream/rgo)
 [![Coverage Status](https://coveralls.io/repos/github/GoLangDream/rgo/badge.svg?branch=main)](https://coveralls.io/github/GoLangDream/rgo?branch=main)
 
-RGo 是一个 Golang 库，提供类似 Ruby 中常用类的功能。它实现了 `RString`、`RInteger` 和 `RArray` 这三个主要类，并且保持了与 Ruby 中对应类相似的 API 设计。
+RGo 是一个 Golang 库，提供类似 Ruby 中常用类的功能。它实现了 `RString`、`RInteger`、`RArray` 和 `RHash` 这些主要类，并且保持了与 Ruby 中对应类相似的 API 设计。
 
 ## 特性
 
 - 通过嵌入结构体和接口模拟继承，确保公共方法不用重复编写
-- 实现了 Ruby 中 String、Integer 和 Array 类常用的方法
+- 实现了 Ruby 中 String、Integer、Array 和 Hash 类常用的方法
 - 使用 Ginkgo 和 Gomega 进行完整的测试
 - 支持链式调用和函数式编程风格
 - 提供丰富的数组操作方法，包括：
@@ -18,6 +18,11 @@ RGo 是一个 Golang 库，提供类似 Ruby 中常用类的功能。它实现�
   - 数组切片（Slice、Take、Drop等）
   - 数组分组（GroupBy、Partition等）
   - 数组迭代（Each、EachWithIndex等）
+- 提供完整的哈希表操作，包括：
+  - 基本操作（Get、Set、Delete等）
+  - 转换方法（ToJSON、ToYAML、ToXML等）
+  - 迭代和过滤（Each、Select、Reject等）
+  - 合并操作（Merge、MergeBang等）
 
 ## 安装
 
@@ -39,7 +44,7 @@ contains := str.Include("hello")      // 返回 true
 parts := str.Split(" ")               // 返回包含 ["hello", "world"] 的 RArray
 ```
 
-更多 RString 的详细文档请参考 [RString.md](RString.md)
+更多 RString 的详细文档请参考 [RString.md](docs/RString.md)
 
 ### RInteger
 
@@ -52,7 +57,7 @@ sum := num.Add(goby.NewRInteger(10))  // 返回 52
 abs := goby.NewRInteger(-10).Abs()    // 返回 10
 ```
 
-更多 RInteger 的详细文档请参考 [RInteger.md](RInteger.md)
+更多 RInteger 的详细文档请参考 [RInteger.md](docs/RInteger.md)
 
 ### RArray
 
@@ -107,7 +112,43 @@ arr.EachWithIndex(func(obj goby.Object, index int) {
 })
 ```
 
-更多 RArray 的详细文档请参考 [RArray.md](RArray.md)
+更多 RArray 的详细文档请参考 [RArray.md](docs/RArray.md)
+
+### RHash
+
+```go
+import "github.com/GoLangDream/rgo"
+
+// 创建哈希表
+hash := goby.NewHash()
+hash.Set("name", "John")
+hash.Set("age", 30)
+
+// 基本操作
+value, exists := hash.Get("name")     // 返回 "John", true
+size := hash.Size()                   // 返回 2
+keys := hash.Keys()                   // 返回 ["age", "name"]（按字符串排序）
+
+// 转换方法
+jsonStr := hash.ToJSON()              // 返回 {"age":30,"name":"John"}
+yamlStr := hash.ToYAML()              // 返回格式化的 YAML 字符串
+
+// 迭代和过滤
+hash.Each(func(key, value any) {
+    fmt.Printf("%v: %v\n", key, value)
+})
+
+filtered := hash.Select(func(key, value any) bool {
+    return key == "name"
+})
+
+// 合并操作
+otherHash := goby.NewHash()
+otherHash.Set("city", "New York")
+merged := hash.Merge(otherHash)
+```
+
+更多 RHash 的详细文档请参考 [RHash.md](docs/RHash.md)
 
 ## 测试
 

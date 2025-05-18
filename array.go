@@ -1,3 +1,4 @@
+// Package goby 提供了一个类似 Ruby 的数组实现
 package goby
 
 import (
@@ -7,13 +8,13 @@ import (
 	"strings"
 )
 
-// RArray 实现类似 Ruby 中 Array 类的功能
+// RArray 实现了类似 Ruby 的数组功能
 type RArray struct {
 	BaseObject
 	elements []Object
 }
 
-// NewRArray 创建一个新的 RArray 对象
+// NewRArray 创建一个新的数组对象
 func NewRArray(elements []Object) RArray {
 	return RArray{
 		BaseObject: NewBaseObject("Array"),
@@ -30,7 +31,7 @@ func (a RArray) ToString() string {
 	return fmt.Sprintf("[%s]", strings.Join(strs, ", "))
 }
 
-// Equal 比较两个对象是否相等
+// Equal 比较两个数组是否相等
 func (a RArray) Equal(other Object) bool {
 	otherArr, ok := other.(RArray)
 	if !ok || len(a.elements) != len(otherArr.elements) {
@@ -45,12 +46,12 @@ func (a RArray) Equal(other Object) bool {
 	return true
 }
 
-// Length 返回数组长度
+// Length 返回数组的长度
 func (a RArray) Length() int {
 	return len(a.elements)
 }
 
-// Size 是 Length 的别名
+// Size 返回数组的长度（Length 的别名）
 func (a RArray) Size() int {
 	return a.Length()
 }
@@ -113,7 +114,7 @@ func (a RArray) Join(sep string) RString {
 	return NewRString(strings.Join(strs, sep))
 }
 
-// Map 对数组每个元素应用函数并返回新数组
+// Map 对数组中的每个元素应用函数并返回新数组
 func (a RArray) Map(fn func(Object) Object) RArray {
 	result := make([]Object, len(a.elements))
 	for i, elem := range a.elements {
@@ -122,7 +123,7 @@ func (a RArray) Map(fn func(Object) Object) RArray {
 	return NewRArray(result)
 }
 
-// Select 返回满足条件的元素
+// Select 返回满足条件的所有元素组成的新数组
 func (a RArray) Select(fn func(Object) bool) RArray {
 	var result []Object
 	for _, elem := range a.elements {
@@ -133,7 +134,7 @@ func (a RArray) Select(fn func(Object) bool) RArray {
 	return NewRArray(result)
 }
 
-// Reject 返回不满足条件的元素
+// Reject 返回不满足条件的所有元素组成的新数组
 func (a RArray) Reject(fn func(Object) bool) RArray {
 	var result []Object
 	for _, elem := range a.elements {
@@ -144,7 +145,7 @@ func (a RArray) Reject(fn func(Object) bool) RArray {
 	return NewRArray(result)
 }
 
-// Reverse 反转数组
+// Reverse 返回数组的反转副本
 func (a RArray) Reverse() RArray {
 	reversed := make([]Object, len(a.elements))
 	for i, j := 0, len(a.elements)-1; j >= 0; i, j = i+1, j-1 {
@@ -153,7 +154,7 @@ func (a RArray) Reverse() RArray {
 	return NewRArray(reversed)
 }
 
-// Shuffle 随机打乱数组元素顺序
+// Shuffle 返回数组的随机打乱副本
 func (a RArray) Shuffle() RArray {
 	shuffled := make([]Object, len(a.elements))
 	copy(shuffled, a.elements)
@@ -165,7 +166,7 @@ func (a RArray) Shuffle() RArray {
 	return NewRArray(shuffled)
 }
 
-// Sort 对数组元素进行排序（按字符串表示）
+// Sort 返回数组的排序副本（按字符串表示排序）
 func (a RArray) Sort() RArray {
 	sorted := make([]Object, len(a.elements))
 	copy(sorted, a.elements)
@@ -177,7 +178,7 @@ func (a RArray) Sort() RArray {
 	return NewRArray(sorted)
 }
 
-// Uniq 返回去重后的数组
+// Uniq 返回数组的去重副本
 func (a RArray) Uniq() RArray {
 	seen := make(map[string]bool)
 	var result []Object
@@ -211,7 +212,7 @@ func (a RArray) ToArray() []Object {
 	return a.elements
 }
 
-// Compact 移除所有nil元素
+// Compact 返回移除所有 nil 元素后的新数组
 func (a RArray) Compact() RArray {
 	var result []Object
 	for _, elem := range a.elements {
@@ -222,7 +223,7 @@ func (a RArray) Compact() RArray {
 	return NewRArray(result)
 }
 
-// Flatten 展平嵌套数组
+// Flatten 返回展平嵌套数组后的新数组
 func (a RArray) Flatten() RArray {
 	var result []Object
 	for _, elem := range a.elements {
@@ -255,7 +256,7 @@ func (a RArray) RIndex(obj Object) int {
 	return -1
 }
 
-// Count 计算元素出现次数
+// Count 计算元素在数组中出现的次数
 func (a RArray) Count(obj Object) int {
 	count := 0
 	for _, elem := range a.elements {
@@ -316,7 +317,7 @@ func (a RArray) SliceFrom(start int) RArray {
 	return a.Slice(start, len(a.elements))
 }
 
-// Take 返回前n个元素
+// Take 返回前n个元素组成的新数组
 func (a RArray) Take(n int) RArray {
 	if n <= 0 {
 		return NewRArray([]Object{})
@@ -327,7 +328,7 @@ func (a RArray) Take(n int) RArray {
 	return NewRArray(a.elements[:n])
 }
 
-// Drop 返回除前n个元素外的所有元素
+// Drop 返回除前n个元素外的所有元素组成的新数组
 func (a RArray) Drop(n int) RArray {
 	if n <= 0 {
 		return a
@@ -338,7 +339,7 @@ func (a RArray) Drop(n int) RArray {
 	return NewRArray(a.elements[n:])
 }
 
-// GroupBy 按指定条件分组
+// GroupBy 按指定条件对数组元素进行分组
 func (a RArray) GroupBy(fn func(Object) Object) map[string]RArray {
 	groups := make(map[string]RArray)
 	for _, elem := range a.elements {
@@ -365,21 +366,21 @@ func (a RArray) Partition(fn func(Object) bool) (RArray, RArray) {
 	return NewRArray(truePart), NewRArray(falsePart)
 }
 
-// Each 对每个元素执行操作
+// Each 对数组中的每个元素执行操作
 func (a RArray) Each(fn func(Object)) {
 	for _, elem := range a.elements {
 		fn(elem)
 	}
 }
 
-// EachWithIndex 对每个元素及其索引执行操作
+// EachWithIndex 对数组中的每个元素及其索引执行操作
 func (a RArray) EachWithIndex(fn func(Object, int)) {
 	for i, elem := range a.elements {
 		fn(elem, i)
 	}
 }
 
-// EachCons 对每个连续n个元素执行操作
+// EachCons 对数组中的每个连续n个元素执行操作
 func (a RArray) EachCons(n int, fn func(RArray)) {
 	if n <= 0 || n > len(a.elements) {
 		return

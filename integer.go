@@ -1,3 +1,4 @@
+// Package goby 提供了一个类似 Ruby 的整数实现
 package goby
 
 import (
@@ -7,13 +8,13 @@ import (
 	"strconv"
 )
 
-// RInteger 实现类似 Ruby 中 Integer 类的功能
+// RInteger 实现了类似 Ruby 的整数功能
 type RInteger struct {
 	BaseObject
 	value int
 }
 
-// NewRInteger 创建一个新的 RInteger 对象
+// NewRInteger 创建一个新的整数对象
 func NewRInteger(value int) RInteger {
 	return RInteger{
 		BaseObject: NewBaseObject("Integer"),
@@ -26,7 +27,7 @@ func (i RInteger) ToString() string {
 	return strconv.Itoa(i.value)
 }
 
-// Equal 比较两个对象是否相等
+// Equal 比较两个整数是否相等
 func (i RInteger) Equal(other Object) bool {
 	if otherInt, ok := other.(RInteger); ok {
 		return i.value == otherInt.value
@@ -34,27 +35,27 @@ func (i RInteger) Equal(other Object) bool {
 	return false
 }
 
-// Value 返回 RInteger 的底层 int 值
+// Value 返回整数的底层值
 func (i RInteger) Value() int {
 	return i.value
 }
 
-// Add 加法操作
+// Add 返回两个整数的和
 func (i RInteger) Add(other RInteger) RInteger {
 	return NewRInteger(i.value + other.value)
 }
 
-// Sub 减法操作
+// Sub 返回两个整数的差
 func (i RInteger) Sub(other RInteger) RInteger {
 	return NewRInteger(i.value - other.value)
 }
 
-// Mul 乘法操作
+// Mul 返回两个整数的积
 func (i RInteger) Mul(other RInteger) RInteger {
 	return NewRInteger(i.value * other.value)
 }
 
-// Div 除法操作
+// Div 返回两个整数的商
 func (i RInteger) Div(other RInteger) RInteger {
 	if other.value == 0 {
 		panic("除数不能为零")
@@ -62,7 +63,7 @@ func (i RInteger) Div(other RInteger) RInteger {
 	return NewRInteger(i.value / other.value)
 }
 
-// Mod 取模操作
+// Mod 返回两个整数的余数
 func (i RInteger) Mod(other RInteger) RInteger {
 	if other.value == 0 {
 		panic("除数不能为零")
@@ -70,47 +71,47 @@ func (i RInteger) Mod(other RInteger) RInteger {
 	return NewRInteger(i.value % other.value)
 }
 
-// Modulo 是 Mod 的别名（Ruby兼容）
+// Modulo 返回两个整数的余数（Mod 的别名）
 func (i RInteger) Modulo(other RInteger) RInteger {
 	return i.Mod(other)
 }
 
-// Pow 幂运算
+// Pow 返回整数的指定次幂
 func (i RInteger) Pow(exponent RInteger) RInteger {
 	return NewRInteger(int(math.Pow(float64(i.value), float64(exponent.value))))
 }
 
-// BitAnd 位与操作（&）
+// BitAnd 返回两个整数的按位与结果
 func (i RInteger) BitAnd(other RInteger) RInteger {
 	return NewRInteger(i.value & other.value)
 }
 
-// BitOr 位或操作（|）
+// BitOr 返回两个整数的按位或结果
 func (i RInteger) BitOr(other RInteger) RInteger {
 	return NewRInteger(i.value | other.value)
 }
 
-// BitXor 异或操作（^）
+// BitXor 返回两个整数的按位异或结果
 func (i RInteger) BitXor(other RInteger) RInteger {
 	return NewRInteger(i.value ^ other.value)
 }
 
-// BitNot 按位取反操作（~）
+// BitNot 返回整数的按位取反结果
 func (i RInteger) BitNot() RInteger {
 	return NewRInteger(^i.value)
 }
 
-// LeftShift 左移操作（<<）
+// LeftShift 返回整数左移指定位数的结果
 func (i RInteger) LeftShift(count RInteger) RInteger {
 	return NewRInteger(i.value << uint(count.value))
 }
 
-// RightShift 右移操作（>>）
+// RightShift 返回整数右移指定位数的结果
 func (i RInteger) RightShift(count RInteger) RInteger {
 	return NewRInteger(i.value >> uint(count.value))
 }
 
-// BitAt 获取指定位的值（[]）
+// BitAt 返回整数指定位置的值
 func (i RInteger) BitAt(pos RInteger) RInteger {
 	if pos.value < 0 {
 		return NewRInteger(0)
@@ -149,7 +150,7 @@ func (i RInteger) BitLength() int {
 	return bits(v) + 1
 }
 
-// 辅助函数，计算一个无符号整数的位数
+// bits 计算一个无符号整数的位数
 func bits(v uint) int {
 	if v == 0 {
 		return 0
@@ -161,7 +162,7 @@ func bits(v uint) int {
 	return n - 1
 }
 
-// Abs 返回绝对值
+// Abs 返回整数的绝对值
 func (i RInteger) Abs() RInteger {
 	if i.value < 0 {
 		return NewRInteger(-i.value)
@@ -169,32 +170,32 @@ func (i RInteger) Abs() RInteger {
 	return i
 }
 
-// Even 判断是否为偶数
+// Even 检查整数是否为偶数
 func (i RInteger) Even() bool {
 	return i.value%2 == 0
 }
 
-// Odd 判断是否为奇数
+// Odd 检查整数是否为奇数
 func (i RInteger) Odd() bool {
 	return i.value%2 != 0
 }
 
-// Zero 判断是否为零
+// Zero 检查整数是否为零
 func (i RInteger) Zero() bool {
 	return i.value == 0
 }
 
-// Positive 判断是否为正数
+// Positive 检查整数是否为正数
 func (i RInteger) Positive() bool {
 	return i.value > 0
 }
 
-// Negative 判断是否为负数
+// Negative 检查整数是否为负数
 func (i RInteger) Negative() bool {
 	return i.value < 0
 }
 
-// Gcd 求最大公约数
+// Gcd 返回两个整数的最大公约数
 func (i RInteger) Gcd(other RInteger) RInteger {
 	a, b := i.value, other.value
 	if a < 0 {
@@ -211,7 +212,7 @@ func (i RInteger) Gcd(other RInteger) RInteger {
 	return NewRInteger(a)
 }
 
-// Lcm 求最小公倍数
+// Lcm 返回两个整数的最小公倍数
 func (i RInteger) Lcm(other RInteger) RInteger {
 	if i.value == 0 || other.value == 0 {
 		return NewRInteger(0)
@@ -228,7 +229,7 @@ func (i RInteger) Lcm(other RInteger) RInteger {
 	return NewRInteger((a / i.Gcd(other).value) * b)
 }
 
-// GcdLcm 同时返回最大公约数和最小公倍数
+// GcdLcm 同时返回两个整数的最大公约数和最小公倍数
 func (i RInteger) GcdLcm(other RInteger) RArray {
 	gcd := i.Gcd(other)
 	lcm := i.Lcm(other)
@@ -236,7 +237,7 @@ func (i RInteger) GcdLcm(other RInteger) RArray {
 	return NewRArray([]Object{gcd, lcm})
 }
 
-// DivMod 同时返回除法和取模的结果
+// DivMod 同时返回两个整数的商和余数
 func (i RInteger) DivMod(other RInteger) RArray {
 	if other.value == 0 {
 		panic("除数不能为零")
@@ -251,33 +252,30 @@ func (i RInteger) DivMod(other RInteger) RArray {
 	})
 }
 
-// CeilDiv 向上取整除法
+// CeilDiv 返回两个整数的向上取整除法结果
 func (i RInteger) CeilDiv(other RInteger) RInteger {
 	if other.value == 0 {
 		panic("除数不能为零")
 	}
 
-	// 如果是正负不同，则直接使用普通除法
 	if (i.value < 0) != (other.value < 0) {
 		return NewRInteger(i.value / other.value)
 	}
 
-	// 否则使用ceil除法
 	return NewRInteger((i.value + other.value - 1) / other.value)
 }
 
-// Ceil 向上取整（对整数来说就是自身）
+// Ceil 返回整数的向上取整结果
 func (i RInteger) Ceil() RInteger {
 	return i
 }
 
-// Ceil 指定精度的向上取整
+// CeilWithPrecision 返回整数指定精度的向上取整结果
 func (i RInteger) CeilWithPrecision(digits RInteger) RInteger {
 	if digits.value >= 0 {
 		return i
 	}
 
-	// 对于负精度，需要将对应位数置零
 	pow := int(math.Pow(10, float64(-digits.value)))
 	remainder := i.value % pow
 
@@ -290,18 +288,17 @@ func (i RInteger) CeilWithPrecision(digits RInteger) RInteger {
 	return i
 }
 
-// Floor 向下取整（对整数来说就是自身）
+// Floor 返回整数的向下取整结果
 func (i RInteger) Floor() RInteger {
 	return i
 }
 
-// FloorWithPrecision 指定精度的向下取整
+// FloorWithPrecision 返回整数指定精度的向下取整结果
 func (i RInteger) FloorWithPrecision(digits RInteger) RInteger {
 	if digits.value >= 0 {
 		return i
 	}
 
-	// 对于负精度，需要将对应位数置零
 	pow := int(math.Pow(10, float64(-digits.value)))
 	remainder := i.value % pow
 
@@ -314,18 +311,17 @@ func (i RInteger) FloorWithPrecision(digits RInteger) RInteger {
 	return i
 }
 
-// Round 四舍五入（对整数来说就是自身）
+// Round 返回整数的四舍五入结果
 func (i RInteger) Round() RInteger {
 	return i
 }
 
-// RoundWithPrecision 指定精度的四舍五入
+// RoundWithPrecision 返回整数指定精度的四舍五入结果
 func (i RInteger) RoundWithPrecision(digits RInteger) RInteger {
 	if digits.value >= 0 {
 		return i
 	}
 
-	// 对于负精度，需要将对应位数进行四舍五入
 	pow := int(math.Pow(10, float64(-digits.value)))
 	half := pow / 2
 
@@ -341,35 +337,34 @@ func (i RInteger) RoundWithPrecision(digits RInteger) RInteger {
 	}
 }
 
-// Truncate 截断（对整数来说就是自身）
+// Truncate 返回整数的截断结果
 func (i RInteger) Truncate() RInteger {
 	return i
 }
 
-// TruncateWithPrecision 指定精度的截断
+// TruncateWithPrecision 返回整数指定精度的截断结果
 func (i RInteger) TruncateWithPrecision(digits RInteger) RInteger {
 	if digits.value >= 0 {
 		return i
 	}
 
-	// 对于负精度，需要将对应位数置零
 	pow := int(math.Pow(10, float64(-digits.value)))
 	remainder := i.value % pow
 
 	return NewRInteger(i.value - remainder)
 }
 
-// Succ 返回下一个整数（相当于+1）
+// Succ 返回整数的下一个值
 func (i RInteger) Succ() RInteger {
 	return NewRInteger(i.value + 1)
 }
 
-// Next 是 Succ 的别名
+// Next 返回整数的下一个值（Succ 的别名）
 func (i RInteger) Next() RInteger {
 	return i.Succ()
 }
 
-// Pred 返回前一个整数（相当于-1）
+// Pred 返回整数的前一个值
 func (i RInteger) Pred() RInteger {
 	return NewRInteger(i.value - 1)
 }
@@ -395,32 +390,32 @@ func (i RInteger) DownTo(limit RInteger, fn func(RInteger)) {
 	}
 }
 
-// ToRString 转换为 RString
+// ToRString 将整数转换为字符串
 func (i RInteger) ToRString() RString {
 	return NewRString(i.ToString())
 }
 
-// ToInt 返回自身（类似Ruby的to_i）
+// ToInt 返回整数本身
 func (i RInteger) ToInt() RInteger {
 	return i
 }
 
-// ToInteger 返回自身（类似Ruby的to_int）
+// ToInteger 返回整数本身
 func (i RInteger) ToInteger() RInteger {
 	return i
 }
 
-// ToFloat 转换为浮点数
+// ToFloat 将整数转换为浮点数
 func (i RInteger) ToFloat() float64 {
 	return float64(i.value)
 }
 
-// ToRational 转换为有理数（使用big.Rat模拟）
+// ToRational 将整数转换为有理数
 func (i RInteger) ToRational() *big.Rat {
 	return big.NewRat(int64(i.value), 1)
 }
 
-// FDiv 浮点除法
+// FDiv 返回两个整数的浮点除法结果
 func (i RInteger) FDiv(other RInteger) float64 {
 	if other.value == 0 {
 		panic("除数不能为零")
@@ -428,22 +423,22 @@ func (i RInteger) FDiv(other RInteger) float64 {
 	return float64(i.value) / float64(other.value)
 }
 
-// ToHex 转换为十六进制字符串
+// ToHex 将整数转换为十六进制字符串
 func (i RInteger) ToHex() RString {
 	return NewRString(fmt.Sprintf("%x", i.value))
 }
 
-// ToOct 转换为八进制字符串
+// ToOct 将整数转换为八进制字符串
 func (i RInteger) ToOct() RString {
 	return NewRString(fmt.Sprintf("%o", i.value))
 }
 
-// ToBin 转换为二进制字符串
+// ToBin 将整数转换为二进制字符串
 func (i RInteger) ToBin() RString {
 	return NewRString(fmt.Sprintf("%b", i.value))
 }
 
-// ToBase 转换为指定进制字符串
+// ToBase 将整数转换为指定进制的字符串
 func (i RInteger) ToBase(base RInteger) RString {
 	if base.value < 2 || base.value > 36 {
 		panic("进制必须在2到36之间")
@@ -451,8 +446,7 @@ func (i RInteger) ToBase(base RInteger) RString {
 	return NewRString(strconv.FormatInt(int64(i.value), base.value))
 }
 
-// Digits 将数字转换为按位数字的数组
-// 例如 12345.Digits() 返回 [5,4,3,2,1]
+// Digits 将整数转换为按位数字的数组
 func (i RInteger) Digits(base ...int) RArray {
 	baseValue := 10
 	if len(base) > 0 {
@@ -480,28 +474,27 @@ func (i RInteger) Digits(base ...int) RArray {
 	return NewRArray(digits)
 }
 
-// Chr 返回当前数值对应的字符
+// Chr 返回整数对应的 Unicode 字符
 func (i RInteger) Chr() RString {
 	return NewRString(string(rune(i.value)))
 }
 
-// Ord 返回自身（与 RString 的 Ord 方法保持一致）
+// Ord 返回整数本身
 func (i RInteger) Ord() RInteger {
 	return i
 }
 
 // Size 返回整数的字节表示长度
 func (i RInteger) Size() int {
-	return strconv.IntSize / 8 // 返回当前平台整数占用的字节数
+	return strconv.IntSize / 8
 }
 
-// Coerce 将另一个对象转为兼容类型
+// Coerce 将另一个对象转换为兼容类型
 func (i RInteger) Coerce(other Object) RArray {
 	switch v := other.(type) {
 	case RInteger:
 		return NewRArray([]Object{v, i})
 	default:
-		// 尝试转换为数字
 		if str, ok := other.(RString); ok {
 			val, err := strconv.Atoi(str.ToString())
 			if err == nil {
