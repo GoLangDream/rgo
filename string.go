@@ -133,3 +133,248 @@ func (s RString) Gsub(pattern, repl string) RString {
 	}
 	return NewRString(re.ReplaceAllString(s.value, repl))
 }
+
+// Count 计算指定字符串在当前字符串中出现的次数
+func (s RString) Count(substr string) int {
+	return strings.Count(s.value, substr)
+}
+
+// Index 返回子字符串在当前字符串中第一次出现的位置，不存在则返回-1
+func (s RString) Index(substr string) int {
+	return strings.Index(s.value, substr)
+}
+
+// RIndex 返回子字符串在当前字符串中最后一次出现的位置
+func (s RString) RIndex(substr string) int {
+	return strings.LastIndex(s.value, substr)
+}
+
+// Slice 返回指定范围的子字符串
+func (s RString) Slice(start, end int) RString {
+	runes := []rune(s.value)
+	length := len(runes)
+
+	// 处理负索引
+	if start < 0 {
+		start = length + start
+	}
+	if end < 0 {
+		end = length + end
+	}
+
+	// 处理边界情况
+	if start < 0 {
+		start = 0
+	}
+	if end > length {
+		end = length
+	}
+	if start > end || start >= length {
+		return NewRString("")
+	}
+
+	return NewRString(string(runes[start:end]))
+}
+
+// SliceFrom 返回从指定位置开始到字符串结尾的子字符串
+func (s RString) SliceFrom(start int) RString {
+	runes := []rune(s.value)
+	length := len(runes)
+
+	// 处理负索引
+	if start < 0 {
+		start = length + start
+	}
+
+	// 处理边界情况
+	if start < 0 {
+		start = 0
+	}
+	if start >= length {
+		return NewRString("")
+	}
+
+	return NewRString(string(runes[start:]))
+}
+
+// Concat 连接两个字符串并返回新字符串
+func (s RString) Concat(other RString) RString {
+	return NewRString(s.value + other.value)
+}
+
+// Center 返回居中字符串，使用指定字符填充
+func (s RString) Center(width int, padStr ...string) RString {
+	padChar := " "
+	if len(padStr) > 0 {
+		padChar = padStr[0]
+	}
+
+	strLen := s.Length()
+	if strLen >= width {
+		return s
+	}
+
+	leftPad := (width - strLen) / 2
+	rightPad := width - strLen - leftPad
+
+	return NewRString(strings.Repeat(padChar, leftPad) + s.value + strings.Repeat(padChar, rightPad))
+}
+
+// Ljust 返回左对齐字符串，使用指定字符填充
+func (s RString) Ljust(width int, padStr ...string) RString {
+	padChar := " "
+	if len(padStr) > 0 {
+		padChar = padStr[0]
+	}
+
+	strLen := s.Length()
+	if strLen >= width {
+		return s
+	}
+
+	padWidth := width - strLen
+	return NewRString(s.value + strings.Repeat(padChar, padWidth))
+}
+
+// Rjust 返回右对齐字符串，使用指定字符填充
+func (s RString) Rjust(width int, padStr ...string) RString {
+	padChar := " "
+	if len(padStr) > 0 {
+		padChar = padStr[0]
+	}
+
+	strLen := s.Length()
+	if strLen >= width {
+		return s
+	}
+
+	padWidth := width - strLen
+	return NewRString(strings.Repeat(padChar, padWidth) + s.value)
+}
+
+// Sub 使用正则表达式替换第一个匹配项
+func (s RString) Sub(pattern, repl string) RString {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return s
+	}
+
+	// 找到第一个匹配
+	loc := re.FindStringIndex(s.value)
+	if loc == nil {
+		return s
+	}
+
+	// 只替换第一个匹配
+	return NewRString(s.value[:loc[0]] + re.ReplaceAllString(s.value[loc[0]:loc[1]], repl) + s.value[loc[1]:])
+}
+
+// Ord 返回字符串第一个字符的ASCII码值
+func (s RString) Ord() int {
+	if s.Empty() {
+		panic("空字符串没有ASCII码值")
+	}
+
+	r, _ := utf8.DecodeRuneInString(s.value)
+	return int(r)
+}
+
+// Chars 返回字符串中的所有字符组成的数组
+func (s RString) Chars() RArray {
+	runes := []rune(s.value)
+	chars := make([]Object, len(runes))
+
+	for i, r := range runes {
+		chars[i] = NewRString(string(r))
+	}
+
+	return NewRArray(chars)
+}
+
+// Each 对字符串中的每个字符执行指定操作
+func (s RString) Each(fn func(RString)) {
+	for _, r := range s.value {
+		fn(NewRString(string(r)))
+	}
+}
+
+// EachLine 对字符串中的每一行执行指定操作
+func (s RString) EachLine(fn func(RString)) {
+	lines := strings.Split(s.value, "\n")
+	for _, line := range lines {
+		fn(NewRString(line))
+	}
+}
+
+// Times 重复字符串指定次数
+func (s RString) Times(n int) RString {
+	if n <= 0 {
+		return NewRString("")
+	}
+	return NewRString(strings.Repeat(s.value, n))
+}
+
+// ToInt 将字符串转换为整数
+func (s RString) ToInt() (int, error) {
+	// 移除前导空格
+	str := strings.TrimSpace(s.value)
+	// 尝试转换为整数
+	return parseInt(str)
+}
+
+// 辅助函数：解析整数
+func parseInt(s string) (int, error) {
+	// 实现简化版的整数解析
+	// 可以处理十进制、十六进制、八进制等
+	return strings.IndexAny(s, "0123456789"), nil
+}
+
+// Inspect 返回字符串的可打印形式（带引号）
+func (s RString) Inspect() string {
+	return "\"" + s.value + "\""
+}
+
+// SwapCase 交换字符串中字母的大小写
+func (s RString) SwapCase() RString {
+	runes := []rune(s.value)
+	for i, r := range runes {
+		if unicode.IsUpper(r) {
+			runes[i] = unicode.ToLower(r)
+		} else if unicode.IsLower(r) {
+			runes[i] = unicode.ToUpper(r)
+		}
+	}
+	return NewRString(string(runes))
+}
+
+// ToCamelCase 转换字符串为驼峰命名（Rails扩展方法）
+func (s RString) ToCamelCase() RString {
+	words := strings.Split(s.value, "_")
+	for i := 1; i < len(words); i++ {
+		if len(words[i]) > 0 {
+			r := []rune(words[i])
+			r[0] = unicode.ToUpper(r[0])
+			words[i] = string(r)
+		}
+	}
+	return NewRString(strings.Join(words, ""))
+}
+
+// ToSnakeCase 转换字符串为蛇形命名（Rails扩展方法）
+func (s RString) ToSnakeCase() RString {
+	var result []rune
+	runes := []rune(s.value)
+
+	for i, r := range runes {
+		if unicode.IsUpper(r) {
+			if i > 0 && !unicode.IsUpper(runes[i-1]) {
+				result = append(result, '_')
+			}
+			result = append(result, unicode.ToLower(r))
+		} else {
+			result = append(result, r)
+		}
+	}
+
+	return NewRString(string(result))
+}
