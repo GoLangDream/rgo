@@ -3,8 +3,6 @@ module github.com/GoLangDream/rgo
 go 1.24.3
 
 require (
-	github.com/gertd/go-pluralize v0.2.1
-	github.com/huandu/xstrings v1.5.0
 	github.com/onsi/ginkgo/v2 v2.23.4
 	github.com/onsi/gomega v1.37.0
 )

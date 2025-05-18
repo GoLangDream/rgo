@@ -1,0 +1,206 @@
+package goby_test
+
+import (
+	. "github.com/GoLangDream/rgo"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+)
+
+var _ = Describe("RString", func() {
+	var (
+		emptyStr RString
+		str      RString
+		multiStr RString
+	)
+
+	BeforeEach(func() {
+		emptyStr = NewRString("")
+		str = NewRString("hello world")
+		multiStr = NewRString("hello\nworld")
+	})
+
+	Context("长度相关方法", func() {
+		It("应该返回正确的字符串长度", func() {
+			Expect(emptyStr.Length()).To(Equal(0))
+			Expect(str.Length()).To(Equal(11))
+			Expect(multiStr.Length()).To(Equal(11))
+		})
+
+		It("Size 方法应该与 Length 返回相同结果", func() {
+			Expect(str.Size()).To(Equal(str.Length()))
+		})
+
+		It("应该正确检测空字符串", func() {
+			Expect(emptyStr.Empty()).To(BeTrue())
+			Expect(str.Empty()).To(BeFalse())
+		})
+	})
+
+	Context("变换方法", func() {
+		It("应该正确大写首字母", func() {
+			Expect(NewRString("hello").Capitalize().ToString()).To(Equal("Hello"))
+			Expect(NewRString("Hello").Capitalize().ToString()).To(Equal("Hello"))
+			Expect(emptyStr.Capitalize().ToString()).To(Equal(""))
+		})
+
+		It("应该正确转换大小写", func() {
+			Expect(str.Upcase().ToString()).To(Equal("HELLO WORLD"))
+			Expect(str.Downcase().ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确去除空白", func() {
+			whiteStr := NewRString("  hello world  ")
+			Expect(whiteStr.Strip().ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确去除换行符", func() {
+			crlfStr := NewRString("hello\r\n")
+			Expect(crlfStr.Chomp().ToString()).To(Equal("hello"))
+		})
+
+		It("应该正确反转字符串", func() {
+			Expect(str.Reverse().ToString()).To(Equal("dlrow olleh"))
+			Expect(emptyStr.Reverse().ToString()).To(Equal(""))
+		})
+
+		It("应该正确交换大小写", func() {
+			Expect(NewRString("Hello World").SwapCase().ToString()).To(Equal("hELLO wORLD"))
+			Expect(NewRString("123").SwapCase().ToString()).To(Equal("123"))
+		})
+
+		It("应该正确转换为驼峰命名", func() {
+			Expect(NewRString("hello_world").ToCamelCase().ToString()).To(Equal("helloWorld"))
+			Expect(NewRString("user_id").ToCamelCase().ToString()).To(Equal("userId"))
+		})
+
+		It("应该正确转换为蛇形命名", func() {
+			Expect(NewRString("helloWorld").ToSnakeCase().ToString()).To(Equal("hello_world"))
+			Expect(NewRString("userId").ToSnakeCase().ToString()).To(Equal("user_id"))
+		})
+	})
+
+	Context("查找和替换", func() {
+		It("应该正确检测子串", func() {
+			Expect(str.Include("hello")).To(BeTrue())
+			Expect(str.Include("goodbye")).To(BeFalse())
+		})
+
+		It("应该正确检测前缀和后缀", func() {
+			Expect(str.StartsWith("hello")).To(BeTrue())
+			Expect(str.StartsWith("world")).To(BeFalse())
+			Expect(str.EndsWith("world")).To(BeTrue())
+			Expect(str.EndsWith("hello")).To(BeFalse())
+		})
+
+		It("应该正确替换字符串", func() {
+			Expect(str.ReplaceAll("hello", "hi").ToString()).To(Equal("hi world"))
+			Expect(str.ReplaceAll("nonexistent", "hi").ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确使用正则表达式", func() {
+			Expect(str.Match(`hello.*`)).To(BeTrue())
+			Expect(str.Match(`^world`)).To(BeFalse())
+			Expect(str.Gsub(`hello`, "hi").ToString()).To(Equal("hi world"))
+			Expect(str.Gsub(`\w+`, "word").ToString()).To(Equal("word word"))
+		})
+
+		It("应该正确使用Sub替换第一个匹配项", func() {
+			Expect(str.Sub(`\w+`, "hi").ToString()).To(Equal("hi world"))
+			Expect(NewRString("one two three").Sub(`\w+`, "word").ToString()).To(Equal("word two three"))
+		})
+
+		It("应该正确计算子串出现次数", func() {
+			Expect(NewRString("hello hello world").Count("hello")).To(Equal(2))
+			Expect(NewRString("abababab").Count("ab")).To(Equal(4))
+			Expect(emptyStr.Count("any")).To(Equal(0))
+		})
+	})
+
+	Context("分割字符串", func() {
+		It("应该正确分割字符串", func() {
+			result := str.Split(" ")
+			Expect(result.Length()).To(Equal(2))
+			Expect(result.Get(0).ToString()).To(Equal("hello"))
+			Expect(result.Get(1).ToString()).To(Equal("world"))
+		})
+	})
+
+	Context("索引和切片", func() {
+		It("应该返回正确的索引位置", func() {
+			Expect(str.Index("hello")).To(Equal(0))
+			Expect(str.Index("world")).To(Equal(6))
+			Expect(str.Index("nonexistent")).To(Equal(-1))
+		})
+
+		It("应该返回正确的最后索引位置", func() {
+			repeatStr := NewRString("hello world hello")
+			Expect(repeatStr.RIndex("hello")).To(Equal(12))
+			Expect(str.RIndex("world")).To(Equal(6))
+			Expect(str.RIndex("nonexistent")).To(Equal(-1))
+		})
+
+		It("应该返回正确的子串", func() {
+			Expect(str.Slice(0, 5).ToString()).To(Equal("hello"))
+			Expect(str.Slice(6, 11).ToString()).To(Equal("world"))
+			Expect(str.Slice(-5, -1).ToString()).To(Equal("worl"))
+			Expect(str.Slice(20, 25).ToString()).To(Equal(""))
+		})
+
+		It("应该返回正确的从某位置开始的子串", func() {
+			Expect(str.SliceFrom(6).ToString()).To(Equal("world"))
+			Expect(str.SliceFrom(-5).ToString()).To(Equal("world"))
+			Expect(str.SliceFrom(20).ToString()).To(Equal(""))
+		})
+	})
+
+	Context("格式化和对齐", func() {
+		It("应该正确居中对齐字符串", func() {
+			Expect(NewRString("hello").Center(11).ToString()).To(Equal("   hello   "))
+			Expect(NewRString("hello").Center(11, "-").ToString()).To(Equal("---hello---"))
+			Expect(NewRString("hello").Center(4).ToString()).To(Equal("hello"))
+		})
+
+		It("应该正确左对齐字符串", func() {
+			Expect(NewRString("hello").Ljust(10).ToString()).To(Equal("hello     "))
+			Expect(NewRString("hello").Ljust(10, "*").ToString()).To(Equal("hello*****"))
+		})
+
+		It("应该正确右对齐字符串", func() {
+			Expect(NewRString("hello").Rjust(10).ToString()).To(Equal("     hello"))
+			Expect(NewRString("hello").Rjust(10, "*").ToString()).To(Equal("*****hello"))
+		})
+	})
+
+	Context("字符操作", func() {
+		It("应该返回正确的ASCII码值", func() {
+			Expect(NewRString("A").Ord()).To(Equal(65))
+			Expect(NewRString("a").Ord()).To(Equal(97))
+		})
+
+		It("应该返回正确的字符数组", func() {
+			chars := str.Chars()
+			Expect(chars.Length()).To(Equal(11))
+			Expect(chars.Get(0).ToString()).To(Equal("h"))
+			Expect(chars.Get(5).ToString()).To(Equal(" "))
+		})
+	})
+
+	Context("字符串操作", func() {
+		It("应该正确连接字符串", func() {
+			Expect(str.Concat(NewRString("!")).ToString()).To(Equal("hello world!"))
+			Expect(emptyStr.Concat(str).ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确重复字符串", func() {
+			Expect(NewRString("ab").Times(3).ToString()).To(Equal("ababab"))
+			Expect(NewRString("ab").Times(0).ToString()).To(Equal(""))
+		})
+	})
+
+	Context("检查和调试", func() {
+		It("应该返回正确的检查字符串", func() {
+			Expect(str.Inspect()).To(Equal(`"hello world"`))
+			Expect(emptyStr.Inspect()).To(Equal(`""`))
+		})
+	})
+})
