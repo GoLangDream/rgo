@@ -1,6 +1,8 @@
 package goby_test
 
 import (
+	"testing"
+
 	. "github.com/GoLangDream/rgo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -336,3 +338,336 @@ var _ = Describe("RString", func() {
 		})
 	})
 })
+
+func TestRString_Gsub(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		pattern  string
+		repl     string
+		expected string
+	}{
+		{
+			name:     "无效的正则表达式",
+			input:    "hello",
+			pattern:  "[",
+			repl:     "x",
+			expected: "hello",
+		},
+		{
+			name:     "有效的正则表达式替换",
+			input:    "hello world",
+			pattern:  "o",
+			repl:     "x",
+			expected: "hellx wxrld",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			result := s.Gsub(tt.pattern, tt.repl)
+			if result.ToString() != tt.expected {
+				t.Errorf("Gsub() = %v, want %v", result.ToString(), tt.expected)
+			}
+		})
+	}
+}
+
+func TestRString_Sub(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		pattern  string
+		repl     string
+		expected string
+	}{
+		{
+			name:     "无效的正则表达式",
+			input:    "hello",
+			pattern:  "[",
+			repl:     "x",
+			expected: "hello",
+		},
+		{
+			name:     "无匹配项",
+			input:    "hello",
+			pattern:  "xyz",
+			repl:     "x",
+			expected: "hello",
+		},
+		{
+			name:     "替换第一个匹配项",
+			input:    "hello world",
+			pattern:  "o",
+			repl:     "x",
+			expected: "hellx world",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			result := s.Sub(tt.pattern, tt.repl)
+			if result.ToString() != tt.expected {
+				t.Errorf("Sub() = %v, want %v", result.ToString(), tt.expected)
+			}
+		})
+	}
+}
+
+func TestRString_Ord(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expected    int
+		shouldPanic bool
+	}{
+		{
+			name:        "空字符串",
+			input:       "",
+			expected:    0,
+			shouldPanic: true,
+		},
+		{
+			name:        "ASCII字符",
+			input:       "A",
+			expected:    65,
+			shouldPanic: false,
+		},
+		{
+			name:        "中文字符",
+			input:       "中",
+			expected:    20013,
+			shouldPanic: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil && !tt.shouldPanic {
+					t.Errorf("Ord() panic = %v, want no panic", r)
+				}
+			}()
+
+			s := NewRString(tt.input)
+			result := s.Ord()
+			if !tt.shouldPanic && result != tt.expected {
+				t.Errorf("Ord() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRString_Chars(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: []string{},
+		},
+		{
+			name:     "ASCII字符串",
+			input:    "hello",
+			expected: []string{"h", "e", "l", "l", "o"},
+		},
+		{
+			name:     "中文字符串",
+			input:    "你好",
+			expected: []string{"你", "好"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			result := s.Chars()
+
+			if len(result.ToArray()) != len(tt.expected) {
+				t.Errorf("Chars() length = %v, want %v", len(result.ToArray()), len(tt.expected))
+				return
+			}
+
+			for i, expected := range tt.expected {
+				if str, ok := result.ToArray()[i].(RString); !ok || str.ToString() != expected {
+					t.Errorf("Chars()[%d] = %v, want %v", i, result.ToArray()[i], expected)
+				}
+			}
+		})
+	}
+}
+
+func TestRString_Each(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: []string{},
+		},
+		{
+			name:     "ASCII字符串",
+			input:    "hello",
+			expected: []string{"h", "e", "l", "l", "o"},
+		},
+		{
+			name:     "中文字符串",
+			input:    "你好",
+			expected: []string{"你", "好"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			var result []string
+
+			s.Each(func(r RString) {
+				result = append(result, r.ToString())
+			})
+
+			if len(result) != len(tt.expected) {
+				t.Errorf("Each() length = %v, want %v", len(result), len(tt.expected))
+				return
+			}
+
+			for i, expected := range tt.expected {
+				if result[i] != expected {
+					t.Errorf("Each()[%d] = %v, want %v", i, result[i], expected)
+				}
+			}
+		})
+	}
+}
+
+func TestRString_EachLine(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: []string{""},
+		},
+		{
+			name:     "单行字符串",
+			input:    "hello",
+			expected: []string{"hello"},
+		},
+		{
+			name:     "多行字符串",
+			input:    "hello\nworld\n你好",
+			expected: []string{"hello", "world", "你好"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			var result []string
+
+			s.EachLine(func(r RString) {
+				result = append(result, r.ToString())
+			})
+
+			if len(result) != len(tt.expected) {
+				t.Errorf("EachLine() length = %v, want %v", len(result), len(tt.expected))
+				return
+			}
+
+			for i, expected := range tt.expected {
+				if result[i] != expected {
+					t.Errorf("EachLine()[%d] = %v, want %v", i, result[i], expected)
+				}
+			}
+		})
+	}
+}
+
+func TestRString_Times(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		times    int
+		expected string
+	}{
+		{
+			name:     "零次重复",
+			input:    "hello",
+			times:    0,
+			expected: "",
+		},
+		{
+			name:     "负数重复",
+			input:    "hello",
+			times:    -1,
+			expected: "",
+		},
+		{
+			name:     "一次重复",
+			input:    "hello",
+			times:    1,
+			expected: "hello",
+		},
+		{
+			name:     "多次重复",
+			input:    "hello",
+			times:    3,
+			expected: "hellohellohello",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			result := s.Times(tt.times)
+			if result.ToString() != tt.expected {
+				t.Errorf("Times() = %v, want %v", result.ToString(), tt.expected)
+			}
+		})
+	}
+}
+
+func TestRString_ToInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected int
+	}{
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: -1,
+		},
+		{
+			name:     "纯数字字符串",
+			input:    "123",
+			expected: 0,
+		},
+		{
+			name:     "带空格的数字字符串",
+			input:    "  456  ",
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewRString(tt.input)
+			result, _ := s.ToInt()
+			if result != tt.expected {
+				t.Errorf("ToInt() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
