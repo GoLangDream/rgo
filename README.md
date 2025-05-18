@@ -1,4 +1,7 @@
 # RGo
+[![Go](https://github.com/GoLangDream/goby/actions/workflows/test.yml/badge.svg)](https://github.com/GoLangDream/goby/actions/workflows/test.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/GoLangDream/rgo)](https://goreportcard.com/report/github.com/GoLangDream/rgo)
+[![Coverage Status](https://coveralls.io/repos/github/GoLangDream/rgo/badge.svg?branch=main)](https://coveralls.io/github/GoLangDream/rgo?branch=main)
 
 RGo 是一个 Golang 库，提供类似 Ruby 中常用类的功能。它实现了 `RString`、`RInteger` 和 `RArray` 这三个主要类，并且保持了与 Ruby 中对应类相似的 API 设计。
 
