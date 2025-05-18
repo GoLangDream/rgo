@@ -112,6 +112,19 @@ var _ = Describe("RArray", func() {
 			Expect(uniq.Get(1).ToString()).To(Equal("b"))
 			Expect(uniq.Get(2).ToString()).To(Equal("c"))
 		})
+
+		It("应该正确处理空数组的转换", func() {
+			Expect(emptyArr.Join(",").ToString()).To(Equal(""))
+			Expect(emptyArr.Reverse().Length()).To(Equal(0))
+			Expect(emptyArr.Uniq().Length()).To(Equal(0))
+		})
+
+		It("应该正确处理单元素数组的转换", func() {
+			singleArr := NewRArray([]Object{NewRString("a")})
+			Expect(singleArr.Join(",").ToString()).To(Equal("a"))
+			Expect(singleArr.Reverse().Get(0).ToString()).To(Equal("a"))
+			Expect(singleArr.Uniq().Get(0).ToString()).To(Equal("a"))
+		})
 	})
 
 	Context("数组变换", func() {
@@ -146,6 +159,35 @@ var _ = Describe("RArray", func() {
 			Expect(result.Length()).To(Equal(1))
 			Expect(result.Get(0).ToString()).To(Equal("42"))
 		})
+
+		It("应该正确处理空数组的变换", func() {
+			result := emptyArr.Map(func(obj Object) Object {
+				return obj
+			})
+			Expect(result.Length()).To(Equal(0))
+
+			result = emptyArr.Select(func(obj Object) bool {
+				return true
+			})
+			Expect(result.Length()).To(Equal(0))
+
+			result = emptyArr.Reject(func(obj Object) bool {
+				return true
+			})
+			Expect(result.Length()).To(Equal(0))
+		})
+
+		It("应该正确处理所有元素都被过滤的情况", func() {
+			result := strArr.Select(func(obj Object) bool {
+				return false
+			})
+			Expect(result.Length()).To(Equal(0))
+
+			result = strArr.Reject(func(obj Object) bool {
+				return true
+			})
+			Expect(result.Length()).To(Equal(0))
+		})
 	})
 
 	Context("检测包含", func() {
@@ -173,6 +215,10 @@ var _ = Describe("RArray", func() {
 			Expect(compacted.Get(2).ToString()).To(Equal("c"))
 		})
 
+		It("应该正确处理空数组的压缩", func() {
+			Expect(emptyArr.Compact().Length()).To(Equal(0))
+		})
+
 		It("应该正确展平嵌套数组", func() {
 			arr := NewRArray([]Object{
 				NewRString("a"),
@@ -188,6 +234,27 @@ var _ = Describe("RArray", func() {
 			Expect(flattened.Get(1).ToString()).To(Equal("b"))
 			Expect(flattened.Get(2).ToString()).To(Equal("c"))
 			Expect(flattened.Get(3).ToString()).To(Equal("d"))
+		})
+
+		It("应该正确处理多层嵌套数组的展平", func() {
+			arr := NewRArray([]Object{
+				NewRString("a"),
+				NewRArray([]Object{
+					NewRString("b"),
+					NewRArray([]Object{
+						NewRString("c"),
+						NewRString("d"),
+					}),
+				}),
+				NewRString("e"),
+			})
+			flattened := arr.Flatten()
+			Expect(flattened.Length()).To(Equal(5))
+			Expect(flattened.Get(0).ToString()).To(Equal("a"))
+			Expect(flattened.Get(1).ToString()).To(Equal("b"))
+			Expect(flattened.Get(2).ToString()).To(Equal("c"))
+			Expect(flattened.Get(3).ToString()).To(Equal("d"))
+			Expect(flattened.Get(4).ToString()).To(Equal("e"))
 		})
 	})
 
@@ -237,6 +304,15 @@ var _ = Describe("RArray", func() {
 				return obj.(RInteger).Value() > 5
 			})).To(BeTrue())
 		})
+
+		It("应该正确处理空数组的查询", func() {
+			Expect(emptyArr.Index(NewRString("a"))).To(Equal(-1))
+			Expect(emptyArr.RIndex(NewRString("a"))).To(Equal(-1))
+			Expect(emptyArr.Count(NewRString("a"))).To(Equal(0))
+			Expect(emptyArr.Any(func(obj Object) bool { return true })).To(BeFalse())
+			Expect(emptyArr.All(func(obj Object) bool { return true })).To(BeTrue())
+			Expect(emptyArr.None(func(obj Object) bool { return true })).To(BeTrue())
+		})
 	})
 
 	Context("数组切片", func() {
@@ -251,12 +327,16 @@ var _ = Describe("RArray", func() {
 			Expect(arr.Slice(1, 3).Length()).To(Equal(2))
 			Expect(arr.Slice(1, 3).Get(0).ToString()).To(Equal("b"))
 			Expect(arr.Slice(1, 3).Get(1).ToString()).To(Equal("c"))
-			Expect(arr.SliceFrom(2).Length()).To(Equal(3))
-			Expect(arr.SliceFrom(2).Get(0).ToString()).To(Equal("c"))
-			Expect(arr.Take(2).Length()).To(Equal(2))
-			Expect(arr.Take(2).Get(0).ToString()).To(Equal("a"))
-			Expect(arr.Drop(2).Length()).To(Equal(3))
-			Expect(arr.Drop(2).Get(0).ToString()).To(Equal("c"))
+			Expect(arr.Slice(-3, -1).Length()).To(Equal(2))
+			Expect(arr.Slice(-3, -1).Get(0).ToString()).To(Equal("c"))
+			Expect(arr.Slice(-3, -1).Get(1).ToString()).To(Equal("d"))
+			Expect(arr.Slice(10, 20).Length()).To(Equal(0))
+			Expect(arr.Slice(-20, -10).Length()).To(Equal(0))
+		})
+
+		It("应该正确处理空数组的切片", func() {
+			Expect(emptyArr.Slice(0, 1).Length()).To(Equal(0))
+			Expect(emptyArr.Slice(-1, 1).Length()).To(Equal(0))
 		})
 	})
 
@@ -348,6 +428,17 @@ var _ = Describe("RArray", func() {
 				result = append(result, subArr.Join("").ToString())
 			})
 			Expect(result).To(Equal([]string{"ab", "cd"}))
+		})
+	})
+
+	Context("数组比较", func() {
+		It("应该正确比较数组相等性", func() {
+			arr1 := NewRArray([]Object{NewRString("a"), NewRString("b")})
+			arr2 := NewRArray([]Object{NewRString("a"), NewRString("b")})
+			arr3 := NewRArray([]Object{NewRString("a"), NewRString("c")})
+			Expect(arr1.Equal(arr2)).To(BeTrue())
+			Expect(arr1.Equal(arr3)).To(BeFalse())
+			Expect(arr1.Equal(emptyArr)).To(BeFalse())
 		})
 	})
 })

@@ -77,6 +77,32 @@ var _ = Describe("RString", func() {
 			Expect(NewRString("helloWorld").ToSnakeCase().ToString()).To(Equal("hello_world"))
 			Expect(NewRString("userId").ToSnakeCase().ToString()).To(Equal("user_id"))
 		})
+
+		It("应该正确处理空字符串的变换", func() {
+			Expect(emptyStr.Capitalize().ToString()).To(Equal(""))
+			Expect(emptyStr.Upcase().ToString()).To(Equal(""))
+			Expect(emptyStr.Downcase().ToString()).To(Equal(""))
+			Expect(emptyStr.Strip().ToString()).To(Equal(""))
+			Expect(emptyStr.Chomp().ToString()).To(Equal(""))
+			Expect(emptyStr.Reverse().ToString()).To(Equal(""))
+			Expect(emptyStr.SwapCase().ToString()).To(Equal(""))
+			Expect(emptyStr.ToCamelCase().ToString()).To(Equal(""))
+			Expect(emptyStr.ToSnakeCase().ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理特殊字符的变换", func() {
+			specialStr := NewRString("!@#$%^&*()")
+			Expect(specialStr.Upcase().ToString()).To(Equal("!@#$%^&*()"))
+			Expect(specialStr.Downcase().ToString()).To(Equal("!@#$%^&*()"))
+			Expect(specialStr.SwapCase().ToString()).To(Equal("!@#$%^&*()"))
+		})
+
+		It("应该正确处理Unicode字符的变换", func() {
+			unicodeStr := NewRString("你好世界")
+			Expect(unicodeStr.Upcase().ToString()).To(Equal("你好世界"))
+			Expect(unicodeStr.Downcase().ToString()).To(Equal("你好世界"))
+			Expect(unicodeStr.SwapCase().ToString()).To(Equal("你好世界"))
+		})
 	})
 
 	Context("查找和替换", func() {
@@ -114,6 +140,29 @@ var _ = Describe("RString", func() {
 			Expect(NewRString("abababab").Count("ab")).To(Equal(4))
 			Expect(emptyStr.Count("any")).To(Equal(0))
 		})
+
+		It("应该正确处理空字符串的查找和替换", func() {
+			Expect(emptyStr.Include("any")).To(BeFalse())
+			Expect(emptyStr.StartsWith("any")).To(BeFalse())
+			Expect(emptyStr.EndsWith("any")).To(BeFalse())
+			Expect(emptyStr.ReplaceAll("any", "new").ToString()).To(Equal(""))
+			Expect(emptyStr.Match(`.*`)).To(BeTrue())
+			Expect(emptyStr.Gsub(`.*`, "new").ToString()).To(Equal("new"))
+			Expect(emptyStr.Sub(`.*`, "new").ToString()).To(Equal("new"))
+			Expect(emptyStr.Count("any")).To(Equal(0))
+		})
+
+		It("应该正确处理正则表达式的特殊情况", func() {
+			Expect(str.Match(`^$`)).To(BeFalse())
+			Expect(str.Gsub(`^$`, "new").ToString()).To(Equal("hello world"))
+			Expect(str.Sub(`^$`, "new").ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确处理多次替换", func() {
+			repeatStr := NewRString("hello hello hello")
+			Expect(repeatStr.ReplaceAll("hello", "hi").ToString()).To(Equal("hi hi hi"))
+			Expect(repeatStr.Gsub(`hello`, "hi").ToString()).To(Equal("hi hi hi"))
+		})
 	})
 
 	Context("分割字符串", func() {
@@ -122,6 +171,26 @@ var _ = Describe("RString", func() {
 			Expect(result.Length()).To(Equal(2))
 			Expect(result.Get(0).ToString()).To(Equal("hello"))
 			Expect(result.Get(1).ToString()).To(Equal("world"))
+		})
+
+		It("应该正确处理空字符串的分割", func() {
+			result := emptyStr.Split(" ")
+			Expect(result.Length()).To(Equal(1))
+			Expect(result.Get(0).ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理不包含分隔符的字符串", func() {
+			result := str.Split(",")
+			Expect(result.Length()).To(Equal(1))
+			Expect(result.Get(0).ToString()).To(Equal("hello world"))
+		})
+
+		It("应该正确处理连续分隔符", func() {
+			spacesStr := NewRString("hello   world")
+			result := spacesStr.Split(" ")
+			Expect(result.Length()).To(Equal(4))
+			Expect(result.Get(0).ToString()).To(Equal("hello"))
+			Expect(result.Get(3).ToString()).To(Equal("world"))
 		})
 	})
 
@@ -151,6 +220,25 @@ var _ = Describe("RString", func() {
 			Expect(str.SliceFrom(-5).ToString()).To(Equal("world"))
 			Expect(str.SliceFrom(20).ToString()).To(Equal(""))
 		})
+
+		It("应该正确处理空字符串的索引和切片", func() {
+			Expect(emptyStr.Index("any")).To(Equal(-1))
+			Expect(emptyStr.RIndex("any")).To(Equal(-1))
+			Expect(emptyStr.Slice(0, 1).ToString()).To(Equal(""))
+			Expect(emptyStr.SliceFrom(0).ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理越界索引", func() {
+			Expect(str.Index("nonexistent")).To(Equal(-1))
+			Expect(str.RIndex("nonexistent")).To(Equal(-1))
+			Expect(str.Slice(100, 200).ToString()).To(Equal(""))
+			Expect(str.SliceFrom(100).ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理负索引", func() {
+			Expect(str.Slice(-5, -1).ToString()).To(Equal("worl"))
+			Expect(str.SliceFrom(-5).ToString()).To(Equal("world"))
+		})
 	})
 
 	Context("格式化和对齐", func() {
@@ -169,6 +257,24 @@ var _ = Describe("RString", func() {
 			Expect(NewRString("hello").Rjust(10).ToString()).To(Equal("     hello"))
 			Expect(NewRString("hello").Rjust(10, "*").ToString()).To(Equal("*****hello"))
 		})
+
+		It("应该正确处理空字符串的对齐", func() {
+			Expect(emptyStr.Center(5).ToString()).To(Equal("     "))
+			Expect(emptyStr.Ljust(5).ToString()).To(Equal("     "))
+			Expect(emptyStr.Rjust(5).ToString()).To(Equal("     "))
+		})
+
+		It("应该正确处理长度小于填充长度的情况", func() {
+			Expect(NewRString("hi").Center(1).ToString()).To(Equal("hi"))
+			Expect(NewRString("hi").Ljust(1).ToString()).To(Equal("hi"))
+			Expect(NewRString("hi").Rjust(1).ToString()).To(Equal("hi"))
+		})
+
+		It("应该正确处理自定义填充字符", func() {
+			Expect(NewRString("hi").Center(5, "*").ToString()).To(Equal("*hi**"))
+			Expect(NewRString("hi").Ljust(5, "*").ToString()).To(Equal("hi***"))
+			Expect(NewRString("hi").Rjust(5, "*").ToString()).To(Equal("***hi"))
+		})
 	})
 
 	Context("字符操作", func() {
@@ -183,6 +289,20 @@ var _ = Describe("RString", func() {
 			Expect(chars.Get(0).ToString()).To(Equal("h"))
 			Expect(chars.Get(5).ToString()).To(Equal(" "))
 		})
+
+		It("应该正确处理空字符串的字符操作", func() {
+			Expect(func() { emptyStr.Ord() }).To(PanicWith("空字符串没有ASCII码值"))
+			chars := emptyStr.Chars()
+			Expect(chars.Length()).To(Equal(0))
+		})
+
+		It("应该正确处理Unicode字符的字符操作", func() {
+			unicodeStr := NewRString("你好")
+			chars := unicodeStr.Chars()
+			Expect(chars.Length()).To(Equal(2))
+			Expect(chars.Get(0).ToString()).To(Equal("你"))
+			Expect(chars.Get(1).ToString()).To(Equal("好"))
+		})
 	})
 
 	Context("字符串操作", func() {
@@ -194,6 +314,18 @@ var _ = Describe("RString", func() {
 		It("应该正确重复字符串", func() {
 			Expect(NewRString("ab").Times(3).ToString()).To(Equal("ababab"))
 			Expect(NewRString("ab").Times(0).ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理空字符串的连接", func() {
+			Expect(emptyStr.Concat(NewRString("hello")).ToString()).To(Equal("hello"))
+			Expect(NewRString("hello").Concat(emptyStr).ToString()).To(Equal("hello"))
+			Expect(emptyStr.Concat(emptyStr).ToString()).To(Equal(""))
+		})
+
+		It("应该正确处理字符串的重复", func() {
+			Expect(NewRString("ab").Times(0).ToString()).To(Equal(""))
+			Expect(NewRString("ab").Times(1).ToString()).To(Equal("ab"))
+			Expect(NewRString("ab").Times(3).ToString()).To(Equal("ababab"))
 		})
 	})
 

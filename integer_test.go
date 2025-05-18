@@ -122,6 +122,74 @@ var _ = Describe("RInteger", func() {
 			Expect(NewRInteger(-5).FDiv(NewRInteger(2))).To(Equal(-2.5))
 			Expect(func() { positive.FDiv(zero) }).To(PanicWith("除数不能为零"))
 		})
+
+		It("应该正确处理除零错误", func() {
+			Expect(func() { positive.Div(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { negative.Div(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { zero.Div(zero) }).To(PanicWith("除数不能为零"))
+		})
+
+		It("应该正确处理取模运算的边界情况", func() {
+			Expect(func() { positive.Mod(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { negative.Mod(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { zero.Mod(zero) }).To(PanicWith("除数不能为零"))
+		})
+
+		It("应该正确处理幂运算的边界情况", func() {
+			Expect(NewRInteger(0).Pow(NewRInteger(0)).Value()).To(Equal(1))
+			Expect(NewRInteger(0).Pow(NewRInteger(1)).Value()).To(Equal(0))
+			Expect(NewRInteger(1).Pow(NewRInteger(0)).Value()).To(Equal(1))
+			Expect(NewRInteger(1).Pow(NewRInteger(1)).Value()).To(Equal(1))
+		})
+
+		It("应该正确处理最大公约数的边界情况", func() {
+			Expect(NewRInteger(0).Gcd(NewRInteger(5)).Value()).To(Equal(5))
+			Expect(NewRInteger(5).Gcd(NewRInteger(0)).Value()).To(Equal(5))
+			Expect(NewRInteger(0).Gcd(NewRInteger(0)).Value()).To(Equal(0))
+		})
+
+		It("应该正确处理最小公倍数的边界情况", func() {
+			Expect(NewRInteger(0).Lcm(NewRInteger(5)).Value()).To(Equal(0))
+			Expect(NewRInteger(5).Lcm(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).Lcm(NewRInteger(0)).Value()).To(Equal(0))
+		})
+
+		It("应该正确处理同时返回最大公约数和最小公倍数的边界情况", func() {
+			result := NewRInteger(0).GcdLcm(NewRInteger(5))
+			Expect(result.Length()).To(Equal(2))
+			Expect(result.Get(0).(RInteger).Value()).To(Equal(5))
+			Expect(result.Get(1).(RInteger).Value()).To(Equal(0))
+
+			result = NewRInteger(5).GcdLcm(NewRInteger(0))
+			Expect(result.Length()).To(Equal(2))
+			Expect(result.Get(0).(RInteger).Value()).To(Equal(5))
+			Expect(result.Get(1).(RInteger).Value()).To(Equal(0))
+
+			result = NewRInteger(0).GcdLcm(NewRInteger(0))
+			Expect(result.Length()).To(Equal(2))
+			Expect(result.Get(0).(RInteger).Value()).To(Equal(0))
+			Expect(result.Get(1).(RInteger).Value()).To(Equal(0))
+		})
+
+		It("应该正确处理同时返回商和余数的边界情况", func() {
+			result := NewRInteger(0).DivMod(NewRInteger(5))
+			Expect(result.Length()).To(Equal(2))
+			Expect(result.Get(0).(RInteger).Value()).To(Equal(0))
+			Expect(result.Get(1).(RInteger).Value()).To(Equal(0))
+
+			Expect(func() { NewRInteger(5).DivMod(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+			Expect(func() { NewRInteger(0).DivMod(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+		})
+
+		It("应该正确处理向上取整除法的边界情况", func() {
+			Expect(func() { NewRInteger(5).CeilDiv(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+			Expect(func() { NewRInteger(0).CeilDiv(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+		})
+
+		It("应该正确处理浮点除法的边界情况", func() {
+			Expect(func() { NewRInteger(5).FDiv(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+			Expect(func() { NewRInteger(0).FDiv(NewRInteger(0)) }).To(PanicWith("除数不能为零"))
+		})
 	})
 
 	Context("位运算", func() {
@@ -184,6 +252,27 @@ var _ = Describe("RInteger", func() {
 			Expect(NewRInteger(4).BitLength()).To(Equal(3))
 			Expect(NewRInteger(8).BitLength()).To(Equal(4))
 		})
+
+		It("应该正确处理位运算的边界情况", func() {
+			Expect(NewRInteger(0).BitAnd(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).BitOr(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).BitXor(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).BitNot().Value()).To(Equal(-1))
+		})
+
+		It("应该正确处理位移操作的边界情况", func() {
+			Expect(NewRInteger(0).LeftShift(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).RightShift(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).LeftShift(NewRInteger(1)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).RightShift(NewRInteger(1)).Value()).To(Equal(0))
+		})
+
+		It("应该正确处理位检查的边界情况", func() {
+			Expect(NewRInteger(0).BitAt(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).AllBits(NewRInteger(0))).To(BeTrue())
+			Expect(NewRInteger(0).AnyBits(NewRInteger(0))).To(BeFalse())
+			Expect(NewRInteger(0).NoBits(NewRInteger(0))).To(BeTrue())
+		})
 	})
 
 	Context("取整和舍入", func() {
@@ -214,6 +303,18 @@ var _ = Describe("RInteger", func() {
 			Expect(negative.TruncateWithPrecision(NewRInteger(-1)).Value()).To(Equal(-10))
 			Expect(NewRInteger(42).TruncateWithPrecision(NewRInteger(1)).Value()).To(Equal(42))
 		})
+
+		It("应该正确处理取整和舍入的边界情况", func() {
+			Expect(NewRInteger(0).Ceil().Value()).To(Equal(0))
+			Expect(NewRInteger(0).Floor().Value()).To(Equal(0))
+			Expect(NewRInteger(0).Round().Value()).To(Equal(0))
+			Expect(NewRInteger(0).Truncate().Value()).To(Equal(0))
+
+			Expect(NewRInteger(0).CeilWithPrecision(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).FloorWithPrecision(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).RoundWithPrecision(NewRInteger(0)).Value()).To(Equal(0))
+			Expect(NewRInteger(0).TruncateWithPrecision(NewRInteger(0)).Value()).To(Equal(0))
+		})
 	})
 
 	Context("遍历方法", func() {
@@ -239,6 +340,29 @@ var _ = Describe("RInteger", func() {
 				sum += i.Value()
 			})
 			Expect(sum).To(Equal(5 + 4 + 3 + 2 + 1))
+		})
+
+		It("应该正确处理遍历方法的边界情况", func() {
+			// Times
+			count := 0
+			NewRInteger(0).Times(func(i RInteger) {
+				count++
+			})
+			Expect(count).To(Equal(0))
+
+			// UpTo
+			count = 0
+			NewRInteger(5).UpTo(NewRInteger(4), func(i RInteger) {
+				count++
+			})
+			Expect(count).To(Equal(0))
+
+			// DownTo
+			count = 0
+			NewRInteger(4).DownTo(NewRInteger(5), func(i RInteger) {
+				count++
+			})
+			Expect(count).To(Equal(0))
 		})
 	})
 
@@ -296,6 +420,10 @@ var _ = Describe("RInteger", func() {
 		It("应该正确转换为字符", func() {
 			Expect(NewRInteger(65).Chr().ToString()).To(Equal("A"))
 			Expect(NewRInteger(97).Chr().ToString()).To(Equal("a"))
+		})
+
+		It("应该正确处理转换方法的边界情况", func() {
+			Expect(NewRInteger(0).ToString()).To(Equal("0"))
 		})
 	})
 
