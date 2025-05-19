@@ -1,4 +1,4 @@
-package goby
+package rgo
 
 // Object 是所有 R 类型的基础接口
 type Object interface {

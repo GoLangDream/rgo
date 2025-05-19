@@ -1,4 +1,4 @@
-package goby_test
+package rgo_test
 
 import (
 	. "github.com/GoLangDream/rgo"

@@ -1,4 +1,4 @@
-package goby
+package rgo
 
 import (
 	"fmt"

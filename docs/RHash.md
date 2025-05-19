@@ -6,11 +6,14 @@ RHash 是一个模仿 Ruby Hash 的 Go 实现，提供了类似 Ruby 的哈希�
 
 ```go
 // 创建空哈希表
-hash := goby.NewHash()
+hash := rgo.NewHash()
 
 // 使用 map 创建哈希表
-m := map[any]any{"key1": "value1", "key2": "value2"}
-hash := goby.NewHashWithMap(m)
+m := map[string]interface{}{
+    "name": "John",
+    "age":  30,
+}
+hash := rgo.NewHashWithMap(m)
 ```
 
 ## 基本操作

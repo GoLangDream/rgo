@@ -68,10 +68,10 @@ arr := NewRArray([]Object{
 import "github.com/GoLangDream/rgo"
 
 // 创建数组
-arr := goby.NewRArray([]goby.Object{
-    goby.NewRString("a"),
-    goby.NewRString("b"),
-    goby.NewRInteger(1),
+arr := rgo.NewRArray([]rgo.Object{
+    rgo.NewRString("a"),
+    rgo.NewRString("b"),
+    rgo.NewRInteger(1),
 })
 
 // 数组操作
@@ -80,48 +80,48 @@ length := arr.Length()                // 返回 3
 joined := arr.Join(", ")              // 返回 "a, b, 1"
 
 // 数组变换
-mapped := arr.Map(func(obj goby.Object) goby.Object {
-    if str, ok := obj.(goby.RString); ok {
-        return goby.NewRString(str.ToString() + "!")
+mapped := arr.Map(func(obj rgo.Object) rgo.Object {
+    if str, ok := obj.(rgo.RString); ok {
+        return rgo.NewRString(str.ToString() + "!")
     }
     return obj
 })
 // mapped 包含 ["a!", "b!", 1]
 
 // 数组查询
-hasA := arr.Include(goby.NewRString("a"))  // 返回 true
-count := arr.Count(goby.NewRString("a"))   // 返回 1
+hasA := arr.Include(rgo.NewRString("a"))  // 返回 true
+count := arr.Count(rgo.NewRString("a"))   // 返回 1
 
 // 数组切片
 subArr := arr.Slice(0, 2)  // 返回 ["a", "b"]
 
 // 数组分组
-groups := arr.GroupBy(func(obj goby.Object) goby.Object {
-    if _, ok := obj.(goby.RString); ok {
-        return goby.NewRString("string")
+groups := arr.GroupBy(func(obj rgo.Object) rgo.Object {
+    if _, ok := obj.(rgo.RString); ok {
+        return rgo.NewRString("string")
     }
-    return goby.NewRString("integer")
+    return rgo.NewRString("integer")
 })
 // groups 包含 {"string": ["a", "b"], "integer": [1]}
 
 // 数组迭代
-arr.Each(func(obj goby.Object) {
+arr.Each(func(obj rgo.Object) {
     fmt.Println(obj.ToString())
 })
 
 // 使用EachWithIndex
-arr.EachWithIndex(func(obj goby.Object, index int) {
+arr.EachWithIndex(func(obj rgo.Object, index int) {
     fmt.Printf("%d: %s\n", index, obj.ToString())
 })
 
 // 使用EachCons
-arr.EachCons(2, func(subArr goby.RArray) {
-    fmt.Println(subArr.Join("").ToString())
+arr.EachCons(2, func(subArr rgo.RArray) {
+    fmt.Println(subArr.ToString())
 })
 
 // 使用EachSlice
-arr.EachSlice(2, func(subArr goby.RArray) {
-    fmt.Println(subArr.Join("").ToString())
+arr.EachSlice(2, func(subArr rgo.RArray) {
+    fmt.Println(subArr.ToString())
 })
 ```
 

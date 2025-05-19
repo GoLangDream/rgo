@@ -1,5 +1,5 @@
-// Package goby 提供了一个类似 Ruby 的字符串实现
-package goby
+// Package rgo 提供了一个类似 Ruby 的字符串实现
+package rgo
 
 import (
 	"regexp"

@@ -1,4 +1,4 @@
-package goby_test
+package rgo_test
 
 import (
 	"fmt"

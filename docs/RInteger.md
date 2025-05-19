@@ -86,45 +86,45 @@ i := NewRInteger(42)
 ```go
 import "github.com/GoLangDream/rgo"
 
-num := goby.NewRInteger(42)
+num := rgo.NewRInteger(42)
 isEven := num.Even()                  // 返回 true
-sum := num.Add(goby.NewRInteger(10))  // 返回 52
-abs := goby.NewRInteger(-10).Abs()    // 返回 10
+sum := num.Add(rgo.NewRInteger(10))  // 返回 52
+abs := rgo.NewRInteger(-10).Abs()    // 返回 10
 
 // 基本数学运算
-a := goby.NewRInteger(10)
-b := goby.NewRInteger(3)
+a := rgo.NewRInteger(10)
+b := rgo.NewRInteger(3)
 gcd := a.Gcd(b)                       // 最大公约数: 1
 lcm := a.Lcm(b)                       // 最小公倍数: 30
 divmod := a.DivMod(b)                 // 返回商和余数: [3, 1]
 
 // 位运算
-bits := goby.NewRInteger(10)           // 二进制: 1010
-mask := goby.NewRInteger(12)           // 二进制: 1100
+bits := rgo.NewRInteger(10)           // 二进制: 1010
+mask := rgo.NewRInteger(12)           // 二进制: 1100
 bits.BitAnd(mask)                      // 位与: 8 (1000)
 bits.BitOr(mask)                       // 位或: 14 (1110)
 bits.BitXor(mask)                      // 位异或: 6 (0110)
-bits.LeftShift(goby.NewRInteger(1))    // 左移: 20 (10100)
-bits.BitAt(goby.NewRInteger(1))        // 获取第1位: 1
-bits.AllBits(goby.NewRInteger(8))      // 检查位: true (8=1000)
+bits.LeftShift(rgo.NewRInteger(1))    // 左移: 20 (10100)
+bits.BitAt(rgo.NewRInteger(1))        // 获取第1位: 1
+bits.AllBits(rgo.NewRInteger(8))      // 检查位: true (8=1000)
 
 // 格式转换
-n := goby.NewRInteger(255)
+n := rgo.NewRInteger(255)
 n.ToHex()                              // 十六进制: "ff"
 n.ToOct()                              // 八进制: "377"
 n.ToBin()                              // 二进制: "11111111"
-n.ToBase(goby.NewRInteger(36))         // 36进制: "73"
+n.ToBase(rgo.NewRInteger(36))         // 36进制: "73"
 n.Chr()                                // ASCII字符: "ÿ"
 n.Digits()                             // 返回各位数字: [5, 5, 2]
 
 // 取整与舍入
-n = goby.NewRInteger(42)
-n.RoundWithPrecision(goby.NewRInteger(-1))  // 四舍五入到十位: 40
-n.CeilWithPrecision(goby.NewRInteger(-1))   // 向上取整到十位: 50
-n.FloorWithPrecision(goby.NewRInteger(-1))  // 向下取整到十位: 40
+n = rgo.NewRInteger(42)
+n.RoundWithPrecision(rgo.NewRInteger(-1))  // 四舍五入到十位: 40
+n.CeilWithPrecision(rgo.NewRInteger(-1))   // 向上取整到十位: 50
+n.FloorWithPrecision(rgo.NewRInteger(-1))  // 向下取整到十位: 40
 
 // 遍历示例
-goby.NewRInteger(5).Times(func(i goby.RInteger) {
+rgo.NewRInteger(5).Times(func(i rgo.RInteger) {
     fmt.Println(i.ToString())         // 打印 0, 1, 2, 3, 4
 })
 ```
