@@ -5,8 +5,8 @@
 ## 创建RInteger
 
 ```go
-// 创建一个整数
-num := NewRInteger(42)
+// 创建一个新的 RInteger
+i := NewRInteger(42)
 ```
 
 ## 基本方法
@@ -24,6 +24,7 @@ num := NewRInteger(42)
 
 ### 数学运算
 - `Add(other)`: 加法
+- `AddInt(other)`: 与原生 int 类型相加
 - `Sub(other)`: 减法
 - `Mul(other)`: 乘法
 - `Div(other)`: 整除
@@ -127,3 +128,10 @@ goby.NewRInteger(5).Times(func(i goby.RInteger) {
     fmt.Println(i.ToString())         // 打印 0, 1, 2, 3, 4
 })
 ```
+
+## 注意事项
+
+1. 所有数学运算方法都会返回新的 `RInteger` 实例，不会修改原实例
+2. 除法和取模操作在除数为零时会触发 panic
+3. 幂运算在指数为负数时会返回 0
+4. 所有比较操作都返回布尔值

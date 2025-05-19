@@ -40,44 +40,85 @@ func (i RInteger) Value() int {
 	return i.value
 }
 
-// Add 返回两个整数的和
-func (i RInteger) Add(other RInteger) RInteger {
+// Add 返回整数与原生 int 的和
+func (i RInteger) Add(other int) RInteger {
+	return NewRInteger(i.value + other)
+}
+
+// AddRInt 返回两个 RInteger 的和
+func (i RInteger) AddRInt(other RInteger) RInteger {
 	return NewRInteger(i.value + other.value)
 }
 
-// Sub 返回两个整数的差
-func (i RInteger) Sub(other RInteger) RInteger {
+// Sub 返回整数与原生 int 的差
+func (i RInteger) Sub(other int) RInteger {
+	return NewRInteger(i.value - other)
+}
+
+// SubRInt 返回两个 RInteger 的差
+func (i RInteger) SubRInt(other RInteger) RInteger {
 	return NewRInteger(i.value - other.value)
 }
 
-// Mul 返回两个整数的积
-func (i RInteger) Mul(other RInteger) RInteger {
+// Mul 返回整数与原生 int 的积
+func (i RInteger) Mul(other int) RInteger {
+	return NewRInteger(i.value * other)
+}
+
+// MulRInt 返回两个 RInteger 的积
+func (i RInteger) MulRInt(other RInteger) RInteger {
 	return NewRInteger(i.value * other.value)
 }
 
-// Div 返回两个整数的商
-func (i RInteger) Div(other RInteger) RInteger {
+// Div 返回整数与原生 int 的商
+func (i RInteger) Div(other int) RInteger {
+	if other == 0 {
+		panic("除数不能为零")
+	}
+	return NewRInteger(i.value / other)
+}
+
+// DivRInt 返回两个 RInteger 的商
+func (i RInteger) DivRInt(other RInteger) RInteger {
 	if other.value == 0 {
 		panic("除数不能为零")
 	}
 	return NewRInteger(i.value / other.value)
 }
 
-// Mod 返回两个整数的余数
-func (i RInteger) Mod(other RInteger) RInteger {
+// Mod 返回整数与原生 int 的余数
+func (i RInteger) Mod(other int) RInteger {
+	if other == 0 {
+		panic("除数不能为零")
+	}
+	return NewRInteger(i.value % other)
+}
+
+// ModRInt 返回两个 RInteger 的余数
+func (i RInteger) ModRInt(other RInteger) RInteger {
 	if other.value == 0 {
 		panic("除数不能为零")
 	}
 	return NewRInteger(i.value % other.value)
 }
 
-// Modulo 返回两个整数的余数（Mod 的别名）
-func (i RInteger) Modulo(other RInteger) RInteger {
+// Modulo 返回整数与原生 int 的余数（Mod 的别名）
+func (i RInteger) Modulo(other int) RInteger {
 	return i.Mod(other)
 }
 
-// Pow 返回整数的指定次幂
-func (i RInteger) Pow(exponent RInteger) RInteger {
+// ModuloRInt 返回两个 RInteger 的余数（ModRInt 的别名）
+func (i RInteger) ModuloRInt(other RInteger) RInteger {
+	return i.ModRInt(other)
+}
+
+// Pow 返回整数与原生 int 的幂
+func (i RInteger) Pow(exponent int) RInteger {
+	return NewRInteger(int(math.Pow(float64(i.value), float64(exponent))))
+}
+
+// PowRInt 返回两个 RInteger 的幂
+func (i RInteger) PowRInt(exponent RInteger) RInteger {
 	return NewRInteger(int(math.Pow(float64(i.value), float64(exponent.value))))
 }
 

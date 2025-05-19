@@ -48,13 +48,76 @@ parts := str.Split(" ")               // 返回包含 ["hello", "world"] 的 RAr
 
 ### RInteger
 
-```go
-import "github.com/GoLangDream/rgo"
+`RInteger` 是一个整数类型的包装器，提供了丰富的整数操作方法。
 
-num := goby.NewRInteger(42)
-isEven := num.Even()                  // 返回 true
-sum := num.Add(goby.NewRInteger(10))  // 返回 52
-abs := goby.NewRInteger(-10).Abs()    // 返回 10
+### 创建
+
+```go
+// 创建一个新的 RInteger
+i := goby.NewRInteger(42)
+```
+
+### 基本运算
+
+```go
+// 加法
+result := i.Add(10)      // 与原生 int 相加
+result = i.AddRInt(j)    // 与另一个 RInteger 相加
+
+// 减法
+result := i.Sub(10)      // 与原生 int 相减
+result = i.SubRInt(j)    // 与另一个 RInteger 相减
+
+// 乘法
+result := i.Mul(10)      // 与原生 int 相乘
+result = i.MulRInt(j)    // 与另一个 RInteger 相乘
+
+// 除法
+result := i.Div(10)      // 与原生 int 相除
+result = i.DivRInt(j)    // 与另一个 RInteger 相除
+
+// 取模
+result := i.Mod(10)      // 与原生 int 取模
+result = i.ModRInt(j)    // 与另一个 RInteger 取模
+
+// 幂运算
+result := i.Pow(2)       // 与原生 int 的幂
+result = i.PowRInt(j)    // 与另一个 RInteger 的幂
+```
+
+### 比较操作
+
+```go
+// 相等比较
+i.Eq(10)      // 与原生 int 比较
+i.EqRInt(j)   // 与另一个 RInteger 比较
+
+// 大于比较
+i.Gt(10)      // 与原生 int 比较
+i.GtRInt(j)   // 与另一个 RInteger 比较
+
+// 小于比较
+i.Lt(10)      // 与原生 int 比较
+i.LtRInt(j)   // 与另一个 RInteger 比较
+```
+
+### 其他操作
+
+```go
+// 获取绝对值
+abs := i.Abs()
+
+// 获取最大值
+max := goby.MaxRInt(i, j)
+
+// 获取最小值
+min := goby.MinRInt(i, j)
+
+// 转换为字符串
+str := i.ToString()
+
+// 转换为原生 int
+n := i.ToInt()
 ```
 
 更多 RInteger 的详细文档请参考 [RInteger.md](docs/RInteger.md)
@@ -163,4 +226,3 @@ go test -v
 ## 许可证
 
 MIT License
-

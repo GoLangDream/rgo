@@ -1,6 +1,8 @@
 package goby_test
 
 import (
+	"testing"
+
 	. "github.com/GoLangDream/rgo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -44,39 +46,45 @@ var _ = Describe("RInteger", func() {
 
 	Context("数学运算", func() {
 		It("应该正确执行加法运算", func() {
-			Expect(positive.Add(negative).Value()).To(Equal(32))
-			Expect(negative.Add(positive).Value()).To(Equal(32))
-			Expect(zero.Add(positive).Value()).To(Equal(42))
+			Expect(positive.AddRInt(negative).Value()).To(Equal(32))
+			Expect(negative.AddRInt(positive).Value()).To(Equal(32))
+			Expect(zero.AddRInt(positive).Value()).To(Equal(42))
+		})
+
+		It("应该正确执行与原生 int 的加法运算", func() {
+			Expect(positive.Add(-10).Value()).To(Equal(32))
+			Expect(negative.Add(42).Value()).To(Equal(32))
+			Expect(zero.Add(42).Value()).To(Equal(42))
 		})
 
 		It("应该正确执行减法运算", func() {
-			Expect(positive.Sub(negative).Value()).To(Equal(52))
-			Expect(negative.Sub(positive).Value()).To(Equal(-52))
-			Expect(zero.Sub(negative).Value()).To(Equal(10))
+			Expect(positive.SubRInt(negative).Value()).To(Equal(52))
+			Expect(negative.SubRInt(positive).Value()).To(Equal(-52))
+			Expect(zero.SubRInt(negative).Value()).To(Equal(10))
 		})
 
 		It("应该正确执行乘法运算", func() {
-			Expect(positive.Mul(NewRInteger(2)).Value()).To(Equal(84))
-			Expect(negative.Mul(NewRInteger(3)).Value()).To(Equal(-30))
-			Expect(zero.Mul(positive).Value()).To(Equal(0))
+			Expect(positive.MulRInt(NewRInteger(2)).Value()).To(Equal(84))
+			Expect(negative.MulRInt(NewRInteger(3)).Value()).To(Equal(-30))
+			Expect(zero.MulRInt(positive).Value()).To(Equal(0))
 		})
 
 		It("应该正确执行除法运算", func() {
-			Expect(positive.Div(NewRInteger(2)).Value()).To(Equal(21))
-			Expect(negative.Div(NewRInteger(2)).Value()).To(Equal(-5))
-			Expect(func() { zero.Div(zero) }).To(PanicWith("除数不能为零"))
+			Expect(positive.DivRInt(NewRInteger(2)).Value()).To(Equal(21))
+			Expect(negative.DivRInt(NewRInteger(2)).Value()).To(Equal(-5))
+			Expect(func() { zero.DivRInt(zero) }).To(PanicWith("除数不能为零"))
 		})
 
 		It("应该正确执行取模运算", func() {
-			Expect(positive.Mod(NewRInteger(5)).Value()).To(Equal(2))
-			Expect(negative.Mod(NewRInteger(3)).Value()).To(Equal(-1))
-			Expect(func() { positive.Mod(zero) }).To(PanicWith("除数不能为零"))
+			Expect(positive.ModRInt(NewRInteger(5)).Value()).To(Equal(2))
+			Expect(negative.ModRInt(NewRInteger(3)).Value()).To(Equal(-1))
+			Expect(func() { positive.ModRInt(zero) }).To(PanicWith("除数不能为零"))
 		})
 
 		It("应该正确执行幂运算", func() {
-			Expect(NewRInteger(2).Pow(NewRInteger(3)).Value()).To(Equal(8))
-			Expect(NewRInteger(3).Pow(NewRInteger(2)).Value()).To(Equal(9))
-			Expect(zero.Pow(positive).Value()).To(Equal(0))
+			Expect(NewRInteger(2).PowRInt(NewRInteger(3)).Value()).To(Equal(8))
+			Expect(NewRInteger(3).PowRInt(NewRInteger(2)).Value()).To(Equal(9))
+			Expect(zero.PowRInt(positive).Value()).To(Equal(0))
 		})
 
 		It("应该正确计算绝对值", func() {
@@ -124,22 +132,22 @@ var _ = Describe("RInteger", func() {
 		})
 
 		It("应该正确处理除零错误", func() {
-			Expect(func() { positive.Div(zero) }).To(PanicWith("除数不能为零"))
-			Expect(func() { negative.Div(zero) }).To(PanicWith("除数不能为零"))
-			Expect(func() { zero.Div(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { positive.DivRInt(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { negative.DivRInt(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { zero.DivRInt(zero) }).To(PanicWith("除数不能为零"))
 		})
 
 		It("应该正确处理取模运算的边界情况", func() {
-			Expect(func() { positive.Mod(zero) }).To(PanicWith("除数不能为零"))
-			Expect(func() { negative.Mod(zero) }).To(PanicWith("除数不能为零"))
-			Expect(func() { zero.Mod(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { positive.ModRInt(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { negative.ModRInt(zero) }).To(PanicWith("除数不能为零"))
+			Expect(func() { zero.ModRInt(zero) }).To(PanicWith("除数不能为零"))
 		})
 
 		It("应该正确处理幂运算的边界情况", func() {
-			Expect(NewRInteger(0).Pow(NewRInteger(0)).Value()).To(Equal(1))
-			Expect(NewRInteger(0).Pow(NewRInteger(1)).Value()).To(Equal(0))
-			Expect(NewRInteger(1).Pow(NewRInteger(0)).Value()).To(Equal(1))
-			Expect(NewRInteger(1).Pow(NewRInteger(1)).Value()).To(Equal(1))
+			Expect(NewRInteger(0).PowRInt(NewRInteger(0)).Value()).To(Equal(1))
+			Expect(NewRInteger(0).PowRInt(NewRInteger(1)).Value()).To(Equal(0))
+			Expect(NewRInteger(1).PowRInt(NewRInteger(0)).Value()).To(Equal(1))
+			Expect(NewRInteger(1).PowRInt(NewRInteger(1)).Value()).To(Equal(1))
 		})
 
 		It("应该正确处理最大公约数的边界情况", func() {
@@ -452,3 +460,311 @@ var _ = Describe("RInteger", func() {
 		})
 	})
 })
+
+func TestRInteger_Add(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    int
+		expected RInteger
+	}{
+		{"正数相加", NewRInteger(5), 3, NewRInteger(8)},
+		{"负数相加", NewRInteger(-5), -3, NewRInteger(-8)},
+		{"正负相加", NewRInteger(5), -3, NewRInteger(2)},
+		{"零相加", NewRInteger(0), 0, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Add(tt.other)
+			if result != tt.expected {
+				t.Errorf("Add() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_AddRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    RInteger
+		expected RInteger
+	}{
+		{"正数相加", NewRInteger(5), NewRInteger(3), NewRInteger(8)},
+		{"负数相加", NewRInteger(-5), NewRInteger(-3), NewRInteger(-8)},
+		{"正负相加", NewRInteger(5), NewRInteger(-3), NewRInteger(2)},
+		{"零相加", NewRInteger(0), NewRInteger(0), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.AddRInt(tt.other)
+			if result != tt.expected {
+				t.Errorf("AddRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_Sub(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    int
+		expected RInteger
+	}{
+		{"正数相减", NewRInteger(5), 3, NewRInteger(2)},
+		{"负数相减", NewRInteger(-5), -3, NewRInteger(-2)},
+		{"正负相减", NewRInteger(5), -3, NewRInteger(8)},
+		{"零相减", NewRInteger(0), 0, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Sub(tt.other)
+			if result != tt.expected {
+				t.Errorf("Sub() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_SubRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    RInteger
+		expected RInteger
+	}{
+		{"正数相减", NewRInteger(5), NewRInteger(3), NewRInteger(2)},
+		{"负数相减", NewRInteger(-5), NewRInteger(-3), NewRInteger(-2)},
+		{"正负相减", NewRInteger(5), NewRInteger(-3), NewRInteger(8)},
+		{"零相减", NewRInteger(0), NewRInteger(0), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.SubRInt(tt.other)
+			if result != tt.expected {
+				t.Errorf("SubRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_Mul(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    int
+		expected RInteger
+	}{
+		{"正数相乘", NewRInteger(5), 3, NewRInteger(15)},
+		{"负数相乘", NewRInteger(-5), -3, NewRInteger(15)},
+		{"正负相乘", NewRInteger(5), -3, NewRInteger(-15)},
+		{"零相乘", NewRInteger(0), 0, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Mul(tt.other)
+			if result != tt.expected {
+				t.Errorf("Mul() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_MulRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    RInteger
+		expected RInteger
+	}{
+		{"正数相乘", NewRInteger(5), NewRInteger(3), NewRInteger(15)},
+		{"负数相乘", NewRInteger(-5), NewRInteger(-3), NewRInteger(15)},
+		{"正负相乘", NewRInteger(5), NewRInteger(-3), NewRInteger(-15)},
+		{"零相乘", NewRInteger(0), NewRInteger(0), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.MulRInt(tt.other)
+			if result != tt.expected {
+				t.Errorf("MulRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_Div(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    int
+		expected RInteger
+	}{
+		{"正数相除", NewRInteger(6), 3, NewRInteger(2)},
+		{"负数相除", NewRInteger(-6), -3, NewRInteger(2)},
+		{"正负相除", NewRInteger(6), -3, NewRInteger(-2)},
+		{"零除以非零", NewRInteger(0), 5, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Div(tt.other)
+			if result != tt.expected {
+				t.Errorf("Div() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+
+	// 测试除以零的情况
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Div() 除以零时没有触发 panic")
+		}
+	}()
+	NewRInteger(5).Div(0)
+}
+
+func TestRInteger_DivRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    RInteger
+		expected RInteger
+	}{
+		{"正数相除", NewRInteger(6), NewRInteger(3), NewRInteger(2)},
+		{"负数相除", NewRInteger(-6), NewRInteger(-3), NewRInteger(2)},
+		{"正负相除", NewRInteger(6), NewRInteger(-3), NewRInteger(-2)},
+		{"零除以非零", NewRInteger(0), NewRInteger(5), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.DivRInt(tt.other)
+			if result != tt.expected {
+				t.Errorf("DivRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+
+	// 测试除以零的情况
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("DivRInt() 除以零时没有触发 panic")
+		}
+	}()
+	NewRInteger(5).DivRInt(NewRInteger(0))
+}
+
+func TestRInteger_Mod(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    int
+		expected RInteger
+	}{
+		{"正数取模", NewRInteger(7), 3, NewRInteger(1)},
+		{"负数取模", NewRInteger(-7), -3, NewRInteger(-1)},
+		{"正负取模", NewRInteger(7), -3, NewRInteger(1)},
+		{"零取模", NewRInteger(0), 5, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Mod(tt.other)
+			if result != tt.expected {
+				t.Errorf("Mod() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+
+	// 测试除以零的情况
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Mod() 除以零时没有触发 panic")
+		}
+	}()
+	NewRInteger(5).Mod(0)
+}
+
+func TestRInteger_ModRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		other    RInteger
+		expected RInteger
+	}{
+		{"正数取模", NewRInteger(7), NewRInteger(3), NewRInteger(1)},
+		{"负数取模", NewRInteger(-7), NewRInteger(-3), NewRInteger(-1)},
+		{"正负取模", NewRInteger(7), NewRInteger(-3), NewRInteger(1)},
+		{"零取模", NewRInteger(0), NewRInteger(5), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.ModRInt(tt.other)
+			if result != tt.expected {
+				t.Errorf("ModRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+
+	// 测试除以零的情况
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("ModRInt() 除以零时没有触发 panic")
+		}
+	}()
+	NewRInteger(5).ModRInt(NewRInteger(0))
+}
+
+func TestRInteger_Pow(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		exponent int
+		expected RInteger
+	}{
+		{"正数次幂", NewRInteger(2), 3, NewRInteger(8)},
+		{"零次幂", NewRInteger(5), 0, NewRInteger(1)},
+		{"负次幂", NewRInteger(2), -1, NewRInteger(0)},
+		{"零的次幂", NewRInteger(0), 5, NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.Pow(tt.exponent)
+			if result != tt.expected {
+				t.Errorf("Pow() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRInteger_PowRInt(t *testing.T) {
+	tests := []struct {
+		name     string
+		i        RInteger
+		exponent RInteger
+		expected RInteger
+	}{
+		{"正数次幂", NewRInteger(2), NewRInteger(3), NewRInteger(8)},
+		{"零次幂", NewRInteger(5), NewRInteger(0), NewRInteger(1)},
+		{"负次幂", NewRInteger(2), NewRInteger(-1), NewRInteger(0)},
+		{"零的次幂", NewRInteger(0), NewRInteger(5), NewRInteger(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.i.PowRInt(tt.exponent)
+			if result != tt.expected {
+				t.Errorf("PowRInt() = %v, 期望 %v", result, tt.expected)
+			}
+		})
+	}
+}
