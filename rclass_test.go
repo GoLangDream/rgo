@@ -65,7 +65,7 @@ func TestRClassInheritance(t *testing.T) {
 
 func TestRClassMethodMissing(t *testing.T) {
 	dynamic := RClassBuilder("Dynamic", func(c *RClass) {
-		SetMethodMissing(c, func(name string, args ...interface{}) interface{} {
+		SetMethodMissing(c, func(name string, args ...any) any {
 			return "Called " + name + " with " + fmt.Sprint(args)
 		})
 	})
@@ -129,4 +129,51 @@ func TestRClassClassVars(t *testing.T) {
 	if result2 != 2 {
 		t.Errorf("Expected 2, got %d", result2)
 	}
+}
+
+func TestRClassClassMethods(t *testing.T) {
+	// 创建一个带有类方法的类
+	math := RClassBuilder("Math", func(c *RClass) {
+		// 定义类方法
+		RDefineClassMethod(c, "Pi", func() float64 {
+			return 3.14159
+		})
+
+		RDefineClassMethod(c, "Square", func(n int) int {
+			return n * n
+		})
+
+		// 定义实例方法
+		RDefineMethod(c, "Add", func(a, b int) int {
+			return a + b
+		})
+	})
+
+	// 测试类方法
+	pi := math.Call("Pi").(float64)
+	if pi != 3.14159 {
+		t.Errorf("Expected 3.14159, got %f", pi)
+	}
+
+	square := math.Call("Square", 5).(int)
+	if square != 25 {
+		t.Errorf("Expected 25, got %d", square)
+	}
+
+	// 创建实例并测试实例方法
+	instance := math.New()
+	sum := instance.Call("Add", 2, 3).(int)
+	if sum != 5 {
+		t.Errorf("Expected 5, got %d", sum)
+	}
+
+	// 验证实例不能直接调用类方法
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("Expected panic when calling class method on instance")
+			}
+		}()
+		instance.Call("Pi")
+	}()
 }

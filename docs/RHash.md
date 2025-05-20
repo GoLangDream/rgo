@@ -9,7 +9,7 @@ RHash 是一个模仿 Ruby Hash 的 Go 实现，提供了类似 Ruby 的哈希�
 hash := rgo.NewHash()
 
 // 使用 map 创建哈希表
-m := map[string]interface{}{
+m := map[string]any{
     "name": "John",
     "age":  30,
 }

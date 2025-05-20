@@ -65,7 +65,7 @@ func TestHashKeys(t *testing.T) {
 		t.Errorf("Expected 2 keys, got %d", len(keys))
 	}
 
-	keyMap := make(map[interface{}]bool)
+	keyMap := make(map[any]bool)
 	for _, k := range keys {
 		keyMap[k] = true
 	}
@@ -85,7 +85,7 @@ func TestHashValues(t *testing.T) {
 		t.Errorf("Expected 2 values, got %d", len(values))
 	}
 
-	valueMap := make(map[interface{}]bool)
+	valueMap := make(map[any]bool)
 	for _, v := range values {
 		valueMap[v] = true
 	}
@@ -202,7 +202,7 @@ func TestHashEach(t *testing.T) {
 	h.Set("key2", "value2")
 
 	count := 0
-	h.Each(func(key, value interface{}) {
+	h.Each(func(key, value any) {
 		count++
 	})
 
@@ -217,7 +217,7 @@ func TestHashSelect(t *testing.T) {
 	h.Set("key2", "value2")
 	h.Set("key3", "value3")
 
-	selected := h.Select(func(key, value interface{}) bool {
+	selected := h.Select(func(key, value any) bool {
 		return key.(string) == "key1" || key.(string) == "key2"
 	})
 
@@ -232,7 +232,7 @@ func TestHashReject(t *testing.T) {
 	h.Set("key2", "value2")
 	h.Set("key3", "value3")
 
-	rejected := h.Reject(func(key, value interface{}) bool {
+	rejected := h.Reject(func(key, value any) bool {
 		return key.(string) == "key1"
 	})
 
@@ -246,7 +246,7 @@ func TestHashTransformKeys(t *testing.T) {
 	h.Set("key1", "value1")
 	h.Set("key2", "value2")
 
-	transformed := h.TransformKeys(func(key interface{}) interface{} {
+	transformed := h.TransformKeys(func(key any) any {
 		return key.(string) + "_transformed"
 	})
 
@@ -264,7 +264,7 @@ func TestHashTransformValues(t *testing.T) {
 	h.Set("key1", "value1")
 	h.Set("key2", "value2")
 
-	transformed := h.TransformValues(func(value interface{}) interface{} {
+	transformed := h.TransformValues(func(value any) any {
 		return value.(string) + "_transformed"
 	})
 

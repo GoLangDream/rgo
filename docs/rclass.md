@@ -1,6 +1,6 @@
-# RClass - Ruby 风格的类系统
+# RClass
 
-RClass 是一个模拟 Ruby 类系统的 Go 实现，提供了类似 Ruby 的元编程特性。
+RClass 是 RGo 库中提供的一个类似 Ruby 的类系统实现。它支持实例方法、类方法、实例变量、类变量、方法缺失处理以及类继承等特性。
 
 ## 基本用法
 
@@ -22,16 +22,15 @@ calc := calculator.New()
 result := calc.Call("Add", 2, 3).(int) // 返回 5
 ```
 
-## 元编程特性
+## 实例方法
 
-### 实例变量
+实例方法是类的实例可以调用的方法。使用 `RDefineMethod` 定义：
 
 ```go
 person := RClassBuilder("Person", func(c *RClass) {
     RDefineMethod(c, "SetName", func(name string) {
         SetInstanceVar(c, "@name", name)
     })
-
     RDefineMethod(c, "GetName", func() string {
         return GetInstanceVar(c, "@name").(string)
     })
@@ -42,12 +41,46 @@ p.Call("SetName", "John")
 name := p.Call("GetName").(string) // 返回 "John"
 ```
 
-### 类变量
+## 类方法
+
+类方法是类本身可以调用的方法。使用 `RDefineClassMethod` 定义：
+
+```go
+math := RClassBuilder("Math", func(c *RClass) {
+    RDefineClassMethod(c, "Pi", func() float64 {
+        return 3.14159
+    })
+})
+
+pi := math.Call("Pi").(float64) // 返回 3.14159
+```
+
+## 实例变量
+
+实例变量是属于实例的变量，使用 `SetInstanceVar` 和 `GetInstanceVar` 操作：
+
+```go
+person := RClassBuilder("Person", func(c *RClass) {
+    RDefineMethod(c, "SetAge", func(age int) {
+        SetInstanceVar(c, "@age", age)
+    })
+    RDefineMethod(c, "GetAge", func() int {
+        return GetInstanceVar(c, "@age").(int)
+    })
+})
+
+p := person.New()
+p.Call("SetAge", 25)
+age := p.Call("GetAge").(int) // 返回 25
+```
+
+## 类变量
+
+类变量是属于类的变量，所有实例共享。使用 `SetClassVar` 和 `GetClassVar` 操作：
 
 ```go
 counter := RClassBuilder("Counter", func(c *RClass) {
     SetClassVar(c, "@@count", 0)
-
     RDefineMethod(c, "Increment", func() int {
         count := GetClassVar(c, "@@count").(int)
         count++
@@ -62,11 +95,13 @@ c1.Call("Increment") // 返回 1
 c2.Call("Increment") // 返回 2
 ```
 
-### 方法缺失处理
+## 方法缺失处理
+
+当调用未定义的方法时，可以通过 `SetMethodMissing` 设置处理器：
 
 ```go
 dynamic := RClassBuilder("Dynamic", func(c *RClass) {
-    SetMethodMissing(c, func(name string, args ...interface{}) interface{} {
+    SetMethodMissing(c, func(name string, args ...any) any {
         return "Called " + name + " with " + fmt.Sprint(args)
     })
 })
@@ -76,7 +111,9 @@ result := d.Call("UndefinedMethod", "arg1", "arg2").(string)
 // 返回 "Called UndefinedMethod with [arg1 arg2]"
 ```
 
-### 继承
+## 类继承
+
+通过 `Inherit` 方法实现类继承：
 
 ```go
 animal := RClassBuilder("Animal", func(c *RClass) {
@@ -93,97 +130,29 @@ dog := RClassBuilder("Dog", func(c *RClass) {
 
 dog.Inherit(animal)
 d := dog.New()
-result := d.Call("Speak").(string) // 返回 "Woof!"
+sound := d.Call("Speak").(string) // 返回 "Woof!"
 ```
 
-## API 参考
+## 方法查询
 
-### RClassBuilder
+使用 `RespondTo` 检查是否响应某个方法：
 
 ```go
-func RClassBuilder(name string, block func(*RClass)) *RClass
+if dog.RespondTo("Speak") {
+    // 方法存在
+}
 ```
 
-创建一个新的类。`name` 是类名，`block` 是用于定义类的方法和变量的闭包。
-
-### RDefineMethod
+使用 `Methods` 获取所有可用的方法名：
 
 ```go
-func RDefineMethod(c *RClass, name string, method interface{})
+methods := dog.Methods() // 返回所有方法名的切片
 ```
-
-定义实例方法。`name` 是方法名，`method` 是方法实现。
-
-### RDefineClassMethod
-
-```go
-func RDefineClassMethod(c *RClass, name string, method interface{})
-```
-
-定义类方法。
-
-### SetInstanceVar/GetInstanceVar
-
-```go
-func SetInstanceVar(c *RClass, name string, value interface{})
-func GetInstanceVar(c *RClass, name string) interface{}
-```
-
-设置和获取实例变量。
-
-### SetClassVar/GetClassVar
-
-```go
-func SetClassVar(c *RClass, name string, value interface{})
-func GetClassVar(c *RClass, name string) interface{}
-```
-
-设置和获取类变量。
-
-### SetMethodMissing
-
-```go
-func SetMethodMissing(c *RClass, handler func(name string, args ...interface{}) interface{})
-```
-
-设置方法缺失处理器。
-
-### Inherit
-
-```go
-func (c *RClass) Inherit(parent *RClass)
-```
-
-设置类的继承关系。
-
-### Call
-
-```go
-func (c *RClass) Call(methodName string, args ...interface{}) interface{}
-```
-
-调用方法。
-
-### New
-
-```go
-func (c *RClass) New() *RClass
-```
-
-创建类的新实例。
-
-## 最佳实践
-
-1. 使用 `@` 前缀命名实例变量
-2. 使用 `@@` 前缀命名类变量
-3. 在类定义块中定义所有方法和变量
-4. 使用 `methodMissing` 处理动态方法调用
-5. 合理使用继承来复用代码
 
 ## 注意事项
 
-1. 所有方法调用都是通过 `Call` 方法进行
-2. 方法返回值需要类型断言
-3. 类变量在实例间共享
-4. 实例变量是实例私有的
-5. 方法缺失处理器需要处理所有未定义的方法调用
+1. 类方法和实例方法是分开存储的，不能混用
+2. 类变量在所有实例间共享
+3. 实例变量是每个实例独立的
+4. 继承时，子类可以重写父类的方法
+5. 方法调用使用 `Call` 方法，需要类型断言获取返回值

@@ -232,11 +232,22 @@ calculator := RClassBuilder("Calculator", func(c *RClass) {
     RDefineMethod(c, "Add", func(a, b int) int {
         return a + b
     })
+
+    // 定义类方法
+    RDefineClassMethod(c, "Create", func() *RClass {
+        return c.New()
+    })
+
+    // 定义类变量
+    SetClassVar(c, "@@version", "1.0.0")
 })
 
 // 创建实例
 calc := calculator.New()
 result := calc.Call("Add", 2, 3).(int) // 返回 5
+
+// 调用类方法
+newCalc := calculator.Call("Create").(*RClass)
 
 // 使用实例变量
 person := RClassBuilder("Person", func(c *RClass) {
@@ -249,40 +260,19 @@ person := RClassBuilder("Person", func(c *RClass) {
 })
 
 // 使用类变量
-counter := RClassBuilder("Counter", func(c *RClass) {
-    SetClassVar(c, "@@count", 0)
-    RDefineMethod(c, "Increment", func() int {
-        count := GetClassVar(c, "@@count").(int)
-        count++
-        SetClassVar(c, "@@count", count)
-        return count
-    })
-})
-
-// 使用方法缺失处理
-dynamic := RClassBuilder("Dynamic", func(c *RClass) {
-    SetMethodMissing(c, func(name string, args ...interface{}) interface{} {
-        return "Called " + name + " with " + fmt.Sprint(args)
-    })
-})
-
-// 使用继承
-animal := RClassBuilder("Animal", func(c *RClass) {
-    RDefineMethod(c, "Speak", func() string {
-        return "Some sound"
-    })
-})
-
-dog := RClassBuilder("Dog", func(c *RClass) {
-    RDefineMethod(c, "Speak", func() string {
-        return "Woof!"
-    })
-})
-
-dog.Inherit(animal)
+version := GetClassVar(calculator, "@@version").(string) // 返回 "1.0.0"
 ```
 
-更多 RClass 的详细文档请参考 [RClass.md](docs/rclass.md)
+RClass 支持以下特性：
+
+1. 实例方法：通过 `RDefineMethod` 定义，只能被实例调用
+2. 类方法：通过 `RDefineClassMethod` 定义，只能被类调用
+3. 实例变量：通过 `SetInstanceVar` 和 `GetInstanceVar` 操作
+4. 类变量：通过 `SetClassVar` 和 `GetClassVar` 操作
+5. 方法缺失处理：通过 `SetMethodMissing` 设置
+6. 类继承：通过 `Inherit` 方法实现
+
+更多 RClass 的详细文档请参考 [RClass.md](docs/RClass.md)
 
 ## 测试
 

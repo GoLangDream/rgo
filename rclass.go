@@ -9,11 +9,12 @@ import (
 // RClass 表示一个 Ruby 风格的类
 type RClass struct {
 	name          string
-	methods       map[string]interface{}
-	instanceVars  map[string]interface{}
-	classVars     map[string]interface{}
+	methods       map[string]any
+	classMethods  map[string]any // 新增：存储类方法
+	instanceVars  map[string]any
+	classVars     map[string]any
 	parent        *RClass
-	methodMissing func(name string, args ...interface{}) interface{}
+	methodMissing func(name string, args ...any) any
 	mu            sync.RWMutex
 }
 
@@ -21,9 +22,10 @@ type RClass struct {
 func RClassBuilder(name string, block func(*RClass)) *RClass {
 	class := &RClass{
 		name:         name,
-		methods:      make(map[string]interface{}),
-		instanceVars: make(map[string]interface{}),
-		classVars:    make(map[string]interface{}),
+		methods:      make(map[string]any),
+		classMethods: make(map[string]any), // 初始化类方法映射
+		instanceVars: make(map[string]any),
+		classVars:    make(map[string]any),
 	}
 
 	if block != nil {
@@ -34,25 +36,26 @@ func RClassBuilder(name string, block func(*RClass)) *RClass {
 }
 
 // RDefineMethod 定义实例方法
-func RDefineMethod(c *RClass, name string, method interface{}) {
+func RDefineMethod(c *RClass, name string, method any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.methods[name] = method
 }
 
 // RDefineClassMethod 定义类方法
-func RDefineClassMethod(c *RClass, name string, method interface{}) {
+func RDefineClassMethod(c *RClass, name string, method any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.methods[name] = method
+	c.classMethods[name] = method
 }
 
 // New 创建类的新实例
 func (c *RClass) New() *RClass {
 	instance := &RClass{
 		name:          c.name,
-		methods:       make(map[string]interface{}),
-		instanceVars:  make(map[string]interface{}),
+		methods:       make(map[string]any),
+		classMethods:  c.classMethods,
+		instanceVars:  make(map[string]any),
 		classVars:     c.classVars,
 		parent:        c,
 		methodMissing: c.methodMissing, // 复制 methodMissing 处理器
@@ -67,9 +70,13 @@ func (c *RClass) New() *RClass {
 }
 
 // Call 调用方法
-func (c *RClass) Call(methodName string, args ...interface{}) interface{} {
+func (c *RClass) Call(methodName string, args ...any) any {
 	c.mu.RLock()
 	method, exists := c.methods[methodName]
+	if !exists {
+		// 如果实例方法不存在，尝试查找类方法
+		method, exists = c.classMethods[methodName]
+	}
 	c.mu.RUnlock()
 
 	if !exists {
@@ -105,35 +112,35 @@ func (c *RClass) Call(methodName string, args ...interface{}) interface{} {
 }
 
 // SetInstanceVar 设置实例变量
-func SetInstanceVar(c *RClass, name string, value interface{}) {
+func SetInstanceVar(c *RClass, name string, value any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.instanceVars[name] = value
 }
 
 // GetInstanceVar 获取实例变量
-func GetInstanceVar(c *RClass, name string) interface{} {
+func GetInstanceVar(c *RClass, name string) any {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.instanceVars[name]
 }
 
 // SetClassVar 设置类变量
-func SetClassVar(c *RClass, name string, value interface{}) {
+func SetClassVar(c *RClass, name string, value any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.classVars[name] = value
 }
 
 // GetClassVar 获取类变量
-func GetClassVar(c *RClass, name string) interface{} {
+func GetClassVar(c *RClass, name string) any {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.classVars[name]
 }
 
 // SetMethodMissing 设置方法缺失处理器
-func SetMethodMissing(c *RClass, handler func(name string, args ...interface{}) interface{}) {
+func SetMethodMissing(c *RClass, handler func(name string, args ...any) any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.methodMissing = handler
