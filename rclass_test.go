@@ -1,179 +1,115 @@
 package rgo
 
 import (
-	"fmt"
 	"testing"
 )
 
-func TestRClassBasic(t *testing.T) {
-	calculator := RClassBuilder("Calculator", func(c *RClass) {
-		// 定义实例方法
-		RDefineMethod(c, "Add", func(a, b int) int {
-			return a + b
-		})
+func TestRClass(t *testing.T) {
+	// 测试类创建
+	person := Class("Person")
+	if person.Name() != "Person" {
+		t.Errorf("Expected class name to be 'Person', got '%s'", person.Name())
+	}
 
-		RDefineMethod(c, "Subtract", func(a, b int) int {
-			return a - b
-		})
+	// 测试属性访问器
+	person.AttrAccessor("age")
 
-		// 定义类方法
-		RDefineClassMethod(c, "Create", func() *RClass {
-			return c.New()
-		})
+	// 测试方法缺失处理
+	person.MethodMissing(func(name string, args ...any) any {
+		return "Method not found"
 	})
-
-	// 创建实例
-	calc := calculator.New()
 
 	// 测试实例方法
-	result := calc.Call("Add", 2, 3).(int)
-	if result != 5 {
-		t.Errorf("Expected 5, got %d", result)
-	}
-
-	result = calc.Call("Subtract", 5, 3).(int)
-	if result != 2 {
-		t.Errorf("Expected 2, got %d", result)
-	}
-}
-
-func TestRClassInheritance(t *testing.T) {
-	animal := RClassBuilder("Animal", func(c *RClass) {
-		RDefineMethod(c, "Speak", func() string {
-			return "Some sound"
-		})
-	})
-
-	dog := RClassBuilder("Dog", func(c *RClass) {
-		RDefineMethod(c, "Speak", func() string {
-			return "Woof!"
-		})
-	})
-
-	// 设置继承关系
-	dog.Inherit(animal)
-
-	// 创建实例
-	d := dog.New()
-
-	// 测试方法重写
-	result := d.Call("Speak").(string)
-	if result != "Woof!" {
-		t.Errorf("Expected 'Woof!', got %s", result)
-	}
-}
-
-func TestRClassMethodMissing(t *testing.T) {
-	dynamic := RClassBuilder("Dynamic", func(c *RClass) {
-		SetMethodMissing(c, func(name string, args ...any) any {
-			return "Called " + name + " with " + fmt.Sprint(args)
-		})
-	})
-
-	// 创建实例
-	d := dynamic.New()
-
-	// 测试未定义的方法
-	result := d.Call("UndefinedMethod", "arg1", "arg2").(string)
-	expected := "Called UndefinedMethod with [arg1 arg2]"
-	if result != expected {
-		t.Errorf("Expected '%s', got '%s'", expected, result)
-	}
-}
-
-func TestRClassInstanceVars(t *testing.T) {
-	person := RClassBuilder("Person", func(c *RClass) {
-		RDefineMethod(c, "SetName", func(name string) {
-			SetInstanceVar(c, "@name", name)
-		})
-
-		RDefineMethod(c, "GetName", func() string {
-			return GetInstanceVar(c, "@name").(string)
-		})
-	})
-
-	// 创建实例
-	p := person.New()
-
-	// 设置和获取实例变量
-	p.Call("SetName", "John")
-	result := p.Call("GetName").(string)
-	if result != "John" {
-		t.Errorf("Expected 'John', got %s", result)
-	}
-}
-
-func TestRClassClassVars(t *testing.T) {
-	counter := RClassBuilder("Counter", func(c *RClass) {
-		SetClassVar(c, "@@count", 0)
-
-		RDefineMethod(c, "Increment", func() int {
-			count := GetClassVar(c, "@@count").(int)
-			count++
-			SetClassVar(c, "@@count", count)
-			return count
-		})
-	})
-
-	// 创建两个实例
-	c1 := counter.New()
-	c2 := counter.New()
-
-	// 测试类变量共享
-	result1 := c1.Call("Increment").(int)
-	if result1 != 1 {
-		t.Errorf("Expected 1, got %d", result1)
-	}
-
-	result2 := c2.Call("Increment").(int)
-	if result2 != 2 {
-		t.Errorf("Expected 2, got %d", result2)
-	}
-}
-
-func TestRClassClassMethods(t *testing.T) {
-	// 创建一个带有类方法的类
-	math := RClassBuilder("Math", func(c *RClass) {
-		// 定义类方法
-		RDefineClassMethod(c, "Pi", func() float64 {
-			return 3.14159
-		})
-
-		RDefineClassMethod(c, "Square", func(n int) int {
-			return n * n
-		})
-
-		// 定义实例方法
-		RDefineMethod(c, "Add", func(a, b int) int {
-			return a + b
-		})
+	person.DefineMethod("say_hello", func(self *RClass) string {
+		return "Hello!"
 	})
 
 	// 测试类方法
-	pi := math.Call("Pi").(float64)
-	if pi != 3.14159 {
-		t.Errorf("Expected 3.14159, got %f", pi)
+	person.DefineClassMethod("create", func(name string) *RClass {
+		instance := person.New()
+		instance.SetInstanceVar("name", name)
+		return instance
+	})
+
+	// 测试实例创建和方法调用
+	john := person.New()
+	result := john.Call("say_hello", john).(string)
+	if result != "Hello!" {
+		t.Errorf("Expected 'Hello!', got '%s'", result)
 	}
 
-	square := math.Call("Square", 5).(int)
-	if square != 25 {
-		t.Errorf("Expected 25, got %d", square)
+	// 测试类方法调用
+	mary := person.Call("create", "Mary").(*RClass)
+	name := mary.GetInstanceVar("name").(string)
+	if name != "Mary" {
+		t.Errorf("Expected 'Mary', got '%s'", name)
 	}
 
-	// 创建实例并测试实例方法
-	instance := math.New()
-	sum := instance.Call("Add", 2, 3).(int)
-	if sum != 5 {
-		t.Errorf("Expected 5, got %d", sum)
+	// 测试属性访问器
+	john.Call("age=", john, 30)
+	age := john.Call("age", john).(int)
+	if age != 30 {
+		t.Errorf("Expected 30, got %d", age)
 	}
 
-	// 验证实例不能直接调用类方法
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("Expected panic when calling class method on instance")
-			}
-		}()
-		instance.Call("Pi")
-	}()
+	// 测试继承
+	employee := Class("Employee")
+	employee.Inherit(person)
+	employee.DefineMethod("say_hello", func(self *RClass) string {
+		return "Hello, I am an employee!"
+	})
+
+	bob := employee.New()
+	result = bob.Call("say_hello", bob).(string)
+	if result != "Hello, I am an employee!" {
+		t.Errorf("Expected 'Hello, I am an employee!', got '%s'", result)
+	}
+
+	// 测试父类方法调用
+	bob.Call("age=", bob, 35)
+	age = bob.Call("age", bob).(int)
+	if age != 35 {
+		t.Errorf("Expected 35, got %d", age)
+	}
+
+	// 测试类型检查
+	if !bob.IsA("Employee") {
+		t.Error("Expected bob to be an Employee")
+	}
+	if !bob.IsA("Person") {
+		t.Error("Expected bob to be a Person")
+	}
+	if bob.IsA("Animal") {
+		t.Error("Expected bob not to be an Animal")
+	}
+
+	// 测试方法缺失处理
+	result = john.Call("undefined_method").(string)
+	if result != "Method not found" {
+		t.Errorf("Expected 'Method not found', got '%s'", result)
+	}
+
+	// 测试方法列表
+	methods := person.Methods()
+	if len(methods) < 2 {
+		t.Errorf("Expected at least 2 methods, got %d", len(methods))
+	}
+
+	classMethods := person.ClassMethods()
+	if len(classMethods) < 1 {
+		t.Errorf("Expected at least 1 class method, got %d", len(classMethods))
+	}
+
+	// 测试变量列表
+	john.SetInstanceVar("name", "John")
+	instanceVars := john.InstanceVars()
+	if len(instanceVars) < 1 {
+		t.Errorf("Expected at least 1 instance variable, got %d", len(instanceVars))
+	}
+
+	person.SetClassVar("count", 0)
+	classVars := person.ClassVars()
+	if len(classVars) < 1 {
+		t.Errorf("Expected at least 1 class variable, got %d", len(classVars))
+	}
 }
