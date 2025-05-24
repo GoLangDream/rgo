@@ -232,42 +232,7 @@ func BenchmarkRClassOriginalComplexScenario(b *testing.B) {
 	}
 }
 
-// BenchmarkRClassOptimizedComplexScenario 测试优化版 RClass 复杂场景性能
-func BenchmarkRClassOptimizedComplexScenario(b *testing.B) {
-	// 创建类层次结构
-	animal := ClassOptimized("Animal")
-	animal.DefineMethod("speak", func(self *RClassOptimized) string {
-		return "Some sound"
-	})
-	animal.AttrAccessor("name")
-
-	dog := ClassOptimized("Dog")
-	dog.Inherit(animal)
-	dog.DefineMethod("speak", func(self *RClassOptimized) string {
-		return "Woof!"
-	})
-	dog.DefineMethod("fetch", func(self *RClassOptimized) string {
-		return "Fetching..."
-	})
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// 创建实例
-		myDog := dog.New()
-
-		// 设置属性
-		myDog.Call("name=", "Buddy")
-
-		// 调用方法
-		_ = myDog.Call("name")
-		_ = myDog.Call("speak")
-		_ = myDog.Call("fetch")
-
-		// 检查类型
-		_ = myDog.IsA("Dog")
-		_ = myDog.IsA("Animal")
-	}
-}
+// BenchmarkRClassOptimizedComplexScenario 测试优化版 RClass 复杂场景性能func BenchmarkRClassOptimizedComplexScenario(b *testing.B) {	// 创建类层次结构	animal := ClassOptimized("Animal")	animal.DefineMethod("speak", func() string {		return "Some sound"	})	animal.AttrAccessor("name")	dog := ClassOptimized("Dog")	dog.Inherit(animal)	dog.DefineMethod("speak", func() string {		return "Woof!"	})	dog.DefineMethod("fetch", func() string {		return "Fetching..."	})	b.ResetTimer()	for i := 0; i < b.N; i++ {		// 创建实例		myDog := dog.New()				// 设置属性		myDog.Call("name=", "Buddy")				// 调用方法		_ = myDog.Call("name")		_ = myDog.Call("speak")		_ = myDog.Call("fetch")				// 检查类型		_ = myDog.IsA("Dog")		_ = myDog.IsA("Animal")	}}
 
 // =============================================================================
 // 内存分配测试
