@@ -188,7 +188,13 @@ func (l *Lexer) NextToken() Token {
 			tok = newToken(MULTIPLY, l.ch)
 		}
 	case '%':
-		tok = l.readPercentString()
+		if l.peekChar() == 'q' || l.peekChar() == 'Q' || l.peekChar() == 'w' || l.peekChar() == 'W' ||
+			l.peekChar() == 'i' || l.peekChar() == 'I' || l.peekChar() == 'r' || l.peekChar() == 's' ||
+			l.peekChar() == 'x' || l.peekChar() == 's' {
+			tok = l.readPercentString()
+		} else {
+			tok = newToken(MOD, l.ch)
+		}
 	case '=':
 		if l.peekChar() == '=' {
 			if l.peekCharN(2) == '=' {

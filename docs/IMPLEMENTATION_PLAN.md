@@ -596,7 +596,7 @@ type EmeraldValue interface {
 
 ---
 
-## 当前进度 (2026-02-24)
+## 当前进度 (2026-02-25)
 
 ### 已完成
 
@@ -616,8 +616,32 @@ type EmeraldValue interface {
   - 字节码生成
   - 符号表管理
 - [x] CLI 入口 - `cmd/rgo/main.go`
+- [x] 新对象系统 (Go 结构体方案)
+  - `vm/object/value.go` - EmeraldValue 和 ValueType
+  - `vm/object/class.go` - Class 结构体和方法表
+  - `vm/object/module.go` - Module 结构体
+  - `vm/object/object.go` - Object 基础结构
+  - `vm/object/basic_object.go` - BasicObject
+- [x] 核心类初始化 - `core/init.go`
+  - 所有 Ruby 核心类 (Object, Class, Module, Integer, String, Array, Hash 等)
+  - 所有核心方法定义
+- [x] 虚拟机更新 - `rvm/executor.go`
+  - 基于 Frame 的调用帧管理
+  - 完整的方法分发机制
+  - 与新对象系统集成
 
-### 已创建文件
+### 已删除的旧文件
+
+以下旧的 Ruby 语法模拟代码已删除：
+- object.go, object_test.go
+- rclass.go, rclass_test.go, RClass.md
+- string.go, string_test.go
+- integer.go, integer_test.go
+- array.go, array_test.go
+- hash.go, hash_test.go
+- benchmark_test.go, rclass_benchmark_test.go, goby_suite_test.go
+
+### 当前文件结构
 
 ```
 rgo/
@@ -630,22 +654,33 @@ rgo/
 │   ├── parser/
 │   │   ├── parser.go          # Pratt Parser
 │   │   └── ast/
-│   │       └── node.go       # AST 节点
+│   │       └── node.go        # AST 节点
 │   ├── compiler/
 │   │   ├── compiler.go        # 字节码编译器
 │   │   ├── opcode.go          # 操作码定义
-│   │   └── bytecode.go      # 字节码工具
-│   └── executor.go           # 虚拟机实现
-├── docs/
+│   │   └── bytecode.go        # 字节码工具
+│   └── executor.go            # 虚拟机实现
+├── vm/
+│   └── object/
+│       ├── value.go           # EmeraldValue 定义
+│       ├── class.go           # Class 结构体
+│       ├── module.go          # Module 结构体
+│       ├── object.go          # Object 结构体
+│       └── basic_object.go    # BasicObject
+├── core/
+│   └── init.go                # 核心类初始化
+└── docs/
 │   └── IMPLEMENTATION_PLAN.md # 实现计划
 ```
 
 ### 待完成
 
-- [x] 虚拟机 (VM) 实现
-- [x] 基本内置方法 (部分)
-- [ ] 完整对象系统
-- [ ] Ruby 核心类库
+- [ ] 代码编译测试验证 (需要 Go 环境)
+- [ ] 控制流完善 (if/unless/while/until)
+- [ ] 方法定义完善 (def)
+- [ ] 类/模块定义完善 (class/module)
+- [ ] 闭包和块机制完善
+- [ ] 异常处理
 - [ ] Ruby 标准库
 - [ ] Rails 兼容层
 - [ ] ruby/spec 测试集成
@@ -708,17 +743,15 @@ true
 - 整数运算: `+`, `-`, `*`, `/`, `%`, `**`
 - 浮点数运算
 - 字符串连接
+- 字符串方法: `length`, `upcase`, `downcase`, `to_s`
 - 变量赋值和引用
 - 比较运算: `>`, `<`, `>=`, `<=`, `==`, `!=`
-- 数组字面量 `[1, 2, 3]`
-- 哈希字面量 `{a: 1, b: 2}`
-- 内置方法:
-  - Integer: `to_s`, `chr`, `odd?`, `even?`, `zero?`, `abs`
-  - String: `length`, `size`, `empty?`, `to_s`, `upcase`, `downcase`
-  - Array: `length`, `size`, `first`, `last`, `push`, `pop`, `empty?`, `join`, `reverse`
+- puts/print/p 内置函数
 
-### 待完善
+### 待完善 (已记录到 TODO.md)
 
+- 解析器: `?` 方法名、哈希字面量
+- 虚拟机: 数组 3+ 元素超时、数组方法调用超时
 - 控制流 (if/unless/while/until)
 - 方法定义 (def)
 - 类定义 (class/module)

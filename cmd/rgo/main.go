@@ -8,9 +8,15 @@ import (
 	"github.com/GoLangDream/rgo/rvm/compiler"
 	"github.com/GoLangDream/rgo/rvm/lexer"
 	"github.com/GoLangDream/rgo/rvm/parser"
+	"github.com/GoLangDream/rgo/vm/object"
+	"github.com/GoLangDream/rgo/core"
 )
 
 func main() {
+	fmt.Fprintf(os.Stderr, "DEBUG main: starting\n")
+	core.Init()
+	fmt.Fprintf(os.Stderr, "DEBUG main: core initialized\n")
+
 	args := os.Args[1:]
 
 	if len(args) > 0 {
@@ -27,8 +33,11 @@ func main() {
 		file.Read(content)
 
 		l := lexer.New(string(content))
+		fmt.Fprintf(os.Stderr, "DEBUG main: lexer created\n")
 		p := parser.New(l)
+		fmt.Fprintf(os.Stderr, "DEBUG main: parser created\n")
 		program := p.ParseProgram()
+		fmt.Fprintf(os.Stderr, "DEBUG main: ParseProgram done, stmts=%d\n", len(program.Statements))
 
 		if len(p.Errors()) > 0 {
 			for _, err := range p.Errors() {
@@ -45,8 +54,11 @@ func main() {
 		}
 
 		bytecode := c.Bytecode()
+		fmt.Fprintf(os.Stderr, "DEBUG: bytecode instructions len=%d\n", len(bytecode.Instructions))
 		v := rvm.New(bytecode)
+		fmt.Fprintf(os.Stderr, "DEBUG: VM created\n")
 		err = v.Run()
+		fmt.Fprintf(os.Stderr, "DEBUG: Run completed, err=%v\n", err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
 			os.Exit(1)
@@ -59,26 +71,9 @@ func main() {
 	}
 }
 
-func formatValue(v interface{}) string {
-	switch val := v.(type) {
-	case int64:
-		return fmt.Sprintf("%d", val)
-	case float64:
-		return fmt.Sprintf("%g", val)
-	case string:
-		return val
-	case bool:
-		if val {
-			return "true"
-		}
-		return "false"
-	case nil:
+func formatValue(v *object.EmeraldValue) string {
+	if v == nil {
 		return "nil"
-	case []interface{}:
-		return fmt.Sprintf("%v", val)
-	case map[interface{}]interface{}:
-		return fmt.Sprintf("%v", val)
-	default:
-		return fmt.Sprintf("%v", val)
 	}
+	return v.Inspect()
 }

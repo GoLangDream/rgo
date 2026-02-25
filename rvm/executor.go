@@ -2,63 +2,103 @@ package rvm
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/GoLangDream/rgo/rvm/compiler"
+	"github.com/GoLangDream/rgo/vm/object"
+	"github.com/GoLangDream/rgo/core"
 )
 
 const StackSize = 2048
+const MaxFrames = 1024
+
+type Frame struct {
+	Fn       *object.Function
+	Ip       int
+	Bp       int
+	Closure  *object.Closure
+}
 
 type VM struct {
-	constants []interface{}
-	globals   []interface{}
+	constants []*object.EmeraldValue
+	globals   []*object.EmeraldValue
 
-	stack []interface{}
+	stack []*object.EmeraldValue
 	sp    int
 
+	frames []*Frame
+	fp     int
+
 	instructions compiler.Instructions
-	ip           int
+
+	poppedValues []*object.EmeraldValue
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
+	core.Init()
+
+	mainFn := &object.Function{
+		Name:        "__main__",
+		Instructions: bytecode.Instructions,
+		NumLocals:   0,
+	}
+
+	mainFrame := &Frame{
+		Fn: mainFn,
+		Ip: -1,
+		Bp: 0,
+	}
+
 	return &VM{
 		constants:    bytecode.Constants,
-		globals:      make([]interface{}, 100),
-		stack:        make([]interface{}, StackSize),
+		globals:      make([]*object.EmeraldValue, 100),
+		stack:        make([]*object.EmeraldValue, StackSize),
 		sp:           0,
+		frames:       []*Frame{mainFrame},
+		fp:           0,
 		instructions: bytecode.Instructions,
-		ip:           -1,
 	}
 }
 
 func (vm *VM) Run() error {
-	for vm.ip < len(vm.instructions)-1 {
-		vm.ip++
+	frame := vm.frames[vm.fp]
+	instructions := frame.Fn.Instructions
 
-		op := compiler.Opcode(vm.instructions[vm.ip])
+	count := 0
+	for frame.Ip < len(instructions)-1 {
+		count++
+		if count > 1000 {
+			return fmt.Errorf("infinite loop detected at ip=%d, op=%v", frame.Ip, instructions[frame.Ip])
+		}
+		frame.Ip++
 
-		err := vm.execute(op)
+		op := compiler.Opcode(instructions[frame.Ip])
+
+		err := vm.execute(op, frame)
 		if err != nil {
 			return err
 		}
+		frame = vm.frames[vm.fp]
+		instructions = frame.Fn.Instructions
 	}
 
 	return nil
 }
 
-func (vm *VM) execute(op compiler.Opcode) error {
+func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	switch op {
 	case compiler.OpConstant:
 		idx := vm.readUint16()
 		vm.push(vm.constants[idx])
 
 	case compiler.OpTrue:
-		vm.push(true)
+		vm.push(core.R.TrueVal)
 
 	case compiler.OpFalse:
-		vm.push(false)
+		vm.push(core.R.FalseVal)
 
 	case compiler.OpNil:
-		vm.push(nil)
+		vm.push(core.R.NilVal)
 
 	case compiler.OpPop:
 		vm.pop()
@@ -66,110 +106,164 @@ func (vm *VM) execute(op compiler.Opcode) error {
 	case compiler.OpAdd:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.add(left, right))
+		result := vm.add(left, right)
+		vm.push(result)
 
 	case compiler.OpSub:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.sub(left, right))
+		result := vm.sub(left, right)
+		vm.push(result)
 
 	case compiler.OpMul:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.mul(left, right))
+		result := vm.mul(left, right)
+		vm.push(result)
 
 	case compiler.OpDiv:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.div(left, right))
+		result := vm.div(left, right)
+		vm.push(result)
 
 	case compiler.OpMod:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.mod(left, right))
+		result := vm.mod(left, right)
+		vm.push(result)
 
 	case compiler.OpPow:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.pow(left, right))
+		result := vm.pow(left, right)
+		vm.push(result)
 
-	case compiler.OpMinus:
+	case compiler.OpMinus, compiler.OpNeg:
 		val := vm.pop()
-		vm.push(vm.negate(val))
+		result := vm.negate(val)
+		vm.push(result)
 
 	case compiler.OpBang:
 		val := vm.pop()
-		vm.push(vm.bang(val))
+		result := vm.bang(val)
+		vm.push(result)
 
 	case compiler.OpEqual:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.equals(left, right))
+		result := vm.equals(left, right)
+		vm.push(result)
 
 	case compiler.OpNotEqual:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(!vm.equals(left, right))
+		result := vm.equals(left, right)
+		if result.Type == object.ValueBool && result.Data == true {
+			vm.push(core.R.FalseVal)
+		} else {
+			vm.push(core.R.TrueVal)
+		}
 
 	case compiler.OpGreaterThan:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.greaterThan(left, right))
+		result := vm.greaterThan(left, right)
+		vm.push(result)
 
 	case compiler.OpGreaterThanOrEqual:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(!vm.lessThan(left, right))
+		result := vm.greaterThan(left, right)
+		if result.Type == object.ValueNil {
+			vm.push(core.R.TrueVal)
+		} else if result.Type == object.ValueBool && result.Data == true {
+			vm.push(core.R.TrueVal)
+		} else {
+			vm.push(core.R.FalseVal)
+		}
 
 	case compiler.OpLessThan:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(vm.lessThan(left, right))
+		result := vm.lessThan(left, right)
+		vm.push(result)
 
 	case compiler.OpLessThanOrEqual:
 		right := vm.pop()
 		left := vm.pop()
-		vm.push(!vm.greaterThan(left, right))
+		result := vm.lessThan(left, right)
+		if result.Type == object.ValueNil {
+			vm.push(core.R.TrueVal)
+		} else if result.Type == object.ValueBool && result.Data == true {
+			vm.push(core.R.TrueVal)
+		} else {
+			vm.push(core.R.FalseVal)
+		}
 
 	case compiler.OpJump:
 		pos := vm.readUint16()
-		vm.ip = pos - 1
+		frame.Ip = pos - 1
 
 	case compiler.OpJumpNotTruthy:
 		pos := vm.readUint16()
 		condition := vm.pop()
-		if !vm.isTruthy(condition) {
-			vm.ip = pos - 1
+		if !condition.IsTruthy() {
+			frame.Ip = pos - 1
+		}
+
+	case compiler.OpJumpTruthy:
+		pos := vm.readUint16()
+		condition := vm.pop()
+		if condition.IsTruthy() {
+			frame.Ip = pos - 1
 		}
 
 	case compiler.OpArray:
+		fmt.Fprintf(os.Stderr, "DEBUG: OpArray executing\n")
 		n := vm.readUint16()
-		arr := make([]interface{}, n)
-		for i := n - 1; i >= 0; i-- {
-			arr[i] = vm.pop()
+		fmt.Fprintf(os.Stderr, "DEBUG: OpArray n=%d\n", n)
+		if n > 100 {
+			return fmt.Errorf("OpArray: too many elements: %d", n)
 		}
-		vm.push(arr)
+		elems := make([]*object.EmeraldValue, n)
+		for i := n - 1; i >= 0; i-- {
+			elems[i] = vm.pop()
+			fmt.Fprintf(os.Stderr, "DEBUG OpArray: i=%d, elem=%v\n", i, elems[i])
+		}
+		fmt.Fprintf(os.Stderr, "DEBUG OpArray: sp after pop=%d\n", vm.sp)
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  elems,
+			Class: core.R.Classes["Array"],
+		})
 
 	case compiler.OpHash:
 		n := vm.readUint16()
-		h := make(map[interface{}]interface{})
+		h := make(map[*object.EmeraldValue]*object.EmeraldValue)
 		for i := 0; i < int(n); i++ {
 			value := vm.pop()
 			key := vm.pop()
 			h[key] = value
 		}
-		vm.push(h)
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueHash,
+			Data:  h,
+			Class: core.R.Classes["Hash"],
+		})
 
 	case compiler.OpIndex:
 		index := vm.pop()
 		left := vm.pop()
-		vm.push(vm.index(left, index))
+		result := vm.index(left, index)
+		vm.push(result)
 
 	case compiler.OpIndexAssign:
 		value := vm.pop()
 		index := vm.pop()
 		left := vm.pop()
-		vm.push(vm.indexAssign(left, index, value))
+		result := vm.indexAssign(left, index, value)
+		vm.push(result)
 
 	case compiler.OpGetGlobal:
 		idx := vm.readUint16()
@@ -181,32 +275,43 @@ func (vm *VM) execute(op compiler.Opcode) error {
 
 	case compiler.OpGetLocal:
 		idx := vm.readUint8()
-		basePtr := 0
+		basePtr := frame.Bp
 		vm.push(vm.stack[basePtr+idx])
 
 	case compiler.OpSetLocal:
 		idx := vm.readUint8()
-		basePtr := 0
+		basePtr := frame.Bp
 		vm.stack[basePtr+idx] = vm.peek(0)
 
+	case compiler.OpGetFree:
+		idx := vm.readUint8()
+		vm.push(frame.Closure.Free[idx])
+
 	case compiler.OpSelf:
-		vm.push(vm.stack[0])
+		vm.push(vm.stack[frame.Bp])
 
 	case compiler.OpReturn:
-		vm.sp = 0
+		vm.sp = frame.Bp
+		if vm.fp > 0 {
+			vm.fp--
+		}
 
 	case compiler.OpReturnValue:
-		vm.sp = 0
-		vm.push(vm.pop())
+		retVal := vm.pop()
+		vm.sp = frame.Bp
+		if vm.fp > 0 {
+			vm.fp--
+		}
+		vm.push(retVal)
 
 	case compiler.OpSend:
 		methodNameIdx := vm.readUint16()
-		block := vm.readUint8()
+		blockArg := vm.readUint8()
 		numArgs := vm.readUint8()
-		_ = block
-		methodName := vm.constants[methodNameIdx].(string)
+		_ = blockArg
+		methodName := vm.constants[methodNameIdx].Data.(string)
 
-		args := make([]interface{}, 0)
+		args := make([]*object.EmeraldValue, 0)
 		for i := 0; i < int(numArgs); i++ {
 			args = append(args, vm.pop())
 		}
@@ -219,38 +324,123 @@ func (vm *VM) execute(op compiler.Opcode) error {
 		return fmt.Errorf("unexpected break")
 
 	case compiler.OpDefineMethod:
-		_ = vm.readUint16()
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+
+		closureVal := vm.pop()
+		closure, ok := closureVal.Data.(*object.Closure)
+		if !ok {
+			return fmt.Errorf("expected closure, got %T", closureVal.Data)
+		}
+
+		method := &object.Method{
+			Name: name,
+			Fn:   closure.Fn,
+		}
+
+		mainObj := core.R.Main.Data.(*object.Object)
+		mainObj.Class.DefineMethod(name, method)
+
+		vm.push(closureVal)
 
 	case compiler.OpDefineClassMethod:
-		_ = vm.readUint16()
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+
+		fn := &object.Function{
+			Name:        name,
+			Instructions: vm.pop().Data.([]byte),
+			NumLocals:   0,
+		}
+
+		method := &object.Method{
+			Name: name,
+			Fn:   fn,
+		}
+
+		classVal := vm.stack[frame.Bp]
+		if obj, ok := classVal.Data.(*object.Object); ok {
+			obj.Class.DefineClassMethod(name, method)
+		}
 
 	case compiler.OpClass:
-		_ = vm.readUint16()
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+
+		class := object.NewClass(name)
+		class.SuperClass = core.R.Classes["Object"]
+
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueClass,
+			Data:  class,
+			Class: core.R.Classes["Class"],
+		})
 
 	case compiler.OpModule:
-		_ = vm.readUint16()
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+
+		module := object.NewModule(name)
+
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueModule,
+			Data:  module,
+			Class: core.R.Classes["Module"],
+		})
 
 	case compiler.OpDup:
 		vm.push(vm.peek(0))
 
-	case compiler.OpLambda:
-		_ = vm.readUint16()
-		numFree := vm.readUint8()
-		vm.push(numFree)
-
 	case compiler.OpClosure:
-		_ = vm.readUint16()
+		fnIdx := vm.readUint16()
 		numFree := vm.readUint8()
 
-		free := make([]interface{}, numFree)
+		constant := vm.constants[fnIdx]
+		fn, ok := constant.Data.(*object.Function)
+		if !ok {
+			return fmt.Errorf("not a function: %v", constant)
+		}
+
+		free := make([]*object.EmeraldValue, numFree)
 		for i := numFree - 1; i >= 0; i-- {
 			free[i] = vm.pop()
 		}
-		vm.push(free)
 
-	case compiler.OpNeg:
-		val := vm.pop()
-		vm.push(vm.negate(val))
+		closure := &object.Closure{
+			Fn:   fn,
+			Free: free,
+		}
+
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueClosure,
+			Data:  closure,
+			Class: core.R.Classes["Class"],
+		})
+
+	case compiler.OpLambda:
+		fnIdx := vm.readUint16()
+		numFree := vm.readUint8()
+
+		fn, ok := vm.constants[fnIdx].Data.(*object.Function)
+		if !ok {
+			return fmt.Errorf("not a function: %v", vm.constants[fnIdx])
+		}
+
+		free := make([]*object.EmeraldValue, numFree)
+		for i := numFree - 1; i >= 0; i-- {
+			free[i] = vm.pop()
+		}
+
+		closure := &object.Closure{
+			Fn:   fn,
+			Free: free,
+		}
+
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueClosure,
+			Data:  closure,
+			Class: core.R.Classes["Class"],
+		})
 
 	default:
 		return fmt.Errorf("unknown opcode: %v", op)
@@ -259,176 +449,169 @@ func (vm *VM) execute(op compiler.Opcode) error {
 	return nil
 }
 
-func (vm *VM) push(val interface{}) {
+func (vm *VM) push(val *object.EmeraldValue) {
 	vm.stack[vm.sp] = val
 	vm.sp++
 }
 
-func (vm *VM) pop() interface{} {
+func (vm *VM) pop() *object.EmeraldValue {
 	vm.sp--
-	return vm.stack[vm.sp]
+	val := vm.stack[vm.sp]
+	vm.poppedValues = append(vm.poppedValues, val)
+	return val
 }
 
-func (vm *VM) peek(n int) interface{} {
+func (vm *VM) peek(n int) *object.EmeraldValue {
 	return vm.stack[vm.sp-1-n]
 }
 
 func (vm *VM) readUint16() int {
-	vm.ip++
-	high := int(vm.instructions[vm.ip])
-	vm.ip++
-	low := int(vm.instructions[vm.ip])
+	frame := vm.frames[vm.fp]
+	frame.Ip++
+	high := int(frame.Fn.Instructions[frame.Ip])
+	frame.Ip++
+	low := int(frame.Fn.Instructions[frame.Ip])
 	return high<<8 | low
 }
 
 func (vm *VM) readUint8() int {
-	vm.ip++
-	return int(vm.instructions[vm.ip])
+	frame := vm.frames[vm.fp]
+	frame.Ip++
+	return int(frame.Fn.Instructions[frame.Ip])
 }
 
-func (vm *VM) isTruthy(val interface{}) bool {
-	switch v := val.(type) {
-	case bool:
-		return v
-	case nil:
-		return false
-	default:
-		return true
-	}
-}
-
-func (vm *VM) add(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) add(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l + r
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: l + r, Class: core.R.Classes["Integer"]}
 		case float64:
-			return float64(l) + r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) + r, Class: core.R.Classes["Float"]}
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l + float64(r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l + float64(r), Class: core.R.Classes["Float"]}
 		case float64:
-			return l + r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l + r, Class: core.R.Classes["Float"]}
 		}
 	case string:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case string:
-			return l + r
+			return &object.EmeraldValue{Type: object.ValueString, Data: l + r, Class: core.R.Classes["String"]}
 		}
 	}
-	return fmt.Sprintf("%v%v", left, right)
+	return core.R.NilVal
 }
 
-func (vm *VM) sub(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) sub(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l - r
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: l - r, Class: core.R.Classes["Integer"]}
 		case float64:
-			return float64(l) - r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) - r, Class: core.R.Classes["Float"]}
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l - float64(r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l - float64(r), Class: core.R.Classes["Float"]}
 		case float64:
-			return l - r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l - r, Class: core.R.Classes["Float"]}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) mul(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) mul(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l * r
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: l * r, Class: core.R.Classes["Integer"]}
 		case float64:
-			return float64(l) * r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) * r, Class: core.R.Classes["Float"]}
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l * float64(r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l * float64(r), Class: core.R.Classes["Float"]}
 		case float64:
-			return l * r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l * r, Class: core.R.Classes["Float"]}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) div(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) div(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
 			if r == 0 {
-				return nil
+				return core.R.NilVal
 			}
-			return l / r
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: l / r, Class: core.R.Classes["Integer"]}
 		case float64:
 			if r == 0 {
-				return nil
+				return core.R.NilVal
 			}
-			return float64(l) / r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) / r, Class: core.R.Classes["Float"]}
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
 			if r == 0 {
-				return nil
+				return core.R.NilVal
 			}
-			return l / float64(r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l / float64(r), Class: core.R.Classes["Float"]}
 		case float64:
 			if r == 0 {
-				return nil
+				return core.R.NilVal
 			}
-			return l / r
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: l / r, Class: core.R.Classes["Float"]}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) mod(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) mod(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
 			if r == 0 {
-				return nil
+				return core.R.NilVal
 			}
-			return l % r
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: l % r, Class: core.R.Classes["Integer"]}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) pow(left, right interface{}) interface{} {
-	switch l := left.(type) {
+func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
 			if r < 0 {
-				return 1.0 / vm.powInt(l, -int(r))
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / vm.powInt(l, -int(r)), Class: core.R.Classes["Float"]}
 			}
-			return vm.powInt(l, int(r))
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: vm.powInt(l, int(r)), Class: core.R.Classes["Integer"]}
 		case float64:
-			return vm.mathPow(float64(l), r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: vm.mathPow(float64(l), r), Class: core.R.Classes["Float"]}
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return vm.mathPow(l, float64(r))
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: vm.mathPow(l, float64(r)), Class: core.R.Classes["Float"]}
 		case float64:
-			return vm.mathPow(l, r)
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: vm.mathPow(l, r), Class: core.R.Classes["Float"]}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
 func (vm *VM) powInt(base int64, exp int) int64 {
@@ -447,356 +630,266 @@ func (vm *VM) mathPow(base, exp float64) float64 {
 	return result
 }
 
-func (vm *VM) negate(val interface{}) interface{} {
-	switch v := val.(type) {
+func (vm *VM) negate(val *object.EmeraldValue) *object.EmeraldValue {
+	switch v := val.Data.(type) {
 	case int64:
-		return -v
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: -v, Class: core.R.Classes["Integer"]}
 	case float64:
-		return -v
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: -v, Class: core.R.Classes["Float"]}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) bang(val interface{}) interface{} {
-	switch v := val.(type) {
+func (vm *VM) bang(val *object.EmeraldValue) *object.EmeraldValue {
+	switch v := val.Data.(type) {
 	case bool:
-		return !v
-	case nil:
-		return true
-	default:
-		return false
+		if v {
+			return core.R.FalseVal
+		}
+		return core.R.TrueVal
 	}
+	if val.Type == object.ValueNil {
+		return core.R.TrueVal
+	}
+	return core.R.FalseVal
 }
 
-func (vm *VM) equals(left, right interface{}) bool {
-	switch l := left.(type) {
+func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
+	if left.Type == object.ValueNil && right.Type == object.ValueNil {
+		return core.R.TrueVal
+	}
+	switch l := left.Data.(type) {
 	case bool:
-		r, ok := right.(bool)
-		return ok && l == r
-	case nil:
-		return right == nil
+		r, ok := right.Data.(bool)
+		if !ok {
+			return core.R.FalseVal
+		}
+		if l == r {
+			return core.R.TrueVal
+		}
+		return core.R.FalseVal
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l == r
+			if l == r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		case float64:
-			return float64(l) == r
+			if float64(l) == r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l == float64(r)
+			if l == float64(r) {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		case float64:
-			return l == r
+			if l == r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		}
 	case string:
-		r, ok := right.(string)
-		return ok && l == r
+		r, ok := right.Data.(string)
+		if !ok {
+			return core.R.FalseVal
+		}
+		if l == r {
+			return core.R.TrueVal
+		}
+		return core.R.FalseVal
 	}
-	return false
+	if left == right {
+		return core.R.TrueVal
+	}
+	return core.R.FalseVal
 }
 
-func (vm *VM) lessThan(left, right interface{}) bool {
-	switch l := left.(type) {
+func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
 	case int64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l < r
+			if l < r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		case float64:
-			return float64(l) < r
+			if float64(l) < r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		}
 	case float64:
-		switch r := right.(type) {
+		switch r := right.Data.(type) {
 		case int64:
-			return l < float64(r)
+			if l < float64(r) {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		case float64:
-			return l < r
+			if l < r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
 		}
 	}
-	return false
+	return core.R.NilVal
 }
 
-func (vm *VM) greaterThan(left, right interface{}) bool {
-	return vm.lessThan(right, left)
+func (vm *VM) greaterThan(left, right *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
+	case int64:
+		switch r := right.Data.(type) {
+		case int64:
+			if l > r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		case float64:
+			if float64(l) > r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		}
+	case float64:
+		switch r := right.Data.(type) {
+		case int64:
+			if l > float64(r) {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		case float64:
+			if l > r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		}
+	}
+	return core.R.NilVal
 }
 
-func (vm *VM) index(left, index interface{}) interface{} {
-	switch l := left.(type) {
-	case []interface{}:
-		switch i := index.(type) {
+func (vm *VM) index(left, index *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
+	case []*object.EmeraldValue:
+		switch i := index.Data.(type) {
 		case int64:
 			if i < 0 {
 				i = int64(len(l)) + i
 			}
 			if i < 0 || i >= int64(len(l)) {
-				return nil
+				return core.R.NilVal
 			}
 			return l[i]
 		}
-	case map[interface{}]interface{}:
-		return l[index]
+	case map[*object.EmeraldValue]*object.EmeraldValue:
+		if val, ok := l[index]; ok {
+			return val
+		}
+		return core.R.NilVal
 	case string:
-		switch i := index.(type) {
+		switch i := index.Data.(type) {
 		case int64:
 			if i < 0 {
 				i = int64(len(l)) + i
 			}
 			if i < 0 || i >= int64(len(l)) {
-				return nil
+				return core.R.NilVal
 			}
-			return string(l[i])
+			return &object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  string(l[i]),
+				Class: core.R.Classes["String"],
+			}
 		}
 	}
-	return nil
+	return core.R.NilVal
 }
 
-func (vm *VM) indexAssign(left, index, value interface{}) interface{} {
-	switch l := left.(type) {
-	case []interface{}:
-		switch i := index.(type) {
+func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.EmeraldValue {
+	switch l := left.Data.(type) {
+	case []*object.EmeraldValue:
+		switch i := index.Data.(type) {
 		case int64:
 			if i >= 0 && i < int64(len(l)) {
 				l[i] = value
 			}
 		}
-	case map[interface{}]interface{}:
+	case map[*object.EmeraldValue]*object.EmeraldValue:
 		l[index] = value
 	}
 	return value
 }
 
-func (vm *VM) send(receiver interface{}, method string, args []interface{}) interface{} {
-	switch r := receiver.(type) {
-	case int64:
-		return vm.sendToInteger(r, method, args)
-	case float64:
-		return vm.sendToFloat(r, method, args)
-	case string:
-		return vm.sendToString(r, method, args)
-	case []interface{}:
-		return vm.sendToArray(r, method, args)
-	case bool:
-		return vm.sendToBool(r, method, args)
-	default:
-		return nil
+func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
+	methodObj, ok := receiver.Class.GetMethod(method)
+	if !ok {
+		return core.R.NilVal
 	}
-}
 
-func (vm *VM) sendToInteger(val int64, method string, args []interface{}) interface{} {
-	switch method {
-	case "+":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val + a
-			case float64:
-				return float64(val) + a
-			}
-		}
-	case "-":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val - a
-			case float64:
-				return float64(val) - a
-			}
-		}
-	case "*":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val * a
-			case float64:
-				return float64(val) * a
-			}
-		}
-	case "/":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				if a != 0 {
-					return val / a
-				}
-			case float64:
-				if a != 0 {
-					return float64(val) / a
-				}
-			}
-		}
-	case "to_s":
-		return fmt.Sprintf("%d", val)
-	case "chr":
-		return string(rune(val))
-	case "odd?":
-		return val%2 == 1
-	case "even?":
-		return val%2 == 0
-	case "zero?":
-		return val == 0
-	case "abs":
-		if val < 0 {
-			return -val
-		}
-		return val
+	if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+		return fn(receiver, args...)
 	}
-	return nil
-}
 
-func (vm *VM) sendToFloat(val float64, method string, args []interface{}) interface{} {
-	switch method {
-	case "+":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val + float64(a)
-			case float64:
-				return val + a
-			}
+	if fn, ok := methodObj.Fn.(*object.Function); ok {
+		oldFrame := vm.frames[vm.fp]
+		newFrame := &Frame{
+			Fn: fn,
+			Ip: -1,
+			Bp: vm.sp - len(args),
 		}
-	case "-":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val - float64(a)
-			case float64:
-				return val - a
-			}
-		}
-	case "*":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				return val * float64(a)
-			case float64:
-				return val * a
-			}
-		}
-	case "/":
-		if len(args) == 1 {
-			switch a := args[0].(type) {
-			case int64:
-				if a != 0 {
-					return val / float64(a)
-				}
-			case float64:
-				if a != 0 {
-					return val / a
-				}
-			}
-		}
-	case "to_s":
-		return fmt.Sprintf("%g", val)
-	case "to_i":
-		return int64(val)
-	}
-	return nil
-}
+		vm.frames = append(vm.frames, newFrame)
+		vm.fp++
 
-func (vm *VM) sendToString(val string, method string, args []interface{}) interface{} {
-	switch method {
-	case "+":
-		if len(args) == 1 {
-			return val + args[0].(string)
+		for _, arg := range args {
+			vm.stack[vm.sp] = arg
+			vm.sp++
 		}
-	case "length", "size":
-		return int64(len(val))
-	case "empty?":
-		return len(val) == 0
-	case "to_s":
-		return val
-	case "upcase":
-		return vm.toUpper(val)
-	case "downcase":
-		return vm.toLower(val)
-	}
-	return nil
-}
 
-func (vm *VM) toUpper(s string) string {
-	result := ""
-	for _, r := range s {
-		if r >= 'a' && r <= 'z' {
-			result += string(r - 32)
-		} else {
-			result += string(r)
-		}
-	}
-	return result
-}
+		frame := vm.frames[vm.fp]
+		instructions := frame.Fn.Instructions
 
-func (vm *VM) toLower(s string) string {
-	result := ""
-	for _, r := range s {
-		if r >= 'A' && r <= 'Z' {
-			result += string(r + 32)
-		} else {
-			result += string(r)
-		}
-	}
-	return result
-}
-
-func (vm *VM) sendToArray(val []interface{}, method string, args []interface{}) interface{} {
-	switch method {
-	case "length", "size":
-		return int64(len(val))
-	case "first":
-		if len(val) > 0 {
-			return val[0]
-		}
-		return nil
-	case "last":
-		if len(val) > 0 {
-			return val[len(val)-1]
-		}
-		return nil
-	case "push":
-		if len(args) > 0 {
-			return append(val, args[0])
-		}
-	case "pop":
-		if len(val) > 0 {
-			return val[len(val)-1]
-		}
-		return nil
-	case "empty?":
-		return len(val) == 0
-	case "join":
-		if len(args) > 0 {
-			sep := args[0].(string)
-			result := ""
-			for i, v := range val {
-				result += fmt.Sprintf("%v", v)
-				if i < len(val)-1 {
-					result += sep
-				}
+		for frame.Ip < len(instructions)-1 {
+			frame.Ip++
+			op := compiler.Opcode(instructions[frame.Ip])
+			err := vm.execute(op, frame)
+			if err != nil {
+				return core.R.NilVal
 			}
-			return result
+			frame = vm.frames[vm.fp]
+			instructions = frame.Fn.Instructions
 		}
-	case "reverse":
-		result := make([]interface{}, len(val))
-		for i, v := range val {
-			result[len(val)-1-i] = v
+
+		result := core.R.NilVal
+		if vm.sp > frame.Bp {
+			result = vm.stack[vm.sp-1]
 		}
+
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.frames[vm.fp] = oldFrame
+
 		return result
 	}
-	return nil
+
+	return core.R.NilVal
 }
 
-func (vm *VM) sendToBool(val bool, method string, args []interface{}) interface{} {
-	switch method {
-	case "to_s":
-		if val {
-			return "true"
-		}
-		return "false"
-	case "!", "not":
-		return !val
+func (vm *VM) LastPoppedStackElement() *object.EmeraldValue {
+	if vm.sp > 0 {
+		return vm.stack[vm.sp-1]
+	}
+	if len(vm.poppedValues) > 0 {
+		return vm.poppedValues[len(vm.poppedValues)-1]
 	}
 	return nil
 }
 
-func (vm *VM) LastPoppedStackElement() interface{} {
-	return vm.stack[vm.sp]
+func (vm *VM) GetAllResults() []*object.EmeraldValue {
+	return vm.poppedValues
 }

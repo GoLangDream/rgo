@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/GoLangDream/rgo/rvm/parser/ast"
+	"github.com/GoLangDream/rgo/vm/object"
+	"github.com/GoLangDream/rgo/core"
 )
 
 const (
@@ -113,7 +115,7 @@ type CompilationScope struct {
 }
 
 type Compiler struct {
-	constants   []interface{}
+	constants   []*object.EmeraldValue
 	scopes      []CompilationScope
 	scopeIndex  int
 	symbolTable *SymbolTable
@@ -131,7 +133,7 @@ func New() *Compiler {
 	}
 
 	return &Compiler{
-		constants:   []interface{}{},
+		constants:   []*object.EmeraldValue{},
 		scopes:      []CompilationScope{mainScope},
 		symbolTable: symbolTable,
 	}
@@ -151,11 +153,23 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		c.Emit(OpPop)
 	case *ast.IntegerLiteral:
-		c.EmitConstant(node.Value)
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  node.Value,
+			Class: core.R.Classes["Integer"],
+		})
 	case *ast.FloatLiteral:
-		c.EmitConstant(node.Value)
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  node.Value,
+			Class: core.R.Classes["Float"],
+		})
 	case *ast.StringLiteral:
-		c.EmitConstant(node.Value)
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Value,
+			Class: core.R.Classes["String"],
+		})
 	case *ast.Boolean:
 		if node.Value {
 			c.Emit(OpTrue)
@@ -299,12 +313,20 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.MethodCall:
 		// 先 push receiver
-		if err := c.Compile(node.Receiver); err != nil {
-			return err
+		if node.Receiver != nil {
+			if err := c.Compile(node.Receiver); err != nil {
+				return err
+			}
+		} else {
+			c.Emit(OpSelf)
 		}
 
 		// push 方法名到常量池
-		methodNameIdx := c.addConstant(node.Method.Value)
+		methodNameIdx := c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Method.Value,
+			Class: core.R.Classes["String"],
+		})
 
 		// push 参数
 		for _, arg := range node.Args {
@@ -349,7 +371,19 @@ func (c *Compiler) Compile(node interface{}) error {
 		free := c.symbolTable.FreeSymbols
 
 		instructions := c.LeaveScope()
-		c.emit(OpClosure, len(instructions), len(free))
+
+		fn := &object.EmeraldValue{
+			Type: object.ValueFunction,
+			Data: &object.Function{
+				Name:        node.Name.Value,
+				Instructions: instructions,
+				NumLocals:   len(node.Params),
+			},
+			Class: core.R.Classes["Class"],
+		}
+		fnIdx := c.addConstant(fn)
+
+		c.emit(OpClosure, fnIdx, len(free))
 		for _, s := range free {
 			if s.Scope == ScopeLocal {
 				c.emit(OpGetLocal, s.Index)
@@ -358,7 +392,11 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 
-		c.emit(OpDefineMethod, c.addConstant(node.Name.Value))
+		c.emit(OpDefineMethod, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 	case *ast.ClassExpression:
 		if node.SuperClass != nil {
 			if err := c.Compile(node.SuperClass); err != nil {
@@ -366,7 +404,11 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 
-		c.emit(OpClass, c.addConstant(node.Name.Value))
+		c.emit(OpClass, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 
 		if node.SuperClass != nil {
 			c.Emit(OpInherited)
@@ -383,7 +425,11 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.LeaveScope()
 		c.Emit(OpPop)
 	case *ast.ModuleExpression:
-		c.emit(OpModule, c.addConstant(node.Name.Value))
+		c.emit(OpModule, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 
 		c.EnterScope()
 		c.Emit(OpPop)
@@ -464,11 +510,11 @@ func (c *Compiler) Emit(op Opcode) int {
 	return c.emit(op)
 }
 
-func (c *Compiler) EmitConstant(v interface{}) int {
+func (c *Compiler) EmitConstant(v *object.EmeraldValue) int {
 	return c.emit(OpConstant, c.addConstant(v))
 }
 
-func (c *Compiler) addConstant(v interface{}) int {
+func (c *Compiler) addConstant(v *object.EmeraldValue) int {
 	c.constants = append(c.constants, v)
 	return len(c.constants) - 1
 }
@@ -520,5 +566,5 @@ func (c *Compiler) LeaveScope() Instructions {
 
 type Bytecode struct {
 	Instructions Instructions
-	Constants    []interface{}
+	Constants    []*object.EmeraldValue
 }

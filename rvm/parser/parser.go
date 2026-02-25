@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 
 	"github.com/GoLangDream/rgo/rvm/lexer"
@@ -196,7 +197,12 @@ func (p *Parser) ParseProgram() *ast.Program {
 		Statements: []ast.Statement{},
 	}
 
+	count := 0
 	for !p.curTokenIs(lexer.EOF) {
+		count++
+		if count > 1000 {
+			panic("infinite loop in ParseProgram")
+		}
 		stmt := p.parseStatement()
 		if stmt != nil {
 			program.Statements = append(program.Statements, stmt)
@@ -299,8 +305,10 @@ func (p *Parser) parseRaiseStatement() *ast.RaiseExpression {
 }
 
 func (p *Parser) parseExpression(prec int) ast.Expression {
+	println(">>> parseExpression called")
 	prefix := p.prefixFns[p.curToken.Type]
 	if prefix == nil {
+		fmt.Fprintf(os.Stderr, "DEBUG parseExpression: no prefix for token %v\n", p.curToken.Type)
 		if !p.curTokenIs(lexer.EOF) {
 			p.parseError("no prefix parse function for %s found", p.curToken.Type)
 		}
