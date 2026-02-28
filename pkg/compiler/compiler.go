@@ -3,9 +3,9 @@ package compiler
 import (
 	"fmt"
 
-	"github.com/GoLangDream/rgo/rvm/parser/ast"
-	"github.com/GoLangDream/rgo/vm/object"
-	"github.com/GoLangDream/rgo/core"
+	"github.com/GoLangDream/rgo/pkg/core"
+	"github.com/GoLangDream/rgo/pkg/object"
+	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
 
 const (
@@ -65,6 +65,13 @@ func (s *SymbolTable) Define(name string) Symbol {
 func (s *SymbolTable) DefineBuiltin(index int, name string) Symbol {
 	symbol := Symbol{Name: name, Index: index, Scope: ScopeBuiltin}
 	s.store[name] = symbol
+	return symbol
+}
+
+func (s *SymbolTable) DefineGlobal(name string) Symbol {
+	symbol := Symbol{Name: name, Index: len(s.store), Scope: ScopeGlobal}
+	s.store[name] = symbol
+	s.MaxSymbols++
 	return symbol
 }
 
@@ -199,7 +206,55 @@ func (c *Compiler) Compile(node interface{}) error {
 		case ScopeOuter:
 			c.emit(OpGetOuter, sym.ScopeIndex)
 		}
+	case *ast.InstanceVariable:
+		c.emit(OpGetInstanceVar, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name,
+			Class: core.R.Classes["String"],
+		}))
+	case *ast.GlobalVariable:
+		c.emit(OpGetGlobal, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name,
+			Class: core.R.Classes["String"],
+		}))
+	case *ast.ClassVariable:
+		c.emit(OpGetClassVar, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name,
+			Class: core.R.Classes["String"],
+		}))
 	case *ast.InfixExpression:
+		// Short-circuit operators need special handling
+		if node.Operator == "&&" || node.Operator == "and" {
+			if err := c.Compile(node.Left); err != nil {
+				return err
+			}
+			c.Emit(OpDup)
+			jumpPos := c.emit(OpJumpNotTruthy, 9999)
+			c.Emit(OpPop) // pop the duplicated left value
+			if err := c.Compile(node.Right); err != nil {
+				return err
+			}
+			afterRight := len(c.currentInstructions())
+			c.changeOperand(jumpPos, afterRight)
+			return nil
+		}
+		if node.Operator == "||" || node.Operator == "or" {
+			if err := c.Compile(node.Left); err != nil {
+				return err
+			}
+			c.Emit(OpDup)
+			jumpPos := c.emit(OpJumpTruthy, 9999)
+			c.Emit(OpPop) // pop the duplicated left value
+			if err := c.Compile(node.Right); err != nil {
+				return err
+			}
+			afterRight := len(c.currentInstructions())
+			c.changeOperand(jumpPos, afterRight)
+			return nil
+		}
+
 		if err := c.Compile(node.Left); err != nil {
 			return err
 		}
@@ -251,23 +306,55 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		jumpNotTruthyPos := c.emit(OpJumpNotTruthy, 9999)
 
-		if err := c.Compile(node.Consequent); err != nil {
+		if err := c.compileBlockAsValue(node.Consequent); err != nil {
 			return err
 		}
 
-		if node.Alternative != nil {
-			c.emit(OpJump, 9999)
+		if len(node.ElsIf) == 0 && node.Alternative == nil {
+			// Simple if without else — push nil when condition is false
+			jumpToEnd := c.emit(OpJump, 9999)
+			afterConsequent := len(c.currentInstructions())
+			c.changeOperand(jumpNotTruthyPos, afterConsequent)
+			c.Emit(OpNil)
+			afterNil := len(c.currentInstructions())
+			c.changeOperand(jumpToEnd, afterNil)
+		} else {
+			// if with elsif/else — need jump over remaining branches
+			jumpToEndPositions := []int{}
+			jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
 
 			afterConsequent := len(c.currentInstructions())
 			c.changeOperand(jumpNotTruthyPos, afterConsequent)
 
-			if err := c.Compile(node.Alternative); err != nil {
-				return err
+			// Compile elsif branches
+			for _, elsif := range node.ElsIf {
+				if err := c.Compile(elsif.Condition); err != nil {
+					return err
+				}
+				elsifJumpPos := c.emit(OpJumpNotTruthy, 9999)
+				if err := c.compileBlockAsValue(elsif.Consequent); err != nil {
+					return err
+				}
+				jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
+				afterElsif := len(c.currentInstructions())
+				c.changeOperand(elsifJumpPos, afterElsif)
+			}
+
+			// Compile else branch
+			if node.Alternative != nil {
+				if err := c.compileBlockAsValue(node.Alternative); err != nil {
+					return err
+				}
+			} else {
+				c.Emit(OpNil)
+			}
+
+			// Patch all jump-to-end positions
+			afterAll := len(c.currentInstructions())
+			for _, pos := range jumpToEndPositions {
+				c.changeOperand(pos, afterAll)
 			}
 		}
-
-		afterConsequent := len(c.currentInstructions())
-		c.changeOperand(jumpNotTruthyPos, afterConsequent)
 	case *ast.ArrayLiteral:
 		for _, e := range node.Elements {
 			if err := c.Compile(e); err != nil {
@@ -297,6 +384,28 @@ func (c *Compiler) Compile(node interface{}) error {
 	case *ast.AssignExpression:
 		if err := c.Compile(node.Value); err != nil {
 			return err
+		}
+
+		// Check if the name is a global variable (starts with $)
+		if len(node.Name.Value) > 0 && node.Name.Value[0] == '$' {
+			// Define in symbol table and use index
+			if _, ok := c.symbolTable.Resolve(node.Name.Value); !ok {
+				c.symbolTable.Define(node.Name.Value)
+			}
+			sym, _ := c.symbolTable.Resolve(node.Name.Value)
+			c.symbolTable.DefineGlobal(node.Name.Value)
+			c.emit(OpSetGlobal, sym.Index)
+			return nil
+		}
+
+		// Check if the name is a class variable (starts with @@)
+		if len(node.Name.Value) > 1 && node.Name.Value[0] == '@' && node.Name.Value[1] == '@' {
+			c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
+			return nil
 		}
 
 		sym, ok := c.symbolTable.Resolve(node.Name.Value)
@@ -361,12 +470,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.symbolTable.Define(param.Value)
 		}
 
-		if err := c.Compile(node.Body); err != nil {
+		// Use compileBlockAsValue to preserve the last expression's value
+		if err := c.compileBlockAsValue(node.Body); err != nil {
 			return err
 		}
 
-		c.Emit(OpReturn)
-		c.Emit(OpPop)
+		c.Emit(OpReturnValue)
+		// OpReturnValue will pop the return value, reset sp, then push it back
 
 		free := c.symbolTable.FreeSymbols
 
@@ -375,9 +485,9 @@ func (c *Compiler) Compile(node interface{}) error {
 		fn := &object.EmeraldValue{
 			Type: object.ValueFunction,
 			Data: &object.Function{
-				Name:        node.Name.Value,
+				Name:         node.Name.Value,
 				Instructions: instructions,
-				NumLocals:   len(node.Params),
+				NumLocals:    len(node.Params),
 			},
 			Class: core.R.Classes["Class"],
 		}
@@ -464,6 +574,31 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		afterBody := len(c.currentInstructions())
 		c.changeOperand(jumpNotTruthyPos, afterBody)
+
+		// while returns nil in Ruby
+		c.Emit(OpNil)
+	case *ast.UntilExpression:
+		// until is like while with negated condition
+		loopStart := len(c.currentInstructions())
+
+		if err := c.Compile(node.Condition); err != nil {
+			return err
+		}
+
+		// Jump out if condition is TRUE (opposite of while)
+		jumpTruthyPos := c.emit(OpJumpTruthy, 9999)
+
+		if err := c.Compile(node.Body); err != nil {
+			return err
+		}
+
+		c.emit(OpJump, loopStart)
+
+		afterBody := len(c.currentInstructions())
+		c.changeOperand(jumpTruthyPos, afterBody)
+
+		// until returns nil in Ruby
+		c.Emit(OpNil)
 	case *ast.BreakExpression:
 		c.Emit(OpBreak)
 	case *ast.NextExpression:
@@ -497,6 +632,27 @@ func (c *Compiler) Bytecode() *Bytecode {
 
 func (c *Compiler) currentInstructions() Instructions {
 	return c.scopes[c.scopeIndex].instructions
+}
+
+// compileBlockAsValue compiles a BlockExpression but removes the last OpPop
+// so the block's last value stays on the stack (used for if/elsif/else branches)
+func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
+	if block == nil || len(block.Statements) == 0 {
+		c.Emit(OpNil)
+		return nil
+	}
+	for _, s := range block.Statements {
+		if err := c.Compile(s); err != nil {
+			return err
+		}
+	}
+	// Remove the last OpPop so the value remains on the stack
+	last := c.scopes[c.scopeIndex].lastInstruction
+	if last.Opcode == OpPop {
+		c.scopes[c.scopeIndex].instructions = c.scopes[c.scopeIndex].instructions[:last.Position]
+		c.scopes[c.scopeIndex].lastInstruction = c.scopes[c.scopeIndex].previousInstruction
+	}
+	return nil
 }
 
 func (c *Compiler) emit(op Opcode, operands ...int) int {

@@ -29,6 +29,7 @@ func New(input string) *Lexer {
 func (l *Lexer) readChar() {
 	if l.readPosition >= len(l.input) {
 		l.ch = 0
+		l.position = l.readPosition
 	} else {
 		r, w := utf8.DecodeRuneInString(l.input[l.readPosition:])
 		l.ch = r
@@ -100,6 +101,11 @@ func (l *Lexer) NewLine() Token {
 func (l *Lexer) NextToken() Token {
 	l.skipWhitespace()
 
+	// Skip inline comments
+	if l.ch == '#' {
+		l.skipComment()
+	}
+
 	var tok Token
 	tok.Line = l.line
 	tok.Column = l.column
@@ -117,16 +123,15 @@ func (l *Lexer) NextToken() Token {
 		return tok
 	case '"':
 		tok = l.readString(false)
+		// readString stops at closing quote; readChar() below consumes it
 	case '\'':
 		tok = l.readString(true)
+		// readString stops at closing quote; readChar() below consumes it
 	case '`':
 		tok = l.readRawString()
+		return tok // readRawString already consumed closing backtick
 	case '[':
-		if l.peekChar() == ']' {
-			tok = l.makeTwoCharToken(LBRACKET, RBRACKET)
-		} else {
-			tok = newToken(LBRACKET, l.ch)
-		}
+		tok = newToken(LBRACKET, l.ch)
 	case ']':
 		tok = newToken(RBRACKET, l.ch)
 	case '(':
@@ -138,6 +143,7 @@ func (l *Lexer) NextToken() Token {
 			tok = l.makeTwoCharToken(LBRACE, RBRACE)
 		} else if l.peekChar() == '-' {
 			tok = l.readHashArrow()
+			return tok // readHashArrow already advanced
 		} else {
 			tok = newToken(LBRACE, l.ch)
 		}
@@ -149,6 +155,7 @@ func (l *Lexer) NextToken() Token {
 		tok = newToken(SEMICOLON, l.ch)
 	case ':':
 		tok = l.readSymbolOrColon()
+		return tok // readSymbolOrColon already advanced past content
 	case '.':
 		if l.peekChar() == '.' {
 			if l.peekCharN(2) == '.' {
@@ -161,6 +168,7 @@ func (l *Lexer) NextToken() Token {
 		}
 	case '/':
 		tok = l.readSlashOrRegexp()
+		return tok // readSlashOrRegexp already advanced past content
 	case '+':
 		if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(PLUS, PLUS_ASSIGN)
@@ -192,6 +200,7 @@ func (l *Lexer) NextToken() Token {
 			l.peekChar() == 'i' || l.peekChar() == 'I' || l.peekChar() == 'r' || l.peekChar() == 's' ||
 			l.peekChar() == 'x' || l.peekChar() == 's' {
 			tok = l.readPercentString()
+			return tok // readPercentString already advanced past content
 		} else {
 			tok = newToken(MOD, l.ch)
 		}
@@ -226,6 +235,7 @@ func (l *Lexer) NextToken() Token {
 			}
 		} else if l.peekChar() == '<' {
 			tok = l.readLeftShift()
+			return tok // readLeftShift already advanced past content
 		} else {
 			tok = newToken(LESS_THAN, l.ch)
 		}
@@ -255,14 +265,17 @@ func (l *Lexer) NextToken() Token {
 		tok = newToken(QUESTION, l.ch)
 	case '@':
 		tok = l.readVariable()
+		return tok // readVariable already advanced past content
 	case '$':
 		tok = l.readGlobalVariable()
+		return tok // readGlobalVariable already advanced past content
 	case '_':
 		if len(l.input[l.position:]) >= 5 && l.input[l.position:l.position+5] == "__END__" {
 			tok.Type = EOF
 			tok.Literal = ""
 		} else {
 			tok = l.readIdentifier()
+			return tok // readIdentifier already advanced past content
 		}
 	default:
 		if isLetter(l.ch) {
@@ -388,24 +401,25 @@ func (l *Lexer) readVariable() Token {
 }
 
 func (l *Lexer) readGlobalVariable() Token {
+	l.readChar() // skip '$'
 	position := l.position
 
-	l.readChar()
 	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
 
-	if position == l.position {
-		l.readChar()
+	lit := l.input[position:l.position]
+	if len(lit) == 0 {
+		// Special global variables like $-, $!, etc.
 		if l.ch == '-' {
 			l.readChar()
-			position := l.position
+			position = l.position
 			for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 				l.readChar()
 			}
 			return Token{
 				Type:    IDENT,
-				Literal: "-$" + l.input[position:l.position],
+				Literal: "$-" + l.input[position:l.position],
 				Line:    l.line,
 				Column:  l.column,
 			}
@@ -415,7 +429,7 @@ func (l *Lexer) readGlobalVariable() Token {
 
 	return Token{
 		Type:    DOLLAR,
-		Literal: "$" + l.input[position:l.position],
+		Literal: "$" + lit,
 		Line:    l.line,
 		Column:  l.column,
 	}
@@ -629,8 +643,11 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 
 	for l.ch != quote && l.ch != 0 {
 		if l.ch == '\\' {
-			l.readChar()
+			// Flush raw text before the backslash
+			lit += l.input[position:l.position]
+			l.readChar() // skip '\'
 			lit += l.readEscapeSequence()
+			position = l.position // skip past the escape in raw input
 		} else if l.ch == '#' && l.peekChar() == '{' {
 			lit += l.input[position:l.position]
 			lit += l.readStringInterpolation()
@@ -793,7 +810,8 @@ func (l *Lexer) readMetaEscape() string {
 }
 
 func (l *Lexer) readStringInterpolation() string {
-	l.readChar()
+	l.readChar() // skip '#'
+	l.readChar() // skip '{'
 
 	depth := 1
 	start := l.position
@@ -806,15 +824,12 @@ func (l *Lexer) readStringInterpolation() string {
 			if depth == 0 {
 				break
 			}
-		} else if l.ch == '\n' {
-			l.readChar()
-			continue
 		}
 		l.readChar()
 	}
 
 	lit := l.input[start:l.position]
-	l.readChar()
+	l.readChar() // skip closing '}'
 
 	return "#{" + lit + "}"
 }

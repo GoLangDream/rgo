@@ -199,5 +199,9 @@ func LookupIdent(ident string) TokenType {
 	if tok, ok := keywords[ident]; ok {
 		return tok
 	}
+	// Constants start with uppercase letter
+	if len(ident) > 0 && ident[0] >= 'A' && ident[0] <= 'Z' {
+		return CONSTANT
+	}
 	return IDENT
 }

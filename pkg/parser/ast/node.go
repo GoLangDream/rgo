@@ -3,7 +3,7 @@ package ast
 import (
 	"fmt"
 
-	"github.com/GoLangDream/rgo/rvm/lexer"
+	"github.com/GoLangDream/rgo/pkg/lexer"
 )
 
 type Node interface {

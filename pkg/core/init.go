@@ -3,7 +3,7 @@ package core
 import (
 	"fmt"
 
-	"github.com/GoLangDream/rgo/vm/object"
+	"github.com/GoLangDream/rgo/pkg/object"
 )
 
 type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue

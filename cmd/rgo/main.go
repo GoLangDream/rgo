@@ -4,18 +4,16 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/GoLangDream/rgo/rvm"
-	"github.com/GoLangDream/rgo/rvm/compiler"
-	"github.com/GoLangDream/rgo/rvm/lexer"
-	"github.com/GoLangDream/rgo/rvm/parser"
-	"github.com/GoLangDream/rgo/vm/object"
-	"github.com/GoLangDream/rgo/core"
+	"github.com/GoLangDream/rgo/pkg/compiler"
+	"github.com/GoLangDream/rgo/pkg/core"
+	"github.com/GoLangDream/rgo/pkg/lexer"
+	"github.com/GoLangDream/rgo/pkg/object"
+	"github.com/GoLangDream/rgo/pkg/parser"
+	"github.com/GoLangDream/rgo/pkg/vm"
 )
 
 func main() {
-	fmt.Fprintf(os.Stderr, "DEBUG main: starting\n")
 	core.Init()
-	fmt.Fprintf(os.Stderr, "DEBUG main: core initialized\n")
 
 	args := os.Args[1:]
 
@@ -33,11 +31,8 @@ func main() {
 		file.Read(content)
 
 		l := lexer.New(string(content))
-		fmt.Fprintf(os.Stderr, "DEBUG main: lexer created\n")
 		p := parser.New(l)
-		fmt.Fprintf(os.Stderr, "DEBUG main: parser created\n")
 		program := p.ParseProgram()
-		fmt.Fprintf(os.Stderr, "DEBUG main: ParseProgram done, stmts=%d\n", len(program.Statements))
 
 		if len(p.Errors()) > 0 {
 			for _, err := range p.Errors() {
@@ -54,11 +49,8 @@ func main() {
 		}
 
 		bytecode := c.Bytecode()
-		fmt.Fprintf(os.Stderr, "DEBUG: bytecode instructions len=%d\n", len(bytecode.Instructions))
-		v := rvm.New(bytecode)
-		fmt.Fprintf(os.Stderr, "DEBUG: VM created\n")
+		v := vm.New(bytecode)
 		err = v.Run()
-		fmt.Fprintf(os.Stderr, "DEBUG: Run completed, err=%v\n", err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
 			os.Exit(1)

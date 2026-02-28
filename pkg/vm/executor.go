@@ -1,22 +1,21 @@
-package rvm
+package vm
 
 import (
 	"fmt"
-	"os"
 
-	"github.com/GoLangDream/rgo/rvm/compiler"
-	"github.com/GoLangDream/rgo/vm/object"
-	"github.com/GoLangDream/rgo/core"
+	"github.com/GoLangDream/rgo/pkg/compiler"
+	"github.com/GoLangDream/rgo/pkg/core"
+	"github.com/GoLangDream/rgo/pkg/object"
 )
 
 const StackSize = 2048
 const MaxFrames = 1024
 
 type Frame struct {
-	Fn       *object.Function
-	Ip       int
-	Bp       int
-	Closure  *object.Closure
+	Fn      *object.Function
+	Ip      int
+	Bp      int
+	Closure *object.Closure
 }
 
 type VM struct {
@@ -38,9 +37,9 @@ func New(bytecode *compiler.Bytecode) *VM {
 	core.Init()
 
 	mainFn := &object.Function{
-		Name:        "__main__",
+		Name:         "__main__",
 		Instructions: bytecode.Instructions,
-		NumLocals:   0,
+		NumLocals:    0,
 	}
 
 	mainFrame := &Frame{
@@ -174,10 +173,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpGreaterThanOrEqual:
 		right := vm.pop()
 		left := vm.pop()
-		result := vm.greaterThan(left, right)
-		if result.Type == object.ValueNil {
-			vm.push(core.R.TrueVal)
-		} else if result.Type == object.ValueBool && result.Data == true {
+		gt := vm.greaterThan(left, right)
+		eq := vm.equals(left, right)
+		if (gt.Type == object.ValueBool && gt.Data == true) ||
+			(eq.Type == object.ValueBool && eq.Data == true) {
 			vm.push(core.R.TrueVal)
 		} else {
 			vm.push(core.R.FalseVal)
@@ -192,10 +191,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpLessThanOrEqual:
 		right := vm.pop()
 		left := vm.pop()
-		result := vm.lessThan(left, right)
-		if result.Type == object.ValueNil {
-			vm.push(core.R.TrueVal)
-		} else if result.Type == object.ValueBool && result.Data == true {
+		lt := vm.lessThan(left, right)
+		eq := vm.equals(left, right)
+		if (lt.Type == object.ValueBool && lt.Data == true) ||
+			(eq.Type == object.ValueBool && eq.Data == true) {
 			vm.push(core.R.TrueVal)
 		} else {
 			vm.push(core.R.FalseVal)
@@ -220,18 +219,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 	case compiler.OpArray:
-		fmt.Fprintf(os.Stderr, "DEBUG: OpArray executing\n")
 		n := vm.readUint16()
-		fmt.Fprintf(os.Stderr, "DEBUG: OpArray n=%d\n", n)
 		if n > 100 {
 			return fmt.Errorf("OpArray: too many elements: %d", n)
 		}
 		elems := make([]*object.EmeraldValue, n)
 		for i := n - 1; i >= 0; i-- {
 			elems[i] = vm.pop()
-			fmt.Fprintf(os.Stderr, "DEBUG OpArray: i=%d, elem=%v\n", i, elems[i])
 		}
-		fmt.Fprintf(os.Stderr, "DEBUG OpArray: sp after pop=%d\n", vm.sp)
 		vm.push(&object.EmeraldValue{
 			Type:  object.ValueArray,
 			Data:  elems,
@@ -276,12 +271,70 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpGetLocal:
 		idx := vm.readUint8()
 		basePtr := frame.Bp
-		vm.push(vm.stack[basePtr+idx])
+		// In Ruby, Bp points to self (index 0), parameters start at index 1
+		// But compiler generates indices starting from 0 for first param
+		// So we need to add 1 to skip self
+		stackIdx := basePtr + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= StackSize {
+			return fmt.Errorf("OpGetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", basePtr, idx, stackIdx, vm.sp)
+		}
+		vm.push(vm.stack[stackIdx])
 
 	case compiler.OpSetLocal:
 		idx := vm.readUint8()
 		basePtr := frame.Bp
-		vm.stack[basePtr+idx] = vm.peek(0)
+		// Add 1 to skip self
+		stackIdx := basePtr + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= StackSize {
+			return fmt.Errorf("OpSetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", basePtr, idx, stackIdx, vm.sp)
+		}
+		vm.stack[stackIdx] = vm.peek(0)
+
+	case compiler.OpGetInstanceVar:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		receiver := vm.stack[frame.Bp]
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			if val, ok := obj.InstanceVars[name]; ok {
+				vm.push(val)
+			} else {
+				vm.push(core.R.NilVal)
+			}
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpSetInstanceVar:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		val := vm.peek(0)
+		receiver := vm.stack[frame.Bp]
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			obj.InstanceVars[name] = val
+		}
+
+	case compiler.OpGetClassVar:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		receiver := vm.stack[frame.Bp]
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			if val, ok := obj.ClassVars[name]; ok {
+				vm.push(val)
+			} else {
+				vm.push(core.R.NilVal)
+			}
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpSetClassVar:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		val := vm.peek(0)
+		receiver := vm.stack[frame.Bp]
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			obj.ClassVars[name] = val
+		}
 
 	case compiler.OpGetFree:
 		idx := vm.readUint8()
@@ -291,17 +344,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(vm.stack[frame.Bp])
 
 	case compiler.OpReturn:
+		// Don't decrement fp here - the caller will handle that
 		vm.sp = frame.Bp
-		if vm.fp > 0 {
-			vm.fp--
-		}
 
 	case compiler.OpReturnValue:
 		retVal := vm.pop()
+		// Don't decrement fp here - the caller will handle that
+		// Just reset the stack to the base pointer and push the return value
 		vm.sp = frame.Bp
-		if vm.fp > 0 {
-			vm.fp--
-		}
 		vm.push(retVal)
 
 	case compiler.OpSend:
@@ -348,9 +398,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := vm.constants[nameIdx].Data.(string)
 
 		fn := &object.Function{
-			Name:        name,
+			Name:         name,
 			Instructions: vm.pop().Data.([]byte),
-			NumLocals:   0,
+			NumLocals:    0,
 		}
 
 		method := &object.Method{
@@ -838,18 +888,29 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 
 	if fn, ok := methodObj.Fn.(*object.Function); ok {
 		oldFrame := vm.frames[vm.fp]
-		newFrame := &Frame{
-			Fn: fn,
-			Ip: -1,
-			Bp: vm.sp - len(args),
-		}
-		vm.frames = append(vm.frames, newFrame)
-		vm.fp++
 
+		// Calculate Bp BEFORE pushing anything - it should point to where receiver will be
+		// In Ruby, self is at position 0, then arguments start at position 1
+		bp := vm.sp
+
+		// Push receiver (self) first
+		vm.stack[vm.sp] = receiver
+		vm.sp++
+
+		// Push arguments to stack
 		for _, arg := range args {
 			vm.stack[vm.sp] = arg
 			vm.sp++
 		}
+
+		// Set up new frame - Bp points to receiver (self)
+		newFrame := &Frame{
+			Fn: fn,
+			Ip: -1,
+			Bp: bp,
+		}
+		vm.frames = append(vm.frames, newFrame)
+		vm.fp++
 
 		frame := vm.frames[vm.fp]
 		instructions := frame.Fn.Instructions

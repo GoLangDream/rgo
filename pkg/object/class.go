@@ -65,14 +65,16 @@ func (c *Class) NewInstance() *EmeraldValue {
 }
 
 type Object struct {
-	Class       *Class
+	Class        *Class
 	InstanceVars map[string]*EmeraldValue
+	ClassVars    map[string]*EmeraldValue
 }
 
 func NewObject(class *Class) *Object {
 	return &Object{
-		Class:       class,
+		Class:        class,
 		InstanceVars: make(map[string]*EmeraldValue),
+		ClassVars:    make(map[string]*EmeraldValue),
 	}
 }
 

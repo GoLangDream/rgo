@@ -1,0 +1,3 @@
+[submodule "vendor/ruby/spec"]
+	path = vendor/ruby/spec
+	url = https://github.com/ruby/spec.git
