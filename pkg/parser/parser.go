@@ -385,9 +385,47 @@ func (p *Parser) expectPeek(t lexer.TokenType) bool {
 }
 
 func (p *Parser) parseIdentifier() ast.Expression {
-	return &ast.Identifier{
+	ident := &ast.Identifier{
 		Token: p.curToken,
 		Value: p.curToken.Literal,
+	}
+
+	if p.isArgumentStart(p.peekToken) {
+		call := &ast.MethodCall{
+			Token:    p.curToken,
+			Receiver: nil,
+			Method:   ident,
+		}
+
+		p.nextToken()
+		arg := p.parseExpression(LOWEST)
+		if arg != nil {
+			call.Args = append(call.Args, arg)
+		}
+
+		for p.peekTokenIs(lexer.COMMA) {
+			p.nextToken()
+			p.nextToken()
+			arg := p.parseExpression(LOWEST)
+			if arg != nil {
+				call.Args = append(call.Args, arg)
+			}
+		}
+
+		return call
+	}
+
+	return ident
+}
+
+func (p *Parser) isArgumentStart(token lexer.Token) bool {
+	switch token.Type {
+	case lexer.STRING, lexer.INT, lexer.FLOAT, lexer.TRUE, lexer.FALSE, lexer.NIL,
+		lexer.LBRACKET, lexer.LBRACE, lexer.IDENT, lexer.MINUS, lexer.BANG,
+		lexer.REGEXP, lexer.SYMBOL:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1046,20 +1084,24 @@ func (p *Parser) parseCaseExpression() ast.Expression {
 
 	p.nextToken()
 
-	if !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.END) && !p.peekTokenIs(lexer.WHEN) {
+	if !p.curTokenIs(lexer.WHEN) && !p.curTokenIs(lexer.ELSE) && !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.END) {
 		exp.Expression = p.parseExpression(LOWEST)
 	}
 
 	p.skipNewlines()
 
-	for p.peekTokenIs(lexer.WHEN) {
+	for p.peekTokenIs(lexer.WHEN) || p.curTokenIs(lexer.WHEN) {
 		clause := &ast.CaseClause{
 			Token: p.curToken,
 		}
 
-		p.nextToken()
+		if p.curTokenIs(lexer.WHEN) {
+			p.nextToken()
+		}
 
-		for !p.peekTokenIs(lexer.THEN) && !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.EOF) {
+		p.skipNewlines()
+
+		for !p.peekTokenIs(lexer.THEN) && !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.END) && !p.peekTokenIs(lexer.EOF) {
 			cond := p.parseExpression(LOWEST)
 			clause.Conditions = append(clause.Conditions, cond)
 
@@ -1076,7 +1118,7 @@ func (p *Parser) parseCaseExpression() ast.Expression {
 		clause.Body = &ast.BlockExpression{
 			Token: p.curToken,
 		}
-		for !p.curTokenIs(lexer.END) && !p.curTokenIs(lexer.WHEN) && !p.peekTokenIs(lexer.ELSE) && !p.curTokenIs(lexer.EOF) {
+		for !p.curTokenIs(lexer.END) && !p.peekTokenIs(lexer.WHEN) && !p.peekTokenIs(lexer.ELSE) && !p.curTokenIs(lexer.EOF) {
 			stmt := p.parseStatement()
 			if stmt != nil {
 				clause.Body.Statements = append(clause.Body.Statements, stmt)

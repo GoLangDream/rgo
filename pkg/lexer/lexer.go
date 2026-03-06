@@ -179,7 +179,7 @@ func (l *Lexer) NextToken() Token {
 		if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(MINUS, MINUS_ASSIGN)
 		} else if l.peekChar() == '>' {
-			tok = l.makeTwoCharToken(MINUS, ARROW)
+			tok = l.makeTwoCharToken(MINUS, MINUS_ARROW)
 		} else {
 			tok = newToken(MINUS, l.ch)
 		}
@@ -346,7 +346,12 @@ func (l *Lexer) readHashArrow() Token {
 
 func (l *Lexer) readIdentifier() Token {
 	position := l.position
-	for isLetter(l.ch) || isDigit(l.ch) {
+	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+		l.readChar()
+	}
+
+	// Handle ? and ! as suffix for method names (e.g., odd?, foo!)
+	if l.ch == '?' || l.ch == '!' {
 		l.readChar()
 	}
 

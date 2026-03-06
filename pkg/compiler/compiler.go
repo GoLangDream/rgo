@@ -279,6 +279,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpEqual)
 		case "!=":
 			c.Emit(OpNotEqual)
+		case "===":
+			methodNameIdx := c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "===",
+				Class: core.R.Classes["String"],
+			})
+			c.emit(OpSend, methodNameIdx, 0, 1)
 		case ">":
 			c.Emit(OpGreaterThan)
 		case ">=":
@@ -354,6 +361,58 @@ func (c *Compiler) Compile(node interface{}) error {
 			for _, pos := range jumpToEndPositions {
 				c.changeOperand(pos, afterAll)
 			}
+		}
+	case *ast.CaseExpression:
+		if node.Expression != nil {
+			if err := c.Compile(node.Expression); err != nil {
+				return err
+			}
+		}
+		jumpToEndPositions := []int{}
+		for _, clause := range node.Clauses {
+			for _, cond := range clause.Conditions {
+				if node.Expression != nil {
+					c.Emit(OpDup)
+					if err := c.Compile(cond); err != nil {
+						return err
+					}
+					methodNameIdx := c.addConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  "===",
+						Class: core.R.Classes["String"],
+					})
+					c.emit(OpSend, methodNameIdx, 0, 1)
+					condJumpPos := c.emit(OpJumpNotTruthy, 9999)
+					if err := c.Compile(clause.Body); err != nil {
+						return err
+					}
+					jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
+					afterCond := len(c.currentInstructions())
+					c.changeOperand(condJumpPos, afterCond)
+				} else {
+					if err := c.Compile(cond); err != nil {
+						return err
+					}
+					condJumpPos := c.emit(OpJumpNotTruthy, 9999)
+					if err := c.Compile(clause.Body); err != nil {
+						return err
+					}
+					jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
+					afterCond := len(c.currentInstructions())
+					c.changeOperand(condJumpPos, afterCond)
+				}
+			}
+		}
+		if node.Else != nil {
+			if err := c.Compile(node.Else); err != nil {
+				return err
+			}
+		} else {
+			c.Emit(OpNil)
+		}
+		afterAll := len(c.currentInstructions())
+		for _, pos := range jumpToEndPositions {
+			c.changeOperand(pos, afterAll)
 		}
 	case *ast.ArrayLiteral:
 		for _, e := range node.Elements {

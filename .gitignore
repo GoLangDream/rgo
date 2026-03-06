@@ -16,3 +16,10 @@
 
 .idea
 covprofile.cov
+
+# RGo executables
+rgo
+rgo_new
+rgo-spec
+rgo-test
+rgo_test

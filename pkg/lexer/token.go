@@ -58,11 +58,12 @@ const (
 	DOT2 TokenType = ".."
 	DOT3 TokenType = "..."
 
-	COMMA     TokenType = ","
-	COLON     TokenType = ":"
-	COLON2    TokenType = "::"
-	SEMICOLON TokenType = ";"
-	ARROW     TokenType = "=>"
+	COMMA       TokenType = ","
+	COLON       TokenType = ":"
+	COLON2      TokenType = "::"
+	SEMICOLON   TokenType = ";"
+	ARROW       TokenType = "=>"
+	MINUS_ARROW TokenType = "->"
 
 	LPAREN   TokenType = "("
 	RPAREN   TokenType = ")"

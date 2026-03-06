@@ -48,7 +48,7 @@ func New(bytecode *compiler.Bytecode) *VM {
 		Bp: 0,
 	}
 
-	return &VM{
+	vm := &VM{
 		constants:    bytecode.Constants,
 		globals:      make([]*object.EmeraldValue, 100),
 		stack:        make([]*object.EmeraldValue, StackSize),
@@ -57,6 +57,10 @@ func New(bytecode *compiler.Bytecode) *VM {
 		fp:           0,
 		instructions: bytecode.Instructions,
 	}
+
+	vm.stack[0] = core.R.Main
+
+	return vm
 }
 
 func (vm *VM) Run() error {
@@ -237,8 +241,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		n := vm.readUint16()
 		h := make(map[*object.EmeraldValue]*object.EmeraldValue)
 		for i := 0; i < int(n); i++ {
-			value := vm.pop()
 			key := vm.pop()
+			value := vm.pop()
 			h[key] = value
 		}
 		vm.push(&object.EmeraldValue{
@@ -361,9 +365,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		_ = blockArg
 		methodName := vm.constants[methodNameIdx].Data.(string)
 
-		args := make([]*object.EmeraldValue, 0)
+		args := make([]*object.EmeraldValue, int(numArgs))
 		for i := 0; i < int(numArgs); i++ {
-			args = append(args, vm.pop())
+			args[numArgs-1-i] = vm.pop()
 		}
 		receiver := vm.pop()
 
@@ -838,8 +842,10 @@ func (vm *VM) index(left, index *object.EmeraldValue) *object.EmeraldValue {
 			return l[i]
 		}
 	case map[*object.EmeraldValue]*object.EmeraldValue:
-		if val, ok := l[index]; ok {
-			return val
+		for k, v := range l {
+			if k.Equals(index) {
+				return v
+			}
 		}
 		return core.R.NilVal
 	case string:

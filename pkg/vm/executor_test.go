@@ -523,3 +523,20 @@ func TestDefReturn(t *testing.T) {
 	result, _ := runRuby(t, "def get_five\n  return 5\nend\nget_five()")
 	assertIntResult(t, result, 5)
 }
+
+func TestCaseWhenSimple(t *testing.T) {
+	l := lexer.New("case when true then 10 end")
+	p := parser.New(l)
+	program := p.ParseProgram()
+
+	if len(p.Errors()) > 0 {
+		t.Fatalf("parse errors: %v", p.Errors())
+	}
+
+	t.Logf("parsed successfully, statements: %d", len(program.Statements))
+}
+
+func TestCaseWhenNoMatch(t *testing.T) {
+	result, _ := runRuby(t, "case 1\nwhen 2\n  10\nelse\n  20\nend")
+	assertIntResult(t, result, 20)
+}

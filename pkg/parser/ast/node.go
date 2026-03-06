@@ -757,8 +757,9 @@ func (d *DefinedExpression) TokenLiteral() string { return d.Token.Literal }
 func (d *DefinedExpression) String() string       { return "defined?(" + d.Expression.String() + ")" }
 
 type ProcLiteral struct {
-	Token lexer.Token
-	Body  *BlockExpression
+	Token  lexer.Token
+	Params []*Identifier
+	Body   *BlockExpression
 }
 
 func (p *ProcLiteral) expressionNode()      {}

@@ -13,9 +13,12 @@
 
 **项目总计：247 个测试，全部通过**
 
-## 阶段 0.6：本次会话新增功能
+## 阶段 0.6：本次会话新增功能（2025-03-04）
 
 ### 新增
+- [x] `?` 方法名解析 - `10.odd?` — 修改Lexer将`?`作为标识符的一部分
+- [x] 三元运算符 `? :` — 修改Parser和Compiler支持
+- [x] case/when 解析 — Parser支持（Compiler部分支持）
 - [x] class 定义 — 基本解析和编译支持
 - [x] 实例变量 (@foo) — 解析和赋值支持（部分）
 - [x] 常量 — CONSTANT token 类型支持（大写字母开头）
@@ -82,12 +85,29 @@
 ## 阶段 1：修复解析器 bug（已完成）
 
 ### 低优先级（需要Lexer修改）
-- [ ] `?` 方法名解析 - `10.odd?` — 需要修改Lexer将`?`作为标识符的一部分
-- [ ] `? :` 三元运算符 — 需要修改Lexer和Parser
+- [ ] `?` 方法名解析 - `10.odd?` — 已完成（2025-03-04）
+- [ ] `? :` 三元运算符 — 已完成（2025-03-04）
 - [ ] 字符串插值 `"hello #{name}"` — 运行时支持
 
 ### 已修复
 - [x] 多参数表达式 `puts 1, 2, 3` — 已支持（作为方法参数）
+
+## 新发现的问题（2025-03-04）
+
+### 本次更新
+- [x] `?` 方法名解析 - `10.odd?` - 已实现
+- [x] 三元运算符 `? :` - 已实现
+- [x] Stabby lambda `-> {}` - Parser已实现，Compiler部分实现（解析工作，调用需添加call方法）
+- [x] MINUS_ARROW token 支持
+
+### 已知问题
+- case/when 解析存在无限循环问题
+- case/when Compiler 实现不完整
+- RangeExpression (1..5) 未实现
+- ForExpression (for i in arr) 未实现
+- RescueClause/BeginExpression 未完全实现
+- 很多 AST 节点类型未在 Compiler 中实现
+- Lambda/Proc 调用需要添加 call 方法
 
 ## 阶段 2：控制流和方法定义（已完成）
 
@@ -104,22 +124,346 @@
 - [x] 实例变量 (@foo) — 解析和赋值支持
 - [x] 类变量 (@@foo) — 解析和赋值支持
 - [x] 全局变量 ($foo) — 解析和赋值支持
-- [ ] 闭包和 block — 需要实现
+- [x] Lambda (stabby lambda `-> {}`) — Parser已实现
+- [ ] 闭包和 block — 部分实现
 
-## 阶段 4：更多内置类型和标准库
+## 阶段 4：Ruby Spec 对照 - 缺失功能清单
 
-- [ ] Symbol, Regexp, Range
-- [ ] Proc, Lambda
-- [ ] IO, File
-- [ ] Exception
-- [ ] 标准库 (Marshal, JSON, Time, Date)
-- [ ] Kernel#require/load/eval
+**基于 `vendor/ruby/spec/` 分析（Ruby 3.3+ 规范）**
+
+RGo 当前状态：
+- ✅ Lexer: 140+ tokens（覆盖完整）
+- ✅ Parser: 40+ AST 节点（语法支持良好）
+- ✅ Compiler: 80+ opcodes（编译能力强）
+- ⚠️ Core 类: 仅 17/59 类，方法不完整
+- ❌ 标准库: 几乎为空
+
+### 4.1 核心类方法补全（优先级 P0-P1）
+
+#### P0 - 必须实现（Enumerable 依赖）
+- [ ] **Enumerable 模块** - 所有集合类的基础
+  - `each`, `map`, `select`, `reject`, `find`, `reduce`, `any?`, `all?`, `none?`, `one?`
+  - `sort`, `sort_by`, `group_by`, `partition`, `take`, `drop`, `first`, `last`
+  - `min`, `max`, `min_by`, `max_by`, `count`, `sum`, `zip`
+
+#### P0 - Array 核心方法（100+ spec 文件）
+当前：19 个方法 | 需要：80+ 方法
+
+**已实现**: `length`, `size`, `first`, `last`, `push`, `pop`, `empty?`, `join`, `reverse`, `[]`, `each`, `map`, `select`, `find`, `concat`, `delete_at`, `shift`, `unshift`, `sample`, `clear`, `include`
+
+**缺失（高频）**:
+- [ ] 修改: `<<`, `insert`, `fill`, `replace`, `compact`, `compact!`, `flatten`, `flatten!`, `uniq`, `uniq!`
+- [ ] 查询: `index`, `rindex`, `count`, `empty?`, `include?`, `any?`, `all?`, `none?`
+- [ ] 迭代: `each_index`, `each_with_index`, `map!`, `select!`, `reject`, `reject!`, `keep_if`, `delete_if`
+- [ ] 转换: `to_h`, `to_s`, `inspect`, `to_a`, `pack`
+- [ ] 集合: `&` (交集), `|` (并集), `-` (差集), `+` (连接)
+- [ ] 排序: `sort`, `sort!`, `sort_by`, `shuffle`, `shuffle!`, `rotate`, `rotate!`
+- [ ] 切片: `slice`, `slice!`, `take`, `take_while`, `drop`, `drop_while`, `values_at`
+- [ ] 其他: `zip`, `transpose`, `product`, `permutation`, `combination`, `repeated_permutation`
+
+#### P0 - String 核心方法（100+ spec 文件）
+当前：25 个方法 | 需要：100+ 方法
+
+**已实现**: `+`, `*`, `length`, `size`, `empty?`, `to_s`, `upcase`, `downcase`, `strip`, `[]`, `capitalize`, `include?`, `start_with?`, `end_with?`, `reverse`, `to_i`, `count`, `bytes`, `chars`, `find`, `slice`, `to_sym`, `ljust`, `rjust`, `center`
+
+**缺失（高频）**:
+- [ ] 修改: `upcase!`, `downcase!`, `capitalize!`, `swapcase`, `strip!`, `lstrip`, `rstrip`, `chomp`, `chop`, `delete`, `tr`, `squeeze`
+- [ ] 查询: `index`, `rindex`, `scan`, `match`, `match?`, `=~`, `ord`, `chr`
+- [ ] 替换: `sub`, `sub!`, `gsub`, `gsub!`, `replace`
+- [ ] 分割: `split`, `lines`, `each_line`, `each_char`, `each_byte`, `codepoints`, `grapheme_clusters`
+- [ ] 格式: `%` (格式化), `center`, `ljust`, `rjust`, `insert`, `concat`
+- [ ] 转换: `to_i`, `to_f`, `to_sym`, `intern`, `hex`, `oct`, `unpack`
+- [ ] 编码: `encoding`, `encode`, `force_encoding`, `valid_encoding?`, `ascii_only?`
+- [ ] 其他: `succ`, `next`, `upto`, `sum`, `crypt`, `dump`, `inspect`
+
+#### P0 - Hash 核心方法（69 spec 文件）
+当前：17 个方法 | 需要：50+ 方法
+
+**已实现**: `[]`, `[]=`, `keys`, `values`, `length`, `size`, `empty?`, `each`, `each_key`, `each_value`, `key?`, `has_key?`, `include?`, `fetch`, `merge`, `delete`, `clear`, `has_value?`
+
+**缺失（高频）**:
+- [ ] 修改: `merge!`, `update`, `delete_if`, `keep_if`, `select!`, `reject!`, `compact`, `compact!`
+- [ ] 查询: `dig`, `fetch_values`, `value?`, `member?`
+- [ ] 迭代: `each_pair`, `map`, `select`, `reject`, `filter`, `transform_keys`, `transform_values`
+- [ ] 转换: `to_a`, `to_h`, `to_s`, `inspect`, `invert`, `flatten`
+- [ ] 默认值: `default`, `default=`, `default_proc`, `default_proc=`
+- [ ] 其他: `assoc`, `rassoc`, `shift`, `replace`, `compare_by_identity`, `rehash`
+
+#### P0 - Integer 扩展方法
+当前：20 个方法 | 需要：40+ 方法
+
+**已实现**: `+`, `-`, `*`, `/`, `%`, `**`, `to_s`, `succ`, `pred`, `chr`, `odd?`, `even?`, `zero?`, `abs`, `to_f`, `times`, `upto`, `downto`, `gcd`, `lcm`, `divmod`
+
+**缺失**:
+- [ ] 位运算: `&`, `|`, `^`, `~`, `<<`, `>>`, `[]` (bit access)
+- [ ] 数学: `ceil`, `floor`, `round`, `truncate`, `magnitude`, `remainder`, `fdiv`
+- [ ] 查询: `positive?`, `negative?`, `finite?`, `infinite?`, `integer?`
+- [ ] 转换: `to_i`, `to_int`, `to_r`, `digits`, `bit_length`, `size`
+- [ ] 迭代: `step`, `next`, `pred`
+- [ ] 其他: `coerce`, `numerator`, `denominator`, `rationalize`
+
+#### P0 - Float 扩展方法
+当前：11 个方法 | 需要：30+ 方法
+
+**已实现**: `+`, `-`, `*`, `/`, `to_s`, `to_i`, `floor`, `ceil`, `round`, `abs`
+
+**缺失**:
+- [ ] 数学: `truncate`, `magnitude`, `fdiv`, `quo`, `remainder`, `divmod`, `modulo`
+- [ ] 查询: `finite?`, `infinite?`, `nan?`, `zero?`, `positive?`, `negative?`
+- [ ] 转换: `to_f`, `to_r`, `rationalize`, `numerator`, `denominator`
+- [ ] 其他: `next_float`, `prev_float`, `coerce`
+
+#### P0 - Kernel 模块（全局方法）
+当前：约 10 个 | 需要：50+ 方法
+
+**已实现**: `puts`, `print`, `p`, `gets`, `class`, `to_s`, `inspect`, `nil?`, `is_a?`, `respond_to?`
+
+**缺失（高频）**:
+- [ ] IO: `printf`, `putc`, `readline`, `readlines`, `getc`, `gets`
+- [ ] 对象: `send`, `__send__`, `public_send`, `method`, `methods`, `instance_variables`
+- [ ] 类型: `kind_of?`, `instance_of?`, `is_a?`, `respond_to?`, `respond_to_missing?`
+- [ ] 转换: `Array()`, `Hash()`, `String()`, `Integer()`, `Float()`, `Rational()`, `Complex()`
+- [ ] 控制: `loop`, `catch`, `throw`, `raise`, `fail`, `exit`, `abort`, `at_exit`
+- [ ] 求值: `eval`, `instance_eval`, `class_eval`, `module_eval`, `binding`
+- [ ] 加载: `require`, `require_relative`, `load`, `autoload`, `autoload?`
+- [ ] 其他: `sleep`, `rand`, `srand`, `caller`, `caller_locations`, `warn`, `set_trace_func`
+
+### 4.2 未实现的核心类（优先级 P1-P2）
+
+#### P1 - 基础对象类型
+- [ ] **Symbol** - AST 存在，运行时未实现
+  - 方法: `to_s`, `to_sym`, `id2name`, `inspect`, `length`, `size`, `empty?`, `upcase`, `downcase`, `capitalize`, `swapcase`, `succ`, `next`, `<=>`, `casecmp`, `match`, `=~`, `[]`, `slice`, `encoding`
+  
+- [ ] **Range** - AST 存在，运行时未实现
+  - 方法: `begin`, `end`, `exclude_end?`, `first`, `last`, `min`, `max`, `size`, `step`, `cover?`, `include?`, `member?`, `each`, `map`, `to_a`, `to_s`, `inspect`, `===`, `==`, `eql?`, `hash`
+
+- [ ] **Regexp** - AST 存在，运行时和匹配引擎未实现
+  - 方法: `=~`, `===`, `match`, `match?`, `names`, `named_captures`, `source`, `options`, `casefold?`, `fixed_encoding?`, `encoding`, `to_s`, `inspect`, `~`, `escape`, `union`, `try_convert`
+
+#### P1 - 闭包和块
+- [ ] **Proc** - 部分支持，需完善
+  - 方法: `call`, `[]`, `===`, `yield`, `arity`, `parameters`, `binding`, `source_location`, `lambda?`, `curry`, `<<`, `>>`, `to_proc`, `to_s`, `inspect`
+
+- [ ] **Method** - 方法对象化
+  - 方法: `call`, `[]`, `===`, `arity`, `parameters`, `source_location`, `owner`, `receiver`, `name`, `original_name`, `unbind`, `super_method`, `to_proc`, `to_s`, `inspect`
+
+- [ ] **Binding** - 绑定上下文
+  - 方法: `eval`, `local_variables`, `local_variable_get`, `local_variable_set`, `local_variable_defined?`, `receiver`, `source_location`
+
+#### P2 - 异常系统（59 个 spec 文件）
+- [ ] **Exception** 基类及子类
+  - `StandardError`, `RuntimeError`, `ArgumentError`, `TypeError`, `NameError`, `NoMethodError`
+  - `IndexError`, `KeyError`, `RangeError`, `ZeroDivisionError`, `FloatDomainError`
+  - `IOError`, `EOFError`, `SystemCallError`, `Errno::*`
+  - `SystemExit`, `SystemStackError`, `ScriptError`, `SyntaxError`, `LoadError`
+  - 方法: `message`, `backtrace`, `backtrace_locations`, `cause`, `full_message`, `exception`, `to_s`, `inspect`, `set_backtrace`
+
+#### P2 - 数值类型
+- [ ] **Numeric** - 数值基类
+  - 方法: `+@`, `-@`, `abs`, `magnitude`, `coerce`, `divmod`, `fdiv`, `modulo`, `remainder`, `quo`, `real?`, `integer?`, `zero?`, `nonzero?`, `finite?`, `infinite?`, `positive?`, `negative?`, `step`, `truncate`, `floor`, `ceil`, `round`
+
+- [ ] **Rational** - 有理数
+  - 方法: `numerator`, `denominator`, `to_i`, `to_f`, `to_r`, `to_s`, `inspect`, `+`, `-`, `*`, `/`, `**`, `%`, `divmod`, `fdiv`, `abs`, `magnitude`, `ceil`, `floor`, `round`, `truncate`
+
+- [ ] **Complex** - 复数
+  - 方法: `real`, `imaginary`, `imag`, `abs`, `magnitude`, `arg`, `angle`, `phase`, `conjugate`, `conj`, `polar`, `rect`, `rectangular`, `to_i`, `to_f`, `to_r`, `to_c`, `to_s`, `inspect`
+
+#### P2 - 对象系统完善
+- [ ] **Object** 方法补全
+  - 缺失: `dup`, `clone`, `freeze`, `frozen?`, `taint`, `tainted?`, `untaint`, `trust`, `untrust`, `untrusted?`, `tap`, `then`, `yield_self`, `method_missing`, `singleton_class`, `singleton_methods`, `define_singleton_method`, `extend`, `instance_variable_get`, `instance_variable_set`, `instance_variable_defined?`, `remove_instance_variable`
+
+- [ ] **Class** 方法补全
+  - 缺失: `new`, `allocate`, `superclass`, `ancestors`, `included_modules`, `instance_methods`, `public_instance_methods`, `protected_instance_methods`, `private_instance_methods`, `constants`, `const_get`, `const_set`, `const_defined?`, `remove_const`, `class_variables`, `class_variable_get`, `class_variable_set`, `class_variable_defined?`, `remove_class_variable`
+
+- [ ] **Module** 方法补全
+  - 缺失: `include`, `prepend`, `extend`, `included`, `prepended`, `extended`, `module_function`, `attr_reader`, `attr_writer`, `attr_accessor`, `alias_method`, `undef_method`, `remove_method`, `define_method`, `method_defined?`, `public`, `private`, `protected`, `public_class_method`, `private_class_method`, `module_eval`, `class_eval`, `constants`, `const_missing`
+
+#### P2 - 其他核心类
+- [ ] **Struct** - 结构体类
+- [ ] **Time** - 时间处理
+- [ ] **Date** / **DateTime** - 日期处理
+- [ ] **Set** - 集合类
+- [ ] **Enumerator** - 枚举器
+- [ ] **MatchData** - 正则匹配结果
+- [ ] **Math** 模块 - 数学函数
+- [ ] **Comparable** 模块 - 比较功能
+- [ ] **Random** - 随机数生成器
+
+#### P3 - IO 和文件系统
+- [ ] **IO** - 输入输出基类
+- [ ] **File** - 文件操作
+- [ ] **Dir** - 目录操作
+- [ ] **FileTest** - 文件测试
+- [ ] **Encoding** - 字符编码
+
+#### P3 - 并发（暂缓）
+- [ ] **Thread** - 线程支持
+- [ ] **Fiber** - 纤程
+- [ ] **Mutex** - 互斥锁
+- [ ] **Queue** / **SizedQueue** - 线程安全队列
+- [ ] **ConditionVariable** - 条件变量
+
+#### P3 - 系统和进程
+- [ ] **Process** - 进程管理
+- [ ] **Signal** - 信号处理
+- [ ] **GC** - 垃圾回收控制
+- [ ] **ObjectSpace** - 对象空间
+- [ ] **Marshal** - 对象序列化
+- [ ] **TracePoint** - 追踪点
+- [ ] **Warning** - 警告处理
+
+### 4.3 语言特性补全（60+ 规范文件）
+
+#### 已实现 ✅
+- [x] 方法定义 (`def`)
+- [x] 类定义 (`class`)
+- [x] 条件语句 (`if/elsif/else`)
+- [x] 循环 (`while/until`)
+- [x] 返回语句 (`return`)
+- [x] 变量赋值（局部、实例、类、全局、常量）
+- [x] 三元运算符 (`? :`)
+
+#### 部分实现 ⚠️
+- [ ] **case/when** - Parser 支持，Compiler 不完整
+- [ ] **Lambda** - Parser 支持，运行时不完整
+- [ ] **Block** - 部分支持，缺少 `yield` 和 `block_given?`
+- [ ] **break/next** - AST 存在，部分未实现
+
+#### 未实现 ❌
+
+**P0 - 异常处理**
+- [ ] `begin/rescue/ensure/raise` - 完整的异常处理机制
+- [ ] `rescue` 修饰符 - `foo rescue nil`
+- [ ] 异常类型匹配和多重 rescue
+
+**P1 - 高频语法**
+- [ ] `for` 循环 - AST 存在，Compiler 未实现
+- [ ] `unless` - 反向条件（token 存在）
+- [ ] `redo/retry` - 循环控制
+- [ ] 条件修饰符 - `puts "hi" if true`
+- [ ] 循环修饰符 - `i += 1 while i < 10`
+
+**P1 - 模块系统**
+- [ ] `module` 定义 - AST 存在，运行时未实现
+- [ ] `include/extend/prepend` - 模块混入
+- [ ] `module_function` - 模块函数
+
+**P1 - 方法相关**
+- [ ] `super` - 父类方法调用（token 存在）
+- [ ] `yield` - 块调用（token 存在）
+- [ ] `block_given?` - 块检测
+- [ ] `alias/undef` - 方法别名和取消定义
+- [ ] 方法可见性 - `public/private/protected`（token 存在，未强制）
+
+**P2 - 高级语法**
+- [ ] **字符串插值** - `"hello #{name}"` 运行时支持
+- [ ] **Heredoc** - 多行字符串 `<<EOF`
+- [ ] **正则表达式字面量** - `/pattern/flags`
+- [ ] **Symbol 字面量** - `:symbol` 完整支持
+- [ ] **Range 字面量** - `1..10`, `1...10` 完整支持
+
+**P2 - 参数和赋值**
+- [ ] **多重赋值** - `a, b = 1, 2`
+- [ ] **并行赋值** - `a, b = b, a`
+- [ ] **Splat 操作符** - `*args`, `**kwargs`
+- [ ] **关键字参数** - `def foo(a:, b: 1)`
+- [ ] **块参数** - `def foo(&block)`
+- [ ] **默认参数** - `def foo(a = 1)`
+
+**P3 - 高级特性**
+- [ ] **模式匹配** - `case/in` (Ruby 3.0+)
+- [ ] **安全导航** - `obj&.method`
+- [ ] **BEGIN/END** - 程序开始/结束钩子
+- [ ] **Singleton class** - 单例类 `class << obj`
+- [ ] **常量解析** - `::` 完整支持
+- [ ] **defined?** - 定义检查（token 存在）
+- [ ] **Encoding 注释** - `# encoding: utf-8`
+
+### 4.4 标准库（50+ 库，优先级 P3）
+
+#### 数据格式
+- [ ] `json` - JSON 解析和生成
+- [ ] `csv` - CSV 处理
+- [ ] `yaml` - YAML 处理
+- [ ] `rexml` - XML 处理
+
+#### 网络
+- [ ] `net/http` - HTTP 客户端
+- [ ] `net/ftp` - FTP 客户端
+- [ ] `socket` - Socket 编程
+- [ ] `uri` - URI 处理
+
+#### Web
+- [ ] `cgi` - CGI 支持
+- [ ] `erb` - 模板引擎
+
+#### 加密
+- [ ] `openssl` - OpenSSL 绑定
+- [ ] `digest` - 摘要算法（MD5, SHA1, SHA256 等）
+
+#### 数学
+- [ ] `matrix` - 矩阵运算
+- [ ] `prime` - 质数
+- [ ] `bigdecimal` - 高精度小数
+
+#### 系统
+- [ ] `fileutils` - 文件工具
+- [ ] `pathname` - 路径名
+- [ ] `tmpdir` - 临时目录
+- [ ] `tempfile` - 临时文件
+
+#### 文本
+- [ ] `stringscanner` - 字符串扫描
+- [ ] `strscan` - 字符串扫描
+
+#### 工具
+- [ ] `pp` - 美化打印
+- [ ] `pstore` - 持久化存储
+- [ ] `dbm` - DBM 数据库
+- [ ] `logger` - 日志记录
+
+### 4.5 实现优先级总结
+
+**P0 - 核心基础（必须，3-6 个月）**
+1. ✅ Enumerable 模块 - 所有集合依赖
+2. ✅ Array 核心方法 - `each`, `map`, `select`, `reject`, `push`, `pop`, `shift`, `unshift`, `compact`, `flatten`, `uniq`, `sort` 等
+3. ✅ String 核心方法 - `split`, `gsub`, `sub`, `scan`, `match`, `strip`, `chomp`, `upcase!`, `downcase!` 等
+4. ✅ Hash 核心方法 - `merge`, `merge!`, `select`, `reject`, `dig`, `transform_keys`, `transform_values` 等
+5. ✅ Kernel 方法 - `puts`, `print`, `p`, `raise`, `require`, `eval`, `loop`, `catch`, `throw`
+6. ✅ Exception 系统 - `begin/rescue/ensure/raise` + 异常类层次结构
+
+**P1 - 常用功能（重要，6-12 个月）**
+7. Range 对象 - `1..10` 完整实现和迭代
+8. Symbol 对象 - `:symbol` 完整实现
+9. Regexp 对象 - 正则表达式匹配引擎
+10. Block/Proc/Lambda - 完整的闭包支持和 `yield`
+11. Module 系统 - `include/extend/prepend` 完整实现
+12. IO/File - 基本文件读写操作
+13. 字符串插值 - `"hello #{name}"` 运行时支持
+
+**P2 - 高级功能（增强，12-18 个月）**
+14. 多重赋值和 Splat - `a, b = 1, 2` 和 `*args`
+15. 关键字参数 - `def foo(a:, b: 1)`
+16. 方法可见性 - `public/private/protected` 强制
+17. Time/Date 类 - 时间日期处理
+18. Struct - 结构体类
+19. Method/Binding 对象 - 方法对象化
+
+**P3 - 标准库（扩展，18+ 个月）**
+20. JSON 库 - `require 'json'`
+21. Net::HTTP - HTTP 客户端
+22. FileUtils - 文件工具
+23. ERB - 模板引擎
+24. Digest - 摘要算法
 
 ## 阶段 5：ruby/spec 测试集成
 
-- [ ] 克隆 ruby/spec，创建测试运行器适配器
+- [ ] 创建 MSpec 适配器，运行 ruby/spec 测试
+- [ ] 针对已实现功能运行对应的 spec 文件
+- [ ] 逐步增加通过的 spec 数量
+- [ ] 目标：通过 core/array, core/string, core/hash, core/integer 基础测试
 
-## 阶段 6：Rails 兼容层
+## 阶段 6：Rails 兼容层（远期目标，24+ 个月）
 
 - [ ] ActionDispatch, ActionController, ActiveRecord, ActionView
 

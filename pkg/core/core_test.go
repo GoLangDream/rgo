@@ -181,18 +181,18 @@ func TestIntChr(t *testing.T) {
 }
 
 func TestIntOdd(t *testing.T) {
-	assertBool(t, callMethod(t, mkInt(3), "odd"), true)
-	assertBool(t, callMethod(t, mkInt(4), "odd"), false)
+	assertBool(t, callMethod(t, mkInt(3), "odd?"), true)
+	assertBool(t, callMethod(t, mkInt(4), "odd?"), false)
 }
 
 func TestIntEven(t *testing.T) {
-	assertBool(t, callMethod(t, mkInt(4), "even"), true)
-	assertBool(t, callMethod(t, mkInt(3), "even"), false)
+	assertBool(t, callMethod(t, mkInt(4), "even?"), true)
+	assertBool(t, callMethod(t, mkInt(3), "even?"), false)
 }
 
 func TestIntZero(t *testing.T) {
-	assertBool(t, callMethod(t, mkInt(0), "zero"), true)
-	assertBool(t, callMethod(t, mkInt(1), "zero"), false)
+	assertBool(t, callMethod(t, mkInt(0), "zero?"), true)
+	assertBool(t, callMethod(t, mkInt(1), "zero?"), false)
 }
 
 func TestIntAbs(t *testing.T) {

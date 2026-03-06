@@ -660,7 +660,7 @@ func TestLambdaArrow(t *testing.T) {
 	if len(toks) != 1 {
 		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
 	}
-	if toks[0].Type != ARROW {
-		t.Errorf("expected ARROW, got %s", toks[0].Type)
+	if toks[0].Type != MINUS_ARROW {
+		t.Errorf("expected MINUS_ARROW, got %s", toks[0].Type)
 	}
 }
