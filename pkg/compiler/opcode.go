@@ -103,6 +103,7 @@ const (
 	OpBitAnd
 	OpBitOr
 	OpBitXor
+	OpBitNot
 	OpBitLeftShift
 	OpBitRightShift
 
@@ -140,6 +141,8 @@ const (
 	OpClassOf
 
 	OpFreeze
+
+	OpSplat
 
 	OpDebug
 )
@@ -244,6 +247,7 @@ var definitions = map[Opcode]Definition{
 	OpBitAnd:        {"OpBitAnd", []int{}},
 	OpBitOr:         {"OpBitOr", []int{}},
 	OpBitXor:        {"OpBitXor", []int{}},
+	OpBitNot:        {"OpBitNot", []int{}},
 	OpBitLeftShift:  {"OpBitLeftShift", []int{}},
 	OpBitRightShift: {"OpBitRightShift", []int{}},
 
@@ -273,6 +277,7 @@ var definitions = map[Opcode]Definition{
 	OpRespondTo:  {"OpRespondTo", []int{}},
 	OpClassOf:    {"OpClassOf", []int{}},
 	OpFreeze:     {"OpFreeze", []int{}},
+	OpSplat:      {"OpSplat", []int{}},
 	OpDebug:      {"OpDebug", []int{}},
 }
 

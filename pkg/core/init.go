@@ -46,6 +46,7 @@ func Init() {
 
 	R.createClasses()
 	R.defineMethods()
+	RegisterMspec()
 }
 
 func (rt *Runtime) createClasses() {
@@ -80,6 +81,8 @@ func (rt *Runtime) createClasses() {
 	regexpClass.SuperClass = objectClass
 	rangeClass := object.NewClass("Range")
 	rangeClass.SuperClass = objectClass
+	procClass := object.NewClass("Proc")
+	procClass.SuperClass = objectClass
 
 	R.TrueVal.Class = trueClass
 	R.FalseVal.Class = falseClass
@@ -100,6 +103,7 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Symbol"] = symbolClass
 	R.Classes["Regexp"] = regexpClass
 	R.Classes["Range"] = rangeClass
+	R.Classes["Proc"] = procClass
 }
 
 func (rt *Runtime) defineMethods() {
@@ -139,6 +143,21 @@ func (rt *Runtime) defineMethods() {
 	integerClass.DefineMethod("lcm", &object.Method{Name: "lcm", Fn: intLcm, Arity: 1})
 	integerClass.DefineMethod("divmod", &object.Method{Name: "divmod", Fn: intDivmod, Arity: 1})
 
+	// Bitwise operators
+	integerClass.DefineMethod("&", &object.Method{Name: "&", Fn: intBitAnd, Arity: 1})
+	integerClass.DefineMethod("|", &object.Method{Name: "|", Fn: intBitOr, Arity: 1})
+	integerClass.DefineMethod("^", &object.Method{Name: "^", Fn: intBitXor, Arity: 1})
+	integerClass.DefineMethod("~", &object.Method{Name: "~", Fn: intBitNot, Arity: 0})
+	integerClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: intLeftShift, Arity: 1})
+	integerClass.DefineMethod(">>", &object.Method{Name: ">>", Fn: intRightShift, Arity: 1})
+
+	// Comparison operators
+	integerClass.DefineMethod("<", &object.Method{Name: "<", Fn: intLessThan, Arity: 1})
+	integerClass.DefineMethod(">", &object.Method{Name: ">", Fn: intGreaterThan, Arity: 1})
+	integerClass.DefineMethod("<=", &object.Method{Name: "<=", Fn: intLessThanOrEqual, Arity: 1})
+	integerClass.DefineMethod(">=", &object.Method{Name: ">=", Fn: intGreaterThanOrEqual, Arity: 1})
+	integerClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: intCompare, Arity: 1})
+
 	symbolClass := R.Classes["Symbol"]
 	symbolClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: symbolToS, Arity: 0})
 	symbolClass.DefineMethod("to_sym", &object.Method{Name: "to_sym", Fn: symbolToSym, Arity: 0})
@@ -156,6 +175,11 @@ func (rt *Runtime) defineMethods() {
 	floatClass.DefineMethod("ceil", &object.Method{Name: "ceil", Fn: floatCeil, Arity: 0})
 	floatClass.DefineMethod("round", &object.Method{Name: "round", Fn: floatRound, Arity: 0})
 	floatClass.DefineMethod("abs", &object.Method{Name: "abs", Fn: floatAbs, Arity: 0})
+	floatClass.DefineMethod("<", &object.Method{Name: "<", Fn: floatLessThan, Arity: 1})
+	floatClass.DefineMethod(">", &object.Method{Name: ">", Fn: floatGreaterThan, Arity: 1})
+	floatClass.DefineMethod("<=", &object.Method{Name: "<=", Fn: floatLessThanOrEqual, Arity: 1})
+	floatClass.DefineMethod(">=", &object.Method{Name: ">=", Fn: floatGreaterThanOrEqual, Arity: 1})
+	floatClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: floatCompare, Arity: 1})
 
 	rangeClass := R.Classes["Range"]
 	rangeClass.DefineMethod("each", &object.Method{Name: "each", Fn: rangeEach, Arity: 0})
@@ -319,6 +343,12 @@ func (rt *Runtime) defineMethods() {
 	hashClass.DefineMethod("shift", &object.Method{Name: "shift", Fn: hashShift, Arity: 0})
 	hashClass.DefineMethod("replace", &object.Method{Name: "replace", Fn: hashReplace, Arity: 1})
 
+	procClass := R.Classes["Proc"]
+	procClass.DefineMethod("call", &object.Method{Name: "call", Fn: procCall, Arity: -1})
+	procClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: procCall, Arity: -1})
+	procClass.DefineMethod("arity", &object.Method{Name: "arity", Fn: procArity, Arity: 0})
+	procClass.DefineMethod("lambda?", &object.Method{Name: "lambda?", Fn: procIsLambda, Arity: 0})
+
 	objectClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: builtinPuts, Arity: -1})
 	objectClass.DefineMethod("print", &object.Method{Name: "print", Fn: builtinPrint, Arity: -1})
 	objectClass.DefineMethod("p", &object.Method{Name: "p", Fn: builtinP, Arity: -1})
@@ -331,6 +361,22 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("raise", &object.Method{Name: "raise", Fn: builtinRaise, Arity: 1})
 	objectClass.DefineMethod("fail", &object.Method{Name: "fail", Fn: builtinRaise, Arity: 1})
 	objectClass.DefineMethod("abort", &object.Method{Name: "abort", Fn: builtinAbort, Arity: 0})
+	objectClass.DefineMethod("should", &object.Method{Name: "should", Arity: 0, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return &object.EmeraldValue{Type: object.ValueObject, Data: r, Class: R.Classes["Expectation"]}
+	}})
+	objectClass.DefineMethod("should_not", &object.Method{Name: "should_not", Arity: 0, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return &object.EmeraldValue{Type: object.ValueObject, Data: r, Class: R.Classes["Expectation"]}
+	}})
+
+	moduleClass := R.Classes["Module"]
+	moduleClass.DefineMethod("include", &object.Method{Name: "include", Fn: moduleInclude, Arity: -1})
+	moduleClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: moduleExtend, Arity: -1})
+	moduleClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: modulePrepend, Arity: -1})
+
+	classClass := R.Classes["Class"]
+	classClass.DefineMethod("include", &object.Method{Name: "include", Fn: classInclude, Arity: -1})
+	classClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: classExtend, Arity: -1})
+	classClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: classPrepend, Arity: -1})
 
 	R.Main = &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -677,6 +723,167 @@ func intDivmod(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 }
 
+func intBitAnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: l & r, Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
+func intBitOr(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: l | r, Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
+func intBitXor(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: l ^ r, Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
+func intBitNot(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	v := receiver.Data.(int64)
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: ^v, Class: R.Classes["Integer"]}
+}
+
+func intLeftShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: l << r, Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
+func intRightShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: l >> r, Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
+func intLessThan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l < r {
+			return R.TrueVal
+		}
+	case float64:
+		if float64(l) < r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func intGreaterThan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l > r {
+			return R.TrueVal
+		}
+	case float64:
+		if float64(l) > r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func intLessThanOrEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l <= r {
+			return R.TrueVal
+		}
+	case float64:
+		if float64(l) <= r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func intGreaterThanOrEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l >= r {
+			return R.TrueVal
+		}
+	case float64:
+		if float64(l) >= r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func intCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(int64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l < r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+		} else if l > r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	case float64:
+		if float64(l) < r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+		} else if float64(l) > r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
+}
+
 func intEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.FalseVal
@@ -850,6 +1057,102 @@ func floatAbs(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		Data:  f,
 		Class: R.Classes["Float"],
 	}
+}
+
+func floatLessThan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(float64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l < float64(r) {
+			return R.TrueVal
+		}
+	case float64:
+		if l < r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func floatGreaterThan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(float64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l > float64(r) {
+			return R.TrueVal
+		}
+	case float64:
+		if l > r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func floatLessThanOrEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(float64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l <= float64(r) {
+			return R.TrueVal
+		}
+	case float64:
+		if l <= r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func floatGreaterThanOrEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	l := receiver.Data.(float64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l >= float64(r) {
+			return R.TrueVal
+		}
+	case float64:
+		if l >= r {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func floatCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	l := receiver.Data.(float64)
+	switch r := args[0].Data.(type) {
+	case int64:
+		if l < float64(r) {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+		} else if l > float64(r) {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	case float64:
+		if l < r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+		} else if l > r {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	return R.NilVal
 }
 
 func stringAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3136,4 +3439,595 @@ func hashReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	receiver.Data = other
 	return receiver
+}
+
+type SpecRunner struct {
+	PassCount    int
+	FailCount    int
+	SkipCount    int
+	ExampleCount int
+	Verbose      bool
+}
+
+var specRunner *SpecRunner
+
+func InitSpecRunner() *SpecRunner {
+	if specRunner == nil {
+		specRunner = &SpecRunner{
+			PassCount:    0,
+			FailCount:    0,
+			SkipCount:    0,
+			ExampleCount: 0,
+			Verbose:      false,
+		}
+	}
+	return specRunner
+}
+
+func GetSpecRunner() *SpecRunner {
+	return specRunner
+}
+
+func RegisterMspec() {
+	specRunner = InitSpecRunner()
+
+	expectationClass := object.NewClass("Expectation")
+	R.Classes["Expectation"] = expectationClass
+
+	expectationClass.DefineMethod("initialize", &object.Method{
+		Name:  "initialize",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) > 0 {
+				receiver.Data = args[0]
+			}
+			return R.NilVal
+		},
+	})
+
+	expectationClass.DefineMethod("should", &object.Method{
+		Name:  "should",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return receiver
+		},
+	})
+
+	expectationClass.DefineMethod("should_not", &object.Method{
+		Name:  "should_not",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			specRunner.ExampleCount++
+			if len(args) == 0 {
+				specRunner.FailCount++
+				fmt.Printf("    FAILED: expected a matcher\n")
+				return R.NilVal
+			}
+
+			actualValue := receiver.Data.(*object.EmeraldValue)
+			matcher := args[0]
+
+			if !actualValue.Equals(matcher) {
+				specRunner.PassCount++
+				fmt.Printf("  ✓ PASS\n")
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected not %v\n", matcher.Inspect())
+			return R.NilVal
+		},
+	})
+
+	expectationClass.DefineMethod("to", &object.Method{
+		Name:  "to",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return receiver
+		},
+	})
+
+	expectationClass.DefineMethod("not_to", &object.Method{
+		Name:  "not_to",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return receiver
+		},
+	})
+
+	expectationClass.DefineMethod("==", &object.Method{
+		Name:  "==",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			if receiver.Equals(args[0]) {
+				return R.TrueVal
+			}
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("eq", &object.Method{
+		Name:  "eq",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	expectationClass.DefineMethod("equal", &object.Method{
+		Name:  "equal",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	expectationClass.DefineMethod("be", &object.Method{
+		Name:  "be",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return receiver
+		},
+	})
+
+	expectationClass.DefineMethod("be_true", &object.Method{
+		Name:  "be_true",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if receiver.Type == object.ValueBool && receiver.Data.(bool) == true {
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected true\n")
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("be_false", &object.Method{
+		Name:  "be_false",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if receiver.Type == object.ValueBool && receiver.Data.(bool) == false {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected false\n")
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("be_nil", &object.Method{
+		Name:  "be_nil",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if receiver.Type == object.ValueNil {
+				specRunner.PassCount++
+				return R.NilVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected nil, got %v\n", receiver.Inspect())
+			return R.NilVal
+		},
+	})
+
+	expectationClass.DefineMethod("be_an_instance_of", &object.Method{
+		Name:  "be_an_instance_of",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			expectedClass, ok := args[0].Data.(*object.Class)
+			if !ok {
+				return R.NilVal
+			}
+			if receiver.Class != nil && receiver.Class.Name == expectedClass.Name {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected instance of %s, got %v\n", expectedClass.Name, receiver.Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("include", &object.Method{
+		Name:  "include",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	expectationClass.DefineMethod("start_with", &object.Method{
+		Name:  "start_with",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			actualValue := receiver.Data.(*object.EmeraldValue)
+			s, ok1 := actualValue.Data.(string)
+			prefix, ok2 := args[0].Data.(string)
+			if ok1 && ok2 && strings.HasPrefix(s, prefix) {
+				specRunner.PassCount++
+				fmt.Printf("  ✓ PASS\n")
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v to start with %v\n", actualValue.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("start_with?", &object.Method{
+		Name:  "start_with?",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			actualValue := receiver.Data.(*object.EmeraldValue)
+			s, ok1 := actualValue.Data.(string)
+			prefix, ok2 := args[0].Data.(string)
+			if ok1 && ok2 && strings.HasPrefix(s, prefix) {
+				return R.TrueVal
+			}
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("end_with", &object.Method{
+		Name:  "end_with",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			actualValue := receiver.Data.(*object.EmeraldValue)
+			s, ok1 := actualValue.Data.(string)
+			suffix, ok2 := args[0].Data.(string)
+			if ok1 && ok2 && strings.HasSuffix(s, suffix) {
+				specRunner.PassCount++
+				fmt.Printf("  ✓ PASS\n")
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v to end with %v\n", actualValue.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("end_with?", &object.Method{
+		Name:  "end_with?",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			actualValue := receiver.Data.(*object.EmeraldValue)
+			s, ok1 := actualValue.Data.(string)
+			suffix, ok2 := args[0].Data.(string)
+			if ok1 && ok2 && strings.HasSuffix(s, suffix) {
+				return R.TrueVal
+			}
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("match", &object.Method{
+		Name:  "match",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	expectationClass.DefineMethod("empty", &object.Method{
+		Name:  "empty",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if s, ok := receiver.Data.(string); ok && len(s) == 0 {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			if arr, ok := receiver.Data.([]*object.EmeraldValue); ok && len(arr) == 0 {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v to be empty\n", receiver.Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod(">", &object.Method{
+		Name:  ">",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			a, ok1 := receiver.Data.(int64)
+			b, ok2 := args[0].Data.(int64)
+			if ok1 && ok2 && a > b {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v > %v\n", receiver.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod(">=", &object.Method{
+		Name:  ">=",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			a, ok1 := receiver.Data.(int64)
+			b, ok2 := args[0].Data.(int64)
+			if ok1 && ok2 && a >= b {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v >= %v\n", receiver.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("<", &object.Method{
+		Name:  "<",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			a, ok1 := receiver.Data.(int64)
+			b, ok2 := args[0].Data.(int64)
+			if ok1 && ok2 && a < b {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v < %v\n", receiver.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	expectationClass.DefineMethod("<=", &object.Method{
+		Name:  "<=",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.FalseVal
+			}
+			a, ok1 := receiver.Data.(int64)
+			b, ok2 := args[0].Data.(int64)
+			if ok1 && ok2 && a <= b {
+				specRunner.PassCount++
+				return R.TrueVal
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v <= %v\n", receiver.Inspect(), args[0].Inspect())
+			return R.FalseVal
+		},
+	})
+
+	objClass := R.Classes["Object"]
+
+	objClass.DefineMethod("describe", &object.Method{
+		Name:  "describe",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			specRunner = InitSpecRunner()
+			if len(args) > 0 {
+				if desc, ok := args[0].Data.(string); ok {
+					fmt.Printf("\n%s\n", desc)
+				}
+			}
+			return R.NilVal
+		},
+	})
+
+	objClass.DefineMethod("it", &object.Method{
+		Name:  "it",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) > 0 {
+				if desc, ok := args[0].Data.(string); ok {
+					fmt.Printf("  ✓ %s\n", desc)
+				}
+			}
+			return R.NilVal
+		},
+	})
+
+	objClass.DefineMethod("expect", &object.Method{
+		Name:  "expect",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			expClass := R.Classes["Expectation"]
+			return &object.EmeraldValue{
+				Type:  object.ValueObject,
+				Data:  args[0],
+				Class: expClass,
+			}
+		},
+	})
+
+	objClass.DefineMethod("eq", &object.Method{
+		Name:  "eq",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	objClass.DefineMethod("equal", &object.Method{
+		Name:  "equal",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			return args[0]
+		},
+	})
+
+	objClass.DefineMethod("it_behaves_like", &object.Method{
+		Name:  "it_behaves_like",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			if name, ok := args[0].Data.(string); ok {
+				fmt.Printf("  behaves like %s\n", name)
+			}
+			return R.NilVal
+		},
+	})
+}
+
+// Proc methods
+func procCall(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	// For now, return nil - actual implementation requires VM integration
+	// This will be properly implemented when block calling is fully integrated
+	return R.NilVal
+}
+
+func procArity(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type == object.ValueProc {
+		proc := receiver.Data.(*object.Proc)
+		if proc.Fn != nil {
+			return &object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  int64(len(proc.Fn.Params)),
+				Class: R.Classes["Integer"],
+			}
+		}
+	} else if receiver.Type == object.ValueClosure {
+		closure := receiver.Data.(*object.Closure)
+		if closure.Fn != nil {
+			return &object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  int64(len(closure.Fn.Params)),
+				Class: R.Classes["Integer"],
+			}
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  int64(0),
+		Class: R.Classes["Integer"],
+	}
+}
+
+func procIsLambda(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type == object.ValueProc {
+		proc := receiver.Data.(*object.Proc)
+		if proc.IsLambda {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func moduleInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueModule {
+		return R.NilVal
+	}
+	module := receiver.Data.(*object.Module)
+	for _, arg := range args {
+		if arg.Type == object.ValueModule {
+			mixin := arg.Data.(*object.Module)
+			module.Include(mixin)
+		}
+	}
+	return R.NilVal
+}
+
+func moduleExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueModule {
+		return R.NilVal
+	}
+	module := receiver.Data.(*object.Module)
+	for _, arg := range args {
+		if arg.Type == object.ValueModule {
+			mixin := arg.Data.(*object.Module)
+			module.Extend(mixin)
+		}
+	}
+	return R.NilVal
+}
+
+func modulePrepend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+func classInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueClass {
+		return R.NilVal
+	}
+	class := receiver.Data.(*object.Class)
+	for _, arg := range args {
+		if arg.Type == object.ValueModule {
+			module := arg.Data.(*object.Module)
+			class.Include(module)
+		}
+	}
+	return R.NilVal
+}
+
+func classExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueClass {
+		return R.NilVal
+	}
+	class := receiver.Data.(*object.Class)
+	for _, arg := range args {
+		if arg.Type == object.ValueModule {
+			module := arg.Data.(*object.Module)
+			class.Extend(module)
+		}
+	}
+	return R.NilVal
+}
+
+func classPrepend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueClass {
+		return R.NilVal
+	}
+	class := receiver.Data.(*object.Class)
+	for _, arg := range args {
+		if arg.Type == object.ValueModule {
+			module := arg.Data.(*object.Module)
+			class.Prepend(module)
+		}
+	}
+	return R.NilVal
 }

@@ -540,3 +540,84 @@ func TestCaseWhenNoMatch(t *testing.T) {
 	result, _ := runRuby(t, "case 1\nwhen 2\n  10\nelse\n  20\nend")
 	assertIntResult(t, result, 20)
 }
+
+// === Keyword Arguments ===
+
+func TestDefWithRequiredKeywordArg(t *testing.T) {
+	result, _ := runRuby(t, "def greet(name:)\n  name\nend\ngreet(name: \"hello\")")
+	assertStringResult(t, result, "hello")
+}
+
+func TestDefWithOptionalKeywordArg(t *testing.T) {
+	result, _ := runRuby(t, "def add(a:, b: 10)\n  a + b\nend\nadd(a: 5)")
+	assertIntResult(t, result, 15)
+}
+
+func TestDefWithOptionalKeywordArgOverridden(t *testing.T) {
+	result, _ := runRuby(t, "def add(a:, b: 10)\n  a + b\nend\nadd(a: 5, b: 20)")
+	assertIntResult(t, result, 25)
+}
+
+func TestDefWithMixedArgs(t *testing.T) {
+	result, _ := runRuby(t, "def calc(x, y:, z: 1)\n  x + y + z\nend\ncalc(10, y: 20)")
+	assertIntResult(t, result, 31)
+}
+
+func TestDefWithMixedArgsAllProvided(t *testing.T) {
+	result, _ := runRuby(t, "def calc(x, y:, z: 1)\n  x + y + z\nend\ncalc(10, y: 20, z: 30)")
+	assertIntResult(t, result, 60)
+}
+
+// === Splat / Rest Params ===
+
+func TestDefWithRestParam(t *testing.T) {
+	result, _ := runRuby(t, "def foo(*args)\n  args\nend\nfoo(1, 2, 3)")
+	if result == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	arr := result.Data.([]*object.EmeraldValue)
+	if len(arr) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(arr))
+	}
+	assertIntResult(t, arr[0], 1)
+	assertIntResult(t, arr[1], 2)
+	assertIntResult(t, arr[2], 3)
+}
+
+func TestDefWithRestParamEmpty(t *testing.T) {
+	result, _ := runRuby(t, "def foo(*args)\n  args\nend\nfoo()")
+	if result == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	arr := result.Data.([]*object.EmeraldValue)
+	if len(arr) != 0 {
+		t.Fatalf("expected 0 elements, got %d", len(arr))
+	}
+}
+
+func TestDefWithNormalAndRestParam(t *testing.T) {
+	result, _ := runRuby(t, "def foo(a, *rest)\n  rest\nend\nfoo(1, 2, 3)")
+	if result == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	arr := result.Data.([]*object.EmeraldValue)
+	if len(arr) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(arr))
+	}
+	assertIntResult(t, arr[0], 2)
+	assertIntResult(t, arr[1], 3)
+}
+
+func TestDefWithNormalAndRestParamAccessNormal(t *testing.T) {
+	result, _ := runRuby(t, "def foo(a, *rest)\n  a\nend\nfoo(10, 20, 30)")
+	assertIntResult(t, result, 10)
+}

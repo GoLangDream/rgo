@@ -60,10 +60,14 @@ var precedences = map[lexer.TokenType]int{
 	lexer.POW_ASSIGN:            ASSIGN,
 	lexer.LSHIFT:                BIN_SHIFT,
 	lexer.RSHIFT:                BIN_SHIFT,
+	lexer.BIT_AND:               SUM,
+	lexer.BIT_OR:                SUM,
+	lexer.BIT_XOR:               SUM,
 	lexer.LBRACKET:              CALL,
 	lexer.DOT:                   CALL,
 	lexer.LPAREN:                CALL,
 	lexer.COLON:                 CALL,
+	lexer.ARROW:                 CALL,
 }
 
 type (
@@ -126,6 +130,11 @@ func New(l *lexer.Lexer) *Parser {
 	p.registerPrefix(lexer.BANG, p.parsePrefixExpression)
 	p.registerPrefix(lexer.MINUS, p.parsePrefixExpression)
 	p.registerPrefix(lexer.PLUS, p.parsePrefixExpression)
+	p.registerPrefix(lexer.BIT_NOT, p.parsePrefixExpression)
+	p.registerPrefix(lexer.MINUS_ARROW, p.parseLambdaExpression)
+	p.registerPrefix(lexer.QUESTION, p.parsePrefixExpression)
+	p.registerPrefix(lexer.LESS_THAN, p.parsePrefixExpression)
+	p.registerPrefix(lexer.MULTIPLY, p.parseSplatExpression)
 	p.registerPrefix(lexer.DEFINED, p.parseDefinedExpression)
 	p.registerPrefix(lexer.ALIAS, p.parseAliasExpression)
 	p.registerPrefix(lexer.UNDEF, p.parseUndefExpression)
@@ -133,6 +142,9 @@ func New(l *lexer.Lexer) *Parser {
 	p.registerPrefix(lexer.EXTEND, p.parseExtendExpression)
 	p.registerPrefix(lexer.PREPEND, p.parsePrependExpression)
 	p.registerPrefix(lexer.CONSTANT, p.parseConstant)
+
+	p.registerPrefix(lexer.DO, p.parseIdentifier)
+	p.registerPrefix(lexer.END, p.parseIdentifier)
 
 	p.registerInfix(lexer.PLUS, p.parseInfixExpression)
 	p.registerInfix(lexer.MINUS, p.parseInfixExpression)
@@ -162,11 +174,17 @@ func New(l *lexer.Lexer) *Parser {
 	p.registerInfix(lexer.OR2, p.parseInfixExpression)
 	p.registerInfix(lexer.AND, p.parseInfixExpression)
 	p.registerInfix(lexer.OR, p.parseInfixExpression)
+	p.registerInfix(lexer.BIT_AND, p.parseInfixExpression)
+	p.registerInfix(lexer.BIT_OR, p.parseInfixExpression)
+	p.registerInfix(lexer.BIT_XOR, p.parseInfixExpression)
+	p.registerInfix(lexer.LSHIFT, p.parseInfixExpression)
+	p.registerInfix(lexer.RSHIFT, p.parseInfixExpression)
 	p.registerInfix(lexer.DOT, p.parseMethodCall)
 	p.registerInfix(lexer.LBRACKET, p.parseIndexExpression)
 	p.registerInfix(lexer.LPAREN, p.parseCallExpression)
 	p.registerInfix(lexer.COLON2, p.parseConstantResolution)
 	p.registerInfix(lexer.COLON, p.parseHashRocket)
+	p.registerInfix(lexer.ARROW, p.parseHashRocket)
 	p.registerInfix(lexer.DOT2, p.parseRangeExpression)
 	p.registerInfix(lexer.DOT3, p.parseRangeExpression)
 
@@ -421,7 +439,7 @@ func (p *Parser) parseIdentifier() ast.Expression {
 func (p *Parser) isArgumentStart(token lexer.Token) bool {
 	switch token.Type {
 	case lexer.STRING, lexer.INT, lexer.FLOAT, lexer.TRUE, lexer.FALSE, lexer.NIL,
-		lexer.LBRACKET, lexer.LBRACE, lexer.IDENT, lexer.MINUS, lexer.BANG,
+		lexer.LBRACE, lexer.IDENT, lexer.MINUS, lexer.BANG,
 		lexer.REGEXP, lexer.SYMBOL:
 		return true
 	default:
@@ -561,7 +579,32 @@ func (p *Parser) parseHashPair(hash *ast.HashLiteral) {
 			Token: p.curToken,
 			Value: ":" + p.curToken.Literal,
 		}
-		p.nextToken() // skip colon
+		p.nextToken()
+		p.nextToken()
+		value := p.parseExpression(LOWEST)
+		hash.Pairs[key] = value
+		hash.Order = append(hash.Order, key)
+		return
+	}
+
+	// Handle hash rocket: {"foo" => "bar"} or {:a => 1}
+	if p.peekTokenIs(lexer.ARROW) {
+		// Don't use parseExpression here - it will trigger the ARROW infix handler
+		// Just use the current token as the key
+		keyToken := p.curToken
+		var key ast.Expression
+		switch keyToken.Type {
+		case lexer.STRING:
+			key = &ast.StringLiteral{Token: keyToken, Value: keyToken.Literal}
+		case lexer.SYMBOL:
+			key = &ast.SymbolLiteral{Token: keyToken, Value: keyToken.Literal}
+		case lexer.IDENT:
+			key = &ast.Identifier{Token: keyToken, Value: keyToken.Literal}
+		case lexer.INT:
+			n, _ := strconv.ParseInt(keyToken.Literal, 10, 64)
+			key = &ast.IntegerLiteral{Token: keyToken, Value: n}
+		}
+		p.nextToken() // move to ARROW
 		p.nextToken() // move to value
 		value := p.parseExpression(LOWEST)
 		hash.Pairs[key] = value
@@ -569,18 +612,19 @@ func (p *Parser) parseHashPair(hash *ast.HashLiteral) {
 		return
 	}
 
-	// Handle hash rocket: {"a" => 1, :b => 2}
-	key := p.parseExpression(LOWEST)
-
-	if !p.expectPeek(lexer.ARROW) {
-		return
+	if p.peekTokenIs(lexer.COLON) {
+		if p.curTokenIs(lexer.IDENT) {
+			key := &ast.SymbolLiteral{
+				Token: p.curToken,
+				Value: ":" + p.curToken.Literal,
+			}
+			p.nextToken()
+			value := p.parseExpression(LOWEST)
+			hash.Pairs[key] = value
+			hash.Order = append(hash.Order, key)
+			return
+		}
 	}
-
-	p.nextToken()
-	value := p.parseExpression(LOWEST)
-
-	hash.Pairs[key] = value
-	hash.Order = append(hash.Order, key)
 }
 
 func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
@@ -610,6 +654,17 @@ func (p *Parser) parsePrefixExpression() ast.Expression {
 	expression.Right = p.parseExpression(PREFIX)
 
 	return expression
+}
+
+func (p *Parser) parseSplatExpression() ast.Expression {
+	exp := &ast.SplatExpression{
+		Token: p.curToken,
+	}
+
+	p.nextToken()
+	exp.Value = p.parseExpression(LOWEST)
+
+	return exp
 }
 
 func (p *Parser) parseInfixExpression(left ast.Expression) ast.Expression {
@@ -707,24 +762,18 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 	}
 
 	if p.peekTokenIs(lexer.LPAREN) {
-		p.nextToken() // move to LPAREN
+		p.nextToken()
 
 		if p.peekTokenIs(lexer.RPAREN) {
-			p.nextToken() // skip RPAREN, no args
+			p.nextToken()
 		} else {
-			p.nextToken() // move to first arg
-			arg := p.parseExpression(LOWEST)
-			if arg != nil {
-				call.Args = append(call.Args, arg)
-			}
+			p.nextToken()
+			p.parseOneCallArg(call)
 
 			for p.peekTokenIs(lexer.COMMA) {
-				p.nextToken() // skip comma
-				p.nextToken() // move to next arg
-				arg := p.parseExpression(LOWEST)
-				if arg != nil {
-					call.Args = append(call.Args, arg)
-				}
+				p.nextToken()
+				p.nextToken()
+				p.parseOneCallArg(call)
 			}
 
 			if !p.expectPeek(lexer.RPAREN) {
@@ -733,7 +782,15 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 		}
 	}
 
+	// Handle index access: obj[key]
+	if p.peekTokenIs(lexer.LBRACKET) {
+		return p.parseIndexExpression(left)
+	}
+
 	if p.peekTokenIs(lexer.LBRACE) {
+		p.nextToken()
+		call.Block = p.parseBlockExpression()
+	} else if p.peekTokenIs(lexer.DO) {
 		p.nextToken()
 		call.Block = p.parseBlockExpression()
 	}
@@ -756,25 +813,18 @@ func (p *Parser) parseCallExpression(fn ast.Expression) ast.Expression {
 		return nil
 	}
 
-	// curToken is LPAREN, parse arguments
 	if p.peekTokenIs(lexer.RPAREN) {
 		p.nextToken()
 		return call
 	}
 
 	p.nextToken()
-	arg := p.parseExpression(LOWEST)
-	if arg != nil {
-		call.Args = append(call.Args, arg)
-	}
+	p.parseOneCallArg(call)
 
 	for p.peekTokenIs(lexer.COMMA) {
-		p.nextToken() // skip comma
-		p.nextToken() // move to next arg
-		arg := p.parseExpression(LOWEST)
-		if arg != nil {
-			call.Args = append(call.Args, arg)
-		}
+		p.nextToken()
+		p.nextToken()
+		p.parseOneCallArg(call)
 	}
 
 	if !p.expectPeek(lexer.RPAREN) {
@@ -782,6 +832,26 @@ func (p *Parser) parseCallExpression(fn ast.Expression) ast.Expression {
 	}
 
 	return call
+}
+
+func (p *Parser) parseOneCallArg(call *ast.MethodCall) {
+	if p.curTokenIs(lexer.IDENT) && p.peekTokenIs(lexer.COLON) {
+		name := p.curToken.Literal
+		tok := p.curToken
+		p.nextToken() // consume COLON
+		p.nextToken() // move to value
+		val := p.parseExpression(LOWEST)
+		call.KeywordArgs = append(call.KeywordArgs, &ast.KeywordArg{
+			Token: tok,
+			Name:  name,
+			Value: val,
+		})
+		return
+	}
+	arg := p.parseExpression(LOWEST)
+	if arg != nil {
+		call.Args = append(call.Args, arg)
+	}
 }
 
 func (p *Parser) parseConstant() ast.Expression {
@@ -814,35 +884,33 @@ func (p *Parser) parseHashRocket(left ast.Expression) ast.Expression {
 		Order: []ast.Expression{},
 	}
 
+	// Convert identifier to symbol for symbol shorthand (baz: -> :baz)
+	// But only for COLON case, not ARROW case
 	key := left
+	if p.curTokenIs(lexer.COLON) {
+		if ident, ok := left.(*ast.Identifier); ok {
+			key = &ast.SymbolLiteral{
+				Token: ident.Token,
+				Value: ":" + ident.Value,
+			}
+		}
+	}
+
 	p.nextToken()
 	value := p.parseExpression(LOWEST)
 
 	hash.Pairs[key] = value
 	hash.Order = append(hash.Order, key)
 
-	for p.peekTokenIs(lexer.COMMA) {
-		p.nextToken()
-		p.nextToken()
-
-		key = p.parseExpression(LOWEST)
-
-		if !p.expectPeek(lexer.COLON) {
-			return nil
-		}
-
-		p.nextToken()
-		value = p.parseExpression(LOWEST)
-
-		hash.Pairs[key] = value
-		hash.Order = append(hash.Order, key)
-	}
-
 	return hash
 }
 
 func (p *Parser) parseGroupedExpression() ast.Expression {
 	p.nextToken()
+
+	if p.curTokenIs(lexer.RPAREN) {
+		return &ast.NilExpression{Token: p.curToken}
+	}
 
 	exp := p.parseExpression(LOWEST)
 
@@ -1321,22 +1389,7 @@ func (p *Parser) parseDefExpression() ast.Expression {
 			p.nextToken() // skip RPAREN
 		} else {
 			p.nextToken() // move to first param
-			if p.curTokenIs(lexer.IDENT) {
-				exp.Params = append(exp.Params, &ast.Identifier{
-					Token: p.curToken,
-					Value: p.curToken.Literal,
-				})
-			}
-			for p.peekTokenIs(lexer.COMMA) {
-				p.nextToken() // skip comma
-				p.nextToken() // move to next param
-				if p.curTokenIs(lexer.IDENT) {
-					exp.Params = append(exp.Params, &ast.Identifier{
-						Token: p.curToken,
-						Value: p.curToken.Literal,
-					})
-				}
-			}
+			p.parseDefParams(exp)
 			if !p.expectPeek(lexer.RPAREN) {
 				return nil
 			}
@@ -1368,6 +1421,46 @@ func (p *Parser) parseDefExpression() ast.Expression {
 	}
 
 	return exp
+}
+
+func (p *Parser) parseDefParams(exp *ast.DefExpression) {
+	p.parseOneDefParam(exp)
+	for p.peekTokenIs(lexer.COMMA) {
+		p.nextToken() // skip comma
+		p.nextToken() // move to next param
+		p.parseOneDefParam(exp)
+	}
+}
+
+func (p *Parser) parseOneDefParam(exp *ast.DefExpression) {
+	if p.curTokenIs(lexer.MULTIPLY) {
+		p.nextToken()
+		if p.curTokenIs(lexer.IDENT) {
+			exp.RestParam = &ast.Identifier{
+				Token: p.curToken,
+				Value: p.curToken.Literal,
+			}
+		}
+		return
+	}
+	if !p.curTokenIs(lexer.IDENT) {
+		return
+	}
+	name := p.curToken.Literal
+	if p.peekTokenIs(lexer.COLON) {
+		p.nextToken() // consume COLON
+		kp := &ast.KeywordParam{Name: name}
+		if !p.peekTokenIs(lexer.COMMA) && !p.peekTokenIs(lexer.RPAREN) && !p.peekTokenIs(lexer.NEWLINE) {
+			p.nextToken()
+			kp.Default = p.parseExpression(LOWEST)
+		}
+		exp.KeywordParams = append(exp.KeywordParams, kp)
+	} else {
+		exp.Params = append(exp.Params, &ast.Identifier{
+			Token: p.curToken,
+			Value: name,
+		})
+	}
 }
 
 func (p *Parser) parseClassExpression() ast.Expression {
@@ -1469,27 +1562,95 @@ func (p *Parser) parseModuleExpression() ast.Expression {
 	return exp
 }
 
+func (p *Parser) parseLambdaExpression() ast.Expression {
+	lit := &ast.ProcLiteral{
+		Token: p.curToken,
+	}
+
+	if p.peekTokenIs(lexer.LPAREN) {
+		p.nextToken()
+		p.nextToken()
+		for !p.curTokenIs(lexer.RPAREN) && !p.curTokenIs(lexer.EOF) {
+			if p.curTokenIs(lexer.IDENT) {
+				lit.Params = append(lit.Params, &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal})
+			}
+			p.nextToken()
+			if p.curTokenIs(lexer.COMMA) {
+				p.nextToken()
+			}
+		}
+		p.nextToken()
+	}
+
+	if p.curTokenIs(lexer.LBRACE) || p.peekTokenIs(lexer.LBRACE) {
+		if p.peekTokenIs(lexer.LBRACE) {
+			p.nextToken()
+		}
+		lit.Body = p.parseBlockExpression()
+	} else if p.curTokenIs(lexer.DO) || p.peekTokenIs(lexer.DO) {
+		if p.peekTokenIs(lexer.DO) {
+			p.nextToken()
+		}
+		lit.Body = p.parseBlockExpression()
+	}
+
+	return lit
+}
+
 func (p *Parser) parseBlockExpression() *ast.BlockExpression {
 	block := &ast.BlockExpression{
 		Token: p.curToken,
 	}
 
 	p.nextToken()
+	for p.curTokenIs(lexer.NEWLINE) {
+		p.nextToken()
+	}
+
+	if p.curTokenIs(lexer.BIT_OR) {
+		p.nextToken()
+		for !p.curTokenIs(lexer.BIT_OR) && !p.curTokenIs(lexer.EOF) {
+			if p.curTokenIs(lexer.IDENT) {
+				block.Params = append(block.Params, &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal})
+			}
+			p.nextToken()
+			if p.curTokenIs(lexer.COMMA) {
+				p.nextToken()
+			}
+		}
+		if p.curTokenIs(lexer.BIT_OR) {
+			p.nextToken()
+		}
+	}
 
 	for !p.curTokenIs(lexer.RBRACE) && !p.curTokenIs(lexer.END) && !p.curTokenIs(lexer.EOF) {
+		for p.curTokenIs(lexer.NEWLINE) || p.curTokenIs(lexer.SEMICOLON) {
+			p.nextToken()
+		}
+		if p.curTokenIs(lexer.RBRACE) || p.curTokenIs(lexer.END) || p.curTokenIs(lexer.EOF) {
+			break
+		}
 		stmt := p.parseStatement()
 		if stmt != nil {
 			block.Statements = append(block.Statements, stmt)
 		}
 		p.skipNewlines()
+		if p.curTokenIs(lexer.SEMICOLON) {
+			p.nextToken()
+		}
+		if !p.curTokenIs(lexer.RBRACE) && !p.curTokenIs(lexer.END) && !p.curTokenIs(lexer.EOF) && !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.SEMICOLON) {
+			if p.peekTokenIs(lexer.RBRACE) || p.peekTokenIs(lexer.END) || p.peekTokenIs(lexer.NEWLINE) || p.peekTokenIs(lexer.SEMICOLON) || p.peekTokenIs(lexer.EOF) {
+				p.nextToken()
+			}
+		}
 	}
 
 	if p.curTokenIs(lexer.END) {
 		return block
 	}
 
-	if !p.expectPeek(lexer.RBRACE) {
-		return nil
+	if p.curTokenIs(lexer.RBRACE) {
+		return block
 	}
 
 	return block

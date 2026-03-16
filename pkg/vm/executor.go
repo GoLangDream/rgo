@@ -2,6 +2,8 @@ package vm
 
 import (
 	"fmt"
+	"os"
+	"runtime"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
@@ -10,6 +12,14 @@ import (
 
 const StackSize = 2048
 const MaxFrames = 1024
+
+var DevMode = os.Getenv("RGO_DEV") == "1"
+
+func init() {
+	if DevMode {
+		runtime.GOMAXPROCS(1)
+	}
+}
 
 type Frame struct {
 	Fn      *object.Function
@@ -83,6 +93,10 @@ func (vm *VM) Run() error {
 		}
 		frame = vm.frames[vm.fp]
 		instructions = frame.Fn.Instructions
+
+		if DevMode && count%100 == 0 {
+			runtime.Gosched()
+		}
 	}
 
 	return nil
@@ -202,6 +216,70 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.push(core.R.TrueVal)
 		} else {
 			vm.push(core.R.FalseVal)
+		}
+
+	case compiler.OpBitAnd:
+		right := vm.pop()
+		left := vm.pop()
+		l, lok := left.Data.(int64)
+		r, rok := right.Data.(int64)
+		if lok && rok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l & r, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpBitOr:
+		right := vm.pop()
+		left := vm.pop()
+		l, lok := left.Data.(int64)
+		r, rok := right.Data.(int64)
+		if lok && rok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l | r, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpBitXor:
+		right := vm.pop()
+		left := vm.pop()
+		l, lok := left.Data.(int64)
+		r, rok := right.Data.(int64)
+		if lok && rok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l ^ r, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpBitNot:
+		val := vm.pop()
+		v, ok := val.Data.(int64)
+		if ok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: ^v, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpBitLeftShift:
+		right := vm.pop()
+		left := vm.pop()
+		l, lok := left.Data.(int64)
+		r, rok := right.Data.(int64)
+		if lok && rok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l << r, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpBitRightShift:
+		right := vm.pop()
+		left := vm.pop()
+		l, lok := left.Data.(int64)
+		r, rok := right.Data.(int64)
+		if lok && rok {
+			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l >> r, Class: core.R.Classes["Integer"]})
+		} else {
+			vm.push(core.R.NilVal)
 		}
 
 	case compiler.OpJump:
@@ -468,7 +546,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(&object.EmeraldValue{
 			Type:  object.ValueClosure,
 			Data:  closure,
-			Class: core.R.Classes["Class"],
+			Class: core.R.Classes["Proc"],
 		})
 
 	case compiler.OpLambda:
@@ -485,16 +563,86 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			free[i] = vm.pop()
 		}
 
-		closure := &object.Closure{
-			Fn:   fn,
-			Free: free,
+		proc := &object.Proc{
+			Fn:       fn,
+			Env:      free,
+			IsLambda: true,
 		}
 
 		vm.push(&object.EmeraldValue{
-			Type:  object.ValueClosure,
-			Data:  closure,
-			Class: core.R.Classes["Class"],
+			Type:  object.ValueProc,
+			Data:  proc,
+			Class: core.R.Classes["Proc"],
 		})
+
+	case compiler.OpSplat:
+		val := vm.pop()
+		if val.Type == object.ValueArray {
+			elems := val.Data.([]*object.EmeraldValue)
+			for _, elem := range elems {
+				vm.push(elem)
+			}
+		} else {
+			vm.push(val)
+		}
+
+	case compiler.OpIsA, compiler.OpKindOf:
+		classVal := vm.pop()
+		obj := vm.pop()
+
+		if classVal.Type != object.ValueClass {
+			vm.push(core.R.FalseVal)
+			return nil
+		}
+
+		targetClass := classVal.Data.(*object.Class)
+		objClass := obj.Class
+
+		// Check if obj's class is the target class or inherits from it
+		for objClass != nil {
+			if objClass == targetClass {
+				vm.push(core.R.TrueVal)
+				return nil
+			}
+			objClass = objClass.SuperClass
+		}
+		vm.push(core.R.FalseVal)
+
+	case compiler.OpRespondTo:
+		methodName := vm.pop()
+		obj := vm.pop()
+
+		if methodName.Type != object.ValueString && methodName.Type != object.ValueSymbol {
+			vm.push(core.R.FalseVal)
+			return nil
+		}
+
+		var methodNameStr string
+		if methodName.Type == object.ValueSymbol {
+			methodNameStr = methodName.Data.(string)
+		} else {
+			methodNameStr = methodName.Data.(string)
+		}
+
+		// Check if object has the method
+		if obj.Class != nil {
+			_, ok := obj.Class.GetMethod(methodNameStr)
+			if ok {
+				vm.push(core.R.TrueVal)
+				return nil
+			}
+		}
+
+		// For basic objects, check if it's a ValueObject with RespondTo method
+		if obj.Type == object.ValueObject {
+			objData := obj.Data.(*object.Object)
+			if objData.RespondTo(methodNameStr) {
+				vm.push(core.R.TrueVal)
+				return nil
+			}
+		}
+
+		vm.push(core.R.FalseVal)
 
 	default:
 		return fmt.Errorf("unknown opcode: %v", op)
@@ -504,11 +652,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 }
 
 func (vm *VM) push(val *object.EmeraldValue) {
+	if vm.sp >= StackSize {
+		return
+	}
 	vm.stack[vm.sp] = val
 	vm.sp++
 }
 
 func (vm *VM) pop() *object.EmeraldValue {
+	if vm.sp <= 0 {
+		return core.R.NilVal
+	}
 	vm.sp--
 	val := vm.stack[vm.sp]
 	vm.poppedValues = append(vm.poppedValues, val)
@@ -895,21 +1049,84 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	if fn, ok := methodObj.Fn.(*object.Function); ok {
 		oldFrame := vm.frames[vm.fp]
 
-		// Calculate Bp BEFORE pushing anything - it should point to where receiver will be
-		// In Ruby, self is at position 0, then arguments start at position 1
 		bp := vm.sp
 
-		// Push receiver (self) first
 		vm.stack[vm.sp] = receiver
 		vm.sp++
 
-		// Push arguments to stack
-		for _, arg := range args {
-			vm.stack[vm.sp] = arg
+		if len(fn.KeywordParams) > 0 && len(args) > 0 {
+			lastArg := args[len(args)-1]
+			positionalArgs := args[:len(args)-1]
+
+			if fn.HasRestParam {
+				normalCount := fn.RestParamIndex
+				if normalCount > len(positionalArgs) {
+					normalCount = len(positionalArgs)
+				}
+				for i := 0; i < normalCount; i++ {
+					vm.stack[vm.sp] = positionalArgs[i]
+					vm.sp++
+				}
+				restElems := make([]*object.EmeraldValue, 0)
+				if len(positionalArgs) > fn.RestParamIndex {
+					restElems = positionalArgs[fn.RestParamIndex:]
+				}
+				vm.stack[vm.sp] = &object.EmeraldValue{
+					Type:  object.ValueArray,
+					Data:  restElems,
+					Class: core.R.Classes["Array"],
+				}
+				vm.sp++
+			} else {
+				for _, arg := range positionalArgs {
+					vm.stack[vm.sp] = arg
+					vm.sp++
+				}
+			}
+
+			var kwargsHash map[*object.EmeraldValue]*object.EmeraldValue
+			if lastArg.Type == object.ValueHash {
+				kwargsHash = lastArg.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+			}
+
+			for _, kp := range fn.KeywordParams {
+				val := vm.lookupKwarg(kwargsHash, kp.Name)
+				if val == nil {
+					if kp.HasDefault && kp.Default != nil {
+						val = kp.Default
+					} else {
+						val = core.R.NilVal
+					}
+				}
+				vm.stack[vm.sp] = val
+				vm.sp++
+			}
+		} else if fn.HasRestParam {
+			normalCount := fn.RestParamIndex
+			if normalCount > len(args) {
+				normalCount = len(args)
+			}
+			for i := 0; i < normalCount; i++ {
+				vm.stack[vm.sp] = args[i]
+				vm.sp++
+			}
+			restElems := make([]*object.EmeraldValue, 0)
+			if len(args) > fn.RestParamIndex {
+				restElems = args[fn.RestParamIndex:]
+			}
+			vm.stack[vm.sp] = &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  restElems,
+				Class: core.R.Classes["Array"],
+			}
 			vm.sp++
+		} else {
+			for _, arg := range args {
+				vm.stack[vm.sp] = arg
+				vm.sp++
+			}
 		}
 
-		// Set up new frame - Bp points to receiver (self)
 		newFrame := &Frame{
 			Fn: fn,
 			Ip: -1,
@@ -959,4 +1176,17 @@ func (vm *VM) LastPoppedStackElement() *object.EmeraldValue {
 
 func (vm *VM) GetAllResults() []*object.EmeraldValue {
 	return vm.poppedValues
+}
+
+func (vm *VM) lookupKwarg(hash map[*object.EmeraldValue]*object.EmeraldValue, name string) *object.EmeraldValue {
+	if hash == nil {
+		return nil
+	}
+	key := ":" + name
+	for k, v := range hash {
+		if k.Type == object.ValueString && k.Data.(string) == key {
+			return v
+		}
+	}
+	return nil
 }

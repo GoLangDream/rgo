@@ -1,13 +1,15 @@
 package object
 
 type Class struct {
-	Name         string
-	SuperClass   *Class
-	Methods      map[string]*Method
-	Constants    map[string]*EmeraldValue
-	ClassMethods map[string]*Method
-	InstanceVars map[string]*EmeraldValue
-	IsSingleton  bool
+	Name             string
+	SuperClass       *Class
+	Methods          map[string]*Method
+	Constants        map[string]*EmeraldValue
+	ClassMethods     map[string]*Method
+	InstanceVars     map[string]*EmeraldValue
+	IsSingleton      bool
+	IncludedModules  []*Module // Modules included via include
+	PrependedModules []*Module // Modules prepended via prepend
 }
 
 func NewClass(name string) *Class {
@@ -29,11 +31,32 @@ func (c *Class) DefineClassMethod(name string, method *Method) {
 }
 
 func (c *Class) GetMethod(name string) (*Method, bool) {
+	// Check prepended modules first (highest priority)
+	for _, mod := range c.PrependedModules {
+		if method, ok := mod.GetMethod(name); ok {
+			return method, true
+		}
+	}
+
+	// Check class methods
 	method, ok := c.Methods[name]
-	if !ok && c.SuperClass != nil {
+	if ok {
+		return method, ok
+	}
+
+	// Check included modules
+	for _, mod := range c.IncludedModules {
+		if method, ok := mod.GetMethod(name); ok {
+			return method, true
+		}
+	}
+
+	// Check superclass
+	if c.SuperClass != nil {
 		return c.SuperClass.GetMethod(name)
 	}
-	return method, ok
+
+	return nil, false
 }
 
 func (c *Class) DefineConstant(name string, value *EmeraldValue) {
@@ -54,6 +77,20 @@ func (c *Class) SetInstanceVar(name string, value *EmeraldValue) {
 
 func (c *Class) GetInstanceVar(name string) *EmeraldValue {
 	return c.InstanceVars[name]
+}
+
+func (c *Class) Include(module *Module) {
+	c.IncludedModules = append(c.IncludedModules, module)
+}
+
+func (c *Class) Extend(module *Module) {
+	for name, method := range module.Methods {
+		c.ClassMethods[name] = method
+	}
+}
+
+func (c *Class) Prepend(module *Module) {
+	c.PrependedModules = append([]*Module{module}, c.PrependedModules...)
 }
 
 func (c *Class) NewInstance() *EmeraldValue {

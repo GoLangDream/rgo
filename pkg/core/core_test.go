@@ -93,7 +93,7 @@ func TestInitCreatesClasses(t *testing.T) {
 		"BasicObject", "Object", "Module", "Class",
 		"TrueClass", "FalseClass", "NilClass",
 		"Integer", "Float", "String", "Array", "Hash",
-		"Symbol", "Regexp", "Range",
+		"Symbol", "Regexp", "Range", "Proc",
 	}
 	for _, name := range expected {
 		if _, ok := R.Classes[name]; !ok {

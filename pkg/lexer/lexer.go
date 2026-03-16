@@ -242,25 +242,35 @@ func (l *Lexer) NextToken() Token {
 	case '>':
 		if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(GREATER_THAN, GREATER_THAN_OR_EQUAL)
+		} else if l.peekChar() == '>' {
+			tok = l.makeTwoCharToken(RSHIFT, RSHIFT)
 		} else {
 			tok = newToken(GREATER_THAN, l.ch)
 		}
 	case '&':
 		if l.peekChar() == '&' {
-			tok = l.makeTwoCharToken(BANG, AND)
+			tok = l.makeTwoCharToken(AND, AND2)
 		} else if l.peekChar() == '=' {
-			tok = l.makeTwoCharToken(BANG, BANG)
+			tok = l.makeTwoCharToken(BIT_AND, BIT_AND)
 		} else {
-			tok = newToken(BANG, l.ch)
+			tok = newToken(BIT_AND, l.ch)
 		}
 	case '|':
 		if l.peekChar() == '|' {
-			tok = l.makeTwoCharToken(BANG, OR)
+			tok = l.makeTwoCharToken(OR, OR2)
 		} else if l.peekChar() == '=' {
-			tok = l.makeTwoCharToken(BANG, BANG)
+			tok = l.makeTwoCharToken(BIT_OR, BIT_OR)
 		} else {
-			tok = newToken(BANG, l.ch)
+			tok = newToken(BIT_OR, l.ch)
 		}
+	case '^':
+		if l.peekChar() == '=' {
+			tok = l.makeTwoCharToken(BIT_XOR, BIT_XOR)
+		} else {
+			tok = newToken(BIT_XOR, l.ch)
+		}
+	case '~':
+		tok = newToken(BIT_NOT, l.ch)
 	case '?':
 		tok = newToken(QUESTION, l.ch)
 	case '@':

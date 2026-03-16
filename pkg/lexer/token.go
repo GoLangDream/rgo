@@ -49,10 +49,14 @@ const (
 	TERNARY TokenType = "?"
 	THEN    TokenType = "then"
 
-	AND  TokenType = "&&"
-	OR   TokenType = "||"
-	AND2 TokenType = "and"
-	OR2  TokenType = "or"
+	AND     TokenType = "&&"
+	OR      TokenType = "||"
+	AND2    TokenType = "and"
+	OR2     TokenType = "or"
+	BIT_AND TokenType = "&"
+	BIT_OR  TokenType = "|"
+	BIT_XOR TokenType = "^"
+	BIT_NOT TokenType = "~"
 
 	DOT  TokenType = "."
 	DOT2 TokenType = ".."
@@ -137,6 +141,8 @@ const (
 
 	CONSTANT  TokenType = "CONSTANT"
 	BLOCK_END TokenType = "END"
+	LPIPE     TokenType = "|"
+	RPIPE     TokenType = "|"
 )
 
 type Token struct {
@@ -151,6 +157,7 @@ func (t Token) String() string {
 }
 
 var keywords = map[string]TokenType{
+	"|":         LPIPE,
 	"if":        IF,
 	"unless":    UNLESS,
 	"elsif":     ELSIF,

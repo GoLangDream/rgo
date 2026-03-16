@@ -191,30 +191,39 @@ func (v *EmeraldValue) Equals(other *EmeraldValue) bool {
 	}
 }
 
-type Function struct {
+type KeywordParamInfo struct {
 	Name       string
-	Params     []string
-	Body       interface{}
-	FreeVars   []*EmeraldValue
-	Instructions []byte
-	NumLocals  int
+	HasDefault bool
+	Default    *EmeraldValue
+}
+
+type Function struct {
+	Name           string
+	Params         []string
+	KeywordParams  []KeywordParamInfo
+	Body           interface{}
+	FreeVars       []*EmeraldValue
+	Instructions   []byte
+	NumLocals      int
+	HasRestParam   bool
+	RestParamIndex int
 }
 
 type BuiltinFunction struct {
-	Name   string
-	Fn     func(args ...*EmeraldValue) *EmeraldValue
-	Arity  int
+	Name  string
+	Fn    func(args ...*EmeraldValue) *EmeraldValue
+	Arity int
 }
 
 type Method struct {
-	Name   string
-	Fn     interface{}
-	Arity  int
+	Name  string
+	Fn    interface{}
+	Arity int
 }
 
 type Proc struct {
-	Fn      *Function
-	Env     []*EmeraldValue
+	Fn       *Function
+	Env      []*EmeraldValue
 	IsLambda bool
 }
 
@@ -253,7 +262,7 @@ type RRegexp struct {
 }
 
 type RRange struct {
-	Start int64
-	End   int64
+	Start     int64
+	End       int64
 	Exclusive bool
 }

@@ -212,6 +212,7 @@ func (r *RangeExpression) String() string {
 
 type BlockExpression struct {
 	Token      lexer.Token
+	Params     []*Identifier
 	Statements []Statement
 }
 
@@ -327,12 +328,31 @@ func (f *ForExpression) String() string {
 	return "for " + f.Variable.String() + " in " + f.Collection.String() + "\n" + f.Body.String() + "\nend"
 }
 
+// KeywordParam represents a keyword parameter in a method definition (e.g., a:, b: 1)
+type KeywordParam struct {
+	Name    string
+	Default Expression // nil means required keyword arg (a:), non-nil means optional (b: 1)
+}
+
+// KeywordArg represents a keyword argument at a call site (e.g., a: 1)
+type KeywordArg struct {
+	Token lexer.Token
+	Name  string
+	Value Expression
+}
+
+func (k *KeywordArg) expressionNode()      {}
+func (k *KeywordArg) TokenLiteral() string { return k.Token.Literal }
+func (k *KeywordArg) String() string       { return k.Name + ": " + k.Value.String() }
+
 type DefExpression struct {
-	Token    lexer.Token
-	Name     *Identifier
-	Params   []*Identifier
-	Body     *BlockExpression
-	Receiver Expression
+	Token         lexer.Token
+	Name          *Identifier
+	Params        []*Identifier
+	RestParam     *Identifier // *rest parameter, nil if none
+	KeywordParams []*KeywordParam
+	Body          *BlockExpression
+	Receiver      Expression
 }
 
 func (d *DefExpression) expressionNode()      {}
@@ -344,9 +364,23 @@ func (d *DefExpression) String() string {
 	}
 	out += d.Name.String()
 	out += "("
-	for i, p := range d.Params {
-		out += p.String()
-		if i < len(d.Params)-1 {
+	allParams := []string{}
+	for _, p := range d.Params {
+		allParams = append(allParams, p.String())
+	}
+	if d.RestParam != nil {
+		allParams = append(allParams, "*"+d.RestParam.String())
+	}
+	for _, kp := range d.KeywordParams {
+		if kp.Default != nil {
+			allParams = append(allParams, kp.Name+": "+kp.Default.String())
+		} else {
+			allParams = append(allParams, kp.Name+":")
+		}
+	}
+	for i, s := range allParams {
+		out += s
+		if i < len(allParams)-1 {
 			out += ", "
 		}
 	}
@@ -514,6 +548,15 @@ func (n *NilExpression) expressionNode()      {}
 func (n *NilExpression) TokenLiteral() string { return n.Token.Literal }
 func (n *NilExpression) String() string       { return "nil" }
 
+type SplatExpression struct {
+	Token lexer.Token
+	Value Expression
+}
+
+func (s *SplatExpression) expressionNode()      {}
+func (s *SplatExpression) TokenLiteral() string { return s.Token.Literal }
+func (s *SplatExpression) String() string       { return "*" + s.Value.String() }
+
 type InstanceVariable struct {
 	Token lexer.Token
 	Name  string
@@ -606,11 +649,12 @@ func (g *GlobalVarAssign) TokenLiteral() string { return g.Token.Literal }
 func (g *GlobalVarAssign) String() string       { return g.Name + " = " + g.Value.String() }
 
 type MethodCall struct {
-	Token    lexer.Token
-	Receiver Expression
-	Method   *Identifier
-	Args     []Expression
-	Block    *BlockExpression
+	Token       lexer.Token
+	Receiver    Expression
+	Method      *Identifier
+	Args        []Expression
+	KeywordArgs []*KeywordArg
+	Block       *BlockExpression
 }
 
 func (m *MethodCall) expressionNode()      {}
