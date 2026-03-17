@@ -1,0 +1,5 @@
+array: 7/15
+string: 8/15
+hash: 2/15
+integer: 5/15
+float: 4/15
