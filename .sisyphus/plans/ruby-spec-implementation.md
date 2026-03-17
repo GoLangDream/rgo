@@ -493,7 +493,7 @@
 
 ### Wave 2.2 - Kernel 模块 (全局方法)
 
-- [ ] 19-23. 实现 Kernel 方法 (puts, print, p, raise, require, eval, loop, catch, throw 等 117 个方法,分 5 个任务)
+- [x] 19-23. 实现 Kernel 方法 (puts, print, p, raise, require, eval, loop, catch, throw 等 117 个方法,分 5 个任务)
 
   **Recommended Agent Profile**: `unspecified-high` (each) | **Parallel Group**: Wave 2.2
   
