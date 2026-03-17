@@ -516,31 +516,35 @@ func (p *Parser) parseArrayLiteral() ast.Expression {
 		Token:    p.curToken,
 		Elements: []ast.Expression{},
 	}
-
+	for p.peekTokenIs(lexer.NEWLINE) {
+		p.nextToken()
+	}
 	if p.peekTokenIs(lexer.RBRACKET) {
 		p.nextToken()
 		return arr
 	}
-
 	p.nextToken()
 	element := p.parseExpression(LOWEST)
 	if element != nil {
 		arr.Elements = append(arr.Elements, element)
 	}
-
 	for p.peekTokenIs(lexer.COMMA) {
-		p.nextToken() // skip comma
-		p.nextToken() // move to next element
+		p.nextToken()
+		for p.peekTokenIs(lexer.NEWLINE) {
+			p.nextToken()
+		}
+		p.nextToken()
 		element := p.parseExpression(LOWEST)
 		if element != nil {
 			arr.Elements = append(arr.Elements, element)
 		}
 	}
-
+	for p.peekTokenIs(lexer.NEWLINE) {
+		p.nextToken()
+	}
 	if !p.expectPeek(lexer.RBRACKET) {
 		return nil
 	}
-
 	return arr
 }
 
@@ -550,25 +554,29 @@ func (p *Parser) parseHashLiteral() ast.Expression {
 		Pairs: make(map[ast.Expression]ast.Expression),
 		Order: []ast.Expression{},
 	}
-
+	for p.peekTokenIs(lexer.NEWLINE) {
+		p.nextToken()
+	}
 	if p.peekTokenIs(lexer.RBRACE) {
 		p.nextToken()
 		return hash
 	}
-
 	p.nextToken()
 	p.parseHashPair(hash)
-
 	for p.peekTokenIs(lexer.COMMA) {
-		p.nextToken() // skip comma
-		p.nextToken() // move to next key
+		p.nextToken()
+		for p.peekTokenIs(lexer.NEWLINE) {
+			p.nextToken()
+		}
+		p.nextToken()
 		p.parseHashPair(hash)
 	}
-
+	for p.peekTokenIs(lexer.NEWLINE) {
+		p.nextToken()
+	}
 	if !p.expectPeek(lexer.RBRACE) {
 		return nil
 	}
-
 	return hash
 }
 
