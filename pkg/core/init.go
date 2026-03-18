@@ -9,7 +9,6 @@ import (
 
 type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
 
-// CallBlock is set by the VM at startup so core methods can invoke blocks.
 var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
 
 func isTruthy(val *object.EmeraldValue) bool {
