@@ -1,0 +1,5 @@
+array: 8/20
+string: 11/20
+hash: 3/20
+integer: 6/20
+float: 6/20

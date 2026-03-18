@@ -1150,9 +1150,10 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		}
 
 		result := core.R.NilVal
-		if vm.sp > frame.Bp {
+		if vm.sp > bp {
 			result = vm.stack[vm.sp-1]
 		}
+		vm.sp = bp
 
 		vm.frames = vm.frames[:vm.fp]
 		vm.fp--
