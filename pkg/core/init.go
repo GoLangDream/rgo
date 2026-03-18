@@ -9,6 +9,16 @@ import (
 
 type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
 
+// CallBlock is set by the VM at startup so core methods can invoke blocks.
+var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
+
+func isTruthy(val *object.EmeraldValue) bool {
+	if val == nil || val == R.NilVal || val == R.FalseVal {
+		return false
+	}
+	return true
+}
+
 type Runtime struct {
 	Classes map[string]*object.Class
 
@@ -1667,7 +1677,8 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, len(arr))
 	for i, elem := range arr {
-		result[i] = elem
+		val := CallBlock(elem)
+		result[i] = val
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -1680,7 +1691,10 @@ func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, 0)
 	for _, elem := range arr {
-		result = append(result, elem)
+		val := CallBlock(elem)
+		if isTruthy(val) {
+			result = append(result, elem)
+		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -1692,7 +1706,8 @@ func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for _, elem := range arr {
-		if elem.Type == object.ValueInteger && elem.Data.(int64) == 1 {
+		val := CallBlock(elem)
+		if isTruthy(val) {
 			return elem
 		}
 	}
@@ -3316,7 +3331,8 @@ func arrayReject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, 0)
 	for _, elem := range arr {
-		if elem.Type == object.ValueNil {
+		val := CallBlock(elem)
+		if !isTruthy(val) {
 			result = append(result, elem)
 		}
 	}

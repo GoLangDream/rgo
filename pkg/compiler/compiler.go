@@ -681,9 +681,51 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.LeaveScope()
 		c.Emit(OpPop)
 	case *ast.BlockExpression:
-		for _, s := range node.Statements {
-			if err := c.Compile(s); err != nil {
+		// If block has params, compile as closure
+		if len(node.Params) > 0 {
+			c.EnterScope()
+
+			for _, param := range node.Params {
+				c.symbolTable.Define(param.Value)
+			}
+
+			// Compile block body - use compileBlockAsValue to keep last value on stack
+			if err := c.compileBlockAsValue(node); err != nil {
 				return err
+			}
+
+			c.Emit(OpReturnValue)
+
+			free := c.symbolTable.FreeSymbols
+			instructions := c.LeaveScope()
+
+			fnObj := &object.Function{
+				Name:         "__block__",
+				Instructions: instructions,
+				NumLocals:    len(node.Params),
+			}
+
+			fn := &object.EmeraldValue{
+				Type:  object.ValueFunction,
+				Data:  fnObj,
+				Class: core.R.Classes["Class"],
+			}
+			fnIdx := c.addConstant(fn)
+
+			c.emit(OpClosure, fnIdx, len(free))
+			for _, s := range free {
+				if s.Scope == ScopeLocal {
+					c.emit(OpGetLocal, s.Index)
+				} else {
+					c.emit(OpGetFree, s.Index)
+				}
+			}
+		} else {
+			// No params - compile inline (for if/while bodies)
+			for _, s := range node.Statements {
+				if err := c.Compile(s); err != nil {
+					return err
+				}
 			}
 		}
 	case *ast.ProcLiteral:

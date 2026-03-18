@@ -15,6 +15,15 @@ const MaxFrames = 1024
 
 var DevMode = os.Getenv("RGO_DEV") == "1"
 
+var CurrentVM *VM
+
+func CallBlock(args ...*object.EmeraldValue) *object.EmeraldValue {
+	if CurrentVM == nil || CurrentVM.currentBlock == nil {
+		return core.R.NilVal
+	}
+	return CurrentVM.callBlock(CurrentVM.currentBlock, args...)
+}
+
 func init() {
 	if DevMode {
 		runtime.GOMAXPROCS(1)
@@ -41,6 +50,8 @@ type VM struct {
 	instructions compiler.Instructions
 
 	poppedValues []*object.EmeraldValue
+
+	currentBlock *object.EmeraldValue
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
@@ -69,6 +80,8 @@ func New(bytecode *compiler.Bytecode) *VM {
 	}
 
 	vm.stack[0] = core.R.Main
+	CurrentVM = vm
+	core.CallBlock = CallBlock
 
 	return vm
 }
@@ -440,16 +453,23 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		methodNameIdx := vm.readUint16()
 		blockArg := vm.readUint8()
 		numArgs := vm.readUint8()
-		_ = blockArg
 		methodName := vm.constants[methodNameIdx].Data.(string)
 
 		args := make([]*object.EmeraldValue, int(numArgs))
 		for i := 0; i < int(numArgs); i++ {
 			args[numArgs-1-i] = vm.pop()
 		}
+
+		var block *object.EmeraldValue
+		if blockArg == 1 {
+			block = vm.pop()
+		}
 		receiver := vm.pop()
 
+		prevBlock := vm.currentBlock
+		vm.currentBlock = block
 		result := vm.send(receiver, methodName, args)
+		vm.currentBlock = prevBlock
 		vm.push(result)
 
 	case compiler.OpBreak:
@@ -1163,6 +1183,66 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	}
 
 	return core.R.NilVal
+}
+
+func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if block == nil {
+		return core.R.NilVal
+	}
+
+	var fn *object.Function
+	var closure *object.Closure
+	switch block.Type {
+	case object.ValueClosure:
+		closure = block.Data.(*object.Closure)
+		fn = closure.Fn
+	case object.ValueProc:
+		proc := block.Data.(*object.Proc)
+		fn = proc.Fn
+	default:
+		return core.R.NilVal
+	}
+
+	if fn == nil {
+		return core.R.NilVal
+	}
+
+	bp := vm.sp
+
+	vm.stack[vm.sp] = core.R.Main
+	vm.sp++
+
+	for _, arg := range args {
+		vm.stack[vm.sp] = arg
+		vm.sp++
+	}
+
+	newFrame := &Frame{Fn: fn, Ip: -1, Bp: bp, Closure: closure}
+	vm.frames = append(vm.frames, newFrame)
+	vm.fp++
+
+	frame := vm.frames[vm.fp]
+	instructions := frame.Fn.Instructions
+	for frame.Ip < len(instructions)-1 {
+		frame.Ip++
+		op := compiler.Opcode(instructions[frame.Ip])
+		if err := vm.execute(op, frame); err != nil {
+			break
+		}
+		frame = vm.frames[vm.fp]
+		instructions = frame.Fn.Instructions
+	}
+
+	result := core.R.NilVal
+	if vm.sp > bp {
+		result = vm.stack[vm.sp-1]
+	}
+	vm.sp = bp
+
+	vm.frames = vm.frames[:vm.fp]
+	vm.fp--
+
+	return result
 }
 
 func (vm *VM) LastPoppedStackElement() *object.EmeraldValue {
