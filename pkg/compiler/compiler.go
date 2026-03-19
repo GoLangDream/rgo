@@ -2,9 +2,12 @@ package compiler
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/core"
+	"github.com/GoLangDream/rgo/pkg/lexer"
 	"github.com/GoLangDream/rgo/pkg/object"
+	"github.com/GoLangDream/rgo/pkg/parser"
 	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
 
@@ -174,11 +177,18 @@ func (c *Compiler) Compile(node interface{}) error {
 			Class: core.R.Classes["Float"],
 		})
 	case *ast.StringLiteral:
-		c.EmitConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  node.Value,
-			Class: core.R.Classes["String"],
-		})
+		val := node.Value
+		if !strings.Contains(val, "#{") {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  val,
+				Class: core.R.Classes["String"],
+			})
+		} else {
+			if err := c.compileStringInterpolation(val); err != nil {
+				return err
+			}
+		}
 	case *ast.SymbolLiteral:
 		c.EmitConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
@@ -216,7 +226,11 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.emit(OpGetOuter, sym.ScopeIndex)
 		}
 	case *ast.Constant:
-		c.Emit(OpNil)
+		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name,
+			Class: core.R.Classes["String"],
+		}))
 	case *ast.ConstantResolution:
 		c.Emit(OpNil)
 	case *ast.InstanceVariable:
@@ -494,6 +508,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			return nil
 		}
 
+		// Check if the name is an instance variable (starts with @)
+		if len(node.Name.Value) > 0 && node.Name.Value[0] == '@' {
+			c.emit(OpSetInstanceVar, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
+			return nil
+		}
+
 		sym, ok := c.symbolTable.Resolve(node.Name.Value)
 		if !ok {
 			c.symbolTable.Define(node.Name.Value)
@@ -654,14 +678,36 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		c.EnterScope()
-		c.Emit(OpPop)
 
 		if err := c.Compile(node.Body); err != nil {
 			return err
 		}
 
-		c.Emit(OpReturn)
-		c.LeaveScope()
+		c.Emit(OpReturnValue)
+
+		instructions := c.LeaveScope()
+
+		bodyFn := &object.EmeraldValue{
+			Type: object.ValueFunction,
+			Data: &object.Function{
+				Name:         node.Name.Value + "#body",
+				Instructions: instructions,
+				NumLocals:    0,
+			},
+			Class: core.R.Classes["Class"],
+		}
+		fnIdx := c.addConstant(bodyFn)
+		c.emit(OpClosure, fnIdx, 0)
+		c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "__exec_class_body__",
+			Class: core.R.Classes["String"],
+		}), 1, 0)
+		c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 		c.Emit(OpPop)
 	case *ast.ModuleExpression:
 		c.emit(OpModule, c.addConstant(&object.EmeraldValue{
@@ -940,4 +986,103 @@ func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue
 	default:
 		return core.R.NilVal
 	}
+}
+
+func (c *Compiler) compileStringInterpolation(s string) error {
+	parts := splitStringInterpolation(s)
+	if len(parts) == 0 {
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "",
+			Class: core.R.Classes["String"],
+		})
+		return nil
+	}
+
+	first := true
+	for _, part := range parts {
+		if part.isExpr {
+			l := lexer.New(part.text)
+			p := parser.New(l)
+			prog := p.ParseProgram()
+			if len(p.Errors()) > 0 {
+				c.EmitConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  "#{" + part.text + "}",
+					Class: core.R.Classes["String"],
+				})
+			} else if len(prog.Statements) > 0 {
+				stmt := prog.Statements[0]
+				if exprStmt, ok := stmt.(*ast.ExpressionStatement); ok {
+					if err := c.Compile(exprStmt.Expression); err != nil {
+						return err
+					}
+				} else {
+					if err := c.Compile(stmt); err != nil {
+						return err
+					}
+				}
+				methodIdx := c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  "to_s",
+					Class: core.R.Classes["String"],
+				})
+				c.emit(OpSend, methodIdx, 0, 0)
+			} else {
+				c.EmitConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  "",
+					Class: core.R.Classes["String"],
+				})
+			}
+		} else {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  part.text,
+				Class: core.R.Classes["String"],
+			})
+		}
+		if !first {
+			c.Emit(OpAdd)
+		}
+		first = false
+	}
+	return nil
+}
+
+type interpPart struct {
+	text   string
+	isExpr bool
+}
+
+func splitStringInterpolation(s string) []interpPart {
+	var parts []interpPart
+	i := 0
+	start := 0
+	for i < len(s) {
+		if i+1 < len(s) && s[i] == '#' && s[i+1] == '{' {
+			if i > start {
+				parts = append(parts, interpPart{text: s[start:i], isExpr: false})
+			}
+			depth := 1
+			j := i + 2
+			for j < len(s) && depth > 0 {
+				if s[j] == '{' {
+					depth++
+				} else if s[j] == '}' {
+					depth--
+				}
+				j++
+			}
+			parts = append(parts, interpPart{text: s[i+2 : j-1], isExpr: true})
+			start = j
+			i = j
+		} else {
+			i++
+		}
+	}
+	if start < len(s) {
+		parts = append(parts, interpPart{text: s[start:], isExpr: false})
+	}
+	return parts
 }

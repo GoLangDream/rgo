@@ -961,16 +961,22 @@ func (p *Parser) parseYieldExpression() ast.Expression {
 		Token: p.curToken,
 	}
 
-	p.nextToken()
+	if p.peekTokenIs(lexer.NEWLINE) || p.peekTokenIs(lexer.SEMICOLON) || p.peekTokenIs(lexer.EOF) || p.peekTokenIs(lexer.END) {
+		return exp
+	}
 
-	for !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.END) && !p.curTokenIs(lexer.EOF) {
-		arg := p.parseExpression(LOWEST)
+	p.nextToken()
+	arg := p.parseExpression(LOWEST)
+	if arg != nil {
+		exp.Args = append(exp.Args, arg)
+	}
+
+	for p.peekTokenIs(lexer.COMMA) {
+		p.nextToken()
+		p.nextToken()
+		arg = p.parseExpression(LOWEST)
 		if arg != nil {
 			exp.Args = append(exp.Args, arg)
-		}
-
-		if p.curTokenIs(lexer.COMMA) {
-			p.nextToken()
 		}
 	}
 

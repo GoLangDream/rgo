@@ -38,8 +38,9 @@ type Frame struct {
 }
 
 type VM struct {
-	constants []*object.EmeraldValue
-	globals   []*object.EmeraldValue
+	constants  []*object.EmeraldValue
+	globals    []*object.EmeraldValue
+	rubyConsts map[string]*object.EmeraldValue
 
 	stack []*object.EmeraldValue
 	sp    int
@@ -52,6 +53,7 @@ type VM struct {
 	poppedValues []*object.EmeraldValue
 
 	currentBlock *object.EmeraldValue
+	classStack   []*object.EmeraldValue
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
@@ -72,6 +74,7 @@ func New(bytecode *compiler.Bytecode) *VM {
 	vm := &VM{
 		constants:    bytecode.Constants,
 		globals:      make([]*object.EmeraldValue, 100),
+		rubyConsts:   make(map[string]*object.EmeraldValue),
 		stack:        make([]*object.EmeraldValue, StackSize),
 		sp:           0,
 		frames:       []*Frame{mainFrame},
@@ -82,6 +85,9 @@ func New(bytecode *compiler.Bytecode) *VM {
 	vm.stack[0] = core.R.Main
 	CurrentVM = vm
 	core.CallBlock = CallBlock
+	core.CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return vm.send(receiver, method, args)
+	}
 
 	return vm
 }
@@ -363,6 +369,32 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		idx := vm.readUint16()
 		vm.globals[idx] = vm.peek(0)
 
+	case compiler.OpGetConstant:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		if val, ok := vm.rubyConsts[name]; ok {
+			vm.push(val)
+		} else if cls, ok := core.R.Classes[name]; ok {
+			vm.push(&object.EmeraldValue{
+				Type:  object.ValueClass,
+				Data:  cls,
+				Class: core.R.Classes["Class"],
+			})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpSetConstant:
+		nameIdx := vm.readUint16()
+		name := vm.constants[nameIdx].Data.(string)
+		vm.rubyConsts[name] = vm.peek(0)
+		if len(vm.classStack) > 0 {
+			top := vm.classStack[len(vm.classStack)-1]
+			if top.Type == object.ValueClass && top.Data.(*object.Class).Name == name {
+				vm.classStack = vm.classStack[:len(vm.classStack)-1]
+			}
+		}
+
 	case compiler.OpGetLocal:
 		idx := vm.readUint8()
 		basePtr := frame.Bp
@@ -475,6 +507,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpBreak:
 		return fmt.Errorf("unexpected break")
 
+	case compiler.OpYield:
+		result := vm.callBlock(vm.currentBlock)
+		vm.push(result)
+
+	case compiler.OpYieldWithValue:
+		numArgs := int(vm.readUint8())
+		args := make([]*object.EmeraldValue, numArgs)
+		for i := numArgs - 1; i >= 0; i-- {
+			args[i] = vm.pop()
+		}
+		result := vm.callBlock(vm.currentBlock, args...)
+		vm.push(result)
+
 	case compiler.OpDefineMethod:
 		nameIdx := vm.readUint16()
 		name := vm.constants[nameIdx].Data.(string)
@@ -490,8 +535,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Fn:   closure.Fn,
 		}
 
-		mainObj := core.R.Main.Data.(*object.Object)
-		mainObj.Class.DefineMethod(name, method)
+		if len(vm.classStack) > 0 {
+			classVal := vm.classStack[len(vm.classStack)-1]
+			cls := classVal.Data.(*object.Class)
+			cls.DefineMethod(name, method)
+		} else {
+			mainObj := core.R.Main.Data.(*object.Object)
+			mainObj.Class.DefineMethod(name, method)
+		}
 
 		vm.push(closureVal)
 
@@ -519,14 +570,22 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		nameIdx := vm.readUint16()
 		name := vm.constants[nameIdx].Data.(string)
 
-		class := object.NewClass(name)
-		class.SuperClass = core.R.Classes["Object"]
+		var class *object.Class
+		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueClass {
+			class = existing.Data.(*object.Class)
+		} else {
+			class = object.NewClass(name)
+			class.SuperClass = core.R.Classes["Object"]
+		}
 
-		vm.push(&object.EmeraldValue{
+		classVal := &object.EmeraldValue{
 			Type:  object.ValueClass,
 			Data:  class,
 			Class: core.R.Classes["Class"],
-		})
+		}
+		vm.rubyConsts[name] = classVal
+		vm.classStack = append(vm.classStack, classVal)
+		vm.push(classVal)
 
 	case compiler.OpModule:
 		nameIdx := vm.readUint16()
@@ -1057,7 +1116,27 @@ func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.Emera
 }
 
 func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
-	methodObj, ok := receiver.Class.GetMethod(method)
+	if method == "__exec_class_body__" && receiver.Type == object.ValueClass && vm.currentBlock != nil {
+		block := vm.currentBlock
+		vm.currentBlock = nil
+		return vm.callBlock(block, receiver)
+	}
+
+	var methodObj *object.Method
+	var ok bool
+
+	if receiver.Type == object.ValueClass {
+		cls := receiver.Data.(*object.Class)
+		if m, found := cls.ClassMethods[method]; found {
+			methodObj = m
+			ok = true
+		}
+	}
+
+	if !ok {
+		methodObj, ok = receiver.Class.GetMethod(method)
+	}
+
 	if !ok {
 		return core.R.NilVal
 	}

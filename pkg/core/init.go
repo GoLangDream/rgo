@@ -11,6 +11,24 @@ type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 
 var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
 
+var CallMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
+
+func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	cls, ok := receiver.Data.(*object.Class)
+	if !ok {
+		return R.NilVal
+	}
+	obj := &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  object.NewObject(cls),
+		Class: cls,
+	}
+	if CallMethod != nil {
+		CallMethod(obj, "initialize", args...)
+	}
+	return obj
+}
+
 func isTruthy(val *object.EmeraldValue) bool {
 	if val == nil || val == R.NilVal || val == R.FalseVal {
 		return false
@@ -386,6 +404,7 @@ func (rt *Runtime) defineMethods() {
 	classClass.DefineMethod("include", &object.Method{Name: "include", Fn: classInclude, Arity: -1})
 	classClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: classExtend, Arity: -1})
 	classClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: classPrepend, Arity: -1})
+	classClass.DefineMethod("new", &object.Method{Name: "new", Fn: classNew, Arity: -1})
 
 	R.Main = &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -1667,7 +1686,9 @@ func stringToSym(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for _, elem := range arr {
-		fmt.Println(elem.Inspect())
+		if CallBlock != nil {
+			CallBlock(elem)
+		}
 	}
 	return receiver
 }

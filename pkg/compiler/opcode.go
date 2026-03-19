@@ -256,7 +256,7 @@ var definitions = map[Opcode]Definition{
 	OpNeg:    {"OpNeg", []int{}},
 
 	OpYield:          {"OpYield", []int{}},
-	OpYieldWithValue: {"OpYieldWithValue", []int{}},
+	OpYieldWithValue: {"OpYieldWithValue", []int{1}},
 
 	OpRescue:      {"OpRescue", []int{2}},
 	OpRescueMatch: {"OpRescueMatch", []int{}},
