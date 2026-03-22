@@ -530,6 +530,44 @@ func (c *Compiler) Compile(node interface{}) error {
 		case ScopeLocal:
 			c.emit(OpSetLocal, sym.Index)
 		}
+	case *ast.MultiAssignExpression:
+		for _, val := range node.Values {
+			if err := c.Compile(val); err != nil {
+				return err
+			}
+		}
+		for i := len(node.Names) - 1; i >= 0; i-- {
+			name := node.Names[i]
+			if len(name.Value) > 0 && name.Value[0] == '$' {
+				sym, _ := c.symbolTable.Resolve(name.Value)
+				c.symbolTable.DefineGlobal(name.Value)
+				c.emit(OpSetGlobal, sym.Index)
+			} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
+				c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  name.Value,
+					Class: core.R.Classes["String"],
+				}))
+			} else if len(name.Value) > 0 && name.Value[0] == '@' {
+				c.emit(OpSetInstanceVar, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  name.Value,
+					Class: core.R.Classes["String"],
+				}))
+			} else {
+				if _, ok := c.symbolTable.Resolve(name.Value); !ok {
+					c.symbolTable.Define(name.Value)
+				}
+				sym, _ := c.symbolTable.Resolve(name.Value)
+				switch sym.Scope {
+				case ScopeGlobal:
+					c.emit(OpSetGlobal, sym.Index)
+				case ScopeLocal:
+					c.emit(OpSetLocal, sym.Index)
+				}
+			}
+			c.Emit(OpPop)
+		}
 	case *ast.MethodCall:
 		if node.Receiver != nil {
 			if err := c.Compile(node.Receiver); err != nil {
@@ -842,6 +880,45 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.SelfExpression:
 		c.Emit(OpSelf)
+	case *ast.RaiseExpression:
+		if node.Error != nil {
+			if err := c.Compile(node.Error); err != nil {
+				return err
+			}
+		} else {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "RuntimeError",
+				Class: core.R.Classes["String"],
+			})
+		}
+		c.Emit(OpRaise)
+	case *ast.ThrowExpression:
+		if node.Label != nil {
+			if err := c.Compile(node.Label); err != nil {
+				return err
+			}
+		} else {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "RuntimeError",
+				Class: core.R.Classes["String"],
+			})
+		}
+		if node.Value != nil {
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+		}
+		c.Emit(OpThrow)
+	case *ast.CatchExpression:
+		if err := c.compileCatchExpression(node); err != nil {
+			return err
+		}
+	case *ast.BeginExpression:
+		if err := c.compileBeginExpression(node); err != nil {
+			return err
+		}
 	case *ast.SplatExpression:
 		if err := c.Compile(node.Value); err != nil {
 			return err
@@ -883,6 +960,89 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 		c.scopes[c.scopeIndex].instructions = c.scopes[c.scopeIndex].instructions[:last.Position]
 		c.scopes[c.scopeIndex].lastInstruction = c.scopes[c.scopeIndex].previousInstruction
 	}
+	return nil
+}
+
+func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
+	hasRescue := len(node.Rescue) > 0
+	hasElse := node.Else != nil
+	hasEnsure := node.Ensure != nil
+
+	if !hasRescue && !hasElse && !hasEnsure {
+		return c.compileBlockAsValue(node.Body)
+	}
+
+	c.emit(OpBeginRescue, 0, 0, 0)
+
+	if err := c.compileBlockAsValue(node.Body); err != nil {
+		return err
+	}
+
+	jumpToEnd := c.emit(OpJump, 0)
+
+	rescueOffsets := make([]int, len(node.Rescue))
+	for i, rescue := range node.Rescue {
+		rescueOffsets[i] = len(c.currentInstructions())
+
+		for _, exc := range rescue.Exceptions {
+			if err := c.Compile(exc); err != nil {
+				return err
+			}
+		}
+		c.Emit(OpRescue)
+
+		if err := c.compileBlockAsValue(rescue.Body); err != nil {
+			return err
+		}
+
+		if i < len(node.Rescue)-1 {
+			c.emit(OpJump, 0)
+		}
+	}
+
+	ensureStart := len(c.currentInstructions())
+	if hasEnsure {
+		c.emit(OpEnsure, 0)
+		if err := c.compileBlockAsValue(node.Ensure); err != nil {
+			return err
+		}
+	}
+
+	if hasElse {
+		if err := c.compileBlockAsValue(node.Else); err != nil {
+			return err
+		}
+	}
+
+	endStart := len(c.currentInstructions())
+
+	if len(node.Rescue) > 0 {
+		c.changeOperand(rescueOffsets[len(rescueOffsets)-1], ensureStart)
+	}
+
+	c.changeOperand(jumpToEnd, endStart)
+
+	return nil
+}
+
+func (c *Compiler) compileCatchExpression(node *ast.CatchExpression) error {
+	if node.Label != nil {
+		if err := c.Compile(node.Label); err != nil {
+			return err
+		}
+	}
+
+	c.emit(OpCatch, 0)
+	afterBody := len(c.currentInstructions())
+	c.changeOperand(afterBody-3, afterBody)
+
+	if err := c.compileBlockAsValue(node.Body); err != nil {
+		return err
+	}
+
+	endPos := len(c.currentInstructions())
+	c.changeOperand(afterBody-3, endPos)
+
 	return nil
 }
 

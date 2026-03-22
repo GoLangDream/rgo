@@ -186,6 +186,8 @@ func (v *EmeraldValue) Equals(other *EmeraldValue) bool {
 		return v.Data.(float64) == other.Data.(float64)
 	case ValueString:
 		return v.Data.(string) == other.Data.(string)
+	case ValueClass:
+		return v.Data == other.Data
 	default:
 		return v == other
 	}
@@ -265,4 +267,9 @@ type RRange struct {
 	Start     int64
 	End       int64
 	Exclusive bool
+}
+
+type RException struct {
+	Message   string
+	Backtrace []string
 }

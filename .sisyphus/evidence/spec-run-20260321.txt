@@ -1,0 +1,68 @@
+Ruby Spec Baseline Results - 2026年 03月 21日 星期六 20:55:13 HKT
+======================================
+
+Testing array...
+  PASS: allocate_spec.rb
+  FAIL: all_spec.rb - Compile Error: unknown node type: *ast.RegexpLiteral
+  FAIL: any_spec.rb - Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for . found Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for } found
+  PASS: append_spec.rb
+  PASS: array_spec.rb
+  PASS: assoc_spec.rb
+  PASS: at_spec.rb
+  FAIL: bsearch_index_spec.rb - Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for . found
+  PASS: bsearch_spec.rb
+  PASS: clear_spec.rb
+
+array: 7 passed, 3 failed, 0 timeouts out of 10
+Testing string...
+  PASS: allocate_spec.rb
+  FAIL: append_as_bytes_spec.rb - Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found
+  PASS: append_spec.rb
+  FAIL: ascii_only_spec.rb - Parse Error: no prefix parse function for ] found Parse Error: expected next token to be ], got . instead Parse Error: no prefix parse function for ] found Parse Error: expected next token to be ], got . instead Parse Error: no prefix parse function for ] found
+  PASS: b_spec.rb
+  FAIL: byteindex_spec.rb - Parse Error: no prefix parse function for NEWLINE found Parse Error: no prefix parse function for NEWLINE found
+  FAIL: byterindex_spec.rb - Parse Error: expected next token to be ), got true instead Parse Error: no prefix parse function for / found Parse Error: no prefix parse function for NEWLINE found Parse Error: expected next token to be ), got true instead Parse Error: no prefix parse function for NEWLINE found
+  PASS: bytesize_spec.rb
+  PASS: byteslice_spec.rb
+  FAIL: bytesplice_spec.rb - Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found Parse Error: expected next token to be ), got , instead
+
+string: 5 passed, 5 failed, 0 timeouts out of 10
+Testing hash...
+  FAIL: allocate_spec.rb - Parse Error: invalid assignment target
+  FAIL: any_spec.rb - Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for , found Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for . found Parse Error: no prefix parse function for } found
+  FAIL: assoc_spec.rb - Parse Error: invalid assignment target Parse Error: invalid assignment target Parse Error: invalid assignment target Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for , found
+  FAIL: clear_spec.rb - Parse Error: invalid assignment target
+  PASS: clone_spec.rb
+  FAIL: compact_spec.rb - Parse Error: expected next token to be }, got : instead Parse Error: no prefix parse function for , found Parse Error: no prefix parse function for , found Parse Error: no prefix parse function for } found Parse Error: expected next token to be }, got : instead
+  PASS: compare_by_identity_spec.rb
+  PASS: constructor_spec.rb
+  FAIL: deconstruct_keys_spec.rb - Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found
+  PASS: default_proc_spec.rb
+
+hash: 4 passed, 6 failed, 0 timeouts out of 10
+Testing integer...
+  PASS: abs_spec.rb
+  PASS: allbits_spec.rb
+  PASS: anybits_spec.rb
+  FAIL: bit_and_spec.rb - Parse Error: could not parse "18446744073709551616" as integer Parse Error: could not parse "18446744073709551617" as integer Parse Error: could not parse "36893488147419103232" as integer Parse Error: could not parse "18446744073709551617" as integer Parse Error: could not parse "0x8000000000000000" as integer
+  PASS: bit_length_spec.rb
+  FAIL: bit_or_spec.rb - Parse Error: could not parse "0x1000000000000ffff" as integer Parse Error: could not parse "18446744073709551627" as integer Parse Error: could not parse "18446744073709551627" as integer Parse Error: could not parse "18446744073709551627" as integer Parse Error: could not parse "0x40000000000000000" as integer
+  FAIL: bit_xor_spec.rb - Parse Error: could not parse "0x100000000fffffffa" as integer Parse Error: could not parse "18446744073709551617" as integer Parse Error: could not parse "18446744073709551632" as integer Parse Error: could not parse "18446744073709551644" as integer Parse Error: could not parse "0x40000000000000000" as integer
+  FAIL: case_compare_spec.rb - Parse Error: no prefix parse function for : found Parse Error: no prefix parse function for NEWLINE found
+  FAIL: ceildiv_spec.rb - Parse Error: expected next token to be ), got REGEXP instead
+  PASS: ceil_spec.rb
+
+integer: 5 passed, 5 failed, 0 timeouts out of 10
+Testing float...
+  PASS: abs_spec.rb
+  PASS: angle_spec.rb
+  PASS: arg_spec.rb
+  FAIL: case_compare_spec.rb - Parse Error: no prefix parse function for : found Parse Error: no prefix parse function for NEWLINE found
+  FAIL: ceil_spec.rb - Parse Error: could not parse "9223372036854775808" as integer Parse Error: could not parse "9223372036854775808" as integer
+  FAIL: coerce_spec.rb - Parse Error: no prefix parse function for , found Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found
+  FAIL: comparison_spec.rb - Parse Error: no prefix parse function for = found Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found
+  PASS: constants_spec.rb
+  FAIL: denominator_spec.rb - Parse Error: no prefix parse function for ] found Parse Error: expected next token to be ], got . instead Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for } found Parse Error: no prefix parse function for . found
+  FAIL: divide_spec.rb - Parse Error: no prefix parse function for : found Parse Error: no prefix parse function for ) found Parse Error: no prefix parse function for . found Parse Error: expected next token to be ), got , instead Parse Error: no prefix parse function for ) found
+
+float: 4 passed, 6 failed, 0 timeouts out of 10

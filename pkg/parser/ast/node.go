@@ -618,6 +618,31 @@ func (a *AssignExpression) expressionNode()      {}
 func (a *AssignExpression) TokenLiteral() string { return a.Token.Literal }
 func (a *AssignExpression) String() string       { return a.Name.String() + " = " + a.Value.String() }
 
+type MultiAssignExpression struct {
+	Token  lexer.Token
+	Names  []*Identifier
+	Values []Expression
+}
+
+func (a *MultiAssignExpression) expressionNode() {}
+func (a *MultiAssignExpression) TokenLiteral() string {
+	return a.Token.Literal
+}
+func (a *MultiAssignExpression) String() string {
+	result := a.Names[0].String()
+	for i := 1; i < len(a.Names); i++ {
+		result += ", " + a.Names[i].String()
+	}
+	result += " = "
+	if len(a.Values) > 0 {
+		result += a.Values[0].String()
+		for i := 1; i < len(a.Values); i++ {
+			result += ", " + a.Values[i].String()
+		}
+	}
+	return result
+}
+
 type InstanceVarAssign struct {
 	Token lexer.Token
 	Name  string
@@ -753,6 +778,39 @@ func (r *RaiseExpression) String() string {
 		return "raise " + r.Error.String()
 	}
 	return "raise"
+}
+
+type CatchExpression struct {
+	Token lexer.Token
+	Label Expression
+	Body  *BlockExpression
+}
+
+func (c *CatchExpression) expressionNode()      {}
+func (c *CatchExpression) TokenLiteral() string { return c.Token.Literal }
+func (c *CatchExpression) String() string {
+	out := "catch"
+	if c.Label != nil {
+		out += " " + c.Label.String()
+	}
+	out += "\n" + c.Body.String() + "\nend"
+	return out
+}
+
+type ThrowExpression struct {
+	Token lexer.Token
+	Label Expression
+	Value Expression
+}
+
+func (t *ThrowExpression) statementNode()       {}
+func (t *ThrowExpression) expressionNode()      {}
+func (t *ThrowExpression) TokenLiteral() string { return t.Token.Literal }
+func (t *ThrowExpression) String() string {
+	if t.Value != nil {
+		return "throw " + t.Label.String() + ", " + t.Value.String()
+	}
+	return "throw " + t.Label.String()
 }
 
 type ExpressionStatement struct {

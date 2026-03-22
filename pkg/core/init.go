@@ -13,6 +13,8 @@ var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
 
 var CallMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
 
+var LastException *object.EmeraldValue
+
 func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	cls, ok := receiver.Data.(*object.Class)
 	if !ok {
@@ -111,6 +113,33 @@ func (rt *Runtime) createClasses() {
 	procClass := object.NewClass("Proc")
 	procClass.SuperClass = objectClass
 
+	exceptionClass := object.NewClass("Exception")
+	exceptionClass.SuperClass = objectClass
+	standardErrorClass := object.NewClass("StandardError")
+	standardErrorClass.SuperClass = exceptionClass
+	runtimeErrorClass := object.NewClass("RuntimeError")
+	runtimeErrorClass.SuperClass = standardErrorClass
+	argumentErrorClass := object.NewClass("ArgumentError")
+	argumentErrorClass.SuperClass = standardErrorClass
+	typeErrorClass := object.NewClass("TypeError")
+	typeErrorClass.SuperClass = standardErrorClass
+	nameErrorClass := object.NewClass("NameError")
+	nameErrorClass.SuperClass = standardErrorClass
+	noMethodErrorClass := object.NewClass("NoMethodError")
+	noMethodErrorClass.SuperClass = nameErrorClass
+	indexErrorClass := object.NewClass("IndexError")
+	indexErrorClass.SuperClass = standardErrorClass
+	keyErrorClass := object.NewClass("KeyError")
+	keyErrorClass.SuperClass = indexErrorClass
+	rangeErrorClass := object.NewClass("RangeError")
+	rangeErrorClass.SuperClass = standardErrorClass
+	zeroDivisionErrorClass := object.NewClass("ZeroDivisionError")
+	zeroDivisionErrorClass.SuperClass = standardErrorClass
+	syntaxErrorClass := object.NewClass("SyntaxError")
+	syntaxErrorClass.SuperClass = exceptionClass
+	loadErrorClass := object.NewClass("LoadError")
+	loadErrorClass.SuperClass = standardErrorClass
+
 	R.TrueVal.Class = trueClass
 	R.FalseVal.Class = falseClass
 	R.NilVal.Class = nilClass
@@ -131,6 +160,19 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Regexp"] = regexpClass
 	R.Classes["Range"] = rangeClass
 	R.Classes["Proc"] = procClass
+	R.Classes["Exception"] = exceptionClass
+	R.Classes["StandardError"] = standardErrorClass
+	R.Classes["RuntimeError"] = runtimeErrorClass
+	R.Classes["ArgumentError"] = argumentErrorClass
+	R.Classes["TypeError"] = typeErrorClass
+	R.Classes["NameError"] = nameErrorClass
+	R.Classes["NoMethodError"] = noMethodErrorClass
+	R.Classes["IndexError"] = indexErrorClass
+	R.Classes["KeyError"] = keyErrorClass
+	R.Classes["RangeError"] = rangeErrorClass
+	R.Classes["ZeroDivisionError"] = zeroDivisionErrorClass
+	R.Classes["SyntaxError"] = syntaxErrorClass
+	R.Classes["LoadError"] = loadErrorClass
 }
 
 func (rt *Runtime) defineMethods() {
@@ -375,6 +417,12 @@ func (rt *Runtime) defineMethods() {
 	procClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: procCall, Arity: -1})
 	procClass.DefineMethod("arity", &object.Method{Name: "arity", Fn: procArity, Arity: 0})
 	procClass.DefineMethod("lambda?", &object.Method{Name: "lambda?", Fn: procIsLambda, Arity: 0})
+
+	exceptionClass := R.Classes["Exception"]
+	exceptionClass.DefineMethod("message", &object.Method{Name: "message", Fn: exceptionMessage, Arity: 0})
+	exceptionClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: exceptionToS, Arity: 0})
+	exceptionClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: exceptionInspect, Arity: 0})
+	exceptionClass.DefineMethod("backtrace", &object.Method{Name: "backtrace", Fn: exceptionBacktrace, Arity: 0})
 
 	objectClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: builtinPuts, Arity: -1})
 	objectClass.DefineMethod("print", &object.Method{Name: "print", Fn: builtinPrint, Arity: -1})
@@ -2878,7 +2926,34 @@ func builtinSrand(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func builtinRaise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return R.NilVal
+	var message string
+	var excClass *object.Class
+
+	if len(args) == 0 {
+		if LastException != nil {
+			return LastException
+		}
+		message = "RuntimeError"
+		excClass = R.Classes["RuntimeError"]
+	} else if len(args) == 1 {
+		message = args[0].Inspect()
+		excClass = R.Classes["RuntimeError"]
+	} else {
+		if args[0].Type == object.ValueClass {
+			excClass = args[0].Data.(*object.Class)
+		} else {
+			excClass = R.Classes["RuntimeError"]
+		}
+		message = args[1].Inspect()
+	}
+
+	exc := &object.EmeraldValue{
+		Type:  object.ValueException,
+		Data:  &object.RException{Message: message},
+		Class: excClass,
+	}
+	LastException = exc
+	return exc
 }
 
 func builtinAbort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3948,6 +4023,62 @@ func RegisterMspec() {
 			return R.NilVal
 		},
 	})
+}
+
+func exceptionMessage(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  exc.Message,
+		Class: R.Classes["String"],
+	}
+}
+
+func exceptionToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  exc.Message,
+		Class: R.Classes["String"],
+	}
+}
+
+func exceptionInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  fmt.Sprintf("#<%s: %s>", receiver.Class.Name, exc.Message),
+		Class: R.Classes["String"],
+	}
+}
+
+func exceptionBacktrace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	result := make([]*object.EmeraldValue, len(exc.Backtrace))
+	for i, bt := range exc.Backtrace {
+		result[i] = &object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  bt,
+			Class: R.Classes["String"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
 }
 
 // Proc methods

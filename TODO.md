@@ -223,7 +223,7 @@ RGo 当前状态：
 - [ ] 对象: `send`, `__send__`, `public_send`, `method`, `methods`, `instance_variables`
 - [ ] 类型: `kind_of?`, `instance_of?`, `is_a?`, `respond_to?`, `respond_to_missing?`
 - [ ] 转换: `Array()`, `Hash()`, `String()`, `Integer()`, `Float()`, `Rational()`, `Complex()`
-- [ ] 控制: `loop`, `catch`, `throw`, `raise`, `fail`, `exit`, `abort`, `at_exit`
+- [x] 控制: `loop`, `catch`, `throw`, `fail`, `exit`, `abort`, `at_exit` (raise/catch/throw 已实现)
 - [ ] 求值: `eval`, `instance_eval`, `class_eval`, `module_eval`, `binding`
 - [ ] 加载: `require`, `require_relative`, `load`, `autoload`, `autoload?`
 - [ ] 其他: `sleep`, `rand`, `srand`, `caller`, `caller_locations`, `warn`, `set_trace_func`
@@ -251,12 +251,15 @@ RGo 当前状态：
   - 方法: `eval`, `local_variables`, `local_variable_get`, `local_variable_set`, `local_variable_defined?`, `receiver`, `source_location`
 
 #### P2 - 异常系统（59 个 spec 文件）
-- [ ] **Exception** 基类及子类
-  - `StandardError`, `RuntimeError`, `ArgumentError`, `TypeError`, `NameError`, `NoMethodError`
-  - `IndexError`, `KeyError`, `RangeError`, `ZeroDivisionError`, `FloatDomainError`
-  - `IOError`, `EOFError`, `SystemCallError`, `Errno::*`
-  - `SystemExit`, `SystemStackError`, `ScriptError`, `SyntaxError`, `LoadError`
-  - 方法: `message`, `backtrace`, `backtrace_locations`, `cause`, `full_message`, `exception`, `to_s`, `inspect`, `set_backtrace`
+- [x] **Exception** 基类及子类 - 已实现 (2026-03-22)
+  - `Exception`, `StandardError`, `RuntimeError`, `ArgumentError`, `TypeError`, `NameError`, `NoMethodError`
+  - `IndexError`, `KeyError`, `RangeError`, `ZeroDivisionError`, `SyntaxError`, `LoadError`
+  - 方法: `message`, `backtrace`, `to_s`, `inspect`
+- [x] begin/rescue/ensure 语法支持 - Parser/Compiler/VM 已实现基础支持 (2026-03-22)
+- [ ] `backtrace_locations`, `cause`, `full_message`, `exception`, `set_backtrace` 方法未实现
+- [ ] `IOError`, `EOFError`, `SystemCallError`, `Errno::*`, `SystemExit`, `SystemStackError` 等未实现
+- [ ] rescue 修饰符 `foo rescue nil` 未实现
+- [ ] 多重 rescue `rescue Error1, Error2` 未实现
 
 #### P2 - 数值类型
 - [ ] **Numeric** - 数值基类

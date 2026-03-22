@@ -142,6 +142,7 @@ func New(l *lexer.Lexer) *Parser {
 	p.registerPrefix(lexer.EXTEND, p.parseExtendExpression)
 	p.registerPrefix(lexer.PREPEND, p.parsePrependExpression)
 	p.registerPrefix(lexer.CONSTANT, p.parseConstant)
+	p.registerPrefix(lexer.CATCH, p.parseCatchExpression)
 
 	p.registerPrefix(lexer.DO, p.parseIdentifier)
 	p.registerPrefix(lexer.END, p.parseIdentifier)
@@ -261,6 +262,8 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parseNextStatement()
 	case lexer.RAISE:
 		return p.parseRaiseStatement()
+	case lexer.THROW:
+		return p.parseThrowStatement()
 	default:
 		return p.parseExpressionStatement()
 	}
@@ -271,18 +274,89 @@ func (p *Parser) parseExpressionStatement() *ast.ExpressionStatement {
 		Token: p.curToken,
 	}
 
-	// Don't parse expression if we're at a separator
 	if p.curTokenIs(lexer.SEMICOLON) || p.curTokenIs(lexer.NEWLINE) {
 		return stmt
 	}
 
-	stmt.Expression = p.parseExpression(LOWEST)
+	expr := p.parseExpression(LOWEST)
+
+	if ident, ok := expr.(*ast.Identifier); ok && p.peekTokenIs(lexer.COMMA) {
+		if multiAssign := p.tryParseMultiAssign(ident); multiAssign != nil {
+			stmt.Expression = multiAssign
+			return stmt
+		}
+	}
+
+	stmt.Expression = expr
 
 	if p.peekTokenIs(lexer.NEWLINE) || p.peekTokenIs(lexer.SEMICOLON) {
 		p.nextToken()
 	}
 
 	return stmt
+}
+
+func (p *Parser) tryParseMultiAssign(firstName *ast.Identifier) *ast.MultiAssignExpression {
+	names := []*ast.Identifier{firstName}
+
+	for p.peekTokenIs(lexer.COMMA) {
+		p.nextToken()
+		p.nextToken()
+
+		if p.curTokenIs(lexer.IDENT) {
+			names = append(names, &ast.Identifier{
+				Token: p.curToken,
+				Value: p.curToken.Literal,
+			})
+		} else if p.curTokenIs(lexer.AT) {
+			names = append(names, &ast.Identifier{
+				Token: p.curToken,
+				Value: p.curToken.Literal,
+			})
+		} else if p.curTokenIs(lexer.AT2) {
+			names = append(names, &ast.Identifier{
+				Token: p.curToken,
+				Value: p.curToken.Literal,
+			})
+		} else if p.curTokenIs(lexer.DOLLAR) {
+			names = append(names, &ast.Identifier{
+				Token: p.curToken,
+				Value: p.curToken.Literal,
+			})
+		} else {
+			return nil
+		}
+	}
+
+	if !p.peekTokenIs(lexer.ASSIGN) {
+		return nil
+	}
+
+	p.nextToken()
+	p.nextToken()
+
+	values := []ast.Expression{}
+	if !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.EOF) {
+		val := p.parseExpression(LOWEST)
+		if val != nil {
+			values = append(values, val)
+		}
+
+		for p.peekTokenIs(lexer.COMMA) {
+			p.nextToken()
+			p.nextToken()
+			val := p.parseExpression(LOWEST)
+			if val != nil {
+				values = append(values, val)
+			}
+		}
+	}
+
+	return &ast.MultiAssignExpression{
+		Token:  firstName.Token,
+		Names:  names,
+		Values: values,
+	}
 }
 
 func (p *Parser) parseReturnStatement() *ast.ReturnExpression {
@@ -345,6 +419,68 @@ func (p *Parser) parseRaiseStatement() *ast.RaiseExpression {
 	}
 
 	return stmt
+}
+
+func (p *Parser) parseThrowStatement() *ast.ThrowExpression {
+	stmt := &ast.ThrowExpression{
+		Token: p.curToken,
+	}
+
+	p.nextToken()
+
+	if !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.SEMICOLON) && !p.curTokenIs(lexer.END) {
+		stmt.Label = p.parseExpression(LOWEST)
+		if p.curTokenIs(lexer.COMMA) {
+			p.nextToken()
+			stmt.Value = p.parseExpression(LOWEST)
+		}
+	}
+
+	return stmt
+}
+
+func (p *Parser) parseCatchExpression() ast.Expression {
+	exp := &ast.CatchExpression{
+		Token: p.curToken,
+	}
+
+	p.nextToken()
+
+	if !p.curTokenIs(lexer.DO) && !p.curTokenIs(lexer.LBRACE) && !p.curTokenIs(lexer.NEWLINE) {
+		exp.Label = p.parseExpression(LOWEST)
+	}
+
+	if p.curTokenIs(lexer.DO) {
+		p.nextToken()
+		exp.Body = &ast.BlockExpression{Token: p.curToken}
+	} else if p.curTokenIs(lexer.LBRACE) {
+		p.nextToken()
+		exp.Body = &ast.BlockExpression{Token: p.curToken}
+	} else {
+		if p.peekTokenIs(lexer.DO) || p.peekTokenIs(lexer.LBRACE) {
+			p.nextToken()
+			if p.curTokenIs(lexer.DO) || p.curTokenIs(lexer.LBRACE) {
+				p.nextToken()
+			}
+			exp.Body = &ast.BlockExpression{Token: p.curToken}
+		} else {
+			exp.Body = &ast.BlockExpression{Token: p.curToken}
+		}
+	}
+
+	for !p.curTokenIs(lexer.END) && !p.curTokenIs(lexer.EOF) {
+		stmt := p.parseStatement()
+		if stmt != nil {
+			exp.Body.Statements = append(exp.Body.Statements, stmt)
+		}
+		p.skipNewlines()
+	}
+
+	if !p.expectPeek(lexer.END) {
+		return nil
+	}
+
+	return exp
 }
 
 func (p *Parser) parseExpression(prec int) ast.Expression {
@@ -761,7 +897,7 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 		Receiver: left,
 	}
 
-	if p.peekTokenIs(lexer.IDENT) {
+	if p.peekTokenIs(lexer.IDENT) || p.peekTokenIs(lexer.CLASS) {
 		p.nextToken()
 		call.Method = &ast.Identifier{
 			Token: p.curToken,
@@ -1037,11 +1173,11 @@ func (p *Parser) parseIfExpression() ast.Expression {
 
 	exp.Condition = p.parseExpression(LOWEST)
 
-	// Accept "then", newline, or "{" after condition
+	// Accept "then", newline, semicolon, or "{" after condition
 	if p.peekTokenIs(lexer.THEN) {
 		p.nextToken() // consume "then"
-	} else if !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.LBRACE) {
-		p.parseError("expected then, newline, or { after if condition, got %s", p.peekToken.Type)
+	} else if !p.peekTokenIs(lexer.NEWLINE) && !p.peekTokenIs(lexer.SEMICOLON) && !p.peekTokenIs(lexer.LBRACE) {
+		p.parseError("expected then, newline, ;, or { after if condition, got %s", p.peekToken.Type)
 		return nil
 	}
 

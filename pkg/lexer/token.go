@@ -121,6 +121,8 @@ const (
 	RESCUE TokenType = "rescue"
 	ENSURE TokenType = "ensure"
 	RAISE  TokenType = "raise"
+	CATCH  TokenType = "catch"
+	THROW  TokenType = "throw"
 
 	SUPER TokenType = "super"
 	SELF  TokenType = "self"
@@ -183,6 +185,8 @@ var keywords = map[string]TokenType{
 	"rescue":    RESCUE,
 	"ensure":    ENSURE,
 	"raise":     RAISE,
+	"catch":     CATCH,
+	"throw":     THROW,
 	"super":     SUPER,
 	"self":      SELF,
 	"yield":     YIELD,

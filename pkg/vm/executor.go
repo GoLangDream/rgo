@@ -37,6 +37,19 @@ type Frame struct {
 	Closure *object.Closure
 }
 
+type RescueHandler struct {
+	RescueOffset int
+	EnsureOffset int
+	EndOffset    int
+	Frame        *Frame
+}
+
+type CatchHandler struct {
+	Label     *object.EmeraldValue
+	EndOffset int
+	Frame     *Frame
+}
+
 type VM struct {
 	constants  []*object.EmeraldValue
 	globals    []*object.EmeraldValue
@@ -54,6 +67,11 @@ type VM struct {
 
 	currentBlock *object.EmeraldValue
 	classStack   []*object.EmeraldValue
+
+	rescueStack  []*RescueHandler
+	ensureActive bool
+
+	catchStack []*CatchHandler
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
@@ -722,6 +740,95 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		vm.push(core.R.FalseVal)
+
+	case compiler.OpBeginRescue:
+		rescueOffset := vm.readUint16()
+		ensureOffset := vm.readUint16()
+		endOffset := vm.readUint16()
+
+		handler := &RescueHandler{
+			RescueOffset: rescueOffset,
+			EnsureOffset: ensureOffset,
+			EndOffset:    endOffset,
+			Frame:        frame,
+		}
+		vm.rescueStack = append(vm.rescueStack, handler)
+
+	case compiler.OpEnsure:
+		vm.ensureActive = true
+
+	case compiler.OpRaise:
+		var exception *object.EmeraldValue
+		if vm.sp > 0 {
+			exception = vm.pop()
+		}
+		if exception == nil || exception.Type != object.ValueException {
+			exception = &object.EmeraldValue{
+				Type:  object.ValueException,
+				Data:  &object.RException{Message: "RuntimeError"},
+				Class: core.R.Classes["RuntimeError"],
+			}
+		}
+		core.LastException = exception
+
+		if len(vm.rescueStack) > 0 {
+			handler := vm.rescueStack[len(vm.rescueStack)-1]
+			if handler.Frame == frame {
+				vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
+				if handler.EnsureOffset > 0 {
+					handler.Frame.Ip = handler.EnsureOffset - 1
+				} else {
+					handler.Frame.Ip = handler.EndOffset - 1
+				}
+				vm.ensureActive = false
+				return nil
+			}
+		}
+
+	case compiler.OpRescue:
+		if core.LastException == nil {
+			vm.push(core.R.FalseVal)
+			return nil
+		}
+		if len(vm.rescueStack) == 0 {
+			vm.push(core.R.FalseVal)
+			return nil
+		}
+
+	case compiler.OpCatch:
+		labelIdx := vm.readUint16()
+
+		label := vm.constants[labelIdx]
+		endOffset := vm.readUint16()
+
+		handler := &CatchHandler{
+			Label:     label,
+			EndOffset: endOffset,
+			Frame:     frame,
+		}
+		vm.catchStack = append(vm.catchStack, handler)
+
+	case compiler.OpThrow:
+		var label *object.EmeraldValue
+		if vm.sp > 0 {
+			label = vm.pop()
+		}
+		var value *object.EmeraldValue
+		if vm.sp > 0 {
+			value = vm.pop()
+		}
+
+		for i := len(vm.catchStack) - 1; i >= 0; i-- {
+			handler := vm.catchStack[i]
+			if handler.Label != nil && handler.Label.Equals(label) {
+				vm.catchStack = vm.catchStack[:i]
+				if value != nil {
+					vm.push(value)
+				}
+				handler.Frame.Ip = handler.EndOffset - 1
+				return nil
+			}
+		}
 
 	default:
 		return fmt.Errorf("unknown opcode: %v", op)
