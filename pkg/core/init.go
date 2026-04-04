@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/object"
@@ -12,6 +13,10 @@ type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
 
 var CallMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
+
+var CallBlockWithArgs func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
+
+var LastBlockResult *object.EmeraldValue
 
 var LastException *object.EmeraldValue
 
@@ -140,6 +145,11 @@ func (rt *Runtime) createClasses() {
 	loadErrorClass := object.NewClass("LoadError")
 	loadErrorClass.SuperClass = standardErrorClass
 
+	methodClass := object.NewClass("Method")
+	methodClass.SuperClass = objectClass
+	bindingClass := object.NewClass("Binding")
+	bindingClass.SuperClass = objectClass
+
 	R.TrueVal.Class = trueClass
 	R.FalseVal.Class = falseClass
 	R.NilVal.Class = nilClass
@@ -173,6 +183,8 @@ func (rt *Runtime) createClasses() {
 	R.Classes["ZeroDivisionError"] = zeroDivisionErrorClass
 	R.Classes["SyntaxError"] = syntaxErrorClass
 	R.Classes["LoadError"] = loadErrorClass
+	R.Classes["Method"] = methodClass
+	R.Classes["Binding"] = bindingClass
 }
 
 func (rt *Runtime) defineMethods() {
@@ -232,6 +244,16 @@ func (rt *Runtime) defineMethods() {
 	symbolClass.DefineMethod("to_sym", &object.Method{Name: "to_sym", Fn: symbolToSym, Arity: 0})
 	symbolClass.DefineMethod("length", &object.Method{Name: "length", Fn: symbolLength, Arity: 0})
 	symbolClass.DefineMethod("size", &object.Method{Name: "size", Fn: symbolLength, Arity: 0})
+	symbolClass.DefineMethod("empty?", &object.Method{Name: "empty?", Fn: symbolEmpty, Arity: 0})
+	symbolClass.DefineMethod("upcase", &object.Method{Name: "upcase", Fn: symbolUpcase, Arity: 0})
+	symbolClass.DefineMethod("downcase", &object.Method{Name: "downcase", Fn: symbolDowncase, Arity: 0})
+	symbolClass.DefineMethod("capitalize", &object.Method{Name: "capitalize", Fn: symbolCapitalize, Arity: 0})
+	symbolClass.DefineMethod("swapcase", &object.Method{Name: "swapcase", Fn: symbolSwapcase, Arity: 0})
+	symbolClass.DefineMethod("succ", &object.Method{Name: "succ", Fn: symbolSucc, Arity: 0})
+	symbolClass.DefineMethod("==", &object.Method{Name: "==", Fn: symbolEqual, Arity: 1})
+	symbolClass.DefineMethod("===", &object.Method{Name: "===", Fn: symbolCaseEqual, Arity: 1})
+	symbolClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: symbolIndex, Arity: 1})
+	symbolClass.DefineMethod("slice", &object.Method{Name: "slice", Fn: symbolSlice, Arity: 1})
 
 	floatClass := R.Classes["Float"]
 	floatClass.DefineMethod("+", &object.Method{Name: "+", Fn: floatAdd, Arity: 1})
@@ -253,9 +275,40 @@ func (rt *Runtime) defineMethods() {
 	rangeClass := R.Classes["Range"]
 	rangeClass.DefineMethod("each", &object.Method{Name: "each", Fn: rangeEach, Arity: 0})
 	rangeClass.DefineMethod("to_a", &object.Method{Name: "to_a", Fn: rangeToA, Arity: 0})
+	rangeClass.DefineMethod("begin", &object.Method{Name: "begin", Fn: rangeBegin, Arity: 0})
+	rangeClass.DefineMethod("end", &object.Method{Name: "end", Fn: rangeEnd, Arity: 0})
+	rangeClass.DefineMethod("first", &object.Method{Name: "first", Fn: rangeFirst, Arity: 0})
+	rangeClass.DefineMethod("last", &object.Method{Name: "last", Fn: rangeLast, Arity: 0})
+	rangeClass.DefineMethod("size", &object.Method{Name: "size", Fn: rangeSize, Arity: 0})
+	rangeClass.DefineMethod("exclude_end?", &object.Method{Name: "exclude_end?", Fn: rangeExcludeEnd, Arity: 0})
+	rangeClass.DefineMethod("cover?", &object.Method{Name: "cover?", Fn: rangeCover, Arity: 1})
+	rangeClass.DefineMethod("include?", &object.Method{Name: "include?", Fn: rangeInclude, Arity: 1})
+	rangeClass.DefineMethod("member?", &object.Method{Name: "member?", Fn: rangeInclude, Arity: 1})
+	rangeClass.DefineMethod("==", &object.Method{Name: "==", Fn: rangeEqual, Arity: 1})
+	rangeClass.DefineMethod("===", &object.Method{Name: "===", Fn: rangeCaseEqual, Arity: 1})
 
 	regexpClass := R.Classes["Regexp"]
 	regexpClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: regexpToS, Arity: 0})
+	regexpClass.DefineMethod("source", &object.Method{Name: "source", Fn: regexpSource, Arity: 0})
+	regexpClass.DefineMethod("=~", &object.Method{Name: "=~", Fn: regexpMatch, Arity: 1})
+	regexpClass.DefineMethod("==", &object.Method{Name: "==", Fn: regexpEqual, Arity: 1})
+	regexpClass.DefineMethod("===", &object.Method{Name: "===", Fn: regexpCaseEqual, Arity: 1})
+	regexpClass.DefineMethod("match", &object.Method{Name: "match", Fn: regexpMatch, Arity: 1})
+	regexpClass.DefineMethod("match?", &object.Method{Name: "match?", Fn: regexpMatchQ, Arity: 1})
+
+	methodClass := R.Classes["Method"]
+	methodClass.DefineMethod("call", &object.Method{Name: "call", Fn: methodCall, Arity: -1})
+	methodClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: methodCall, Arity: -1})
+	methodClass.DefineMethod("arity", &object.Method{Name: "arity", Fn: methodArity, Arity: 0})
+	methodClass.DefineMethod("owner", &object.Method{Name: "owner", Fn: methodOwner, Arity: 0})
+	methodClass.DefineMethod("receiver", &object.Method{Name: "receiver", Fn: methodReceiver, Arity: 0})
+	methodClass.DefineMethod("name", &object.Method{Name: "name", Fn: methodName, Arity: 0})
+	methodClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: methodMethodToS, Arity: 0})
+	methodClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: methodMethodInspect, Arity: 0})
+
+	bindingClass := R.Classes["Binding"]
+	bindingClass.DefineMethod("local_variables", &object.Method{Name: "local_variables", Fn: bindingLocalVariables, Arity: 0})
+	bindingClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: bindingEval, Arity: 1})
 
 	stringClass := R.Classes["String"]
 	stringClass.DefineMethod("+", &object.Method{Name: "+", Fn: stringAdd, Arity: 1})
@@ -417,6 +470,10 @@ func (rt *Runtime) defineMethods() {
 	procClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: procCall, Arity: -1})
 	procClass.DefineMethod("arity", &object.Method{Name: "arity", Fn: procArity, Arity: 0})
 	procClass.DefineMethod("lambda?", &object.Method{Name: "lambda?", Fn: procIsLambda, Arity: 0})
+	procClass.DefineMethod("to_proc", &object.Method{Name: "to_proc", Fn: procToProc, Arity: 0})
+	procClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: procToS, Arity: 0})
+	procClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: procInspect, Arity: 0})
+	procClass.DefineMethod("===", &object.Method{Name: "===", Fn: procCaseEqual, Arity: 1})
 
 	exceptionClass := R.Classes["Exception"]
 	exceptionClass.DefineMethod("message", &object.Method{Name: "message", Fn: exceptionMessage, Arity: 0})
@@ -981,7 +1038,17 @@ func intEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 func intTimes(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	n := receiver.Data.(int64)
 	for i := int64(0); i < n; i++ {
-		fmt.Println(i)
+		if CallBlock != nil {
+			LastBlockResult = nil
+			CallBlock(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  i,
+				Class: R.Classes["Integer"],
+			})
+			if LastBlockResult != nil {
+				return LastBlockResult
+			}
+		}
 	}
 	return receiver
 }
@@ -993,7 +1060,13 @@ func intUpto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 	start := receiver.Data.(int64)
 	end := args[0].Data.(int64)
 	for i := start; i <= end; i++ {
-		fmt.Println(i)
+		if CallBlock != nil {
+			CallBlock(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  i,
+				Class: R.Classes["Integer"],
+			})
+		}
 	}
 	return receiver
 }
@@ -1005,7 +1078,13 @@ func intDownto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	start := receiver.Data.(int64)
 	end := args[0].Data.(int64)
 	for i := start; i >= end; i-- {
-		fmt.Println(i)
+		if CallBlock != nil {
+			CallBlock(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  i,
+				Class: R.Classes["Integer"],
+			})
+		}
 	}
 	return receiver
 }
@@ -1982,16 +2061,468 @@ func symbolLength(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 }
 
+func symbolEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	if len(s) == 0 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func symbolUpcase(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	result := ""
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' {
+			result += string(r - 32)
+		} else {
+			result += string(r)
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  result,
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolDowncase(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	result := ""
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			result += string(r + 32)
+		} else {
+			result += string(r)
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  result,
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolCapitalize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	if len(s) == 0 {
+		return receiver
+	}
+	result := ""
+	for i, r := range s {
+		if i == 0 {
+			if r >= 'a' && r <= 'z' {
+				result += string(r - 32)
+			} else {
+				result += string(r)
+			}
+		} else {
+			if r >= 'A' && r <= 'Z' {
+				result += string(r + 32)
+			} else {
+				result += string(r)
+			}
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  result,
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolSwapcase(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	result := ""
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' {
+			result += string(r - 32)
+		} else if r >= 'A' && r <= 'Z' {
+			result += string(r + 32)
+		} else {
+			result += string(r)
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  result,
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolSucc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	if len(s) == 0 {
+		return receiver
+	}
+	result := []byte(s)
+	for i := len(result) - 1; i >= 0; i-- {
+		if result[i] < 'z' {
+			result[i]++
+			break
+		}
+		result[i] = 'a'
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  string(result),
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	if args[0].Type != object.ValueSymbol {
+		return R.FalseVal
+	}
+	s1 := receiver.Data.(string)
+	s2 := args[0].Data.(string)
+	if s1 == s2 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func symbolCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return symbolEqual(receiver, args...)
+}
+
+func symbolIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	s := receiver.Data.(string)
+	idx := 0
+	switch i := args[0].Data.(type) {
+	case int64:
+		idx = int(i)
+	case string:
+		pos := strings.Index(s, i)
+		if pos < 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  string(s[pos]),
+			Class: R.Classes["Symbol"],
+		}
+	}
+	if idx < 0 || idx >= len(s) {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  string(s[idx]),
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func symbolSlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	if len(args) < 1 {
+		return R.NilVal
+	}
+
+	start := 0
+	if args[0].Type == object.ValueInteger {
+		start = int(args[0].Data.(int64))
+	}
+
+	length := len(s)
+	if len(args) >= 2 && args[1].Type == object.ValueInteger {
+		length = int(args[1].Data.(int64))
+	}
+
+	if start < 0 {
+		start = len(s) + start
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > len(s) {
+		return R.NilVal
+	}
+	if length > len(s)-start {
+		length = len(s) - start
+	}
+
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  s[start : start+length],
+		Class: R.Classes["Symbol"],
+	}
+}
+
 func rangeEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return receiver
+	}
+	r := receiver.Data.(*object.RRange)
+	end := r.End
+	if r.Exclusive {
+		end--
+	}
+	for i := r.Start; i <= end; i++ {
+		if CallBlock != nil {
+			CallBlock(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  i,
+				Class: R.Classes["Integer"],
+			})
+		}
+	}
 	return receiver
 }
 
 func rangeToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return receiver
+	if receiver.Type != object.ValueRange {
+		return receiver
+	}
+	r := receiver.Data.(*object.RRange)
+	end := r.End
+	if r.Exclusive {
+		end--
+	}
+	arr := make([]*object.EmeraldValue, 0)
+	for i := r.Start; i <= end; i++ {
+		arr = append(arr, &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  i,
+			Class: R.Classes["Integer"],
+		})
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  arr,
+		Class: R.Classes["Array"],
+	}
+}
+
+func rangeBegin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRange)
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  r.Start,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func rangeEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRange)
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  r.End,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func rangeFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRange)
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  r.Start,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func rangeLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRange)
+	if r.Exclusive {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  r.End - 1,
+			Class: R.Classes["Integer"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  r.End,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func rangeSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRange)
+	end := r.End
+	if r.Exclusive {
+		end--
+	}
+	size := end - r.Start + 1
+	if size < 0 {
+		size = 0
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  int64(size),
+		Class: R.Classes["Integer"],
+	}
+}
+
+func rangeExcludeEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return R.FalseVal
+	}
+	r := receiver.Data.(*object.RRange)
+	if r.Exclusive {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func rangeCover(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	if receiver.Type != object.ValueRange {
+		return R.FalseVal
+	}
+	r := receiver.Data.(*object.RRange)
+	val, ok := args[0].Data.(int64)
+	if !ok {
+		return R.FalseVal
+	}
+	if r.Exclusive {
+		if val >= r.Start && val < r.End {
+			return R.TrueVal
+		}
+	} else {
+		if val >= r.Start && val <= r.End {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func rangeInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rangeCover(receiver, args...)
+}
+
+func rangeEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	if receiver.Type != object.ValueRange || args[0].Type != object.ValueRange {
+		return R.FalseVal
+	}
+	r1 := receiver.Data.(*object.RRange)
+	r2 := args[0].Data.(*object.RRange)
+	if r1.Start == r2.Start && r1.End == r2.End && r1.Exclusive == r2.Exclusive {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func rangeCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rangeCover(receiver, args...)
 }
 
 func regexpToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return receiver
+	if receiver.Type != object.ValueRegexp {
+		return receiver
+	}
+	r := receiver.Data.(*object.RRegexp)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  "/" + r.Pattern + "/" + r.Options,
+		Class: R.Classes["String"],
+	}
+}
+
+func regexpSource(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRegexp {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRegexp)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  r.Pattern,
+		Class: R.Classes["String"],
+	}
+}
+
+func regexpMatch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	if receiver.Type != object.ValueRegexp {
+		return R.NilVal
+	}
+	r := receiver.Data.(*object.RRegexp)
+	str, ok := args[0].Data.(string)
+	if !ok {
+		return R.NilVal
+	}
+	re, err := regexp.Compile(r.Pattern)
+	if err != nil {
+		return R.NilVal
+	}
+	loc := re.FindStringIndex(str)
+	if loc == nil {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  int64(loc[0]),
+		Class: R.Classes["Integer"],
+	}
+}
+
+func regexpMatchQ(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	if receiver.Type != object.ValueRegexp {
+		return R.FalseVal
+	}
+	r := receiver.Data.(*object.RRegexp)
+	str, ok := args[0].Data.(string)
+	if !ok {
+		return R.FalseVal
+	}
+	re, err := regexp.Compile(r.Pattern)
+	if err != nil {
+		return R.FalseVal
+	}
+	if re.MatchString(str) {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func regexpEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	if receiver.Type != object.ValueRegexp || args[0].Type != object.ValueRegexp {
+		return R.FalseVal
+	}
+	r1 := receiver.Data.(*object.RRegexp)
+	r2 := args[0].Data.(*object.RRegexp)
+	if r1.Pattern == r2.Pattern && r1.Options == r2.Options {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func regexpCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return regexpMatchQ(receiver, args...)
 }
 
 func arrayShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4083,8 +4614,9 @@ func exceptionBacktrace(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 
 // Proc methods
 func procCall(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	// For now, return nil - actual implementation requires VM integration
-	// This will be properly implemented when block calling is fully integrated
+	if CallBlockWithArgs != nil {
+		return CallBlockWithArgs(receiver, args...)
+	}
 	return R.NilVal
 }
 
@@ -4123,6 +4655,143 @@ func procIsLambda(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		}
 	}
 	return R.FalseVal
+}
+
+func procToProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func procToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type == object.ValueProc {
+		proc := receiver.Data.(*object.Proc)
+		if proc.IsLambda {
+			return &object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "#<Proc: lambda>",
+				Class: R.Classes["String"],
+			}
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "#<Proc>",
+			Class: R.Classes["String"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  "#<Proc>",
+		Class: R.Classes["String"],
+	}
+}
+
+func procInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return procToS(receiver, args...)
+}
+
+func procCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	return procCall(receiver, args...)
+}
+
+func methodCall(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueMethod {
+		return R.NilVal
+	}
+	method := receiver.Data.(*object.Method)
+	if method.Fn == nil {
+		return R.NilVal
+	}
+	if fn, ok := method.Fn.(*object.Function); ok {
+		return CallMethod(receiver, fn.Name, args...)
+	}
+	if builtin, ok := method.Fn.(BuiltinMethod); ok {
+		return builtin(receiver, args...)
+	}
+	return R.NilVal
+}
+
+func methodArity(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueMethod {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+	}
+	method := receiver.Data.(*object.Method)
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(method.Arity), Class: R.Classes["Integer"]}
+}
+
+func methodOwner(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  "Object",
+		Class: R.Classes["String"],
+	}
+}
+
+func methodReceiver(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueMethod {
+		return R.NilVal
+	}
+	return receiver
+}
+
+func methodName(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueMethod {
+		return R.NilVal
+	}
+	method := receiver.Data.(*object.Method)
+	return &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  method.Name,
+		Class: R.Classes["Symbol"],
+	}
+}
+
+func methodMethodToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueMethod {
+		return &object.EmeraldValue{Type: object.ValueString, Data: "#<Method: nil>", Class: R.Classes["String"]}
+	}
+	method := receiver.Data.(*object.Method)
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  "#<Method: " + method.Name + ">",
+		Class: R.Classes["String"],
+	}
+}
+
+func methodMethodInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return methodMethodToS(receiver, args...)
+}
+
+func bindingLocalVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueBinding {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	binding := receiver.Data.(*object.RBinding)
+	arr := make([]*object.EmeraldValue, 0, len(binding.Locals))
+	for name := range binding.Locals {
+		arr = append(arr, &object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  name,
+			Class: R.Classes["Symbol"],
+		})
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: arr, Class: R.Classes["Array"]}
+}
+
+func bindingEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	str, ok := args[0].Data.(string)
+	if !ok {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  str,
+		Class: R.Classes["String"],
+	}
 }
 
 func moduleInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

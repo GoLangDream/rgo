@@ -35,6 +35,14 @@ type Frame struct {
 	Ip      int
 	Bp      int
 	Closure *object.Closure
+
+	// Block control flow
+	BlockBreakAddr int                  // jump target for break inside while loop
+	WhileStart     int                  // start IP of the while loop body
+	WhileEnd       int                  // end IP of the while loop body
+	BlockBreak     bool                 // true if break was executed in this block
+	BlockBreakVal  *object.EmeraldValue // value returned by break
+	BlockNextVal   *object.EmeraldValue // value returned by next
 }
 
 type RescueHandler struct {
@@ -105,6 +113,9 @@ func New(bytecode *compiler.Bytecode) *VM {
 	core.CallBlock = CallBlock
 	core.CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.send(receiver, method, args)
+	}
+	core.CallBlockWithArgs = func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return vm.callBlock(block, args...)
 	}
 
 	return vm
@@ -523,7 +534,41 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(result)
 
 	case compiler.OpBreak:
-		return fmt.Errorf("unexpected break")
+		val := core.R.NilVal
+		if vm.sp > frame.Bp {
+			val = vm.stack[vm.sp-1]
+			vm.sp--
+		}
+		if frame.WhileEnd >= 0 {
+			frame.Ip = frame.WhileEnd - 1
+			return nil
+		}
+		frame.BlockBreak = true
+		frame.BlockBreakVal = val
+		vm.sp = frame.Bp
+		vm.push(val)
+		return nil
+
+	case compiler.OpBreakValue:
+		val := core.R.NilVal
+		if vm.sp > frame.Bp {
+			val = vm.stack[vm.sp-1]
+			vm.sp--
+		}
+		if frame.WhileEnd >= 0 {
+			frame.Ip = frame.WhileEnd - 1
+			return nil
+		}
+		frame.BlockBreak = true
+		frame.BlockBreakVal = val
+		vm.sp = frame.Bp
+		vm.push(val)
+		return nil
+
+	case compiler.OpSetWhileEnd:
+		target := vm.readUint16()
+		frame.WhileEnd = int(target)
+		frame.BlockBreakAddr = int(target)
 
 	case compiler.OpYield:
 		result := vm.callBlock(vm.currentBlock)
@@ -1403,7 +1448,7 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 		vm.sp++
 	}
 
-	newFrame := &Frame{Fn: fn, Ip: -1, Bp: bp, Closure: closure}
+	newFrame := &Frame{Fn: fn, Ip: -1, Bp: bp, Closure: closure, BlockBreak: false, BlockBreakVal: nil, BlockNextVal: nil, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1}
 	vm.frames = append(vm.frames, newFrame)
 	vm.fp++
 
@@ -1424,6 +1469,18 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 		result = vm.stack[vm.sp-1]
 	}
 	vm.sp = bp
+
+	if frame.BlockBreak {
+		result = frame.BlockBreakVal
+		if result == nil {
+			result = core.R.NilVal
+		}
+		core.LastBlockResult = result
+	} else if frame.BlockNextVal != nil {
+		result = frame.BlockNextVal
+	} else {
+		core.LastBlockResult = nil
+	}
 
 	vm.frames = vm.frames[:vm.fp]
 	vm.fp--

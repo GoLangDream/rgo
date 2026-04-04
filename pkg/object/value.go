@@ -25,6 +25,7 @@ const (
 	ValueClosure
 	ValueProc
 	ValueMethod
+	ValueBinding
 	ValueFiber
 	ValueMatchData
 	ValueIO
@@ -108,6 +109,8 @@ func (v *EmeraldValue) Inspect() string {
 	case ValueMethod:
 		m := v.Data.(*Method)
 		return fmt.Sprintf("#<Method: %s>", m.Name)
+	case ValueBinding:
+		return "#<Binding>"
 	default:
 		return fmt.Sprintf("#<%v>", v.Type)
 	}
@@ -149,6 +152,8 @@ func (v *EmeraldValue) TypeName() string {
 		return "Proc"
 	case ValueMethod:
 		return "Method"
+	case ValueBinding:
+		return "Binding"
 	default:
 		return "Unknown"
 	}
@@ -229,6 +234,11 @@ type Proc struct {
 	IsLambda bool
 }
 
+type ControlFlow struct {
+	Kind  string
+	Value *EmeraldValue
+}
+
 type Closure struct {
 	Fn   *Function
 	Free []*EmeraldValue
@@ -272,4 +282,10 @@ type RRange struct {
 type RException struct {
 	Message   string
 	Backtrace []string
+}
+
+type RBinding struct {
+	Self      *EmeraldValue
+	Locals    map[string]*EmeraldValue
+	Constants map[string]*EmeraldValue
 }

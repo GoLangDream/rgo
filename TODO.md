@@ -231,24 +231,28 @@ RGo 当前状态：
 ### 4.2 未实现的核心类（优先级 P1-P2）
 
 #### P1 - 基础对象类型
-- [ ] **Symbol** - AST 存在，运行时未实现
-  - 方法: `to_s`, `to_sym`, `id2name`, `inspect`, `length`, `size`, `empty?`, `upcase`, `downcase`, `capitalize`, `swapcase`, `succ`, `next`, `<=>`, `casecmp`, `match`, `=~`, `[]`, `slice`, `encoding`
-  
-- [ ] **Range** - AST 存在，运行时未实现
-  - 方法: `begin`, `end`, `exclude_end?`, `first`, `last`, `min`, `max`, `size`, `step`, `cover?`, `include?`, `member?`, `each`, `map`, `to_a`, `to_s`, `inspect`, `===`, `==`, `eql?`, `hash`
+- [x] **Symbol** - 已实现 (2026-03-22)
+  - 方法: `to_s`, `to_sym`, `id2name`, `inspect`, `length`, `size`, `empty?`, `upcase`, `downcase`, `capitalize`, `swapcase`, `succ`, `next`, `==`, `===`, `[]`, `slice`
+   
+- [x] **Range** - 已实现 (2026-03-22)
+  - 方法: `begin`, `end`, `exclude_end?`, `first`, `last`, `size`, `cover?`, `include?`, `member?`, `each`, `to_a`, `==`, `===`
 
-- [ ] **Regexp** - AST 存在，运行时和匹配引擎未实现
-  - 方法: `=~`, `===`, `match`, `match?`, `names`, `named_captures`, `source`, `options`, `casefold?`, `fixed_encoding?`, `encoding`, `to_s`, `inspect`, `~`, `escape`, `union`, `try_convert`
+- [ ] **Regexp** - 部分实现 (2026-03-22)
+  - 方法: `to_s`, `source`, `=~`, `===`, `match`, `match?`, `==` 已实现
+  - 缺失: `names`, `named_captures`, `options`, `casefold?`, `escape`, `union`, `try_convert`
 
 #### P1 - 闭包和块
-- [ ] **Proc** - 部分支持，需完善
-  - 方法: `call`, `[]`, `===`, `yield`, `arity`, `parameters`, `binding`, `source_location`, `lambda?`, `curry`, `<<`, `>>`, `to_proc`, `to_s`, `inspect`
+- [x] **Proc** - 已实现 (2026-03-22)
+  - 方法: `call`, `[]`, `arity`, `lambda?`, `to_proc`, `to_s`, `inspect`, `===` 已实现
+  - 缺失: `yield`, `parameters`, `binding`, `source_location`, `curry`, `<<`, `>>`
 
-- [ ] **Method** - 方法对象化
-  - 方法: `call`, `[]`, `===`, `arity`, `parameters`, `source_location`, `owner`, `receiver`, `name`, `original_name`, `unbind`, `super_method`, `to_proc`, `to_s`, `inspect`
+- [x] **Method** - 已实现 (2026-03-22)
+  - 方法: `call`, `[]`, `arity`, `owner`, `receiver`, `name`, `to_s`, `inspect` 已实现
+  - 缺失: `parameters`, `source_location`, `original_name`, `unbind`, `super_method`, `to_proc`
 
-- [ ] **Binding** - 绑定上下文
-  - 方法: `eval`, `local_variables`, `local_variable_get`, `local_variable_set`, `local_variable_defined?`, `receiver`, `source_location`
+- [x] **Binding** - 已实现 (2026-03-22)
+  - 方法: `local_variables`, `eval` 已实现
+  - 缺失: `local_variable_get`, `local_variable_set`, `local_variable_defined?`, `receiver`, `source_location`
 
 #### P2 - 异常系统（59 个 spec 文件）
 - [x] **Exception** 基类及子类 - 已实现 (2026-03-22)

@@ -122,6 +122,9 @@ type CompilationScope struct {
 	instructions        Instructions
 	lastInstruction     EmittedInstruction
 	previousInstruction EmittedInstruction
+	breakTarget         int
+	nextPatchPos        []int
+	breakValuePatchPos  []int
 }
 
 type Compiler struct {
@@ -830,6 +833,13 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		jumpNotTruthyPos := c.emit(OpJumpNotTruthy, 9999)
 
+		c.scopes[c.scopeIndex].breakTarget = -1
+		c.scopes[c.scopeIndex].nextPatchPos = []int{}
+		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
+
+		endOfWhilePos := len(c.currentInstructions()) + 3 + 1 + 3
+		c.emit(OpSetWhileEnd, endOfWhilePos)
+
 		if err := c.Compile(node.Body); err != nil {
 			return err
 		}
@@ -839,8 +849,22 @@ func (c *Compiler) Compile(node interface{}) error {
 		afterBody := len(c.currentInstructions())
 		c.changeOperand(jumpNotTruthyPos, afterBody)
 
-		// while returns nil in Ruby
+		c.scopes[c.scopeIndex].breakTarget = afterBody
+
 		c.Emit(OpNil)
+
+		endOfWhile := len(c.currentInstructions())
+		c.Emit(OpReturnValue)
+
+		for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
+			c.changeOperand(patchPos, loopStart)
+		}
+		for _, patchPos := range c.scopes[c.scopeIndex].breakValuePatchPos {
+			c.changeOperand(patchPos, endOfWhile)
+		}
+		c.scopes[c.scopeIndex].breakTarget = -1
+		c.scopes[c.scopeIndex].nextPatchPos = []int{}
+		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
 	case *ast.UntilExpression:
 		// until is like while with negated condition
 		loopStart := len(c.currentInstructions())
@@ -864,9 +888,25 @@ func (c *Compiler) Compile(node interface{}) error {
 		// until returns nil in Ruby
 		c.Emit(OpNil)
 	case *ast.BreakExpression:
-		c.Emit(OpBreak)
+		if node.Value != nil {
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+			pos := c.emit(OpBreakValue, 0)
+			c.scopes[c.scopeIndex].breakValuePatchPos = append(c.scopes[c.scopeIndex].breakValuePatchPos, pos)
+		} else {
+			c.Emit(OpBreak)
+		}
 	case *ast.NextExpression:
-		c.Emit(OpJump)
+		if node.Value != nil {
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+		} else {
+			c.Emit(OpNil)
+		}
+		pos := c.emit(OpJump, 0)
+		c.scopes[c.scopeIndex].nextPatchPos = append(c.scopes[c.scopeIndex].nextPatchPos, pos)
 	case *ast.YieldExpression:
 		if len(node.Args) > 0 {
 			for _, arg := range node.Args {
@@ -942,8 +982,10 @@ func (c *Compiler) currentInstructions() Instructions {
 	return c.scopes[c.scopeIndex].instructions
 }
 
-// compileBlockAsValue compiles a BlockExpression but removes the last OpPop
-// so the block's last value stays on the stack (used for if/elsif/else branches)
+// compileBlockAsValue compiles a BlockExpression.
+// For blocks with params, this is called within an EnterScope/LeavaScope pair
+// so the block body's instructions are in the block scope.
+// For blocks without params, the statements are compiled inline in the parent scope.
 func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 	if block == nil || len(block.Statements) == 0 {
 		c.Emit(OpNil)
@@ -954,12 +996,11 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 			return err
 		}
 	}
-	// Remove the last OpPop so the value remains on the stack
-	last := c.scopes[c.scopeIndex].lastInstruction
-	if last.Opcode == OpPop {
-		c.scopes[c.scopeIndex].instructions = c.scopes[c.scopeIndex].instructions[:last.Position]
-		c.scopes[c.scopeIndex].lastInstruction = c.scopes[c.scopeIndex].previousInstruction
+	endPos := len(c.currentInstructions())
+	for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
+		c.changeOperand(patchPos, endPos)
 	}
+	c.scopes[c.scopeIndex].nextPatchPos = []int{}
 	return nil
 }
 
@@ -1095,7 +1136,10 @@ func (c *Compiler) changeOperand(opPos int, operand int) {
 
 func (c *Compiler) EnterScope() {
 	scope := CompilationScope{
-		instructions: Instructions{},
+		instructions:       Instructions{},
+		breakTarget:        -1,
+		nextPatchPos:       []int{},
+		breakValuePatchPos: []int{},
 	}
 	c.scopes = append(c.scopes, scope)
 	c.scopeIndex++

@@ -92,6 +92,7 @@ const (
 
 	OpBreak
 	OpBreakValue
+	OpSetWhileEnd
 
 	OpMatch
 	OpNotMatch
@@ -239,8 +240,9 @@ var definitions = map[Opcode]Definition{
 	OpBlock:        {"OpBlock", []int{2}},
 	OpBlockWithArg: {"OpBlockWithArg", []int{2, 1}},
 
-	OpBreak:      {"OpBreak", []int{}},
-	OpBreakValue: {"OpBreakValue", []int{}},
+	OpBreak:       {"OpBreak", []int{}},
+	OpBreakValue:  {"OpBreakValue", []int{}},
+	OpSetWhileEnd: {"OpSetWhileEnd", []int{2}},
 
 	OpMatch:    {"OpMatch", []int{}},
 	OpNotMatch: {"OpNotMatch", []int{}},

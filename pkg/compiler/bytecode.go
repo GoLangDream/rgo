@@ -21,6 +21,9 @@ func Make(op Opcode, operands ...int) Instructions {
 	offset := 1
 
 	for i, o := range operands {
+		if i >= len(def.OperandWidths) {
+			continue
+		}
 		width := def.OperandWidths[i]
 		switch width {
 		case 2:
