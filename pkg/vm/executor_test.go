@@ -541,6 +541,21 @@ func TestCaseWhenNoMatch(t *testing.T) {
 	assertIntResult(t, result, 20)
 }
 
+func TestCaseWhenMatchWithSubjectAcrossNewlines(t *testing.T) {
+	result, _ := runRuby(t, "case 1\nwhen 1\n  10\nelse\n  20\nend")
+	assertIntResult(t, result, 10)
+}
+
+func TestCaseWhenInlineReturnsBranchValue(t *testing.T) {
+	result, _ := runRuby(t, "case 1 when 1 then 10 else 20 end")
+	assertIntResult(t, result, 10)
+}
+
+func TestCaseWhenMultipleConditions(t *testing.T) {
+	result, _ := runRuby(t, "case 2 when 1, 2 then 10 else 20 end")
+	assertIntResult(t, result, 10)
+}
+
 // === Keyword Arguments ===
 
 func TestDefWithRequiredKeywordArg(t *testing.T) {

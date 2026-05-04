@@ -249,7 +249,7 @@ func (l *Lexer) NextToken() Token {
 		}
 	case '&':
 		if l.peekChar() == '&' {
-			tok = l.makeTwoCharToken(AND, AND2)
+			tok = l.makeTwoCharToken(BIT_AND, AND)
 		} else if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(BIT_AND, BIT_AND)
 		} else {
@@ -257,7 +257,7 @@ func (l *Lexer) NextToken() Token {
 		}
 	case '|':
 		if l.peekChar() == '|' {
-			tok = l.makeTwoCharToken(OR, OR2)
+			tok = l.makeTwoCharToken(BIT_OR, OR)
 		} else if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(BIT_OR, BIT_OR)
 		} else {

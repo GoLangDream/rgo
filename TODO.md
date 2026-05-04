@@ -101,13 +101,22 @@
 - [x] MINUS_ARROW token 支持
 
 ### 已知问题
-- case/when 解析存在无限循环问题
+- [x] case/when 解析存在无限循环问题 — 已修复当前 `pkg/vm` 覆盖的 `case when true then ...` 与 `case expr\nwhen ...\nelse ...` 路径
 - case/when Compiler 实现不完整
 - RangeExpression (1..5) 未实现
 - ForExpression (for i in arr) 未实现
 - RescueClause/BeginExpression 未完全实现
 - 很多 AST 节点类型未在 Compiler 中实现
 - Lambda/Proc 调用需要添加 call 方法
+
+### Codex/Go test OOM 安全诊断
+- 命令：`bash scripts/safe_go_test_test.sh && bash scripts/vm_test_status_test.sh && bash scripts/spec_status_test.sh`
+- 结果：三个脚本测试均通过（safe_go_test_test、vm_test_status_test、spec_status_test）。
+- 命令：`RGO_GO_TEST_TIMEOUT=15 RGO_TEST_MEMORY_KB=4194304 scripts/vm_test_status.sh reports/vm-test-status.csv`
+- 结果：CSV 写入成功，未发生系统 OOM；当前 76 个 VM 测试全部 pass。
+- 命令：`RGO_GO_TEST_TIMEOUT=60 RGO_TEST_MEMORY_KB=4194304 scripts/safe_go_test.sh ./...`
+- 结果：Go 全量测试通过，未发生系统 OOM。
+- 已修复阻塞项：`&&`/`||` token 类型、`case/when` parser token 推进、case 分支值返回、方法 body 隐式返回值保留。
 
 ## 阶段 2：控制流和方法定义（已完成）
 

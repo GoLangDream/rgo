@@ -427,7 +427,8 @@ func (c *Compiler) Compile(node interface{}) error {
 					})
 					c.emit(OpSend, methodNameIdx, 0, 1)
 					condJumpPos := c.emit(OpJumpNotTruthy, 9999)
-					if err := c.Compile(clause.Body); err != nil {
+					c.Emit(OpPop)
+					if err := c.compileBlockAsValue(clause.Body); err != nil {
 						return err
 					}
 					jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
@@ -438,7 +439,7 @@ func (c *Compiler) Compile(node interface{}) error {
 						return err
 					}
 					condJumpPos := c.emit(OpJumpNotTruthy, 9999)
-					if err := c.Compile(clause.Body); err != nil {
+					if err := c.compileBlockAsValue(clause.Body); err != nil {
 						return err
 					}
 					jumpToEndPositions = append(jumpToEndPositions, c.emit(OpJump, 9999))
@@ -448,10 +449,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 		if node.Else != nil {
-			if err := c.Compile(node.Else); err != nil {
+			if node.Expression != nil {
+				c.Emit(OpPop)
+			}
+			if err := c.compileBlockAsValue(node.Else); err != nil {
 				return err
 			}
 		} else {
+			if node.Expression != nil {
+				c.Emit(OpPop)
+			}
 			c.Emit(OpNil)
 		}
 		afterAll := len(c.currentInstructions())
@@ -991,7 +998,15 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 		c.Emit(OpNil)
 		return nil
 	}
-	for _, s := range block.Statements {
+	for i, s := range block.Statements {
+		if i == len(block.Statements)-1 {
+			if exprStmt, ok := s.(*ast.ExpressionStatement); ok {
+				if err := c.Compile(exprStmt.Expression); err != nil {
+					return err
+				}
+				break
+			}
+		}
 		if err := c.Compile(s); err != nil {
 			return err
 		}

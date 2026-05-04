@@ -96,6 +96,29 @@ func TestParseNil(t *testing.T) {
 	}
 }
 
+func TestParseCaseSubjectAndBranchBody(t *testing.T) {
+	expr := parseExpr(t, "case 1\nwhen 1\n  10\nelse\n  20\nend")
+	caseExpr, ok := expr.(*ast.CaseExpression)
+	if !ok {
+		t.Fatalf("expected CaseExpression, got %T", expr)
+	}
+	if caseExpr.Expression == nil {
+		t.Fatal("expected case subject expression")
+	}
+	if len(caseExpr.Clauses) != 1 {
+		t.Fatalf("expected 1 clause, got %d", len(caseExpr.Clauses))
+	}
+	if len(caseExpr.Clauses[0].Conditions) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(caseExpr.Clauses[0].Conditions))
+	}
+	if len(caseExpr.Clauses[0].Body.Statements) != 1 {
+		t.Fatalf("expected 1 branch statement, got %d", len(caseExpr.Clauses[0].Body.Statements))
+	}
+	if caseExpr.Else == nil || len(caseExpr.Else.Statements) != 1 {
+		t.Fatalf("expected else branch with 1 statement")
+	}
+}
+
 func TestParseIdentifier(t *testing.T) {
 	expr := parseExpr(t, "foo")
 	ident, ok := expr.(*ast.Identifier)
