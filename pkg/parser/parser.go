@@ -1767,7 +1767,8 @@ func (p *Parser) hasSpaceBetween(left, right lexer.Token) bool {
 
 func (p *Parser) peekTokenCanBeMethodName() bool {
 	switch p.peekToken.Type {
-	case lexer.IDENT, lexer.CLASS, lexer.BEGIN, lexer.END, lexer.PREPEND, lexer.THEN, lexer.YIELD, lexer.MATCH, lexer.NOT_EQUAL:
+	case lexer.IDENT, lexer.CLASS, lexer.BEGIN, lexer.END, lexer.PREPEND, lexer.THEN, lexer.YIELD, lexer.MATCH, lexer.NOT_EQUAL,
+		lexer.TRUE, lexer.FALSE, lexer.NIL:
 		return true
 	default:
 		return false
@@ -2265,6 +2266,43 @@ func (p *Parser) parseSuperExpression() ast.Expression {
 	}
 
 	p.nextToken()
+	if p.curTokenIs(lexer.LPAREN) {
+		p.skipPeekNewlines()
+		if p.peekTokenIs(lexer.RPAREN) {
+			p.nextToken()
+		} else {
+			p.nextToken()
+			arg := p.parseExpression(LOWEST)
+			if arg != nil {
+				exp.Args = append(exp.Args, arg)
+			}
+
+			for p.peekTokenIs(lexer.COMMA) {
+				p.nextToken()
+				p.skipPeekNewlines()
+				if p.peekTokenIs(lexer.RPAREN) {
+					break
+				}
+				p.nextToken()
+				arg := p.parseExpression(LOWEST)
+				if arg != nil {
+					exp.Args = append(exp.Args, arg)
+				}
+			}
+
+			if !p.curTokenIs(lexer.RPAREN) {
+				p.skipPeekNewlines()
+			}
+			if !p.consumeExpectedRParen() {
+				return nil
+			}
+		}
+		if p.peekTokenIs(lexer.LBRACE) || (p.peekTokenIs(lexer.DO) && !p.stopAtDo) {
+			p.nextToken()
+			exp.Block = p.parseBlockExpression()
+		}
+		return exp
+	}
 	if p.curTokenIs(lexer.LBRACE) || (p.curTokenIs(lexer.DO) && !p.stopAtDo) {
 		exp.Block = p.parseBlockExpression()
 		return exp
@@ -2900,7 +2938,7 @@ func (p *Parser) curTokenCanBeMethodName() bool {
 	case lexer.IDENT, lexer.EQUAL, lexer.EQUAL3, lexer.SPACESHIP, lexer.LESS_THAN, lexer.LESS_THAN_OR_EQUAL,
 		lexer.GREATER_THAN, lexer.GREATER_THAN_OR_EQUAL, lexer.PLUS, lexer.MINUS,
 		lexer.MULTIPLY, lexer.DIVIDE, lexer.MOD, lexer.BIT_AND, lexer.BIT_OR, lexer.BIT_XOR,
-		lexer.MATCH, lexer.NOT_EQUAL, lexer.LBRACKET:
+		lexer.MATCH, lexer.NOT_EQUAL, lexer.LBRACKET, lexer.TRUE, lexer.FALSE, lexer.NIL:
 		return true
 	default:
 		return false

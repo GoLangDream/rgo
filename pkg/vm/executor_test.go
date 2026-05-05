@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
@@ -1539,6 +1540,44 @@ func TestRedoInLambdaRestartsCurrentFrame(t *testing.T) {
 }.call
 $redo_count`)
 	assertIntResult(t, result, 12)
+}
+
+func TestNextWithValueInLambdaReturnsWithoutLooping(t *testing.T) {
+	type result struct {
+		value *object.EmeraldValue
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		l := lexer.New(`-> { 123; next 234; 345 }.call`)
+		p := parser.New(l)
+		program := p.ParseProgram()
+		if len(p.Errors()) > 0 {
+			done <- result{err: fmt.Errorf("parse errors: %v", p.Errors())}
+			return
+		}
+		c := compiler.New()
+		if err := c.Compile(program); err != nil {
+			done <- result{err: err}
+			return
+		}
+		machine := New(c.Bytecode())
+		if err := machine.Run(); err != nil {
+			done <- result{err: err}
+			return
+		}
+		done <- result{value: machine.LastPoppedStackElement()}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		assertIntResult(t, got.value, 234)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("lambda next with a value did not terminate")
+	}
 }
 
 func TestUnlessKeyword(t *testing.T) {

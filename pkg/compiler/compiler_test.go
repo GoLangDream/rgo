@@ -125,6 +125,22 @@ func TestCompileInterpolatedRegexpWithEncodingModifierCall(t *testing.T) {
 	compile(t, `/#{/./}/e.encoding.should == Encoding::EUC_JP`)
 }
 
+func TestCompileKeywordLiteralMethodNameAfterDot(t *testing.T) {
+	compile(t, `module VariablesSpecs
+  def self.false
+    false
+  end
+end
+
+if VariablesSpecs.false
+  a = 1
+end
+
+1.times do
+  defined?(a).should == "local-variable"
+end`)
+}
+
 func countOpcode(instructions Instructions, op Opcode) int {
 	count := 0
 	i := 0

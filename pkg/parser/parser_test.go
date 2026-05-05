@@ -2016,6 +2016,46 @@ func TestParseSuperWithBraceBlock(t *testing.T) {
 	parse(t, `super { break 1 }`)
 }
 
+func TestParseSuperWithEmptyParenthesesTerminates(t *testing.T) {
+	result := make(chan []string, 1)
+
+	go func() {
+		l := lexer.New("super()")
+		p := New(l)
+		p.ParseProgram()
+		result <- p.Errors()
+	}()
+
+	select {
+	case errors := <-result:
+		if len(errors) > 0 {
+			t.Fatalf("parse errors: %v", errors)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("super() parse did not terminate")
+	}
+}
+
+func TestParseSuperWithParenthesizedArgumentsTerminates(t *testing.T) {
+	result := make(chan []string, 1)
+
+	go func() {
+		l := lexer.New("super(1 + 2)")
+		p := New(l)
+		p.ParseProgram()
+		result <- p.Errors()
+	}()
+
+	select {
+	case errors := <-result:
+		if len(errors) > 0 {
+			t.Fatalf("parse errors: %v", errors)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("super with parenthesized arguments parse did not terminate")
+	}
+}
+
 func TestParseClassWithMultipleMethodsAndImplicitEnsure(t *testing.T) {
 	parse(t, `class BreakTest2
   def one
@@ -2378,6 +2418,17 @@ end`)
 func TestParseDefinedWithoutParentheses(t *testing.T) {
 	parse(t, `(defined? a = 10).should == "assignment"`)
 	parse(t, `(not defined? qqq).should == true`)
+}
+
+func TestParseKeywordLiteralMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `VariablesSpecs.false`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "false" {
+		t.Fatalf("expected false method name, got %#v", call.Method)
+	}
 }
 
 func TestParseBitwiseAndShiftCompoundAssignments(t *testing.T) {
