@@ -2,6 +2,8 @@ package object
 
 import (
 	"fmt"
+	"math"
+	"strings"
 )
 
 type ValueType int
@@ -48,6 +50,13 @@ func NewValue(t ValueType, data interface{}, class *Class) *EmeraldValue {
 }
 
 func (v *EmeraldValue) Inspect() string {
+	return v.inspectWithSeen(make(map[*EmeraldValue]bool))
+}
+
+func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
+	if v == nil {
+		return "nil"
+	}
 	switch v.Type {
 	case ValueNil:
 		return "nil"
@@ -59,14 +68,24 @@ func (v *EmeraldValue) Inspect() string {
 	case ValueInteger:
 		return fmt.Sprintf("%d", v.Data)
 	case ValueFloat:
-		return fmt.Sprintf("%g", v.Data)
+		f := v.Data.(float64)
+		s := fmt.Sprintf("%g", f)
+		if !strings.Contains(s, ".") && !strings.Contains(s, "e") && !strings.Contains(s, "E") && !math.IsInf(f, 0) && !math.IsNaN(f) {
+			s += ".0"
+		}
+		return s
 	case ValueString:
 		return v.Data.(string)
 	case ValueArray:
+		if seen[v] {
+			return "[...]"
+		}
+		seen[v] = true
+		defer delete(seen, v)
 		arr := v.Data.([]*EmeraldValue)
 		str := "["
 		for i, e := range arr {
-			str += e.Inspect()
+			str += e.inspectElementWithSeen(seen)
 			if i < len(arr)-1 {
 				str += ", "
 			}
@@ -74,11 +93,16 @@ func (v *EmeraldValue) Inspect() string {
 		str += "]"
 		return str
 	case ValueHash:
+		if seen[v] {
+			return "{...}"
+		}
+		seen[v] = true
+		defer delete(seen, v)
 		h := v.Data.(map[*EmeraldValue]*EmeraldValue)
 		str := "{"
 		i := 0
 		for k, val := range h {
-			str += k.Inspect() + " => " + val.Inspect()
+			str += k.inspectElementWithSeen(seen) + " => " + val.inspectElementWithSeen(seen)
 			i++
 			if i < len(h) {
 				str += ", "
@@ -111,9 +135,32 @@ func (v *EmeraldValue) Inspect() string {
 		return fmt.Sprintf("#<Method: %s>", m.Name)
 	case ValueBinding:
 		return "#<Binding>"
+	case ValueSymbol:
+		return ":" + v.Data.(string)
+	case ValueRange:
+		r := v.Data.(*RRange)
+		op := ".."
+		if r.Exclusive {
+			op = "..."
+		}
+		return fmt.Sprintf("%d%s%d", r.Start, op, r.End)
 	default:
 		return fmt.Sprintf("#<%v>", v.Type)
 	}
+}
+
+func (v *EmeraldValue) InspectElement() string {
+	return v.inspectElementWithSeen(make(map[*EmeraldValue]bool))
+}
+
+func (v *EmeraldValue) inspectElementWithSeen(seen map[*EmeraldValue]bool) string {
+	if v == nil {
+		return "nil"
+	}
+	if v.Type == ValueString {
+		return fmt.Sprintf("%q", v.Data.(string))
+	}
+	return v.inspectWithSeen(seen)
 }
 
 func (v *EmeraldValue) TypeName() string {
@@ -191,6 +238,12 @@ func (v *EmeraldValue) Equals(other *EmeraldValue) bool {
 		return v.Data.(float64) == other.Data.(float64)
 	case ValueString:
 		return v.Data.(string) == other.Data.(string)
+	case ValueSymbol:
+		return v.Data.(string) == other.Data.(string)
+	case ValueRange:
+		r1 := v.Data.(*RRange)
+		r2 := other.Data.(*RRange)
+		return r1.Start == r2.Start && r1.End == r2.End && r1.Exclusive == r2.Exclusive
 	case ValueClass:
 		return v.Data == other.Data
 	default:
@@ -205,15 +258,19 @@ type KeywordParamInfo struct {
 }
 
 type Function struct {
-	Name           string
-	Params         []string
-	KeywordParams  []KeywordParamInfo
-	Body           interface{}
-	FreeVars       []*EmeraldValue
-	Instructions   []byte
-	NumLocals      int
-	HasRestParam   bool
-	RestParamIndex int
+	Name            string
+	Params          []string
+	ParamDefaults   []*EmeraldValue
+	KeywordParams   []KeywordParamInfo
+	Body            interface{}
+	FreeVars        []*EmeraldValue
+	Instructions    []byte
+	Constants       []*EmeraldValue
+	NumLocals       int
+	HasRestParam    bool
+	RestParamIndex  int
+	HasBlockParam   bool
+	BlockParamIndex int
 }
 
 type BuiltinFunction struct {

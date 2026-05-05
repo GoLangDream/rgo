@@ -9,7 +9,11 @@ mkdir -p "$WORK/specs"
 OUT="$WORK/spec_status.csv"
 
 cat >"$WORK/specs/pass_spec.rb" <<'RUBY'
-expect(1).should_not(2)
+describe "status" do
+  it "passes" do
+    1.should == 1
+  end
+end
 RUBY
 
 cat >"$WORK/specs/parse_error_spec.rb" <<'RUBY'
@@ -22,9 +26,16 @@ cat >"$WORK/specs/zero_examples_spec.rb" <<'RUBY'
 value = 1
 RUBY
 
+cat >"$WORK/specs/minitest_test.rb" <<'RUBY'
+test "runs" do
+  1.should == 1
+end
+RUBY
+
 RGO_SPEC_TIMEOUT=1 "$ROOT/scripts/spec_status.sh" "$WORK/specs" "$OUT" >/dev/null
 
 grep -q '^file,status,examples,failures,error_kind,duration_ms$' "$OUT"
+grep -q "$WORK/specs/minitest_test.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/parse_error_spec.rb,parse_error,0,0,parse_error," "$OUT"
 grep -q "$WORK/specs/pass_spec.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/timeout_spec.rb,timeout,0,0,timeout," "$OUT"

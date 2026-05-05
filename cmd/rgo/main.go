@@ -72,13 +72,13 @@ Usage:
 }
 
 func runRubyFile(filename string) {
-	content, err := os.ReadFile(filename)
+	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
 
-	l := lexer.New(string(content))
+	l := lexer.New(content)
 	p := parser.New(l)
 	program := p.ParseProgram()
 
@@ -113,38 +113,9 @@ func runRubyFile(filename string) {
 func runSpecFile(filename string) {
 	testRunner = &SpecRunner{verbose: false}
 	currentFile = filename
-
-	content, err := os.ReadFile(filename)
+	err := executeSpecFile(filename)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-		os.Exit(1)
-	}
-
-	core.RegisterMspec()
-
-	l := lexer.New(string(content))
-	p := parser.New(l)
-	program := p.ParseProgram()
-
-	if len(p.Errors()) > 0 {
-		for _, err := range p.Errors() {
-			fmt.Fprintf(os.Stderr, "Parse Error: %s\n", err)
-		}
-		os.Exit(1)
-	}
-
-	c := compiler.New()
-	err = c.Compile(program)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Compile Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	bytecode := c.Bytecode()
-	v := vm.New(bytecode)
-	err = v.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		testRunner.failCount++
 	}
 
@@ -154,6 +125,77 @@ func runSpecFile(filename string) {
 	if testRunner.failCount > 0 {
 		os.Exit(1)
 	}
+}
+
+func executeSpecFile(filename string) error {
+	core.Init()
+
+	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
+	if err != nil {
+		return fmt.Errorf("Error reading file: %v", err)
+	}
+
+	l := lexer.New(content)
+	p := parser.New(l)
+	program := p.ParseProgram()
+
+	if len(p.Errors()) > 0 {
+		return fmt.Errorf("Parse Error: %s", strings.Join(p.Errors(), "\nParse Error: "))
+	}
+
+	c := compiler.New()
+	err = c.Compile(program)
+	if err != nil {
+		return fmt.Errorf("Compile Error: %v", err)
+	}
+
+	bytecode := c.Bytecode()
+	v := vm.New(bytecode)
+	err = v.Run()
+	if err != nil {
+		return fmt.Errorf("Runtime Error: %v", err)
+	}
+	return nil
+}
+
+func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (string, error) {
+	abs, err := filepath.Abs(filename)
+	if err != nil {
+		return "", err
+	}
+	if seen[abs] {
+		return "", nil
+	}
+	seen[abs] = true
+
+	bytes, err := os.ReadFile(abs)
+	if err != nil {
+		return "", err
+	}
+
+	var out strings.Builder
+	baseDir := filepath.Dir(abs)
+	for _, line := range strings.Split(string(bytes), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "require_relative ") && strings.Contains(trimmed, "shared/") {
+			rel := strings.TrimSpace(strings.TrimPrefix(trimmed, "require_relative "))
+			rel = strings.Trim(rel, "'\"")
+			if !strings.HasSuffix(rel, ".rb") {
+				rel += ".rb"
+			}
+			requiredPath := filepath.Join(baseDir, rel)
+			required, err := readSpecFileWithSharedRequires(requiredPath, seen)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(required)
+			out.WriteString("\n")
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	return out.String(), nil
 }
 
 func (sr *SpecRunner) PrintSummary() {

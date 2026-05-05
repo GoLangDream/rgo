@@ -16,7 +16,13 @@ run_rgo_test() {
   local spec=$1
   local tmp=$2
   if [ -n "$MEMORY_KB" ]; then
-    ulimit -v "$MEMORY_KB" || exit 125
+    case "$MEMORY_KB" in
+      '' | *[!0-9]*)
+        echo "Invalid RGO_TEST_MEMORY_KB: $MEMORY_KB" >&2
+        return 125
+        ;;
+    esac
+    ulimit -v "$MEMORY_KB" || return 125
   fi
   exec "$ROOT/rgo" test "$spec" >"$tmp" 2>&1
 }
@@ -34,7 +40,7 @@ mkdir -p "$(dirname "$OUT")"
 printf 'file,status,examples,failures,error_kind,duration_ms\n' > "$OUT"
 
 if [ -d "$TARGET" ]; then
-  mapfile -t FILES < <(find "$TARGET" -name '*_spec.rb' | sort)
+  mapfile -t FILES < <(find "$TARGET" \( -name '*_spec.rb' -o -name '*_test.rb' \) | sort)
 else
   FILES=("$TARGET")
 fi

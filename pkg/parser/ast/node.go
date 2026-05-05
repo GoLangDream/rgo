@@ -76,6 +76,15 @@ func (f *FloatLiteral) expressionNode()      {}
 func (f *FloatLiteral) TokenLiteral() string { return f.Token.Literal }
 func (f *FloatLiteral) String() string       { return f.Token.Literal }
 
+type RationalLiteral struct {
+	Token lexer.Token
+	Value string
+}
+
+func (r *RationalLiteral) expressionNode()      {}
+func (r *RationalLiteral) TokenLiteral() string { return r.Token.Literal }
+func (r *RationalLiteral) String() string       { return r.Token.Literal }
+
 type StringLiteral struct {
 	Token lexer.Token
 	Value string
@@ -147,11 +156,15 @@ type IndexExpression struct {
 	Token lexer.Token
 	Left  Expression
 	Index Expression
+	End   Expression
 }
 
 func (i *IndexExpression) expressionNode()      {}
 func (i *IndexExpression) TokenLiteral() string { return i.Token.Literal }
 func (i *IndexExpression) String() string {
+	if i.End != nil {
+		return fmt.Sprintf("(%s[%s, %s])", i.Left.String(), i.Index.String(), i.End.String())
+	}
 	return fmt.Sprintf("(%s[%s])", i.Left.String(), i.Index.String())
 }
 
@@ -233,6 +246,7 @@ type IfExpression struct {
 	Consequent  *BlockExpression
 	Alternative *BlockExpression
 	ElsIf       []*ElsIfExpression
+	IsUnless    bool
 }
 
 type ElsIfExpression struct {
@@ -262,6 +276,20 @@ type CaseExpression struct {
 	Expression Expression
 	Clauses    []*CaseClause
 	Else       *BlockExpression
+}
+
+type PatternMatchExpression struct {
+	Token lexer.Token
+	Left  Expression
+}
+
+func (p *PatternMatchExpression) expressionNode()      {}
+func (p *PatternMatchExpression) TokenLiteral() string { return p.Token.Literal }
+func (p *PatternMatchExpression) String() string {
+	if p.Left != nil {
+		return p.Left.String() + " " + p.Token.Literal + " <pattern>"
+	}
+	return p.Token.Literal + " <pattern>"
 }
 
 type CaseClause struct {
@@ -349,7 +377,9 @@ type DefExpression struct {
 	Token         lexer.Token
 	Name          *Identifier
 	Params        []*Identifier
+	ParamDefaults []Expression
 	RestParam     *Identifier // *rest parameter, nil if none
+	BlockParam    *Identifier // &block parameter, nil if none
 	KeywordParams []*KeywordParam
 	Body          *BlockExpression
 	Receiver      Expression
@@ -365,11 +395,18 @@ func (d *DefExpression) String() string {
 	out += d.Name.String()
 	out += "("
 	allParams := []string{}
-	for _, p := range d.Params {
-		allParams = append(allParams, p.String())
+	for i, p := range d.Params {
+		if i < len(d.ParamDefaults) && d.ParamDefaults[i] != nil {
+			allParams = append(allParams, p.String()+" = "+d.ParamDefaults[i].String())
+		} else {
+			allParams = append(allParams, p.String())
+		}
 	}
 	if d.RestParam != nil {
 		allParams = append(allParams, "*"+d.RestParam.String())
+	}
+	if d.BlockParam != nil {
+		allParams = append(allParams, "&"+d.BlockParam.String())
 	}
 	for _, kp := range d.KeywordParams {
 		if kp.Default != nil {
@@ -489,19 +526,29 @@ func (r *RetryExpression) TokenLiteral() string { return r.Token.Literal }
 func (r *RetryExpression) String() string       { return "retry" }
 
 type YieldExpression struct {
-	Token lexer.Token
-	Args  []Expression
+	Token       lexer.Token
+	Args        []Expression
+	KeywordArgs []*KeywordArg
 }
 
 func (y *YieldExpression) expressionNode()      {}
 func (y *YieldExpression) TokenLiteral() string { return y.Token.Literal }
 func (y *YieldExpression) String() string {
 	out := "yield"
-	if len(y.Args) > 0 {
+	if len(y.Args) > 0 || len(y.KeywordArgs) > 0 {
 		out += "("
 		for i, arg := range y.Args {
 			out += arg.String()
 			if i < len(y.Args)-1 {
+				out += ", "
+			}
+		}
+		if len(y.KeywordArgs) > 0 {
+			out += ", "
+		}
+		for i, arg := range y.KeywordArgs {
+			out += arg.String()
+			if i < len(y.KeywordArgs)-1 {
 				out += ", "
 			}
 		}
@@ -513,6 +560,7 @@ func (y *YieldExpression) String() string {
 type SuperExpression struct {
 	Token lexer.Token
 	Args  []Expression
+	Block *BlockExpression
 }
 
 func (s *SuperExpression) expressionNode()      {}
@@ -528,6 +576,9 @@ func (s *SuperExpression) String() string {
 			}
 		}
 		out += ")"
+	}
+	if s.Block != nil {
+		out += " " + s.Block.String()
 	}
 	return out
 }
@@ -609,14 +660,29 @@ func (c *ConstantResolution) String() string {
 }
 
 type AssignExpression struct {
-	Token lexer.Token
-	Name  *Identifier
-	Value Expression
+	Token  lexer.Token
+	Name   *Identifier
+	Target Expression
+	Index  Expression
+	End    Expression
+	Value  Expression
 }
 
 func (a *AssignExpression) expressionNode()      {}
 func (a *AssignExpression) TokenLiteral() string { return a.Token.Literal }
-func (a *AssignExpression) String() string       { return a.Name.String() + " = " + a.Value.String() }
+func (a *AssignExpression) String() string {
+	if a.Index != nil {
+		target := Expression(a.Name)
+		if a.Target != nil {
+			target = a.Target
+		}
+		if a.End != nil {
+			return target.String() + "[" + a.Index.String() + ", " + a.End.String() + "] = " + a.Value.String()
+		}
+		return target.String() + "[" + a.Index.String() + "] = " + a.Value.String()
+	}
+	return a.Name.String() + " = " + a.Value.String()
+}
 
 type MultiAssignExpression struct {
 	Token  lexer.Token
@@ -680,6 +746,7 @@ type MethodCall struct {
 	Args        []Expression
 	KeywordArgs []*KeywordArg
 	Block       *BlockExpression
+	Safe        bool
 }
 
 func (m *MethodCall) expressionNode()      {}
@@ -687,7 +754,11 @@ func (m *MethodCall) TokenLiteral() string { return m.Token.Literal }
 func (m *MethodCall) String() string {
 	out := ""
 	if m.Receiver != nil {
-		out += m.Receiver.String() + "."
+		if m.Safe {
+			out += m.Receiver.String() + "&."
+		} else {
+			out += m.Receiver.String() + "."
+		}
 	}
 	out += m.Method.String()
 	out += "("
@@ -772,6 +843,7 @@ type RaiseExpression struct {
 }
 
 func (r *RaiseExpression) statementNode()       {}
+func (r *RaiseExpression) expressionNode()      {}
 func (r *RaiseExpression) TokenLiteral() string { return r.Token.Literal }
 func (r *RaiseExpression) String() string {
 	if r.Error != nil {

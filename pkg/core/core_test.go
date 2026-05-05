@@ -244,6 +244,15 @@ func TestStringAdd(t *testing.T) {
 	assertStr(t, callMethod(t, mkStr("hello"), "+", mkStr(" world")), "hello world")
 }
 
+func TestStringConcatWithNonStringDoesNotPanic(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("String#concat should not panic for non-string argument: %v", recovered)
+		}
+	}()
+	assertNil(t, callMethod(t, mkStr("hello"), "concat", R.NilVal))
+}
+
 func TestStringMul(t *testing.T) {
 	assertStr(t, callMethod(t, mkStr("ab"), "*", mkInt(3)), "ababab")
 }
@@ -391,6 +400,20 @@ func TestArrayIndexNegative(t *testing.T) {
 func TestArrayIndexOutOfBounds(t *testing.T) {
 	arr := mkArr(mkInt(1))
 	assertNil(t, callMethod(t, arr, "[]", mkInt(5)))
+}
+
+func TestArrayDeleteAtNonIntegerDoesNotPanic(t *testing.T) {
+	arr := mkArr(mkInt(1), mkInt(2))
+	arg := &object.EmeraldValue{Type: object.ValueObject, Data: "not-int", Class: R.Classes["Object"]}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("delete_at panicked for non-integer argument: %v", recovered)
+		}
+	}()
+
+	result := callMethod(t, arr, "delete_at", arg)
+	assertNil(t, result)
 }
 
 // === Object Methods ===

@@ -5,8 +5,8 @@ import (
 
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/lexer"
-	"github.com/GoLangDream/rgo/pkg/parser"
 	"github.com/GoLangDream/rgo/pkg/object"
+	"github.com/GoLangDream/rgo/pkg/parser"
 )
 
 func init() {
@@ -48,6 +48,81 @@ func hasOpcode(instructions Instructions, op Opcode) bool {
 		i += width
 	}
 	return false
+}
+
+func functionConstants(bytecode *Bytecode) []*object.Function {
+	functions := []*object.Function{}
+	for _, constant := range bytecode.Constants {
+		if fn, ok := constant.Data.(*object.Function); ok {
+			functions = append(functions, fn)
+		}
+	}
+	return functions
+}
+
+func TestBlockPassedToMethodCapturesOuterLocalWithLocalOpcode(t *testing.T) {
+	bytecode := compile(t, `def call_proc(&p)
+  p.call
+end
+x = 41
+call_proc { x + 1 }`)
+
+	foundBlockWithLocal := false
+	for _, fn := range functionConstants(bytecode) {
+		if hasOpcode(fn.Instructions, OpGetLocal) {
+			foundBlockWithLocal = true
+			break
+		}
+	}
+	if !foundBlockWithLocal {
+		t.Fatalf("expected a top-level block function to read captured x with OpGetLocal")
+	}
+}
+
+func TestBlockPassedToMethodCapturesEarlierOuterLocalWithLocalOpcode(t *testing.T) {
+	bytecode := compile(t, `x = 41
+def call_proc(&p)
+  p.call
+end
+call_proc { x + 1 }`)
+	foundBlockWithLocal := false
+	for _, fn := range functionConstants(bytecode) {
+		if hasOpcode(fn.Instructions, OpGetLocal) {
+			foundBlockWithLocal = true
+			break
+		}
+	}
+	if !foundBlockWithLocal {
+		t.Fatalf("expected a top-level block function to read captured x with OpGetLocal")
+	}
+}
+
+func TestBlockAssignmentUsesOuterLocalOpcodes(t *testing.T) {
+	bytecode := compile(t, `i = 0
+2.times do
+  i += 1
+end
+i`)
+	foundGetOuter := false
+	foundSetOuter := false
+	for _, fn := range functionConstants(bytecode) {
+		if hasOpcode(fn.Instructions, OpGetOuter) {
+			foundGetOuter = true
+		}
+		if hasOpcode(fn.Instructions, OpSetOuter) {
+			foundSetOuter = true
+		}
+	}
+	if !foundGetOuter {
+		t.Fatal("expected block function to read i with OpGetOuter")
+	}
+	if !foundSetOuter {
+		t.Fatal("expected block function to assign i with OpSetOuter")
+	}
+}
+
+func TestCompileInterpolatedRegexpWithEncodingModifierCall(t *testing.T) {
+	compile(t, `/#{/./}/e.encoding.should == Encoding::EUC_JP`)
 }
 
 func countOpcode(instructions Instructions, op Opcode) int {
@@ -116,6 +191,106 @@ func TestCompileString(t *testing.T) {
 	}
 	if bc.Constants[0].Data.(string) != "hello" {
 		t.Errorf("expected hello, got %v", bc.Constants[0].Data)
+	}
+}
+
+func TestCompileRegexp(t *testing.T) {
+	bc := compile(t, `/foo/`)
+	if len(bc.Constants) != 1 {
+		t.Fatalf("expected 1 constant, got %d", len(bc.Constants))
+	}
+	if bc.Constants[0].Type != object.ValueRegexp {
+		t.Errorf("expected Regexp, got %v", bc.Constants[0].Type)
+	}
+	r, ok := bc.Constants[0].Data.(*object.RRegexp)
+	if !ok {
+		t.Fatalf("expected *object.RRegexp, got %T", bc.Constants[0].Data)
+	}
+	if r.Pattern != "foo" {
+		t.Errorf("expected foo, got %v", r.Pattern)
+	}
+}
+
+func TestCompileIncludeExpressionAsMethodCall(t *testing.T) {
+	bc := compile(t, "include(1)")
+	if !hasOpcode(bc.Instructions, OpSend) {
+		t.Fatal("expected include expression to compile to OpSend")
+	}
+}
+
+func TestCompileDefUsesDistinctLocalIndexes(t *testing.T) {
+	bc := compile(t, "def f(a, b)\n  a + b\nend")
+	var fn *object.Function
+	for _, constant := range bc.Constants {
+		if constant.Type == object.ValueFunction {
+			fn = constant.Data.(*object.Function)
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("expected function constant")
+	}
+
+	indexes := []byte{}
+	for i := 0; i < len(fn.Instructions); i++ {
+		if Opcode(fn.Instructions[i]) == OpGetLocal {
+			indexes = append(indexes, fn.Instructions[i+1])
+			i++
+		}
+	}
+	if len(indexes) != 2 {
+		t.Fatalf("expected 2 OpGetLocal instructions, got %d", len(indexes))
+	}
+	if indexes[0] != 0 || indexes[1] != 1 {
+		t.Fatalf("expected local indexes [0 1], got %v", indexes)
+	}
+}
+
+func TestCompileBeginRescueEnsureDoesNotCorruptConstants(t *testing.T) {
+	bc := compile(t, `x = 0
+begin
+  raise "e"
+rescue
+  x = 1
+ensure
+  x = x + 10
+end
+x`)
+	for i := 0; i < len(bc.Instructions); i++ {
+		op := Opcode(bc.Instructions[i])
+		def, ok := Lookup(byte(op))
+		if !ok {
+			continue
+		}
+		if op == OpConstant {
+			idx := int(bc.Instructions[i+1])<<8 | int(bc.Instructions[i+2])
+			if idx < 0 || idx >= len(bc.Constants) {
+				t.Fatalf("OpConstant at %d references constant %d, only %d constants", i, idx, len(bc.Constants))
+			}
+		}
+		for _, width := range def.OperandWidths {
+			i += width
+		}
+	}
+}
+
+func TestCompileInstanceVariableLambdaAssignmentDoesNotCorruptConstants(t *testing.T) {
+	bc := compile(t, `@value_to_return = -> _ { true }`)
+	for i := 0; i < len(bc.Instructions); i++ {
+		op := Opcode(bc.Instructions[i])
+		def, ok := Lookup(byte(op))
+		if !ok {
+			continue
+		}
+		if op == OpConstant || op == OpSetInstanceVar || op == OpLambda || op == OpClosure {
+			idx := int(bc.Instructions[i+1])<<8 | int(bc.Instructions[i+2])
+			if idx < 0 || idx >= len(bc.Constants) {
+				t.Fatalf("%s at %d references constant %d, only %d constants", def.Name, i, idx, len(bc.Constants))
+			}
+		}
+		for _, width := range def.OperandWidths {
+			i += width
+		}
 	}
 }
 

@@ -2,7 +2,12 @@ package core
 
 import (
 	"fmt"
+	"hash/fnv"
+	"math"
 	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/object"
@@ -15,6 +20,8 @@ var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
 var CallMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
 
 var CallBlockWithArgs func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
+
+var EvalSource func(source string) *object.EmeraldValue
 
 var LastBlockResult *object.EmeraldValue
 
@@ -149,6 +156,8 @@ func (rt *Runtime) createClasses() {
 	methodClass.SuperClass = objectClass
 	bindingClass := object.NewClass("Binding")
 	bindingClass.SuperClass = objectClass
+	activeSupportTestCaseClass := object.NewClass("ActiveSupport::TestCase")
+	activeSupportTestCaseClass.SuperClass = objectClass
 
 	R.TrueVal.Class = trueClass
 	R.FalseVal.Class = falseClass
@@ -185,6 +194,7 @@ func (rt *Runtime) createClasses() {
 	R.Classes["LoadError"] = loadErrorClass
 	R.Classes["Method"] = methodClass
 	R.Classes["Binding"] = bindingClass
+	R.Classes["ActiveSupport::TestCase"] = activeSupportTestCaseClass
 }
 
 func (rt *Runtime) defineMethods() {
@@ -198,6 +208,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("respond_to?", &object.Method{Name: "respond_to?", Fn: methodRespondTo, Arity: 1})
 	objectClass.DefineMethod("send", &object.Method{Name: "send", Fn: methodSend, Arity: 1})
 	objectClass.DefineMethod("is_a?", &object.Method{Name: "is_a?", Fn: methodIsA, Arity: 1})
+	objectClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: methodEval, Arity: 1})
 
 	integerClass := R.Classes["Integer"]
 	integerClass.DefineMethod("+", &object.Method{Name: "+", Fn: intAdd, Arity: 1})
@@ -223,6 +234,12 @@ func (rt *Runtime) defineMethods() {
 	integerClass.DefineMethod("gcd", &object.Method{Name: "gcd", Fn: intGcd, Arity: 1})
 	integerClass.DefineMethod("lcm", &object.Method{Name: "lcm", Fn: intLcm, Arity: 1})
 	integerClass.DefineMethod("divmod", &object.Method{Name: "divmod", Fn: intDivmod, Arity: 1})
+	integerClass.DefineMethod("positive?", &object.Method{Name: "positive?", Fn: intPositive, Arity: 0})
+	integerClass.DefineMethod("negative?", &object.Method{Name: "negative?", Fn: intNegative, Arity: 0})
+	integerClass.DefineMethod("floor", &object.Method{Name: "floor", Fn: intFloor, Arity: 0})
+	integerClass.DefineMethod("ceil", &object.Method{Name: "ceil", Fn: intCeil, Arity: 0})
+	integerClass.DefineMethod("round", &object.Method{Name: "round", Fn: intRound, Arity: 0})
+	integerClass.DefineMethod("digits", &object.Method{Name: "digits", Fn: intDigits, Arity: 0})
 
 	// Bitwise operators
 	integerClass.DefineMethod("&", &object.Method{Name: "&", Fn: intBitAnd, Arity: 1})
@@ -266,6 +283,14 @@ func (rt *Runtime) defineMethods() {
 	floatClass.DefineMethod("ceil", &object.Method{Name: "ceil", Fn: floatCeil, Arity: 0})
 	floatClass.DefineMethod("round", &object.Method{Name: "round", Fn: floatRound, Arity: 0})
 	floatClass.DefineMethod("abs", &object.Method{Name: "abs", Fn: floatAbs, Arity: 0})
+	floatClass.DefineMethod("to_f", &object.Method{Name: "to_f", Fn: floatToF, Arity: 0})
+	floatClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: floatToI, Arity: 0})
+	floatClass.DefineMethod("zero?", &object.Method{Name: "zero?", Fn: floatZero, Arity: 0})
+	floatClass.DefineMethod("positive?", &object.Method{Name: "positive?", Fn: floatPositive, Arity: 0})
+	floatClass.DefineMethod("negative?", &object.Method{Name: "negative?", Fn: floatNegative, Arity: 0})
+	floatClass.DefineMethod("nan?", &object.Method{Name: "nan?", Fn: floatNan, Arity: 0})
+	floatClass.DefineMethod("infinite?", &object.Method{Name: "infinite?", Fn: floatInfinite, Arity: 0})
+	floatClass.DefineMethod("finite?", &object.Method{Name: "finite?", Fn: floatFinite, Arity: 0})
 	floatClass.DefineMethod("<", &object.Method{Name: "<", Fn: floatLessThan, Arity: 1})
 	floatClass.DefineMethod(">", &object.Method{Name: ">", Fn: floatGreaterThan, Arity: 1})
 	floatClass.DefineMethod("<=", &object.Method{Name: "<=", Fn: floatLessThanOrEqual, Arity: 1})
@@ -311,6 +336,7 @@ func (rt *Runtime) defineMethods() {
 	bindingClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: bindingEval, Arity: 1})
 
 	stringClass := R.Classes["String"]
+	stringClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: stringClassNew, Arity: -1})
 	stringClass.DefineMethod("+", &object.Method{Name: "+", Fn: stringAdd, Arity: 1})
 	stringClass.DefineMethod("*", &object.Method{Name: "*", Fn: stringMul, Arity: 1})
 	stringClass.DefineMethod("length", &object.Method{Name: "length", Fn: stringLength, Arity: 0})
@@ -373,39 +399,60 @@ func (rt *Runtime) defineMethods() {
 	arrayClass := R.Classes["Array"]
 	arrayClass.DefineMethod("length", &object.Method{Name: "length", Fn: arrayLength, Arity: 0})
 	arrayClass.DefineMethod("size", &object.Method{Name: "size", Fn: arrayLength, Arity: 0})
-	arrayClass.DefineMethod("first", &object.Method{Name: "first", Fn: arrayFirst, Arity: 0})
-	arrayClass.DefineMethod("last", &object.Method{Name: "last", Fn: arrayLast, Arity: 0})
+	arrayClass.DefineMethod("first", &object.Method{Name: "first", Fn: arrayFirst, Arity: -1})
+	arrayClass.DefineMethod("last", &object.Method{Name: "last", Fn: arrayLast, Arity: -1})
 	arrayClass.DefineMethod("push", &object.Method{Name: "push", Fn: arrayPush, Arity: 1})
 	arrayClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: arrayPush, Arity: 1})
 	arrayClass.DefineMethod("pop", &object.Method{Name: "pop", Fn: arrayPop, Arity: 0})
 	arrayClass.DefineMethod("empty?", &object.Method{Name: "empty?", Fn: arrayEmpty, Arity: 0})
 	arrayClass.DefineMethod("join", &object.Method{Name: "join", Fn: arrayJoin, Arity: 0})
 	arrayClass.DefineMethod("reverse", &object.Method{Name: "reverse", Fn: arrayReverse, Arity: 0})
+	arrayClass.DefineMethod("reverse!", &object.Method{Name: "reverse!", Fn: arrayReverseBang, Arity: 0})
 	arrayClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: arrayIndex, Arity: 1})
+	arrayClass.DefineMethod("at", &object.Method{Name: "at", Fn: arrayIndex, Arity: 1})
 	arrayClass.DefineMethod("each", &object.Method{Name: "each", Fn: arrayEach, Arity: 0})
 	arrayClass.DefineMethod("map", &object.Method{Name: "map", Fn: arrayMap, Arity: 0})
+	arrayClass.DefineMethod("collect", &object.Method{Name: "collect", Fn: arrayMap, Arity: 0})
+	arrayClass.DefineMethod("map!", &object.Method{Name: "map!", Fn: arrayMapBang, Arity: 0})
+	arrayClass.DefineMethod("collect!", &object.Method{Name: "collect!", Fn: arrayMapBang, Arity: 0})
 	arrayClass.DefineMethod("select", &object.Method{Name: "select", Fn: arraySelect, Arity: 0})
+	arrayClass.DefineMethod("select!", &object.Method{Name: "select!", Fn: arraySelectBang, Arity: 0})
+	arrayClass.DefineMethod("filter!", &object.Method{Name: "filter!", Fn: arraySelectBang, Arity: 0})
 	arrayClass.DefineMethod("find", &object.Method{Name: "find", Fn: arrayFind, Arity: 0})
 	arrayClass.DefineMethod("concat", &object.Method{Name: "concat", Fn: arrayConcat, Arity: 1})
 	arrayClass.DefineMethod("delete_at", &object.Method{Name: "delete_at", Fn: arrayDeleteAt, Arity: 1})
+	arrayClass.DefineMethod("delete_if", &object.Method{Name: "delete_if", Fn: arrayDeleteIf, Arity: 0})
+	arrayClass.DefineMethod("keep_if", &object.Method{Name: "keep_if", Fn: arrayKeepIf, Arity: 0})
 	arrayClass.DefineMethod("shift", &object.Method{Name: "shift", Fn: arrayShift, Arity: 0})
 	arrayClass.DefineMethod("unshift", &object.Method{Name: "unshift", Fn: arrayUnshift, Arity: 1})
+	arrayClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: arrayUnshift, Arity: 1})
 	arrayClass.DefineMethod("sample", &object.Method{Name: "sample", Fn: arraySample, Arity: 0})
 	arrayClass.DefineMethod("clear", &object.Method{Name: "clear", Fn: arrayClear, Arity: 0})
-	arrayClass.DefineMethod("include", &object.Method{Name: "include", Fn: arrayInclude, Arity: 1})
+	arrayClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: arrayInitialize, Arity: -1})
+	arrayClass.DefineMethod("include?", &object.Method{Name: "include?", Fn: arrayInclude, Arity: 1})
+	arrayClass.DefineMethod("assoc", &object.Method{Name: "assoc", Fn: arrayAssoc, Arity: 1})
+	arrayClass.DefineMethod("rassoc", &object.Method{Name: "rassoc", Fn: arrayRassoc, Arity: 1})
+	arrayClass.DefineMethod("hash", &object.Method{Name: "hash", Fn: arrayHash, Arity: 0})
 	arrayClass.DefineMethod("[]=", &object.Method{Name: "[]=", Fn: arrayIndexSet, Arity: 2})
 	arrayClass.DefineMethod("count", &object.Method{Name: "count", Fn: arrayCount, Arity: 0})
 	arrayClass.DefineMethod("index", &object.Method{Name: "index", Fn: arrayIndexOf, Arity: 1})
 	arrayClass.DefineMethod("rindex", &object.Method{Name: "rindex", Fn: arrayRIndexOf, Arity: 1})
 	arrayClass.DefineMethod("delete", &object.Method{Name: "delete", Fn: arrayDelete, Arity: 1})
 	arrayClass.DefineMethod("compact", &object.Method{Name: "compact", Fn: arrayCompact, Arity: 0})
+	arrayClass.DefineMethod("compact!", &object.Method{Name: "compact!", Fn: arrayCompactBang, Arity: 0})
 	arrayClass.DefineMethod("flatten", &object.Method{Name: "flatten", Fn: arrayFlatten, Arity: 0})
+	arrayClass.DefineMethod("flatten!", &object.Method{Name: "flatten!", Fn: arrayFlattenBang, Arity: 0})
 	arrayClass.DefineMethod("uniq", &object.Method{Name: "uniq", Fn: arrayUniq, Arity: 0})
+	arrayClass.DefineMethod("uniq!", &object.Method{Name: "uniq!", Fn: arrayUniqBang, Arity: 0})
 	arrayClass.DefineMethod("sort", &object.Method{Name: "sort", Fn: arraySort, Arity: 0})
+	arrayClass.DefineMethod("sort!", &object.Method{Name: "sort!", Fn: arraySortBang, Arity: 0})
 	arrayClass.DefineMethod("+", &object.Method{Name: "+", Fn: arrayPlus, Arity: 1})
 	arrayClass.DefineMethod("-", &object.Method{Name: "-", Fn: arrayMinus, Arity: 1})
+	arrayClass.DefineMethod("difference", &object.Method{Name: "difference", Fn: arrayMinus, Arity: -1})
 	arrayClass.DefineMethod("&", &object.Method{Name: "&", Fn: arrayIntersection, Arity: 1})
+	arrayClass.DefineMethod("intersection", &object.Method{Name: "intersection", Fn: arrayIntersection, Arity: -1})
 	arrayClass.DefineMethod("|", &object.Method{Name: "|", Fn: arrayUnion, Arity: 1})
+	arrayClass.DefineMethod("union", &object.Method{Name: "union", Fn: arrayUnion, Arity: -1})
 	arrayClass.DefineMethod("take", &object.Method{Name: "take", Fn: arrayTake, Arity: 1})
 	arrayClass.DefineMethod("drop", &object.Method{Name: "drop", Fn: arrayDrop, Arity: 1})
 	arrayClass.DefineMethod("any?", &object.Method{Name: "any?", Fn: arrayAny, Arity: 0})
@@ -415,16 +462,38 @@ func (rt *Runtime) defineMethods() {
 	arrayClass.DefineMethod("sum", &object.Method{Name: "sum", Fn: arraySum, Arity: 0})
 	arrayClass.DefineMethod("max", &object.Method{Name: "max", Fn: arrayMax, Arity: 0})
 	arrayClass.DefineMethod("min", &object.Method{Name: "min", Fn: arrayMin, Arity: 0})
+	arrayClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: arrayClassNew, Arity: -1})
 	arrayClass.DefineMethod("insert", &object.Method{Name: "insert", Fn: arrayInsert, Arity: 2})
+	arrayClass.DefineMethod("fill", &object.Method{Name: "fill", Fn: arrayFill, Arity: -1})
 	arrayClass.DefineMethod("slice", &object.Method{Name: "slice", Fn: arraySlice, Arity: 1})
 	arrayClass.DefineMethod("values_at", &object.Method{Name: "values_at", Fn: arrayValuesAt, Arity: -1})
 	arrayClass.DefineMethod("zip", &object.Method{Name: "zip", Fn: arrayZip, Arity: 1})
 	arrayClass.DefineMethod("each_index", &object.Method{Name: "each_index", Fn: arrayEachIndex, Arity: 0})
 	arrayClass.DefineMethod("each_with_index", &object.Method{Name: "each_with_index", Fn: arrayEachWithIndex, Arity: 0})
 	arrayClass.DefineMethod("rotate", &object.Method{Name: "rotate", Fn: arrayRotate, Arity: 0})
+	arrayClass.DefineMethod("rotate!", &object.Method{Name: "rotate!", Fn: arrayRotateBang, Arity: 0})
 	arrayClass.DefineMethod("shuffle", &object.Method{Name: "shuffle", Fn: arrayShuffle, Arity: 0})
+	arrayClass.DefineMethod("shuffle!", &object.Method{Name: "shuffle!", Fn: arrayShuffleBang, Arity: 0})
 	arrayClass.DefineMethod("fetch", &object.Method{Name: "fetch", Fn: arrayFetch, Arity: 1})
 	arrayClass.DefineMethod("reject", &object.Method{Name: "reject", Fn: arrayReject, Arity: 0})
+	arrayClass.DefineMethod("reject!", &object.Method{Name: "reject!", Fn: arrayRejectBang, Arity: 0})
+	arrayClass.DefineMethod("reduce", &object.Method{Name: "reduce", Fn: arrayReduce, Arity: 0})
+	arrayClass.DefineMethod("inject", &object.Method{Name: "inject", Fn: arrayReduce, Arity: 0})
+	arrayClass.DefineMethod("flat_map", &object.Method{Name: "flat_map", Fn: arrayFlatMap, Arity: 0})
+	arrayClass.DefineMethod("collect_concat", &object.Method{Name: "collect_concat", Fn: arrayFlatMap, Arity: 0})
+	arrayClass.DefineMethod("each_with_object", &object.Method{Name: "each_with_object", Fn: arrayEachWithObject, Arity: 1})
+	arrayClass.DefineMethod("partition", &object.Method{Name: "partition", Fn: arrayPartition, Arity: 0})
+	arrayClass.DefineMethod("take_while", &object.Method{Name: "take_while", Fn: arrayTakeWhile, Arity: 0})
+	arrayClass.DefineMethod("drop_while", &object.Method{Name: "drop_while", Fn: arrayDropWhile, Arity: 0})
+	arrayClass.DefineMethod("sort_by", &object.Method{Name: "sort_by", Fn: arraySortBy, Arity: 0})
+	arrayClass.DefineMethod("min_by", &object.Method{Name: "min_by", Fn: arrayMinBy, Arity: 0})
+	arrayClass.DefineMethod("max_by", &object.Method{Name: "max_by", Fn: arrayMaxBy, Arity: 0})
+	arrayClass.DefineMethod("to_a", &object.Method{Name: "to_a", Fn: arrayToA, Arity: 0})
+	arrayClass.DefineMethod("to_ary", &object.Method{Name: "to_ary", Fn: arrayToA, Arity: 0})
+	arrayClass.DefineMethod("deconstruct", &object.Method{Name: "deconstruct", Fn: arrayToA, Arity: 0})
+	arrayClass.DefineMethod("dup", &object.Method{Name: "dup", Fn: arrayDup, Arity: 0})
+	arrayClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: arrayDup, Arity: 0})
+	arrayClass.DefineMethod("replace", &object.Method{Name: "replace", Fn: arrayReplace, Arity: 1})
 
 	hashClass := R.Classes["Hash"]
 	hashClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: hashIndex, Arity: 1})
@@ -493,11 +562,13 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("raise", &object.Method{Name: "raise", Fn: builtinRaise, Arity: 1})
 	objectClass.DefineMethod("fail", &object.Method{Name: "fail", Fn: builtinRaise, Arity: 1})
 	objectClass.DefineMethod("abort", &object.Method{Name: "abort", Fn: builtinAbort, Arity: 0})
+	objectClass.DefineMethod("block_given?", &object.Method{Name: "block_given?", Fn: builtinBlockGiven, Arity: 0})
+	objectClass.DefineMethod("lambda", &object.Method{Name: "lambda", Fn: builtinLambda, Arity: 0})
 	objectClass.DefineMethod("should", &object.Method{Name: "should", Arity: 0, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-		return &object.EmeraldValue{Type: object.ValueObject, Data: r, Class: R.Classes["Expectation"]}
+		return &object.EmeraldValue{Type: object.ValueObject, Data: &expectationData{Value: r}, Class: R.Classes["Expectation"]}
 	}})
 	objectClass.DefineMethod("should_not", &object.Method{Name: "should_not", Arity: 0, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-		return &object.EmeraldValue{Type: object.ValueObject, Data: r, Class: R.Classes["Expectation"]}
+		return &object.EmeraldValue{Type: object.ValueObject, Data: &expectationData{Value: r, Negated: true}, Class: R.Classes["Expectation"]}
 	}})
 
 	moduleClass := R.Classes["Module"]
@@ -602,6 +673,17 @@ func methodSend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	return R.NilVal
 }
 
+func methodEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || EvalSource == nil {
+		return R.NilVal
+	}
+	source, ok := args[0].Data.(string)
+	if !ok {
+		return R.NilVal
+	}
+	return EvalSource(source)
+}
+
 func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.FalseVal
@@ -612,7 +694,7 @@ func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	targetClass := args[0].Data.(*object.Class)
 	currentClass := receiver.Class
 	for currentClass != nil {
-		if currentClass == targetClass {
+		if currentClass == targetClass || currentClass.Name == targetClass.Name {
 			return R.TrueVal
 		}
 		currentClass = currentClass.SuperClass
@@ -701,15 +783,15 @@ func intPow(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	l := receiver.Data.(int64)
+	lf := valueToInt64(receiver)
 	switch r := args[0].Data.(type) {
 	case int64:
 		if r < 0 {
-			return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / powInt(l, -int(r)), Class: R.Classes["Float"]}
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / powInt(lf, -int(r)), Class: R.Classes["Float"]}
 		}
-		return &object.EmeraldValue{Type: object.ValueInteger, Data: powInt(l, int(r)), Class: R.Classes["Integer"]}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: powInt(lf, int(r)), Class: R.Classes["Integer"]}
 	case float64:
-		return &object.EmeraldValue{Type: object.ValueFloat, Data: mathPow(float64(l), r), Class: R.Classes["Float"]}
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: mathPow(float64(lf), r), Class: R.Classes["Float"]}
 	}
 	return R.NilVal
 }
@@ -801,6 +883,64 @@ func intToF(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 	}
 }
 
+func intPositive(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Data.(int64) > 0 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func intNegative(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Data.(int64) < 0 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func intFloor(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func intCeil(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func intRound(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func intDigits(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	v := receiver.Data.(int64)
+	if v < 0 {
+		v = -v
+	}
+	if v == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{newInt(0)},
+			Class: R.Classes["Array"],
+		}
+	}
+	digits := make([]*object.EmeraldValue, 0)
+	for v > 0 {
+		digits = append(digits, newInt(v%10))
+		v /= 10
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  digits,
+		Class: R.Classes["Array"],
+	}
+}
+
+func newInt(v int64) *object.EmeraldValue {
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: v, Class: R.Classes["Integer"]}
+}
+
+func newFloat(v float64) *object.EmeraldValue {
+	return &object.EmeraldValue{Type: object.ValueFloat, Data: v, Class: R.Classes["Float"]}
+}
+
 func intGcd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return receiver
@@ -846,8 +986,11 @@ func intDivmod(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	a := receiver.Data.(int64)
-	b := args[0].Data.(int64)
+	a := valueToInt64(receiver)
+	b := valueToInt64(args[0])
+	if b == 0 {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{R.NilVal, R.NilVal}, Class: R.Classes["Array"]}
+	}
 	quotient := a / b
 	remainder := a % b
 	result := make([]*object.EmeraldValue, 2)
@@ -1046,7 +1189,9 @@ func intTimes(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 				Class: R.Classes["Integer"],
 			})
 			if LastBlockResult != nil {
-				return LastBlockResult
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
 			}
 		}
 	}
@@ -1058,15 +1203,40 @@ func intUpto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 		return R.NilVal
 	}
 	start := receiver.Data.(int64)
-	end := args[0].Data.(int64)
-	for i := start; i <= end; i++ {
-		if CallBlock != nil {
-			CallBlock(&object.EmeraldValue{
+	end := start
+	switch value := args[0].Data.(type) {
+	case int64:
+		end = value
+	case float64:
+		if math.IsInf(value, 1) {
+			end = start + 1023
+		} else {
+			end = int64(value)
+		}
+	default:
+		return R.NilVal
+	}
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		values := make([]*object.EmeraldValue, 0)
+		for i := start; i <= end; i++ {
+			values = append(values, &object.EmeraldValue{
 				Type:  object.ValueInteger,
 				Data:  i,
 				Class: R.Classes["Integer"],
 			})
 		}
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  values,
+			Class: R.Classes["Array"],
+		}
+	}
+	for i := start; i <= end; i++ {
+		CallBlock(&object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  i,
+			Class: R.Classes["Integer"],
+		})
 	}
 	return receiver
 }
@@ -1075,8 +1245,8 @@ func intDownto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	start := receiver.Data.(int64)
-	end := args[0].Data.(int64)
+	start := valueToInt64(receiver)
+	end := valueToInt64(args[0])
 	for i := start; i >= end; i-- {
 		if CallBlock != nil {
 			CallBlock(&object.EmeraldValue{
@@ -1152,9 +1322,18 @@ func floatDiv(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func floatToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	var s string
+	switch v := receiver.Data.(type) {
+	case float64:
+		s = fmt.Sprintf("%g", v)
+	case int64:
+		s = fmt.Sprintf("%d", v)
+	default:
+		s = fmt.Sprintf("%v", receiver.Data)
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueString,
-		Data:  fmt.Sprintf("%g", receiver.Data.(float64)),
+		Data:  s,
 		Class: R.Classes["String"],
 	}
 }
@@ -1204,14 +1383,58 @@ func floatRound(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 
 func floatAbs(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	f := receiver.Data.(float64)
-	if f < 0 {
-		f = -f
+	return newFloat(math.Abs(f))
+}
+
+func floatToF(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func floatZero(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Data.(float64) == 0 {
+		return R.TrueVal
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueFloat,
-		Data:  f,
-		Class: R.Classes["Float"],
+	return R.FalseVal
+}
+
+func floatPositive(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Data.(float64) > 0 {
+		return R.TrueVal
 	}
+	return R.FalseVal
+}
+
+func floatNegative(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Data.(float64) < 0 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func floatNan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if math.IsNaN(receiver.Data.(float64)) {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func floatInfinite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	f := receiver.Data.(float64)
+	if math.IsInf(f, 1) {
+		return newInt(1)
+	}
+	if math.IsInf(f, -1) {
+		return newInt(-1)
+	}
+	return R.NilVal
+}
+
+func floatFinite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	f := receiver.Data.(float64)
+	if !math.IsInf(f, 0) && !math.IsNaN(f) {
+		return R.TrueVal
+	}
+	return R.FalseVal
 }
 
 func floatLessThan(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -1454,8 +1677,102 @@ func arrayLength(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func arrayToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func arrayClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  arrayNewContents(args...),
+		Class: R.Classes["Array"],
+	}
+}
+
+func stringClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	value := ""
+	if len(args) > 0 {
+		if s, ok := args[0].Data.(string); ok {
+			value = s
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  value,
+		Class: R.Classes["String"],
+	}
+}
+
+func arrayInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	receiver.Data = arrayNewContents(args...)
+	return receiver
+}
+
+func arrayNewContents(args ...*object.EmeraldValue) []*object.EmeraldValue {
+	if len(args) == 1 {
+		if arr, ok := valueToArray(args[0]); ok {
+			return append([]*object.EmeraldValue(nil), arr...)
+		}
+	}
+
+	length := 0
+	if len(args) > 0 {
+		if n, ok := valueToInteger(args[0]); ok && n > 0 {
+			length = int(n)
+		}
+	}
+
+	defaultValue := R.NilVal
+	if len(args) > 1 {
+		defaultValue = args[1]
+	}
+
+	arr := make([]*object.EmeraldValue, length)
+	for i := 0; i < length; i++ {
+		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+			arr[i] = CallBlock(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  int64(i),
+				Class: R.Classes["Integer"],
+			})
+		} else {
+			arr[i] = defaultValue
+		}
+	}
+	return arr
+}
+
+func arrayDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	copyArr := append([]*object.EmeraldValue(nil), arr...)
+	return &object.EmeraldValue{Type: object.ValueArray, Data: copyArr, Class: R.Classes["Array"]}
+}
+
+func arrayReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0].Type != object.ValueArray {
+		return receiver
+	}
+	replacement := args[0].Data.([]*object.EmeraldValue)
+	receiver.Data = append([]*object.EmeraldValue(nil), replacement...)
+	return receiver
+}
+
 func arrayFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) > 0 {
+		count, ok := valueToInteger(args[0])
+		if !ok {
+			return R.NilVal
+		}
+		n := int(count)
+		if n < 0 {
+			n = 0
+		}
+		if n > len(arr) {
+			n = len(arr)
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: arr[:n], Class: R.Classes["Array"]}
+	}
 	if len(arr) > 0 {
 		return arr[0]
 	}
@@ -1464,6 +1781,20 @@ func arrayFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 
 func arrayLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) > 0 {
+		count, ok := valueToInteger(args[0])
+		if !ok {
+			return R.NilVal
+		}
+		n := int(count)
+		if n < 0 {
+			n = 0
+		}
+		if n > len(arr) {
+			n = len(arr)
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: arr[len(arr)-n:], Class: R.Classes["Array"]}
+	}
 	if len(arr) > 0 {
 		return arr[len(arr)-1]
 	}
@@ -1472,15 +1803,11 @@ func arrayLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 
 func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
-		return R.NilVal
+		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	newArr := append(arr, args[0])
-	return &object.EmeraldValue{
-		Type:  object.ValueArray,
-		Data:  newArr,
-		Class: R.Classes["Array"],
-	}
+	receiver.Data = append(arr, args[0])
+	return receiver
 }
 
 func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -1501,11 +1828,15 @@ func arrayEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 
 func arrayJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	sep := ""
+	if len(args) > 0 && args[0].Type == object.ValueString {
+		sep = args[0].Data.(string)
+	}
 	result := ""
 	for i, v := range arr {
 		result += v.Inspect()
 		if i < len(arr)-1 {
-			result += ", "
+			result += sep
 		}
 	}
 	return &object.EmeraldValue{
@@ -1528,6 +1859,15 @@ func arrayReverse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 }
 
+func arrayReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	for i, j := 0, len(arr)-1; i < j; i, j = i+1, j-1 {
+		arr[i], arr[j] = arr[j], arr[i]
+	}
+	receiver.Data = arr
+	return receiver
+}
+
 func arrayIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
@@ -1546,12 +1886,21 @@ func arrayIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	return R.NilVal
 }
 
+func hashLookup(h map[*object.EmeraldValue]*object.EmeraldValue, key *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	for k, v := range h {
+		if k.Equals(key) {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 func hashIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	if val, ok := h[args[0]]; ok {
+	h := valueToHashMap(receiver)
+	if val, ok := hashLookup(h, args[0]); ok {
 		return val
 	}
 	return R.NilVal
@@ -1561,13 +1910,19 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if len(args) < 2 {
 		return R.NilVal
 	}
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h := valueToHashMap(receiver)
+	for k := range h {
+		if k.Equals(args[0]) {
+			h[k] = args[1]
+			return args[1]
+		}
+	}
 	h[args[0]] = args[1]
 	return args[1]
 }
 
 func hashKeys(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h := valueToHashMap(receiver)
 	keys := make([]*object.EmeraldValue, 0, len(h))
 	for k := range h {
 		keys = append(keys, k)
@@ -1580,7 +1935,7 @@ func hashKeys(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func hashValues(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h := valueToHashMap(receiver)
 	values := make([]*object.EmeraldValue, 0, len(h))
 	for _, v := range h {
 		values = append(values, v)
@@ -1593,7 +1948,7 @@ func hashValues(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func hashLength(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h := valueToHashMap(receiver)
 	return &object.EmeraldValue{
 		Type:  object.ValueInteger,
 		Data:  int64(len(h)),
@@ -1602,7 +1957,7 @@ func hashLength(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func hashEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	h := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h := valueToHashMap(receiver)
 	if len(h) == 0 {
 		return R.TrueVal
 	}
@@ -1625,7 +1980,7 @@ func builtinPrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 
 func builtinP(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	for _, arg := range args {
-		fmt.Printf("%#v\n", arg.Inspect())
+		fmt.Println(arg.Inspect())
 	}
 	return R.NilVal
 }
@@ -1766,39 +2121,52 @@ func stringSlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		return R.NilVal
 	}
 
+	arg := args[0]
+	switch arg.Data.(type) {
+	case *object.RRegexp:
+		pattern := arg.Data.(*object.RRegexp)
+		re, err := regexp.Compile(pattern.Pattern)
+		if err != nil {
+			return R.NilVal
+		}
+		loc := re.FindStringIndex(s)
+		if loc == nil {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueString, Data: s[loc[0]:loc[1]], Class: R.Classes["String"]}
+	}
+
 	start := 0
-	if args[0].Type == object.ValueInteger {
-		start = int(args[0].Data.(int64))
+	if arg.Type == object.ValueInteger {
+		start = int(arg.Data.(int64))
+	} else if arg.Type == object.ValueFloat {
+		start = int(arg.Data.(float64))
 	}
 
 	length := len(s)
-	if len(args) >= 2 && args[1].Type == object.ValueInteger {
-		length = int(args[1].Data.(int64))
+	if len(args) >= 2 {
+		if args[1].Type == object.ValueInteger {
+			length = int(args[1].Data.(int64))
+		} else if args[1].Type == object.ValueFloat {
+			length = int(args[1].Data.(float64))
+		}
+	}
+	if length < 0 {
+		return R.NilVal
 	}
 
 	if start < 0 {
 		start = len(s) + start
 	}
-	if start < 0 {
-		start = 0
-	}
-	if start > len(s) {
-		return &object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  "",
-			Class: R.Classes["String"],
-		}
+	if start < 0 || start > len(s) {
+		return R.NilVal
 	}
 
 	if length > len(s)-start {
 		length = len(s) - start
 	}
 
-	return &object.EmeraldValue{
-		Type:  object.ValueString,
-		Data:  s[start : start+length],
-		Class: R.Classes["String"],
-	}
+	return &object.EmeraldValue{Type: object.ValueString, Data: s[start : start+length], Class: R.Classes["String"]}
 }
 
 func stringToSym(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -1814,7 +2182,13 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for _, elem := range arr {
 		if CallBlock != nil {
+			LastBlockResult = nil
 			CallBlock(elem)
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
 		}
 	}
 	return receiver
@@ -1834,6 +2208,18 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	}
 }
 
+func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	for i, elem := range arr {
+		arr[i] = CallBlock(elem)
+	}
+	receiver.Data = arr
+	return receiver
+}
+
 func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, 0)
@@ -1850,6 +2236,24 @@ func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func arraySelectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	for _, elem := range arr {
+		if CallBlock(elem).IsTruthy() {
+			newArr = append(newArr, elem)
+		}
+	}
+	if len(newArr) == len(arr) {
+		return R.NilVal
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
 func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for _, elem := range arr {
@@ -1862,11 +2266,17 @@ func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	hash := valueToHashMap(receiver)
+	for k, v := range hash {
+		if CallBlock != nil {
+			CallBlock(k, v)
+		}
+	}
 	return receiver
 }
 
 func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	keys := make([]*object.EmeraldValue, 0, len(hash))
 	for k := range hash {
 		keys = append(keys, k)
@@ -1879,7 +2289,7 @@ func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func hashEachValue(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	values := make([]*object.EmeraldValue, 0, len(hash))
 	for _, v := range hash {
 		values = append(values, v)
@@ -1895,8 +2305,8 @@ func hashHasKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) < 1 {
 		return R.FalseVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	_, ok := hash[args[0]]
+	hash := valueToHashMap(receiver)
+	_, ok := hashLookup(hash, args[0])
 	if ok {
 		return R.TrueVal
 	}
@@ -1905,14 +2315,21 @@ func hashHasKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 
 func stringCount(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	s := receiver.Data.(string)
-	if len(args) < 1 {
+	if len(args) < 1 || args[0] == nil || args[0].Data == nil {
 		return &object.EmeraldValue{
 			Type:  object.ValueInteger,
 			Data:  int64(len(s)),
 			Class: R.Classes["Integer"],
 		}
 	}
-	substr := args[0].Data.(string)
+	substr, ok := args[0].Data.(string)
+	if !ok {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  int64(len(s)),
+			Class: R.Classes["Integer"],
+		}
+	}
 	count := 0
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
@@ -1974,14 +2391,92 @@ func arrayConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if len(args) < 1 {
 		return receiver
 	}
-	other := args[0].Data.([]*object.EmeraldValue)
-	result := make([]*object.EmeraldValue, len(arr)+len(other))
-	copy(result, arr)
-	copy(result[len(arr):], other)
-	return &object.EmeraldValue{
-		Type:  object.ValueArray,
-		Data:  result,
-		Class: R.Classes["Array"],
+	for _, arg := range args {
+		if arg.Type != object.ValueArray {
+			continue
+		}
+		arr = append(arr, arg.Data.([]*object.EmeraldValue)...)
+	}
+	receiver.Data = arr
+	return receiver
+}
+
+func valueToArrayIndex(value *object.EmeraldValue) (int, bool) {
+	idx, ok := valueToInteger(value)
+	if !ok {
+		return 0, false
+	}
+	return int(idx), true
+}
+
+func valueToInteger(value *object.EmeraldValue) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	if value.Type == object.ValueInteger {
+		idx, ok := value.Data.(int64)
+		return idx, ok
+	}
+	if CallMethod == nil || value.Class == nil {
+		return 0, false
+	}
+	if _, ok := value.Class.GetMethod("to_int"); !ok {
+		return 0, false
+	}
+	coerced := CallMethod(value, "to_int")
+	if coerced == nil || coerced.Type != object.ValueInteger {
+		return 0, false
+	}
+	idx, ok := coerced.Data.(int64)
+	if !ok {
+		return 0, false
+	}
+	return idx, true
+}
+
+func valueToArray(value *object.EmeraldValue) ([]*object.EmeraldValue, bool) {
+	if value == nil {
+		return nil, false
+	}
+	if value.Type == object.ValueArray {
+		arr, ok := value.Data.([]*object.EmeraldValue)
+		return arr, ok
+	}
+	if CallMethod == nil || value.Class == nil {
+		return nil, false
+	}
+	if _, ok := value.Class.GetMethod("to_ary"); !ok {
+		return nil, false
+	}
+	coerced := CallMethod(value, "to_ary")
+	if coerced == nil || coerced.Type != object.ValueArray {
+		return nil, false
+	}
+	arr, ok := coerced.Data.([]*object.EmeraldValue)
+	return arr, ok
+}
+
+func valueToHashMap(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+	if value == nil {
+		return nil
+	}
+	if h, ok := value.Data.(map[*object.EmeraldValue]*object.EmeraldValue); ok {
+		return h
+	}
+	return nil
+}
+
+func valueToInt64(value *object.EmeraldValue) int64 {
+	if value == nil {
+		return 0
+	}
+	switch v := value.Data.(type) {
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	default:
+		return 0
 	}
 }
 
@@ -1990,7 +2485,10 @@ func arrayDeleteAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	idx := int(args[0].Data.(int64))
+	idx, ok := valueToArrayIndex(args[0])
+	if !ok {
+		return R.NilVal
+	}
 	if idx < 0 {
 		idx = len(arr) + idx
 	}
@@ -2009,9 +2507,8 @@ func hashFetch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	val, ok := hash[args[0]]
-	if ok {
+	hash := valueToHashMap(receiver)
+	if val, ok := hashLookup(hash, args[0]); ok {
 		return val
 	}
 	return R.NilVal
@@ -2021,15 +2518,25 @@ func hashMerge(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return receiver
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	other := args[0].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
+	other := valueToHashMap(args[0])
 
 	result := make(map[*object.EmeraldValue]*object.EmeraldValue)
 	for k, v := range hash {
 		result[k] = v
 	}
 	for k, v := range other {
-		result[k] = v
+		found := false
+		for rk := range result {
+			if rk.Equals(k) {
+				result[rk] = v
+				found = true
+				break
+			}
+		}
+		if !found {
+			result[k] = v
+		}
 	}
 
 	return &object.EmeraldValue{
@@ -2540,8 +3047,8 @@ func arrayUnshift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	newArr := make([]*object.EmeraldValue, 0, len(arr)+1)
-	newArr = append(newArr, args[0])
+	newArr := make([]*object.EmeraldValue, 0, len(arr)+len(args))
+	newArr = append(newArr, args...)
 	newArr = append(newArr, arr...)
 	receiver.Data = newArr
 	return receiver
@@ -2574,17 +3081,90 @@ func arrayInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	return R.FalseVal
 }
 
+func arrayAssoc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	for _, elem := range receiver.Data.([]*object.EmeraldValue) {
+		if elem.Type != object.ValueArray {
+			continue
+		}
+		nested := elem.Data.([]*object.EmeraldValue)
+		if len(nested) > 0 && nested[0].Equals(args[0]) {
+			return elem
+		}
+	}
+	return R.NilVal
+}
+
+func arrayRassoc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	for _, elem := range receiver.Data.([]*object.EmeraldValue) {
+		if elem.Type != object.ValueArray {
+			continue
+		}
+		nested := elem.Data.([]*object.EmeraldValue)
+		if len(nested) > 1 && nested[1].Equals(args[0]) {
+			return elem
+		}
+	}
+	return R.NilVal
+}
+
+func arrayHash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(valueHashKey(receiver, make(map[*object.EmeraldValue]bool))))
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(h.Sum64()), Class: R.Classes["Integer"]}
+}
+
+func valueHashKey(value *object.EmeraldValue, visiting map[*object.EmeraldValue]bool) string {
+	if value == nil {
+		return "nil"
+	}
+	switch value.Type {
+	case object.ValueArray:
+		if visiting[value] {
+			return "[...]"
+		}
+		visiting[value] = true
+		parts := []string{"array"}
+		for _, elem := range value.Data.([]*object.EmeraldValue) {
+			parts = append(parts, valueHashKey(elem, visiting))
+		}
+		delete(visiting, value)
+		if len(parts) == 2 && (parts[1] == "[...]" || parts[1] == "array|[...]") {
+			return "array|[...]"
+		}
+		return strings.Join(parts, "|")
+	case object.ValueHash:
+		if visiting[value] {
+			return "{...}"
+		}
+		visiting[value] = true
+		parts := []string{"hash"}
+		for key, val := range value.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+			parts = append(parts, valueHashKey(key, visiting)+":"+valueHashKey(val, visiting))
+		}
+		sort.Strings(parts[1:])
+		delete(visiting, value)
+		return strings.Join(parts, "|")
+	default:
+		return fmt.Sprintf("%d:%s", value.Type, value.Inspect())
+	}
+}
+
 func hashDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	val, ok := hash[args[0]]
-	if ok {
-		delete(hash, args[0])
-	}
-	if ok {
-		return val
+	hash := valueToHashMap(receiver)
+	for k, v := range hash {
+		if k.Equals(args[0]) {
+			delete(hash, k)
+			return v
+		}
 	}
 	return R.NilVal
 }
@@ -2598,7 +3178,7 @@ func hashHasValue(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if len(args) < 1 {
 		return R.FalseVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	target := args[0]
 	for _, val := range hash {
 		if val.Equals(target) {
@@ -2612,7 +3192,7 @@ func stringLjust(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	s := receiver.Data.(string)
 	width := 0
 	if len(args) > 0 {
-		width = int(args[0].Data.(int64))
+		width = int(valueToInt64(args[0]))
 	}
 	if len(s) >= width {
 		return &object.EmeraldValue{
@@ -2623,7 +3203,9 @@ func stringLjust(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	pad := " "
 	if len(args) > 1 {
-		pad = args[1].Data.(string)
+		if args[1] != nil && args[1].Data != nil {
+			pad, _ = args[1].Data.(string)
+		}
 	}
 	result := s
 	for len(result) < width {
@@ -2640,7 +3222,7 @@ func stringRjust(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	s := receiver.Data.(string)
 	width := 0
 	if len(args) > 0 {
-		width = int(args[0].Data.(int64))
+		width = int(valueToInt64(args[0]))
 	}
 	if len(s) >= width {
 		return &object.EmeraldValue{
@@ -2651,7 +3233,9 @@ func stringRjust(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	pad := " "
 	if len(args) > 1 {
-		pad = args[1].Data.(string)
+		if args[1] != nil && args[1].Data != nil {
+			pad, _ = args[1].Data.(string)
+		}
 	}
 	result := s
 	for len(result) < width {
@@ -2668,7 +3252,7 @@ func stringCenter(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	s := receiver.Data.(string)
 	width := 0
 	if len(args) > 0 {
-		width = int(args[0].Data.(int64))
+		width = int(valueToInt64(args[0]))
 	}
 	if len(s) >= width {
 		return &object.EmeraldValue{
@@ -2679,7 +3263,9 @@ func stringCenter(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 	pad := " "
 	if len(args) > 1 {
-		pad = args[1].Data.(string)
+		if args[1] != nil && args[1].Data != nil {
+			pad, _ = args[1].Data.(string)
+		}
 	}
 	left := (width - len(s)) / 2
 	right := width - len(s) - left
@@ -2705,7 +3291,56 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return R.NilVal
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	idx := int(args[0].Data.(int64))
+	if args[0].Type == object.ValueRange {
+		replacement := arrayReplacementValues(args[1])
+		start, count, ok := arrayRangeAssignmentBounds(args[0].Data.(*object.RRange), len(arr))
+		if !ok {
+			return args[1]
+		}
+		updated := append([]*object.EmeraldValue{}, arr[:start]...)
+		updated = append(updated, replacement...)
+		updated = append(updated, arr[start+count:]...)
+		receiver.Data = updated
+		return args[1]
+	}
+	if len(args) >= 3 {
+		idx, ok := valueToArrayIndex(args[0])
+		if !ok {
+			return R.NilVal
+		}
+		count64, ok := valueToInteger(args[1])
+		if !ok {
+			return R.NilVal
+		}
+		if idx < 0 {
+			idx = len(arr) + idx
+		}
+		if idx < 0 {
+			return R.NilVal
+		}
+		if idx > len(arr) {
+			for len(arr) < idx {
+				arr = append(arr, R.NilVal)
+			}
+		}
+		count := int(count64)
+		if count < 0 {
+			return R.NilVal
+		}
+		if idx+count > len(arr) {
+			count = len(arr) - idx
+		}
+		replacement := arrayReplacementValues(args[2])
+		updated := append([]*object.EmeraldValue{}, arr[:idx]...)
+		updated = append(updated, replacement...)
+		updated = append(updated, arr[idx+count:]...)
+		receiver.Data = updated
+		return args[2]
+	}
+	idx, ok := valueToArrayIndex(args[0])
+	if !ok {
+		return R.NilVal
+	}
 	if idx < 0 {
 		idx = len(arr) + idx
 	}
@@ -2714,6 +3349,40 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	}
 	arr[idx] = args[1]
 	return args[1]
+}
+
+func arrayReplacementValues(value *object.EmeraldValue) []*object.EmeraldValue {
+	if elems, ok := valueToArray(value); ok {
+		return elems
+	}
+	return []*object.EmeraldValue{value}
+}
+
+func arrayRangeAssignmentBounds(r *object.RRange, length int) (int, int, bool) {
+	start := int(r.Start)
+	end := int(r.End)
+	if start < 0 {
+		start = length + start
+	}
+	if end < 0 {
+		end = length + end
+	}
+	if r.Exclusive {
+		end--
+	}
+	if start < 0 {
+		return 0, 0, false
+	}
+	if start > length {
+		start = length
+	}
+	if end < start {
+		return start, 0, true
+	}
+	if end >= length {
+		end = length - 1
+	}
+	return start, end - start + 1, true
 }
 
 func arrayCount(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2794,6 +3463,36 @@ func arrayDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	return result
 }
 
+func arrayDeleteIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	for _, elem := range arr {
+		if !CallBlock(elem).IsTruthy() {
+			newArr = append(newArr, elem)
+		}
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
+func arrayKeepIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	for _, elem := range arr {
+		if CallBlock(elem).IsTruthy() {
+			newArr = append(newArr, elem)
+		}
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
 func arrayCompact(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	newArr := make([]*object.EmeraldValue, 0)
@@ -2809,24 +3508,52 @@ func arrayCompact(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 }
 
-func arrayFlatten(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+func arrayCompactBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
-	newArr := make([]*object.EmeraldValue, 0)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	changed := false
 	for _, elem := range arr {
-		if elem.Type == object.ValueArray {
-			nested := elem.Data.([]*object.EmeraldValue)
-			for _, n := range nested {
-				newArr = append(newArr, n)
-			}
-		} else {
-			newArr = append(newArr, elem)
+		if elem.Type == object.ValueNil {
+			changed = true
+			continue
 		}
+		newArr = append(newArr, elem)
 	}
+	if !changed {
+		return R.NilVal
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
+func arrayFlatten(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
-		Data:  newArr,
+		Data:  flattenArray(receiver.Data.([]*object.EmeraldValue)),
 		Class: R.Classes["Array"],
 	}
+}
+
+func arrayFlattenBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	flattened := flattenArray(arr)
+	if len(flattened) == len(arr) {
+		return R.NilVal
+	}
+	receiver.Data = flattened
+	return receiver
+}
+
+func flattenArray(arr []*object.EmeraldValue) []*object.EmeraldValue {
+	result := make([]*object.EmeraldValue, 0)
+	for _, elem := range arr {
+		if elem.Type == object.ValueArray {
+			result = append(result, flattenArray(elem.Data.([]*object.EmeraldValue))...)
+		} else {
+			result = append(result, elem)
+		}
+	}
+	return result
 }
 
 func arrayUniq(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2847,19 +3574,37 @@ func arrayUniq(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 }
 
+func arrayUniqBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	seen := make(map[string]bool)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	changed := false
+	for _, elem := range arr {
+		key := elem.Inspect()
+		if seen[key] {
+			changed = true
+			continue
+		}
+		seen[key] = true
+		newArr = append(newArr, elem)
+	}
+	if !changed {
+		return R.NilVal
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
 func arraySort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if len(arr) == 0 {
 		return receiver
 	}
-	// Simple bubble sort - works for integers
 	newArr := make([]*object.EmeraldValue, len(arr))
 	copy(newArr, arr)
 	for i := 0; i < len(newArr)-1; i++ {
 		for j := 0; j < len(newArr)-i-1; j++ {
-			v1 := newArr[j].Data.(int64)
-			v2 := newArr[j+1].Data.(int64)
-			if v1 > v2 {
+			if compareValues(newArr[j], newArr[j+1]) > 0 {
 				newArr[j], newArr[j+1] = newArr[j+1], newArr[j]
 			}
 		}
@@ -2869,6 +3614,19 @@ func arraySort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		Data:  newArr,
 		Class: R.Classes["Array"],
 	}
+}
+
+func arraySortBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	for i := 0; i < len(arr)-1; i++ {
+		for j := 0; j < len(arr)-i-1; j++ {
+			if compareValues(arr[j], arr[j+1]) > 0 {
+				arr[j], arr[j+1] = arr[j+1], arr[j]
+			}
+		}
+	}
+	receiver.Data = arr
+	return receiver
 }
 
 func arrayPlus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2892,10 +3650,14 @@ func arrayMinus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	other := args[0].Data.([]*object.EmeraldValue)
 	otherMap := make(map[string]bool)
-	for _, o := range other {
-		otherMap[o.Inspect()] = true
+	for _, arg := range args {
+		if arg.Type != object.ValueArray {
+			continue
+		}
+		for _, o := range arg.Data.([]*object.EmeraldValue) {
+			otherMap[o.Inspect()] = true
+		}
 	}
 	newArr := make([]*object.EmeraldValue, 0)
 	for _, elem := range arr {
@@ -2915,7 +3677,10 @@ func arrayIntersection(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	other := args[0].Data.([]*object.EmeraldValue)
+	other, ok := valueToArray(args[0])
+	if !ok {
+		return R.NilVal
+	}
 	arrMap := make(map[string]bool)
 	for _, a := range arr {
 		arrMap[a.Inspect()] = true
@@ -2937,11 +3702,7 @@ func arrayIntersection(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 }
 
 func arrayUnion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
-		return receiver
-	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	other := args[0].Data.([]*object.EmeraldValue)
 	seen := make(map[string]bool)
 	newArr := make([]*object.EmeraldValue, 0)
 	for _, a := range arr {
@@ -2951,11 +3712,17 @@ func arrayUnion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 			newArr = append(newArr, a)
 		}
 	}
-	for _, o := range other {
-		key := o.Inspect()
-		if !seen[key] {
-			seen[key] = true
-			newArr = append(newArr, o)
+	for _, arg := range args {
+		other, ok := valueToArray(arg)
+		if !ok {
+			return R.NilVal
+		}
+		for _, o := range other {
+			key := o.Inspect()
+			if !seen[key] {
+				seen[key] = true
+				newArr = append(newArr, o)
+			}
 		}
 	}
 	return &object.EmeraldValue{
@@ -2970,7 +3737,11 @@ func arrayTake(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return R.NilVal
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	n := int(args[0].Data.(int64))
+	count, ok := valueToInteger(args[0])
+	if !ok {
+		return R.NilVal
+	}
+	n := int(count)
 	if n > len(arr) {
 		n = len(arr)
 	}
@@ -2992,7 +3763,11 @@ func arrayDrop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return R.NilVal
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	n := int(args[0].Data.(int64))
+	count, ok := valueToInteger(args[0])
+	if !ok {
+		return R.NilVal
+	}
+	n := int(count)
 	if n > len(arr) {
 		n = len(arr)
 	}
@@ -3014,13 +3789,16 @@ func arrayAny(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(arr) == 0 {
 		return R.FalseVal
 	}
-	// For now, return true if any element is truthy
 	for _, elem := range arr {
-		if elem.Type != object.ValueNil && elem.Type != object.ValueBool {
-			return R.TrueVal
-		}
-		if elem.Type == object.ValueBool && elem.Data.(bool) {
-			return R.TrueVal
+		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+			val := CallBlock(elem)
+			if isTruthy(val) {
+				return R.TrueVal
+			}
+		} else {
+			if isTruthy(elem) {
+				return R.TrueVal
+			}
 		}
 	}
 	return R.FalseVal
@@ -3031,13 +3809,16 @@ func arrayAll(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(arr) == 0 {
 		return R.TrueVal
 	}
-	// For now, return true if all elements are truthy
 	for _, elem := range arr {
-		if elem.Type == object.ValueNil {
-			return R.FalseVal
-		}
-		if elem.Type == object.ValueBool && !elem.Data.(bool) {
-			return R.FalseVal
+		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+			val := CallBlock(elem)
+			if !isTruthy(val) {
+				return R.FalseVal
+			}
+		} else {
+			if !isTruthy(elem) {
+				return R.FalseVal
+			}
 		}
 	}
 	return R.TrueVal
@@ -3048,13 +3829,16 @@ func arrayNone(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(arr) == 0 {
 		return R.TrueVal
 	}
-	// For now, return true if no element is truthy
 	for _, elem := range arr {
-		if elem.Type != object.ValueNil && elem.Type != object.ValueBool {
-			return R.FalseVal
-		}
-		if elem.Type == object.ValueBool && elem.Data.(bool) {
-			return R.FalseVal
+		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+			val := CallBlock(elem)
+			if isTruthy(val) {
+				return R.FalseVal
+			}
+		} else {
+			if isTruthy(elem) {
+				return R.FalseVal
+			}
 		}
 	}
 	return R.TrueVal
@@ -3115,24 +3899,33 @@ func stringGsub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return receiver
 	}
 	s := receiver.Data.(string)
-	old := args[0].Data.(string)
-	new := args[1].Data.(string)
-	result := ""
-	for i := 0; i < len(s); {
-		idx := strings.Index(s[i:], old)
-		if idx < 0 {
-			result += s[i:]
-			break
+	replacement, ok := args[1].Data.(string)
+	if !ok {
+		replacement = ""
+	}
+	switch pattern := args[0].Data.(type) {
+	case string:
+		result := ""
+		for i := 0; i < len(s); {
+			idx := strings.Index(s[i:], pattern)
+			if idx < 0 {
+				result += s[i:]
+				break
+			}
+			result += s[i : i+idx]
+			result += replacement
+			i += idx + len(pattern)
 		}
-		result += s[i : i+idx]
-		result += new
-		i += idx + len(old)
+		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
+	case *object.RRegexp:
+		re, err := regexp.Compile(pattern.Pattern)
+		if err != nil {
+			return receiver
+		}
+		result := re.ReplaceAllString(s, replacement)
+		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueString,
-		Data:  result,
-		Class: R.Classes["String"],
-	}
+	return receiver
 }
 
 func stringSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3140,18 +3933,27 @@ func stringSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return receiver
 	}
 	s := receiver.Data.(string)
-	old := args[0].Data.(string)
-	new := args[1].Data.(string)
-	idx := strings.Index(s, old)
-	if idx < 0 {
-		return receiver
+	replacement, ok := args[1].Data.(string)
+	if !ok {
+		replacement = ""
 	}
-	result := s[:idx] + new + s[idx+len(old):]
-	return &object.EmeraldValue{
-		Type:  object.ValueString,
-		Data:  result,
-		Class: R.Classes["String"],
+	switch pattern := args[0].Data.(type) {
+	case string:
+		idx := strings.Index(s, pattern)
+		if idx < 0 {
+			return receiver
+		}
+		result := s[:idx] + replacement + s[idx+len(pattern):]
+		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
+	case *object.RRegexp:
+		re, err := regexp.Compile(pattern.Pattern)
+		if err != nil {
+			return receiver
+		}
+		result := re.ReplaceAllString(s, replacement)
+		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
 	}
+	return receiver
 }
 
 func stringSplit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3269,7 +4071,10 @@ func stringConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		return receiver
 	}
 	s := receiver.Data.(string)
-	other := args[0].Data.(string)
+	other, ok := args[0].Data.(string)
+	if !ok {
+		return R.NilVal
+	}
 	receiver.Data = s + other
 	return receiver
 }
@@ -3279,16 +4084,36 @@ func stringIndexOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return R.NilVal
 	}
 	s := receiver.Data.(string)
-	substr := args[0].Data.(string)
-	idx := strings.Index(s, substr)
-	if idx < 0 {
+	arg := args[0]
+	if arg == nil || arg.Data == nil {
 		return R.NilVal
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueInteger,
-		Data:  int64(idx),
-		Class: R.Classes["Integer"],
+	switch v := arg.Data.(type) {
+	case string:
+		idx := strings.Index(s, v)
+		if idx < 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]}
+	case int64:
+		c := string(rune(v))
+		idx := strings.Index(s, c)
+		if idx < 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]}
+	case *object.RRegexp:
+		re, err := regexp.Compile(v.Pattern)
+		if err != nil {
+			return R.NilVal
+		}
+		loc := re.FindStringIndex(s)
+		if loc == nil {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(loc[0]), Class: R.Classes["Integer"]}
 	}
+	return R.NilVal
 }
 
 func stringRIndexOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3296,16 +4121,36 @@ func stringRIndexOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		return R.NilVal
 	}
 	s := receiver.Data.(string)
-	substr := args[0].Data.(string)
-	idx := strings.LastIndex(s, substr)
-	if idx < 0 {
+	arg := args[0]
+	if arg == nil || arg.Data == nil {
 		return R.NilVal
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueInteger,
-		Data:  int64(idx),
-		Class: R.Classes["Integer"],
+	switch v := arg.Data.(type) {
+	case string:
+		idx := strings.LastIndex(s, v)
+		if idx < 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]}
+	case int64:
+		c := string(rune(v))
+		idx := strings.LastIndex(s, c)
+		if idx < 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]}
+	case *object.RRegexp:
+		re, err := regexp.Compile(v.Pattern)
+		if err != nil {
+			return R.NilVal
+		}
+		all := re.FindAllStringIndex(s, -1)
+		if len(all) == 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(all[len(all)-1][0]), Class: R.Classes["Integer"]}
 	}
+	return R.NilVal
 }
 
 func stringOrd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3410,8 +4255,12 @@ func hashMergeBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if len(args) < 1 {
 		return receiver
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	other := args[0].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
+	if hash == nil {
+		hash = make(map[*object.EmeraldValue]*object.EmeraldValue)
+		receiver.Data = hash
+	}
+	other := valueToHashMap(args[0])
 	for k, v := range other {
 		hash[k] = v
 	}
@@ -3419,7 +4268,7 @@ func hashMergeBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 }
 
 func hashInvert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	result := make(map[*object.EmeraldValue]*object.EmeraldValue)
 	for k, v := range hash {
 		result[v] = k
@@ -3432,8 +4281,17 @@ func hashInvert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	for {
+	if CallBlock != nil {
+		for {
+			CallBlock()
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+		}
 	}
+	return R.NilVal
 }
 
 func builtinExit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3488,6 +4346,23 @@ func builtinRaise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func builtinAbort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+var BlockGivenCheck func() bool
+var CurrentBlockValue func() *object.EmeraldValue
+
+func builtinBlockGiven(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck != nil && BlockGivenCheck() {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func builtinLambda(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return args[0]
+	}
 	return R.NilVal
 }
 
@@ -3767,6 +4642,9 @@ func arrayInsert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if idx < 0 {
 		idx = int64(len(arr)) + idx + 1
 	}
+	if idx < 0 {
+		idx = 0
+	}
 	if idx > int64(len(arr)) {
 		idx = int64(len(arr))
 	}
@@ -3783,6 +4661,46 @@ func arrayInsert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	start := 0
+	end := len(arr)
+	if len(args) >= 2 && args[1].Type == object.ValueInteger {
+		start = int(args[1].Data.(int64))
+		if start < 0 {
+			start = len(arr) + start
+		}
+		if start < 0 {
+			start = 0
+		}
+	}
+	if len(args) >= 3 && args[2].Type == object.ValueInteger {
+		length := int(args[2].Data.(int64))
+		if length < 0 {
+			length = 0
+		}
+		end = start + length
+	}
+	if start > len(arr) {
+		for len(arr) < start {
+			arr = append(arr, R.NilVal)
+		}
+	}
+	if end > len(arr) {
+		for len(arr) < end {
+			arr = append(arr, R.NilVal)
+		}
+	}
+	for i := start; i < end; i++ {
+		arr[i] = args[0]
+	}
+	receiver.Data = arr
+	return receiver
+}
+
 func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if len(args) < 1 {
@@ -3795,6 +4713,9 @@ func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	length := len(arr)
 	if len(args) >= 2 && args[1].Type == object.ValueInteger {
 		length = int(args[1].Data.(int64))
+	}
+	if length < 0 {
+		return R.NilVal
 	}
 	if start < 0 {
 		start = len(arr) + start
@@ -3823,7 +4744,8 @@ func arrayValuesAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, 0)
 	for _, arg := range args {
-		if arg.Type == object.ValueInteger {
+		switch arg.Type {
+		case object.ValueInteger:
 			idx := int(arg.Data.(int64))
 			if idx < 0 {
 				idx = len(arr) + idx
@@ -3832,6 +4754,26 @@ func arrayValuesAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 				result = append(result, arr[idx])
 			} else {
 				result = append(result, R.NilVal)
+			}
+		case object.ValueRange:
+			rangeObj := arg.Data.(*object.RRange)
+			start := int(rangeObj.Start)
+			end := int(rangeObj.End)
+			if start < 0 {
+				start = len(arr) + start
+			}
+			if end < 0 {
+				end = len(arr) + end
+			}
+			if rangeObj.Exclusive {
+				end--
+			}
+			for i := start; i <= end; i++ {
+				if i >= 0 && i < len(arr) {
+					result = append(result, arr[i])
+				} else {
+					result = append(result, R.NilVal)
+				}
 			}
 		}
 	}
@@ -3847,12 +4789,12 @@ func arrayZip(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	other := args[0].Data.([]*object.EmeraldValue)
+	other, ok := valueToArray(args[0])
+	if !ok {
+		return R.NilVal
+	}
 	result := make([]*object.EmeraldValue, 0)
 	maxLen := len(arr)
-	if len(other) > maxLen {
-		maxLen = len(other)
-	}
 	for i := 0; i < maxLen; i++ {
 		row := make([]*object.EmeraldValue, 0)
 		if i < len(arr) {
@@ -3889,7 +4831,7 @@ func arrayEachIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 func arrayEachWithIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for i, elem := range arr {
-		fmt.Printf("%d: %s\n", i, elem.Inspect())
+		CallBlock(elem, &object.EmeraldValue{Type: object.ValueInteger, Data: int64(i), Class: R.Classes["Integer"]})
 	}
 	return receiver
 }
@@ -3917,6 +4859,12 @@ func arrayRotate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func arrayRotateBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	rotated := arrayRotate(receiver, args...).Data.([]*object.EmeraldValue)
+	receiver.Data = rotated
+	return receiver
+}
+
 func arrayShuffle(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, len(arr))
@@ -3930,6 +4878,12 @@ func arrayShuffle(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		Data:  result,
 		Class: R.Classes["Array"],
 	}
+}
+
+func arrayShuffleBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	shuffled := arrayShuffle(receiver, args...).Data.([]*object.EmeraldValue)
+	receiver.Data = shuffled
+	return receiver
 }
 
 func arrayFetch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3950,6 +4904,9 @@ func arrayFetch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) >= 2 {
 		return args[1]
 	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+		return CallBlock(args[0])
+	}
 	return R.NilVal
 }
 
@@ -3969,8 +4926,273 @@ func arrayReject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func arrayRejectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return receiver
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	changed := false
+	for _, elem := range arr {
+		if CallBlock(elem).IsTruthy() {
+			changed = true
+			continue
+		}
+		newArr = append(newArr, elem)
+	}
+	if !changed {
+		return R.NilVal
+	}
+	receiver.Data = newArr
+	return receiver
+}
+
+func arrayReduce(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(arr) == 0 {
+		if len(args) > 0 {
+			return args[0]
+		}
+		return R.NilVal
+	}
+	var acc *object.EmeraldValue
+	startIdx := 0
+	if len(args) > 0 {
+		acc = args[0]
+	} else {
+		acc = arr[0]
+		startIdx = 1
+	}
+	for i := startIdx; i < len(arr); i++ {
+		acc = CallBlock(acc, arr[i])
+	}
+	return acc
+}
+
+func arrayFlatMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	result := make([]*object.EmeraldValue, 0)
+	for _, elem := range arr {
+		val := CallBlock(elem)
+		if val != nil && val.Type == object.ValueArray {
+			subArr := val.Data.([]*object.EmeraldValue)
+			result = append(result, subArr...)
+		} else if val != nil && val.Type != object.ValueNil {
+			result = append(result, val)
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func arrayEachWithObject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	obj := args[0]
+	for _, elem := range arr {
+		CallBlock(elem, obj)
+	}
+	return obj
+}
+
+func arrayPartition(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	trueArr := make([]*object.EmeraldValue, 0)
+	falseArr := make([]*object.EmeraldValue, 0)
+	for _, elem := range arr {
+		val := CallBlock(elem)
+		if isTruthy(val) {
+			trueArr = append(trueArr, elem)
+		} else {
+			falseArr = append(falseArr, elem)
+		}
+	}
+	return &object.EmeraldValue{
+		Type: object.ValueArray,
+		Data: []*object.EmeraldValue{
+			{Type: object.ValueArray, Data: trueArr, Class: R.Classes["Array"]},
+			{Type: object.ValueArray, Data: falseArr, Class: R.Classes["Array"]},
+		},
+		Class: R.Classes["Array"],
+	}
+}
+
+func arrayTakeWhile(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	result := make([]*object.EmeraldValue, 0)
+	for _, elem := range arr {
+		val := CallBlock(elem)
+		if !isTruthy(val) {
+			break
+		}
+		result = append(result, elem)
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func arrayDropWhile(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	dropping := true
+	result := make([]*object.EmeraldValue, 0)
+	for _, elem := range arr {
+		if dropping {
+			val := CallBlock(elem)
+			if isTruthy(val) {
+				continue
+			}
+			dropping = false
+		}
+		result = append(result, elem)
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func compareValues(a, b *object.EmeraldValue) int {
+	if a == nil || a.Type == object.ValueNil {
+		if b == nil || b.Type == object.ValueNil {
+			return 0
+		}
+		return -1
+	}
+	if b == nil || b.Type == object.ValueNil {
+		return 1
+	}
+	switch a.Type {
+	case object.ValueInteger:
+		av := a.Data.(int64)
+		switch b.Type {
+		case object.ValueInteger:
+			bv := b.Data.(int64)
+			if av < bv {
+				return -1
+			} else if av > bv {
+				return 1
+			}
+			return 0
+		case object.ValueFloat:
+			bv := b.Data.(float64)
+			if float64(av) < bv {
+				return -1
+			} else if float64(av) > bv {
+				return 1
+			}
+			return 0
+		}
+	case object.ValueFloat:
+		av := a.Data.(float64)
+		switch b.Type {
+		case object.ValueInteger:
+			bv := float64(b.Data.(int64))
+			if av < bv {
+				return -1
+			} else if av > bv {
+				return 1
+			}
+			return 0
+		case object.ValueFloat:
+			bv := b.Data.(float64)
+			if av < bv {
+				return -1
+			} else if av > bv {
+				return 1
+			}
+			return 0
+		}
+	case object.ValueString:
+		if b.Type == object.ValueString {
+			av := a.Data.(string)
+			bv := b.Data.(string)
+			if av < bv {
+				return -1
+			} else if av > bv {
+				return 1
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
+func arraySortBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(arr) == 0 {
+		return receiver
+	}
+	type kv struct {
+		orig  *object.EmeraldValue
+		sortK *object.EmeraldValue
+	}
+	pairs := make([]kv, len(arr))
+	for i, elem := range arr {
+		pairs[i] = kv{orig: elem, sortK: CallBlock(elem)}
+	}
+	for i := 0; i < len(pairs)-1; i++ {
+		for j := 0; j < len(pairs)-i-1; j++ {
+			if compareValues(pairs[j].sortK, pairs[j+1].sortK) > 0 {
+				pairs[j], pairs[j+1] = pairs[j+1], pairs[j]
+			}
+		}
+	}
+	result := make([]*object.EmeraldValue, len(pairs))
+	for i, p := range pairs {
+		result[i] = p.orig
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func arrayMinBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(arr) == 0 {
+		return R.NilVal
+	}
+	minElem := arr[0]
+	minVal := CallBlock(arr[0])
+	for i := 1; i < len(arr); i++ {
+		val := CallBlock(arr[i])
+		if compareValues(val, minVal) < 0 {
+			minElem = arr[i]
+			minVal = val
+		}
+	}
+	return minElem
+}
+
+func arrayMaxBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(arr) == 0 {
+		return R.NilVal
+	}
+	maxElem := arr[0]
+	maxVal := CallBlock(arr[0])
+	for i := 1; i < len(arr); i++ {
+		val := CallBlock(arr[i])
+		if compareValues(val, maxVal) >= 0 {
+			maxElem = arr[i]
+			maxVal = val
+		}
+	}
+	return maxElem
+}
+
 func hashToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	result := make([]*object.EmeraldValue, 0)
 	for k, v := range hash {
 		result = append(result, &object.EmeraldValue{
@@ -3987,11 +5209,14 @@ func hashToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 }
 
 func hashSelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	result := make(map[*object.EmeraldValue]*object.EmeraldValue)
 	for k, v := range hash {
-		if v.Type != object.ValueNil {
-			result[k] = v
+		if CallBlock != nil {
+			val := CallBlock(k, v)
+			if isTruthy(val) {
+				result[k] = v
+			}
 		}
 	}
 	return &object.EmeraldValue{
@@ -4002,11 +5227,14 @@ func hashSelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func hashReject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	result := make(map[*object.EmeraldValue]*object.EmeraldValue)
 	for k, v := range hash {
-		if v.Type == object.ValueNil {
-			result[k] = v
+		if CallBlock != nil {
+			val := CallBlock(k, v)
+			if !isTruthy(val) {
+				result[k] = v
+			}
 		}
 	}
 	return &object.EmeraldValue{
@@ -4028,7 +5256,7 @@ func hashAssoc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	for k, v := range hash {
 		if k.Equals(args[0]) {
 			return &object.EmeraldValue{
@@ -4045,7 +5273,7 @@ func hashRassoc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	for k, v := range hash {
 		if v.Equals(args[0]) {
 			return &object.EmeraldValue{
@@ -4059,7 +5287,7 @@ func hashRassoc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func hashShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := receiver.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(receiver)
 	for k, v := range hash {
 		delete(hash, k)
 		return &object.EmeraldValue{
@@ -4089,25 +5317,46 @@ type SpecRunner struct {
 	SkipCount    int
 	ExampleCount int
 	Verbose      bool
+	Shared       map[string]*object.EmeraldValue
+}
+
+type expectationData struct {
+	Value   *object.EmeraldValue
+	Negated bool
 }
 
 var specRunner *SpecRunner
 
 func InitSpecRunner() *SpecRunner {
-	if specRunner == nil {
-		specRunner = &SpecRunner{
-			PassCount:    0,
-			FailCount:    0,
-			SkipCount:    0,
-			ExampleCount: 0,
-			Verbose:      false,
-		}
+	specRunner = &SpecRunner{
+		PassCount:    0,
+		FailCount:    0,
+		SkipCount:    0,
+		ExampleCount: 0,
+		Verbose:      false,
+		Shared:       make(map[string]*object.EmeraldValue),
 	}
 	return specRunner
 }
 
 func GetSpecRunner() *SpecRunner {
 	return specRunner
+}
+
+func expectationPayload(receiver *object.EmeraldValue) expectationData {
+	if payload, ok := receiver.Data.(*expectationData); ok {
+		return *payload
+	}
+	if value, ok := receiver.Data.(*object.EmeraldValue); ok {
+		return expectationData{Value: value}
+	}
+	return expectationData{Value: receiver}
+}
+
+func setExpectationNegated(receiver *object.EmeraldValue) {
+	payload := expectationPayload(receiver)
+	payload.Negated = true
+	receiver.Data = &payload
 }
 
 func RegisterMspec() {
@@ -4121,7 +5370,7 @@ func RegisterMspec() {
 		Arity: 1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 			if len(args) > 0 {
-				receiver.Data = args[0]
+				receiver.Data = &expectationData{Value: args[0]}
 			}
 			return R.NilVal
 		},
@@ -4139,14 +5388,13 @@ func RegisterMspec() {
 		Name:  "should_not",
 		Arity: 1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-			specRunner.ExampleCount++
 			if len(args) == 0 {
-				specRunner.FailCount++
-				fmt.Printf("    FAILED: expected a matcher\n")
-				return R.NilVal
+				setExpectationNegated(receiver)
+				return receiver
 			}
+			specRunner.ExampleCount++
 
-			actualValue := receiver.Data.(*object.EmeraldValue)
+			actualValue := expectationPayload(receiver).Value
 			matcher := args[0]
 
 			if !actualValue.Equals(matcher) {
@@ -4183,9 +5431,24 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.FalseVal
 			}
-			if receiver.Equals(args[0]) {
+			payload := expectationPayload(receiver)
+			actual := payload.Value
+			matches := actual.Equals(args[0])
+			if payload.Negated {
+				if !matches {
+					specRunner.PassCount++
+					return R.TrueVal
+				}
+				specRunner.FailCount++
+				fmt.Printf("    FAILED: expected not %v\n", args[0].Inspect())
+				return R.FalseVal
+			}
+			if matches {
+				specRunner.PassCount++
 				return R.TrueVal
 			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v, got %v\n", args[0].Inspect(), actual.Inspect())
 			return R.FalseVal
 		},
 	})
@@ -4300,7 +5563,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.NilVal
 			}
-			actualValue := receiver.Data.(*object.EmeraldValue)
+			actualValue := expectationPayload(receiver).Value
 			s, ok1 := actualValue.Data.(string)
 			prefix, ok2 := args[0].Data.(string)
 			if ok1 && ok2 && strings.HasPrefix(s, prefix) {
@@ -4321,7 +5584,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.FalseVal
 			}
-			actualValue := receiver.Data.(*object.EmeraldValue)
+			actualValue := expectationPayload(receiver).Value
 			s, ok1 := actualValue.Data.(string)
 			prefix, ok2 := args[0].Data.(string)
 			if ok1 && ok2 && strings.HasPrefix(s, prefix) {
@@ -4338,7 +5601,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.NilVal
 			}
-			actualValue := receiver.Data.(*object.EmeraldValue)
+			actualValue := expectationPayload(receiver).Value
 			s, ok1 := actualValue.Data.(string)
 			suffix, ok2 := args[0].Data.(string)
 			if ok1 && ok2 && strings.HasSuffix(s, suffix) {
@@ -4359,7 +5622,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.FalseVal
 			}
-			actualValue := receiver.Data.(*object.EmeraldValue)
+			actualValue := expectationPayload(receiver).Value
 			s, ok1 := actualValue.Data.(string)
 			suffix, ok2 := args[0].Data.(string)
 			if ok1 && ok2 && strings.HasSuffix(s, suffix) {
@@ -4480,11 +5743,37 @@ func RegisterMspec() {
 		Name:  "describe",
 		Arity: -1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-			specRunner = InitSpecRunner()
+			if isSharedExampleDefinition(args) {
+				if len(args) > 0 && CurrentBlockValue != nil {
+					name := specName(args[0])
+					if name != "" {
+						specRunner.Shared[name] = CurrentBlockValue()
+					}
+				}
+				return R.NilVal
+			}
 			if len(args) > 0 {
 				if desc, ok := args[0].Data.(string); ok {
 					fmt.Printf("\n%s\n", desc)
 				}
+			}
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("context", &object.Method{
+		Name:  "context",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if len(args) > 0 {
+				if desc, ok := args[0].Data.(string); ok {
+					fmt.Printf("\n%s\n", desc)
+				}
+			}
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
 			}
 			return R.NilVal
 		},
@@ -4494,10 +5783,101 @@ func RegisterMspec() {
 		Name:  "it",
 		Arity: -1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			specRunner.ExampleCount++
 			if len(args) > 0 {
 				if desc, ok := args[0].Data.(string); ok {
 					fmt.Printf("  ✓ %s\n", desc)
 				}
+			}
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("test", &object.Method{
+		Name:  "test",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			specRunner.ExampleCount++
+			if len(args) > 0 {
+				if desc, ok := args[0].Data.(string); ok {
+					fmt.Printf("  ✓ %s\n", desc)
+				}
+			}
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+
+	objClass.DefineMethod("before", &object.Method{
+		Name:  "before",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("after", &object.Method{
+		Name:  "after",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("suppress_warning", &object.Method{
+		Name:  "suppress_warning",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				return CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("ruby_version_is", &object.Method{
+		Name:  "ruby_version_is",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("platform_is", &object.Method{
+		Name:  "platform_is",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if platformGuardMatches(args) && CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("little_endian", &object.Method{
+		Name:  "little_endian",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if isLittleEndianArch() && CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
+			}
+			return R.NilVal
+		},
+	})
+	objClass.DefineMethod("big_endian", &object.Method{
+		Name:  "big_endian",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if !isLittleEndianArch() && CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				CallBlock()
 			}
 			return R.NilVal
 		},
@@ -4548,12 +5928,83 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.NilVal
 			}
-			if name, ok := args[0].Data.(string); ok {
+			name := specName(args[0])
+			if name != "" {
 				fmt.Printf("  behaves like %s\n", name)
+			}
+			if len(args) > 1 {
+				if mainObj, ok := R.Main.Data.(*object.Object); ok {
+					mainObj.InstanceVars["@method"] = args[1]
+				}
+			}
+			if block, ok := specRunner.Shared[name]; ok && CallBlockWithArgs != nil {
+				return CallBlockWithArgs(block)
 			}
 			return R.NilVal
 		},
 	})
+	objClass.DefineMethod("it_should_behave_like", &object.Method{
+		Name:  "it_should_behave_like",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			method, _ := objClass.GetMethod("it_behaves_like")
+			if fn, ok := method.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+				return fn(receiver, args...)
+			}
+			return R.NilVal
+		},
+	})
+}
+
+func platformGuardMatches(args []*object.EmeraldValue) bool {
+	if len(args) == 0 {
+		return true
+	}
+	last := args[len(args)-1]
+	if last.Type != object.ValueHash {
+		return true
+	}
+	for key, value := range last.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+		if specName(key) == "pointer_size" {
+			if size, ok := valueToInteger(value); ok {
+				return int(size) == strconv.IntSize
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func isLittleEndianArch() bool {
+	switch runtime.GOARCH {
+	case "s390x", "ppc64", "sparc64":
+		return false
+	default:
+		return true
+	}
+}
+
+func specName(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.Data.(string); ok {
+		return strings.TrimPrefix(s, ":")
+	}
+	return ""
+}
+
+func isSharedExampleDefinition(args []*object.EmeraldValue) bool {
+	if len(args) < 2 || args[len(args)-1].Type != object.ValueHash {
+		return false
+	}
+	hash := args[len(args)-1].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	for key, value := range hash {
+		if specName(key) == "shared" && value.IsTruthy() {
+			return true
+		}
+	}
+	return false
 }
 
 func exceptionMessage(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4787,11 +6238,10 @@ func bindingEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if !ok {
 		return R.NilVal
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueString,
-		Data:  str,
-		Class: R.Classes["String"],
+	if EvalSource == nil {
+		return R.NilVal
 	}
+	return EvalSource(str)
 }
 
 func moduleInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

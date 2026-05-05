@@ -23,3 +23,13 @@ rgo_new
 rgo-spec
 rgo-test
 rgo_test
+
+# Local git worktrees
+.worktrees/
+
+# Generated status dashboards and local patch snapshots
+reports/spec-status/
+reports/git-snapshots/
+
+# Local third-party checkouts used for spec exploration
+vendor/rails/

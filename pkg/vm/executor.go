@@ -2,12 +2,17 @@ package vm
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
+	"github.com/GoLangDream/rgo/pkg/lexer"
 	"github.com/GoLangDream/rgo/pkg/object"
+	"github.com/GoLangDream/rgo/pkg/parser"
 )
 
 const StackSize = 2048
@@ -36,13 +41,14 @@ type Frame struct {
 	Bp      int
 	Closure *object.Closure
 
-	// Block control flow
-	BlockBreakAddr int                  // jump target for break inside while loop
-	WhileStart     int                  // start IP of the while loop body
-	WhileEnd       int                  // end IP of the while loop body
-	BlockBreak     bool                 // true if break was executed in this block
-	BlockBreakVal  *object.EmeraldValue // value returned by break
-	BlockNextVal   *object.EmeraldValue // value returned by next
+	MethodName string
+
+	BlockBreakAddr int
+	WhileStart     int
+	WhileEnd       int
+	BlockBreak     bool
+	BlockBreakVal  *object.EmeraldValue
+	BlockNextVal   *object.EmeraldValue
 }
 
 type RescueHandler struct {
@@ -84,11 +90,15 @@ type VM struct {
 
 func New(bytecode *compiler.Bytecode) *VM {
 	core.Init()
+	return newVM(bytecode, nil)
+}
 
+func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	mainFn := &object.Function{
 		Name:         "__main__",
 		Instructions: bytecode.Instructions,
-		NumLocals:    0,
+		Constants:    bytecode.Constants,
+		NumLocals:    bytecode.NumLocals,
 	}
 
 	mainFrame := &Frame{
@@ -102,13 +112,23 @@ func New(bytecode *compiler.Bytecode) *VM {
 		globals:      make([]*object.EmeraldValue, 100),
 		rubyConsts:   make(map[string]*object.EmeraldValue),
 		stack:        make([]*object.EmeraldValue, StackSize),
-		sp:           0,
+		sp:           1 + bytecode.NumLocals,
 		frames:       []*Frame{mainFrame},
 		fp:           0,
 		instructions: bytecode.Instructions,
 	}
+	if parent != nil {
+		vm.globals = parent.globals
+		vm.rubyConsts = parent.rubyConsts
+	}
 
 	vm.stack[0] = core.R.Main
+	vm.installCoreHooks()
+
+	return vm
+}
+
+func (vm *VM) installCoreHooks() {
 	CurrentVM = vm
 	core.CallBlock = CallBlock
 	core.CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -117,8 +137,15 @@ func New(bytecode *compiler.Bytecode) *VM {
 	core.CallBlockWithArgs = func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.callBlock(block, args...)
 	}
-
-	return vm
+	core.BlockGivenCheck = func() bool {
+		return vm.currentBlock != nil
+	}
+	core.CurrentBlockValue = func() *object.EmeraldValue {
+		return vm.currentBlock
+	}
+	core.EvalSource = func(source string) *object.EmeraldValue {
+		return vm.evalSource(source)
+	}
 }
 
 func (vm *VM) Run() error {
@@ -150,11 +177,43 @@ func (vm *VM) Run() error {
 	return nil
 }
 
+func (vm *VM) evalSource(source string) *object.EmeraldValue {
+	l := lexer.New(source)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		return core.R.NilVal
+	}
+
+	c := compiler.New()
+	if err := c.Compile(program); err != nil {
+		return core.R.NilVal
+	}
+
+	parent := CurrentVM
+	child := newVM(c.Bytecode(), vm)
+	if err := child.Run(); err != nil {
+		if parent != nil {
+			parent.installCoreHooks()
+		}
+		return core.R.NilVal
+	}
+	result := child.LastPoppedStackElement()
+	if parent != nil {
+		parent.installCoreHooks()
+	}
+	if result == nil {
+		return core.R.NilVal
+	}
+	return result
+}
+
 func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
+	constants := vm.frameConstants(frame)
 	switch op {
 	case compiler.OpConstant:
 		idx := vm.readUint16()
-		vm.push(vm.constants[idx])
+		vm.push(constants[idx])
 
 	case compiler.OpTrue:
 		vm.push(core.R.TrueVal)
@@ -166,7 +225,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(core.R.NilVal)
 
 	case compiler.OpPop:
-		vm.pop()
+		vm.popFrameValue(frame)
 
 	case compiler.OpAdd:
 		right := vm.pop()
@@ -314,9 +373,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		l, lok := left.Data.(int64)
 		r, rok := right.Data.(int64)
 		if lok && rok {
-			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l << r, Class: core.R.Classes["Integer"]})
+			if r < 0 {
+				vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l >> uint(-r), Class: core.R.Classes["Integer"]})
+			} else {
+				vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l << uint(r), Class: core.R.Classes["Integer"]})
+			}
 		} else {
-			vm.push(core.R.NilVal)
+			vm.push(vm.send(left, "<<", []*object.EmeraldValue{right}))
 		}
 
 	case compiler.OpBitRightShift:
@@ -325,7 +388,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		l, lok := left.Data.(int64)
 		r, rok := right.Data.(int64)
 		if lok && rok {
-			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l >> r, Class: core.R.Classes["Integer"]})
+			if r < 0 {
+				vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l << uint(-r), Class: core.R.Classes["Integer"]})
+			} else {
+				vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l >> uint(r), Class: core.R.Classes["Integer"]})
+			}
 		} else {
 			vm.push(core.R.NilVal)
 		}
@@ -338,6 +405,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		pos := vm.readUint16()
 		condition := vm.pop()
 		if !condition.IsTruthy() {
+			frame.Ip = pos - 1
+		}
+
+	case compiler.OpJumpNotNil:
+		pos := vm.readUint16()
+		condition := vm.pop()
+		if condition.Type != object.ValueNil {
 			frame.Ip = pos - 1
 		}
 
@@ -383,6 +457,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		result := vm.index(left, index)
 		vm.push(result)
 
+	case compiler.OpSliceIndex:
+		length := vm.pop()
+		start := vm.pop()
+		left := vm.pop()
+		result := vm.sliceIndex(left, start, length)
+		vm.push(result)
+
 	case compiler.OpIndexAssign:
 		value := vm.pop()
 		index := vm.pop()
@@ -392,7 +473,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpGetGlobal:
 		idx := vm.readUint16()
-		vm.push(vm.globals[idx])
+		val := vm.globals[idx]
+		if val == nil {
+			val = core.R.NilVal
+		}
+		vm.push(val)
 
 	case compiler.OpSetGlobal:
 		idx := vm.readUint16()
@@ -400,7 +485,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpGetConstant:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name, ok := constants[nameIdx].Data.(string)
+		if !ok {
+			return fmt.Errorf("OpGetConstant: expected string constant, got %T", constants[nameIdx].Data)
+		}
 		if val, ok := vm.rubyConsts[name]; ok {
 			vm.push(val)
 		} else if cls, ok := core.R.Classes[name]; ok {
@@ -415,14 +503,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpSetConstant:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
-		vm.rubyConsts[name] = vm.peek(0)
+		name := constants[nameIdx].Data.(string)
+		value := vm.peek(0)
 		if len(vm.classStack) > 0 {
 			top := vm.classStack[len(vm.classStack)-1]
 			if top.Type == object.ValueClass && top.Data.(*object.Class).Name == name {
+				value = top
 				vm.classStack = vm.classStack[:len(vm.classStack)-1]
+				vm.runMinitestMethods(top)
 			}
 		}
+		vm.rubyConsts[name] = value
 
 	case compiler.OpGetLocal:
 		idx := vm.readUint8()
@@ -445,10 +536,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return fmt.Errorf("OpSetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", basePtr, idx, stackIdx, vm.sp)
 		}
 		vm.stack[stackIdx] = vm.peek(0)
+		if vm.sp <= stackIdx {
+			vm.sp = stackIdx + 1
+		}
 
 	case compiler.OpGetInstanceVar:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 		receiver := vm.stack[frame.Bp]
 		if obj, ok := receiver.Data.(*object.Object); ok {
 			if val, ok := obj.InstanceVars[name]; ok {
@@ -462,7 +556,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpSetInstanceVar:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 		val := vm.peek(0)
 		receiver := vm.stack[frame.Bp]
 		if obj, ok := receiver.Data.(*object.Object); ok {
@@ -471,7 +565,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpGetClassVar:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 		receiver := vm.stack[frame.Bp]
 		if obj, ok := receiver.Data.(*object.Object); ok {
 			if val, ok := obj.ClassVars[name]; ok {
@@ -485,7 +579,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpSetClassVar:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 		val := vm.peek(0)
 		receiver := vm.stack[frame.Bp]
 		if obj, ok := receiver.Data.(*object.Object); ok {
@@ -495,6 +589,31 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpGetFree:
 		idx := vm.readUint8()
 		vm.push(frame.Closure.Free[idx])
+
+	case compiler.OpSetFree:
+		idx := vm.readUint8()
+		frame.Closure.Free[idx] = vm.peek(0)
+
+	case compiler.OpGetOuter:
+		idx := vm.readUint8()
+		if vm.fp > 0 {
+			outer := vm.frames[vm.fp-1]
+			vm.push(vm.stack[outer.Bp+1+idx])
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpSetOuter:
+		_ = vm.readUint8()
+		idx := vm.readUint8()
+		if vm.fp > 0 {
+			outer := vm.frames[vm.fp-1]
+			stackIdx := outer.Bp + 1 + idx
+			vm.stack[stackIdx] = vm.peek(0)
+			if vm.sp <= stackIdx {
+				vm.sp = stackIdx + 1
+			}
+		}
 
 	case compiler.OpSelf:
 		vm.push(vm.stack[frame.Bp])
@@ -514,21 +633,24 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		methodNameIdx := vm.readUint16()
 		blockArg := vm.readUint8()
 		numArgs := vm.readUint8()
-		methodName := vm.constants[methodNameIdx].Data.(string)
+		methodName := constants[methodNameIdx].Data.(string)
+
+		var block *object.EmeraldValue
+		if blockArg == 1 {
+			block = vm.pop()
+		}
 
 		args := make([]*object.EmeraldValue, int(numArgs))
 		for i := 0; i < int(numArgs); i++ {
 			args[numArgs-1-i] = vm.pop()
 		}
 
-		var block *object.EmeraldValue
-		if blockArg == 1 {
-			block = vm.pop()
-		}
 		receiver := vm.pop()
 
 		prevBlock := vm.currentBlock
-		vm.currentBlock = block
+		if blockArg == 1 {
+			vm.currentBlock = block
+		}
 		result := vm.send(receiver, methodName, args)
 		vm.currentBlock = prevBlock
 		vm.push(result)
@@ -570,6 +692,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		frame.WhileEnd = int(target)
 		frame.BlockBreakAddr = int(target)
 
+	case compiler.OpRedo:
+		frame.Ip = -1
+		vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+
 	case compiler.OpYield:
 		result := vm.callBlock(vm.currentBlock)
 		vm.push(result)
@@ -585,7 +711,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpDefineMethod:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 
 		closureVal := vm.pop()
 		closure, ok := closureVal.Data.(*object.Closure)
@@ -611,11 +737,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpDefineClassMethod:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 
 		fn := &object.Function{
 			Name:         name,
 			Instructions: vm.pop().Data.([]byte),
+			Constants:    constants,
 			NumLocals:    0,
 		}
 
@@ -631,7 +758,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpClass:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 
 		var class *object.Class
 		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueClass {
@@ -650,9 +777,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.classStack = append(vm.classStack, classVal)
 		vm.push(classVal)
 
+	case compiler.OpInherited:
+		classVal := vm.pop()
+		superVal := vm.pop()
+		if classVal == nil || classVal.Type != object.ValueClass {
+			return fmt.Errorf("OpInherited: expected class, got %v", classVal)
+		}
+		if superVal == nil || superVal.Type != object.ValueClass {
+			return fmt.Errorf("OpInherited: expected superclass, got %v", superVal)
+		}
+		classVal.Data.(*object.Class).SuperClass = superVal.Data.(*object.Class)
+		vm.push(classVal)
+
 	case compiler.OpModule:
 		nameIdx := vm.readUint16()
-		name := vm.constants[nameIdx].Data.(string)
+		name := constants[nameIdx].Data.(string)
 
 		module := object.NewModule(name)
 
@@ -669,11 +808,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		fnIdx := vm.readUint16()
 		numFree := vm.readUint8()
 
-		constant := vm.constants[fnIdx]
+		constant := constants[fnIdx]
 		fn, ok := constant.Data.(*object.Function)
 		if !ok {
 			return fmt.Errorf("not a function: %v", constant)
 		}
+		fnCopy := *fn
+		fnCopy.Constants = constants
 
 		free := make([]*object.EmeraldValue, numFree)
 		for i := numFree - 1; i >= 0; i-- {
@@ -681,7 +822,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		closure := &object.Closure{
-			Fn:   fn,
+			Fn:   &fnCopy,
 			Free: free,
 		}
 
@@ -695,10 +836,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		fnIdx := vm.readUint16()
 		numFree := vm.readUint8()
 
-		fn, ok := vm.constants[fnIdx].Data.(*object.Function)
+		fn, ok := constants[fnIdx].Data.(*object.Function)
 		if !ok {
-			return fmt.Errorf("not a function: %v", vm.constants[fnIdx])
+			return fmt.Errorf("not a function: %v", constants[fnIdx])
 		}
+		fnCopy := *fn
+		fnCopy.Constants = constants
 
 		free := make([]*object.EmeraldValue, numFree)
 		for i := numFree - 1; i >= 0; i-- {
@@ -706,7 +849,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		proc := &object.Proc{
-			Fn:       fn,
+			Fn:       &fnCopy,
 			Env:      free,
 			IsLambda: true,
 		}
@@ -726,6 +869,176 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 		} else {
 			vm.push(val)
+		}
+
+	case compiler.OpRange:
+		exclusive := vm.readUint8()
+		right := vm.pop()
+		left := vm.pop()
+
+		var start, end int64
+		if l, ok := left.Data.(int64); ok {
+			start = l
+		} else if l, ok := left.Data.(float64); ok {
+			start = int64(l)
+		} else {
+			vm.push(core.R.NilVal)
+			return nil
+		}
+		if r, ok := right.Data.(int64); ok {
+			end = r
+		} else if r, ok := right.Data.(float64); ok {
+			end = int64(r)
+		} else {
+			vm.push(core.R.NilVal)
+			return nil
+		}
+
+		rangeObj := &object.RRange{
+			Start:     start,
+			End:       end,
+			Exclusive: exclusive == 1,
+		}
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueRange,
+			Data:  rangeObj,
+			Class: core.R.Classes["Range"],
+		})
+
+	case compiler.OpRationalNew:
+		denVal := vm.pop()
+		numVal := vm.pop()
+		num := toFloat64(numVal)
+		den := toFloat64(denVal)
+		if den == 0 {
+			vm.push(numVal)
+			return nil
+		}
+		result := num / den
+		vm.push(&object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  result,
+			Class: core.R.Classes["Float"],
+		})
+
+	case compiler.OpSendSuper:
+		methodNameIdx := vm.readUint16()
+		blockArg := vm.readUint8()
+		numArgs := vm.readUint8()
+		_ = constants[methodNameIdx].Data.(string)
+
+		var block *object.EmeraldValue
+		if blockArg == 1 {
+			block = vm.pop()
+		}
+
+		args := make([]*object.EmeraldValue, int(numArgs))
+		for i := 0; i < int(numArgs); i++ {
+			args[int(numArgs)-1-i] = vm.pop()
+		}
+		vm.pop()
+
+		self := vm.stack[frame.Bp]
+		if self.Class == nil || self.Class.SuperClass == nil {
+			vm.push(core.R.NilVal)
+			return nil
+		}
+
+		superClass := self.Class.SuperClass
+		methodObj, ok := superClass.GetMethod(frame.MethodName)
+		if !ok {
+			vm.push(core.R.NilVal)
+			return nil
+		}
+
+		if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+			result := fn(self, args...)
+			vm.push(result)
+			return nil
+		}
+
+		if fn, ok := methodObj.Fn.(*object.Function); ok {
+			oldFrame := vm.frames[vm.fp]
+			prevBlock := vm.currentBlock
+			if blockArg == 1 {
+				vm.currentBlock = block
+			}
+			defer func() {
+				vm.currentBlock = prevBlock
+			}()
+			bp := vm.sp
+			vm.stack[vm.sp] = self
+			vm.sp++
+			for _, arg := range args {
+				vm.stack[vm.sp] = arg
+				vm.sp++
+			}
+			if fn.HasBlockParam {
+				blockVal := vm.currentBlock
+				if blockVal == nil {
+					blockVal = core.R.NilVal
+				} else if blockVal.Type == object.ValueClosure {
+					closure := blockVal.Data.(*object.Closure)
+					blockVal = &object.EmeraldValue{
+						Type: object.ValueProc,
+						Data: &object.Proc{
+							Fn:       closure.Fn,
+							Env:      closure.Free,
+							IsLambda: false,
+						},
+						Class: core.R.Classes["Proc"],
+					}
+				}
+				blockSlot := bp + fn.BlockParamIndex + 1
+				vm.stack[blockSlot] = blockVal
+				if vm.sp <= blockSlot {
+					vm.sp = blockSlot + 1
+				}
+			}
+			minSp := bp + 1 + fn.NumLocals
+			if vm.sp < minSp {
+				vm.sp = minSp
+			}
+			newFrame := &Frame{
+				Fn:         fn,
+				Ip:         -1,
+				Bp:         bp,
+				MethodName: frame.MethodName,
+			}
+			vm.frames = append(vm.frames, newFrame)
+			vm.fp++
+
+			curFrame := vm.frames[vm.fp]
+			instructions := curFrame.Fn.Instructions
+			for curFrame.Ip < len(instructions)-1 {
+				curFrame.Ip++
+				op := compiler.Opcode(instructions[curFrame.Ip])
+				if err := vm.execute(op, curFrame); err != nil {
+					break
+				}
+				curFrame = vm.frames[vm.fp]
+				instructions = curFrame.Fn.Instructions
+			}
+
+			result := core.R.NilVal
+			if vm.sp > bp {
+				result = vm.stack[vm.sp-1]
+			}
+			vm.sp = bp
+			vm.frames = vm.frames[:vm.fp]
+			vm.fp--
+			vm.frames[vm.fp] = oldFrame
+			vm.push(result)
+			return nil
+		}
+
+		vm.push(core.R.NilVal)
+
+	case compiler.OpBlockGiven:
+		if vm.currentBlock != nil {
+			vm.push(core.R.TrueVal)
+		} else {
+			vm.push(core.R.FalseVal)
 		}
 
 	case compiler.OpIsA, compiler.OpKindOf:
@@ -808,9 +1121,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			exception = vm.pop()
 		}
 		if exception == nil || exception.Type != object.ValueException {
+			message := "RuntimeError"
+			if exception != nil {
+				if s, ok := exception.Data.(string); ok {
+					message = s
+				}
+			}
 			exception = &object.EmeraldValue{
 				Type:  object.ValueException,
-				Data:  &object.RException{Message: "RuntimeError"},
+				Data:  &object.RException{Message: message},
 				Class: core.R.Classes["RuntimeError"],
 			}
 		}
@@ -820,7 +1139,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			handler := vm.rescueStack[len(vm.rescueStack)-1]
 			if handler.Frame == frame {
 				vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
-				if handler.EnsureOffset > 0 {
+				if handler.RescueOffset > 0 {
+					handler.Frame.Ip = handler.RescueOffset - 1
+				} else if handler.EnsureOffset > 0 {
 					handler.Frame.Ip = handler.EnsureOffset - 1
 				} else {
 					handler.Frame.Ip = handler.EndOffset - 1
@@ -832,19 +1153,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpRescue:
 		if core.LastException == nil {
-			vm.push(core.R.FalseVal)
+			vm.push(core.R.NilVal)
 			return nil
 		}
-		if len(vm.rescueStack) == 0 {
-			vm.push(core.R.FalseVal)
-			return nil
-		}
+		vm.push(core.LastException)
 
 	case compiler.OpCatch:
-		labelIdx := vm.readUint16()
-
-		label := vm.constants[labelIdx]
 		endOffset := vm.readUint16()
+		label := core.R.NilVal
+		if vm.sp > 0 {
+			label = vm.pop()
+		}
 
 		handler := &CatchHandler{
 			Label:     label,
@@ -854,13 +1173,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.catchStack = append(vm.catchStack, handler)
 
 	case compiler.OpThrow:
-		var label *object.EmeraldValue
-		if vm.sp > 0 {
-			label = vm.pop()
-		}
 		var value *object.EmeraldValue
 		if vm.sp > 0 {
 			value = vm.pop()
+		}
+		var label *object.EmeraldValue
+		if vm.sp > 0 {
+			label = vm.pop()
 		}
 
 		for i := len(vm.catchStack) - 1; i >= 0; i-- {
@@ -871,6 +1190,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					vm.push(value)
 				}
 				handler.Frame.Ip = handler.EndOffset - 1
+				if handler.Frame != frame {
+					frame.BlockBreak = true
+					frame.BlockBreakVal = value
+				}
 				return nil
 			}
 		}
@@ -896,12 +1219,35 @@ func (vm *VM) pop() *object.EmeraldValue {
 	}
 	vm.sp--
 	val := vm.stack[vm.sp]
+	if val == nil {
+		val = core.R.NilVal
+	}
 	vm.poppedValues = append(vm.poppedValues, val)
 	return val
 }
 
+func (vm *VM) popFrameValue(frame *Frame) *object.EmeraldValue {
+	minSp := 0
+	if frame != nil && frame.Fn != nil {
+		minSp = frame.Bp + 1 + frame.Fn.NumLocals
+	}
+	if vm.sp <= minSp {
+		val := core.R.NilVal
+		vm.poppedValues = append(vm.poppedValues, val)
+		return val
+	}
+	return vm.pop()
+}
+
 func (vm *VM) peek(n int) *object.EmeraldValue {
 	return vm.stack[vm.sp-1-n]
+}
+
+func (vm *VM) frameConstants(frame *Frame) []*object.EmeraldValue {
+	if frame != nil && frame.Fn != nil && frame.Fn.Constants != nil {
+		return frame.Fn.Constants
+	}
+	return vm.constants
 }
 
 func (vm *VM) readUint16() int {
@@ -980,6 +1326,10 @@ func (vm *VM) mul(left, right *object.EmeraldValue) *object.EmeraldValue {
 		case float64:
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: l * r, Class: core.R.Classes["Float"]}
 		}
+	case string:
+		if left.Type == object.ValueString {
+			return vm.send(left, "*", []*object.EmeraldValue{right})
+		}
 	}
 	return core.R.NilVal
 }
@@ -995,7 +1345,10 @@ func (vm *VM) div(left, right *object.EmeraldValue) *object.EmeraldValue {
 			return &object.EmeraldValue{Type: object.ValueInteger, Data: l / r, Class: core.R.Classes["Integer"]}
 		case float64:
 			if r == 0 {
-				return core.R.NilVal
+				if l == 0 {
+					return &object.EmeraldValue{Type: object.ValueFloat, Data: math.NaN(), Class: core.R.Classes["Float"]}
+				}
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Copysign(math.Inf(1), float64(l)) * math.Copysign(1, r), Class: core.R.Classes["Float"]}
 			}
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) / r, Class: core.R.Classes["Float"]}
 		}
@@ -1003,12 +1356,18 @@ func (vm *VM) div(left, right *object.EmeraldValue) *object.EmeraldValue {
 		switch r := right.Data.(type) {
 		case int64:
 			if r == 0 {
-				return core.R.NilVal
+				if l == 0 {
+					return &object.EmeraldValue{Type: object.ValueFloat, Data: math.NaN(), Class: core.R.Classes["Float"]}
+				}
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Copysign(math.Inf(1), l), Class: core.R.Classes["Float"]}
 			}
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: l / float64(r), Class: core.R.Classes["Float"]}
 		case float64:
 			if r == 0 {
-				return core.R.NilVal
+				if l == 0 {
+					return &object.EmeraldValue{Type: object.ValueFloat, Data: math.NaN(), Class: core.R.Classes["Float"]}
+				}
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Copysign(math.Inf(1), l) * math.Copysign(1, r), Class: core.R.Classes["Float"]}
 			}
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: l / r, Class: core.R.Classes["Float"]}
 		}
@@ -1059,6 +1418,20 @@ func (vm *VM) powInt(base int64, exp int) int64 {
 		result *= base
 	}
 	return result
+}
+
+func toFloat64(val *object.EmeraldValue) float64 {
+	if val == nil {
+		return 0
+	}
+	switch v := val.Data.(type) {
+	case int64:
+		return float64(v)
+	case float64:
+		return v
+	default:
+		return 0
+	}
 }
 
 func (vm *VM) mathPow(base, exp float64) float64 {
@@ -1252,6 +1625,61 @@ func (vm *VM) index(left, index *object.EmeraldValue) *object.EmeraldValue {
 	return core.R.NilVal
 }
 
+func (vm *VM) sliceIndex(left, start, length *object.EmeraldValue) *object.EmeraldValue {
+	var s, l int
+	switch v := start.Data.(type) {
+	case int64:
+		s = int(v)
+	case float64:
+		s = int(v)
+	default:
+		return core.R.NilVal
+	}
+	switch v := length.Data.(type) {
+	case int64:
+		l = int(v)
+	case float64:
+		l = int(v)
+	default:
+		return core.R.NilVal
+	}
+	switch data := left.Data.(type) {
+	case []*object.EmeraldValue:
+		if s < 0 {
+			s = len(data) + s
+		}
+		if s < 0 || s > len(data) {
+			return core.R.NilVal
+		}
+		end := s + l
+		if end > len(data) {
+			end = len(data)
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  data[s:end],
+			Class: core.R.Classes["Array"],
+		}
+	case string:
+		if s < 0 {
+			s = len(data) + s
+		}
+		if s < 0 || s > len(data) {
+			return core.R.NilVal
+		}
+		end := s + l
+		if end > len(data) {
+			end = len(data)
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  data[s:end],
+			Class: core.R.Classes["String"],
+		}
+	}
+	return core.R.NilVal
+}
+
 func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.EmeraldValue {
 	switch l := left.Data.(type) {
 	case []*object.EmeraldValue:
@@ -1262,12 +1690,25 @@ func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.Emera
 			}
 		}
 	case map[*object.EmeraldValue]*object.EmeraldValue:
-		l[index] = value
+		found := false
+		for k := range l {
+			if k.Equals(index) {
+				l[k] = value
+				found = true
+				break
+			}
+		}
+		if !found {
+			l[index] = value
+		}
 	}
 	return value
 }
 
 func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		receiver = core.R.NilVal
+	}
 	if method == "__exec_class_body__" && receiver.Type == object.ValueClass && vm.currentBlock != nil {
 		block := vm.currentBlock
 		vm.currentBlock = nil
@@ -1276,6 +1717,8 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 
 	var methodObj *object.Method
 	var ok bool
+
+	methodName := method
 
 	if receiver.Type == object.ValueClass {
 		cls := receiver.Data.(*object.Class)
@@ -1311,11 +1754,8 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 
 			if fn.HasRestParam {
 				normalCount := fn.RestParamIndex
-				if normalCount > len(positionalArgs) {
-					normalCount = len(positionalArgs)
-				}
 				for i := 0; i < normalCount; i++ {
-					vm.stack[vm.sp] = positionalArgs[i]
+					vm.stack[vm.sp] = positionalArgOrDefault(fn, positionalArgs, i)
 					vm.sp++
 				}
 				restElems := make([]*object.EmeraldValue, 0)
@@ -1329,8 +1769,12 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 				}
 				vm.sp++
 			} else {
-				for _, arg := range positionalArgs {
-					vm.stack[vm.sp] = arg
+				normalCount := len(fn.ParamDefaults)
+				if normalCount < len(positionalArgs) {
+					normalCount = len(positionalArgs)
+				}
+				for i := 0; i < normalCount; i++ {
+					vm.stack[vm.sp] = positionalArgOrDefault(fn, positionalArgs, i)
 					vm.sp++
 				}
 			}
@@ -1354,11 +1798,8 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			}
 		} else if fn.HasRestParam {
 			normalCount := fn.RestParamIndex
-			if normalCount > len(args) {
-				normalCount = len(args)
-			}
 			for i := 0; i < normalCount; i++ {
-				vm.stack[vm.sp] = args[i]
+				vm.stack[vm.sp] = positionalArgOrDefault(fn, args, i)
 				vm.sp++
 			}
 			restElems := make([]*object.EmeraldValue, 0)
@@ -1372,16 +1813,48 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			}
 			vm.sp++
 		} else {
-			for _, arg := range args {
-				vm.stack[vm.sp] = arg
+			normalCount := len(fn.ParamDefaults)
+			if normalCount < len(args) {
+				normalCount = len(args)
+			}
+			for i := 0; i < normalCount; i++ {
+				vm.stack[vm.sp] = positionalArgOrDefault(fn, args, i)
 				vm.sp++
 			}
 		}
 
+		if fn.HasBlockParam {
+			blockVal := vm.currentBlock
+			if blockVal == nil {
+				blockVal = core.R.NilVal
+			} else if blockVal.Type == object.ValueClosure {
+				closure := blockVal.Data.(*object.Closure)
+				blockVal = &object.EmeraldValue{
+					Type: object.ValueProc,
+					Data: &object.Proc{
+						Fn:       closure.Fn,
+						Env:      closure.Free,
+						IsLambda: false,
+					},
+					Class: core.R.Classes["Proc"],
+				}
+			}
+			blockSlot := bp + fn.BlockParamIndex + 1
+			vm.stack[blockSlot] = blockVal
+			if vm.sp <= blockSlot {
+				vm.sp = blockSlot + 1
+			}
+		}
+		minSp := bp + 1 + fn.NumLocals
+		if vm.sp < minSp {
+			vm.sp = minSp
+		}
+
 		newFrame := &Frame{
-			Fn: fn,
-			Ip: -1,
-			Bp: bp,
+			Fn:         fn,
+			Ip:         -1,
+			Bp:         bp,
+			MethodName: methodName,
 		}
 		vm.frames = append(vm.frames, newFrame)
 		vm.fp++
@@ -1416,6 +1889,56 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	return core.R.NilVal
 }
 
+func (vm *VM) runMinitestMethods(classVal *object.EmeraldValue) {
+	if classVal == nil || classVal.Type != object.ValueClass {
+		return
+	}
+	cls := classVal.Data.(*object.Class)
+	if !inheritsFrom(cls, "ActiveSupport::TestCase") || cls.Name == "ActiveSupport::TestCase" {
+		return
+	}
+
+	names := make([]string, 0)
+	for name := range cls.Methods {
+		if strings.HasPrefix(name, "test_") {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		if runner := core.GetSpecRunner(); runner != nil {
+			runner.ExampleCount++
+		}
+		fmt.Printf("  ✓ %s\n", name)
+		instance := &object.EmeraldValue{
+			Type:  object.ValueObject,
+			Data:  object.NewObject(cls),
+			Class: cls,
+		}
+		vm.send(instance, name, nil)
+	}
+}
+
+func inheritsFrom(cls *object.Class, name string) bool {
+	for current := cls; current != nil; current = current.SuperClass {
+		if current.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func positionalArgOrDefault(fn *object.Function, args []*object.EmeraldValue, index int) *object.EmeraldValue {
+	if index < len(args) && args[index] != nil {
+		return args[index]
+	}
+	if index < len(fn.ParamDefaults) && fn.ParamDefaults[index] != nil {
+		return fn.ParamDefaults[index]
+	}
+	return core.R.NilVal
+}
+
 func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if block == nil {
 		return core.R.NilVal
@@ -1430,6 +1953,10 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 	case object.ValueProc:
 		proc := block.Data.(*object.Proc)
 		fn = proc.Fn
+		closure = &object.Closure{
+			Fn:   fn,
+			Free: proc.Env,
+		}
 	default:
 		return core.R.NilVal
 	}
@@ -1437,6 +1964,12 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 	if fn == nil {
 		return core.R.NilVal
 	}
+
+	prevBlock := vm.currentBlock
+	vm.currentBlock = nil
+	defer func() {
+		vm.currentBlock = prevBlock
+	}()
 
 	bp := vm.sp
 
@@ -1446,6 +1979,10 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 	for _, arg := range args {
 		vm.stack[vm.sp] = arg
 		vm.sp++
+	}
+	minSp := bp + 1 + fn.NumLocals
+	if vm.sp < minSp {
+		vm.sp = minSp
 	}
 
 	newFrame := &Frame{Fn: fn, Ip: -1, Bp: bp, Closure: closure, BlockBreak: false, BlockBreakVal: nil, BlockNextVal: nil, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1}
@@ -1461,6 +1998,9 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 			break
 		}
 		frame = vm.frames[vm.fp]
+		if frame.BlockBreak {
+			break
+		}
 		instructions = frame.Fn.Instructions
 	}
 
@@ -1489,11 +2029,11 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 }
 
 func (vm *VM) LastPoppedStackElement() *object.EmeraldValue {
-	if vm.sp > 0 {
-		return vm.stack[vm.sp-1]
-	}
 	if len(vm.poppedValues) > 0 {
 		return vm.poppedValues[len(vm.poppedValues)-1]
+	}
+	if vm.sp > 0 {
+		return vm.stack[vm.sp-1]
 	}
 	return nil
 }
@@ -1513,4 +2053,8 @@ func (vm *VM) lookupKwarg(hash map[*object.EmeraldValue]*object.EmeraldValue, na
 		}
 	}
 	return nil
+}
+
+func (vm *VM) GetCurrentBlock() *object.EmeraldValue {
+	return vm.currentBlock
 }

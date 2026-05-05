@@ -2,6 +2,7 @@ package lexer
 
 import (
 	"fmt"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -15,6 +16,7 @@ type Lexer struct {
 	column       int
 
 	templateNesting uint8
+	pendingTokens   []Token
 }
 
 func New(input string) *Lexer {
@@ -99,6 +101,12 @@ func (l *Lexer) NewLine() Token {
 }
 
 func (l *Lexer) NextToken() Token {
+	if len(l.pendingTokens) > 0 {
+		tok := l.pendingTokens[0]
+		l.pendingTokens = l.pendingTokens[1:]
+		return tok
+	}
+
 	l.skipWhitespace()
 
 	// Skip inline comments
@@ -115,11 +123,14 @@ func (l *Lexer) NextToken() Token {
 		tok.Type = EOF
 		tok.Literal = ""
 	case '\n':
-		tok.Type = NEWLINE
-		tok.Literal = "\n"
 		l.readChar()
 		l.skipWhitespace()
 		l.skipComment()
+		if l.ch == '.' {
+			return l.NextToken()
+		}
+		tok.Type = NEWLINE
+		tok.Literal = "\n"
 		return tok
 	case '"':
 		tok = l.readString(false)
@@ -139,9 +150,7 @@ func (l *Lexer) NextToken() Token {
 	case ')':
 		tok = newToken(RPAREN, l.ch)
 	case '{':
-		if l.peekChar() == '|' {
-			tok = l.makeTwoCharToken(LBRACE, RBRACE)
-		} else if l.peekChar() == '-' {
+		if l.peekChar() == '-' {
 			tok = l.readHashArrow()
 			return tok // readHashArrow already advanced
 		} else {
@@ -196,11 +205,19 @@ func (l *Lexer) NextToken() Token {
 			tok = newToken(MULTIPLY, l.ch)
 		}
 	case '%':
-		if l.peekChar() == 'q' || l.peekChar() == 'Q' || l.peekChar() == 'w' || l.peekChar() == 'W' ||
+		if l.peekChar() == '=' && !l.percentCanStartString() {
+			tok = l.makeTwoCharToken(MOD, MOD_ASSIGN)
+		} else if l.peekChar() == 'q' || l.peekChar() == 'Q' || l.peekChar() == 'w' || l.peekChar() == 'W' ||
 			l.peekChar() == 'i' || l.peekChar() == 'I' || l.peekChar() == 'r' || l.peekChar() == 's' ||
 			l.peekChar() == 'x' || l.peekChar() == 's' {
 			tok = l.readPercentString()
 			return tok // readPercentString already advanced past content
+		} else if l.peekChar() == '(' || l.peekChar() == '[' || l.peekChar() == '{' || l.peekChar() == '<' {
+			tok = l.readPercentString()
+			return tok
+		} else if isBarePercentDelimiter(l.peekChar()) {
+			tok = l.readPercentString()
+			return tok
 		} else {
 			tok = newToken(MOD, l.ch)
 		}
@@ -243,29 +260,47 @@ func (l *Lexer) NextToken() Token {
 		if l.peekChar() == '=' {
 			tok = l.makeTwoCharToken(GREATER_THAN, GREATER_THAN_OR_EQUAL)
 		} else if l.peekChar() == '>' {
-			tok = l.makeTwoCharToken(RSHIFT, RSHIFT)
+			if l.peekCharN(2) == '=' {
+				tok = l.makeThreeCharToken(RSHIFT_ASSIGN)
+			} else {
+				tok = l.makeTwoCharToken(RSHIFT, RSHIFT)
+			}
 		} else {
 			tok = newToken(GREATER_THAN, l.ch)
 		}
 	case '&':
 		if l.peekChar() == '&' {
-			tok = l.makeTwoCharToken(BIT_AND, AND)
+			l.readChar()
+			if l.peekChar() == '=' {
+				tok = Token{Type: AND_ASSIGN, Literal: "&&=", Line: l.line, Column: l.column}
+				l.readChar()
+			} else {
+				tok = Token{Type: AND, Literal: "&&", Line: l.line, Column: l.column}
+			}
+		} else if l.peekChar() == '.' {
+			tok = l.makeTwoCharToken(BIT_AND, SAFE_NAV)
 		} else if l.peekChar() == '=' {
-			tok = l.makeTwoCharToken(BIT_AND, BIT_AND)
+			tok = l.makeTwoCharToken(BIT_AND, BIT_AND_ASSIGN)
 		} else {
 			tok = newToken(BIT_AND, l.ch)
 		}
 	case '|':
 		if l.peekChar() == '|' {
-			tok = l.makeTwoCharToken(BIT_OR, OR)
+			l.readChar()
+			if l.peekChar() == '=' {
+				l.readChar()
+				tok = Token{Type: OR_ASSIGN, Literal: "||=", Line: l.line, Column: l.column}
+			} else {
+				tok = Token{Type: OR, Literal: "||", Line: l.line, Column: l.column}
+			}
 		} else if l.peekChar() == '=' {
-			tok = l.makeTwoCharToken(BIT_OR, BIT_OR)
+			tok = l.makeTwoCharToken(BIT_OR, BIT_OR_ASSIGN)
 		} else {
 			tok = newToken(BIT_OR, l.ch)
 		}
 	case '^':
 		if l.peekChar() == '=' {
-			tok = l.makeTwoCharToken(BIT_XOR, BIT_XOR)
+			tok = l.makeTwoCharToken(BIT_XOR, BIT_XOR_ASSIGN)
 		} else {
 			tok = newToken(BIT_XOR, l.ch)
 		}
@@ -273,6 +308,13 @@ func (l *Lexer) NextToken() Token {
 		tok = newToken(BIT_NOT, l.ch)
 	case '?':
 		tok = newToken(QUESTION, l.ch)
+	case '\\':
+		if l.peekChar() == '\n' {
+			l.readChar()
+			l.readChar()
+			return l.NextToken()
+		}
+		tok = newToken(BACKSLASH, l.ch)
 	case '@':
 		tok = l.readVariable()
 		return tok // readVariable already advanced past content
@@ -299,6 +341,10 @@ func (l *Lexer) NextToken() Token {
 		}
 	}
 
+	if tok.Line == 0 {
+		tok.Line = l.line
+		tok.Column = l.column
+	}
 	l.readChar()
 	return tok
 }
@@ -425,6 +471,16 @@ func (l *Lexer) readGlobalVariable() Token {
 
 	lit := l.input[position:l.position]
 	if len(lit) == 0 {
+		if isSpecialGlobalChar(l.ch) {
+			ch := l.ch
+			l.readChar()
+			return Token{
+				Type:    DOLLAR,
+				Literal: "$" + string(ch),
+				Line:    l.line,
+				Column:  l.column,
+			}
+		}
 		// Special global variables like $-, $!, etc.
 		if l.ch == '-' {
 			l.readChar()
@@ -450,6 +506,15 @@ func (l *Lexer) readGlobalVariable() Token {
 	}
 }
 
+func isSpecialGlobalChar(ch rune) bool {
+	switch ch {
+	case '!', '@', '&', '`', '\'', '"', '+', '~', '=', '/', '\\', ',', ';', '.', '<', '>', '_', '0', '$', '?', ':':
+		return true
+	default:
+		return isDigit(ch)
+	}
+}
+
 func (l *Lexer) readNumber() Token {
 	position := l.position
 
@@ -471,7 +536,12 @@ func (l *Lexer) readNumber() Token {
 			return l.readOctalNumber(position)
 		case 'd', 'D':
 			l.readChar()
-			return l.readDecimalNumber(position)
+			tok := l.readDecimalNumber(position)
+			lit := tok.Literal
+			if len(lit) > 2 && lit[0] == '0' && (lit[1] == 'd' || lit[1] == 'D') {
+				tok.Literal = lit[2:]
+			}
+			return tok
 		case '.':
 			if isDigit(l.peekChar()) {
 				l.readChar()
@@ -481,6 +551,9 @@ func (l *Lexer) readNumber() Token {
 			if isDigit(l.peekChar()) {
 				return l.readDecimalNumber(position)
 			}
+		}
+		if isDigit(l.ch) {
+			return l.readDecimalNumber(position)
 		}
 
 		tok.Literal = "0"
@@ -502,6 +575,18 @@ func (l *Lexer) readDecimalNumber(position int) Token {
 
 	if l.ch == 'e' || l.ch == 'E' {
 		return l.readExponent(position)
+	}
+
+	if l.ch == 'r' {
+		l.readChar()
+		lit := l.input[position:l.position]
+		lit = removeUnderscores(lit)
+		return Token{
+			Type:    RATIONAL,
+			Literal: lit,
+			Line:    l.line,
+			Column:  l.column,
+		}
 	}
 
 	lit := l.input[position:l.position]
@@ -575,6 +660,18 @@ func (l *Lexer) readFloat(position int) Token {
 		return l.readExponent(position)
 	}
 
+	if l.ch == 'r' {
+		l.readChar()
+		lit := l.input[position:l.position]
+		lit = removeUnderscores(lit)
+		return Token{
+			Type:    RATIONAL,
+			Literal: lit,
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+
 	lit := l.input[position:l.position]
 	lit = removeUnderscores(lit)
 
@@ -641,7 +738,7 @@ func (l *Lexer) readString(singleQuote bool) Token {
 
 func (l *Lexer) readSingleQuotedString(position int, quote rune) string {
 	for l.ch != quote && l.ch != 0 {
-		if l.ch == '\\' && l.peekChar() == quote {
+		if l.ch == '\\' && (l.peekChar() == quote || l.peekChar() == '\\') {
 			l.readChar()
 		}
 		l.readChar()
@@ -918,6 +1015,8 @@ func (l *Lexer) readPercentString() Token {
 		l.readChar()
 	}
 
+	openDelimiter := delimiter
+	pairedDelimiter := true
 	if delimiter == '(' {
 		delimiter = ')'
 	} else if delimiter == '[' {
@@ -926,15 +1025,53 @@ func (l *Lexer) readPercentString() Token {
 		delimiter = '}'
 	} else if delimiter == '<' {
 		delimiter = '>'
+	} else {
+		pairedDelimiter = false
 	}
 
 	l.readChar()
 
 	position := l.position
+	depth := 1
 
-	for l.ch != delimiter && l.ch != 0 {
-		if l.ch == '\\' && l.peekChar() == delimiter {
+	for l.ch != 0 {
+		if l.ch == '\\' {
 			l.readChar()
+			if l.ch != 0 {
+				l.readChar()
+			}
+			continue
+		}
+		if l.ch == '#' && l.peekChar() == '{' {
+			l.readChar()
+			l.readChar()
+			interpDepth := 1
+			for l.ch != 0 && interpDepth > 0 {
+				if l.ch == '\\' {
+					l.readChar()
+					if l.ch != 0 {
+						l.readChar()
+					}
+					continue
+				}
+				if l.ch == '{' {
+					interpDepth++
+				} else if l.ch == '}' {
+					interpDepth--
+				}
+				l.readChar()
+			}
+			continue
+		}
+		if pairedDelimiter && l.ch == openDelimiter {
+			depth++
+		} else if pairedDelimiter && l.ch == delimiter {
+			depth--
+			if depth == 0 {
+				break
+			}
+		} else if !pairedDelimiter && l.ch == delimiter {
+			break
 		}
 		l.readChar()
 	}
@@ -952,7 +1089,15 @@ func (l *Lexer) readPercentString() Token {
 	return tok
 }
 
+func isBarePercentDelimiter(ch rune) bool {
+	if ch == 0 || (isLetter(ch) && ch != '_') || isDigit(ch) || ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r' {
+		return false
+	}
+	return true
+}
+
 func (l *Lexer) readSlashOrRegexp() Token {
+	canStartRegexp := l.slashCanStartRegexp()
 	l.readChar()
 
 	if l.ch == '=' {
@@ -965,21 +1110,43 @@ func (l *Lexer) readSlashOrRegexp() Token {
 		}
 	}
 
-	if l.ch == ' ' {
+	if !canStartRegexp {
 		return newToken(DIVIDE, '/')
 	}
 
 	// Regexp
 	position := l.position - 1
+	interpolationDepth := 0
 
-	for l.ch != '/' && l.ch != 0 {
+	for l.ch != 0 {
+		if interpolationDepth == 0 && l.ch == '/' {
+			break
+		}
 		if l.ch == '\\' {
 			l.readChar()
+		} else if l.ch == '#' && l.peekChar() == '{' {
+			interpolationDepth++
+			l.readChar()
+		} else if interpolationDepth > 0 {
+			if l.ch == '{' {
+				interpolationDepth++
+			} else if l.ch == '}' {
+				interpolationDepth--
+			}
 		}
 		l.readChar()
 	}
 
-	lit := l.input[position:l.position]
+	if l.ch == 0 {
+		return Token{
+			Type:    ILLEGAL,
+			Literal: l.input[position:l.position],
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+
+	lit := l.input[position : l.position+1]
 	l.readChar()
 
 	// Check for modifiers
@@ -996,78 +1163,189 @@ func (l *Lexer) readSlashOrRegexp() Token {
 	}
 }
 
-func (l *Lexer) readLeftShift() Token {
-	ch := l.ch
-	l.readChar()
-
-	if l.ch == '-' {
-		l.readChar()
-		position := l.position
-
-		// Check for heredoc
-		if l.ch == '\n' {
-			return l.readHeredoc(position)
+func (l *Lexer) slashCanStartRegexp() bool {
+	pos := l.position
+	for pos > 0 {
+		r, size := utf8.DecodeLastRuneInString(l.input[:pos])
+		pos -= size
+		if r == '/' {
+			continue
 		}
-
-		if isLetter(l.ch) {
-			return l.readHeredoc(position)
+		if r == '\n' {
+			return true
 		}
-
-		l.position = position
-		l.ch = '-'
+		if r == ' ' || r == '\t' || r == '\r' {
+			continue
+		}
+		if isLetter(r) || r == '_' {
+			end := pos + size
+			start := pos
+			for start > 0 {
+				prev, prevSize := utf8.DecodeLastRuneInString(l.input[:start])
+				if !isLetter(prev) && !isDigit(prev) && prev != '_' {
+					break
+				}
+				start -= prevSize
+			}
+			switch l.input[start:end] {
+			case "when", "case", "if", "unless", "elsif", "return", "raise", "rescue", "in", "do", "then":
+				return true
+			default:
+				return false
+			}
+		}
+		return !(isLetter(r) || isDigit(r) || r == '_' || r == ')' || r == ']' || r == '}')
 	}
+	return true
+}
 
-	if l.peekChar() == '=' {
+func (l *Lexer) percentCanStartString() bool {
+	pos := l.position
+	for pos > 0 {
+		r, size := utf8.DecodeLastRuneInString(l.input[:pos])
+		pos -= size
+		if r == '\n' {
+			return true
+		}
+		if r == ' ' || r == '\t' || r == '\r' {
+			continue
+		}
+		return !(isLetter(r) || isDigit(r) || r == '_' || r == ')' || r == ']' || r == '}')
+	}
+	return true
+}
+
+func (l *Lexer) readLeftShift() Token {
+	line := l.line
+	column := l.column
+
+	l.readChar()
+	if l.ch == '<' {
 		l.readChar()
+
+		if l.ch == '=' {
+			l.readChar()
+			return Token{
+				Type:    LSHIFT_ASSIGN,
+				Literal: "<<=",
+				Line:    line,
+				Column:  column,
+			}
+		}
+
+		if l.ch == '-' || l.ch == '~' || isLetter(l.ch) || l.ch == '"' || l.ch == '\'' {
+			return l.readHeredoc(line, column)
+		}
+
 		return Token{
-			Type:    ASSIGN,
-			Literal: string(ch) + string(l.ch),
-			Line:    l.line,
-			Column:  l.column,
+			Type:    LSHIFT,
+			Literal: "<<",
+			Line:    line,
+			Column:  column,
 		}
 	}
 
 	return Token{
 		Type:    LESS_THAN,
 		Literal: "<<",
-		Line:    l.line,
-		Column:  l.column,
+		Line:    line,
+		Column:  column,
 	}
 }
 
-func (l *Lexer) readHeredoc(position int) Token {
-	l.readChar()
+func (l *Lexer) readHeredoc(line, column int) Token {
+	allowIndentedTerminator := false
+	if l.ch == '-' || l.ch == '~' {
+		allowIndentedTerminator = true
+		l.readChar()
+	}
+
+	quote := rune(0)
+	if l.ch == '"' || l.ch == '\'' {
+		quote = l.ch
+		l.readChar()
+	}
 
 	start := l.position
-
 	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
-
 	delimiter := l.input[start:l.position]
-
-	if l.ch == '-' {
+	if quote != 0 && l.ch == quote {
 		l.readChar()
 	}
 
-	l.readChar()
-
-	position = l.position
-	var lit string
-
-	for !endsWith(l.input[position:l.position], delimiter) && l.ch != 0 {
+	suffixStart := l.position
+	for l.ch != '\n' && l.ch != 0 {
+		l.readChar()
+	}
+	markerSuffix := l.input[suffixStart:l.position]
+	hasMarkerSuffix := strings.TrimSpace(markerSuffix) != ""
+	l.queueHeredocMarkerSuffix(markerSuffix)
+	if l.ch == '\n' {
 		l.readChar()
 	}
 
-	lit = l.input[position:l.position]
-	l.readChar()
+	contentStart := l.position
+	contentEnd := l.position
+	for l.ch != 0 {
+		lineStart := l.position
+		for l.ch != '\n' && l.ch != 0 {
+			l.readChar()
+		}
+		lineText := l.input[lineStart:l.position]
+		if heredocTerminatorMatches(lineText, delimiter, allowIndentedTerminator) {
+			contentEnd = lineStart
+			break
+		}
+		contentEnd = l.position
+		if l.ch == '\n' {
+			l.readChar()
+		}
+	}
+
+	lit := l.input[contentStart:contentEnd]
+	if l.ch == '\n' {
+		l.readChar()
+	}
+	if hasMarkerSuffix {
+		l.pendingTokens = append(l.pendingTokens, Token{
+			Type:    NEWLINE,
+			Literal: "\n",
+			Line:    l.line,
+			Column:  l.column,
+		})
+	}
 
 	return Token{
 		Type:    STRING,
-		Literal: "<<" + delimiter + lit + delimiter,
-		Line:    l.line,
-		Column:  l.column,
+		Literal: lit,
+		Line:    line,
+		Column:  column,
 	}
+}
+
+func (l *Lexer) queueHeredocMarkerSuffix(suffix string) {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return
+	}
+
+	suffixLexer := New(suffix)
+	for {
+		tok := suffixLexer.NextToken()
+		if tok.Type == EOF {
+			return
+		}
+		l.pendingTokens = append(l.pendingTokens, tok)
+	}
+}
+
+func heredocTerminatorMatches(lineText, delimiter string, allowIndented bool) bool {
+	if allowIndented {
+		return strings.TrimSpace(lineText) == delimiter
+	}
+	return lineText == delimiter
 }
 
 func (l *Lexer) readSymbolOrColon() Token {
@@ -1094,7 +1372,7 @@ func (l *Lexer) readSymbolOrColon() Token {
 		if l.ch == '=' && l.peekChar() != '>' {
 			l.readChar()
 			return Token{
-				Type:    ASSIGN,
+				Type:    SYMBOL,
 				Literal: ":" + lit + "=",
 				Line:    l.line,
 				Column:  l.column,
@@ -1114,7 +1392,81 @@ func (l *Lexer) readSymbolOrColon() Token {
 		}
 	}
 
+	if l.ch == '"' || l.ch == '\'' {
+		return l.readQuotedSymbol()
+	}
+
+	if l.ch == '@' || l.ch == '$' {
+		position := l.position
+		if l.ch == '@' && l.peekChar() == '@' {
+			l.readChar()
+		}
+		l.readChar()
+		for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+			l.readChar()
+		}
+		return Token{
+			Type:    SYMBOL,
+			Literal: ":" + l.input[position:l.position],
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+
+	if l.colonFollowsIdentifier() && (l.ch == '|' || l.ch == ',' || l.ch == ')' || l.ch == '}' || l.ch == '\n' || l.ch == 0) {
+		return newToken(COLON, ':')
+	}
+
+	if strings.ContainsRune("+-*/%&|^~<>=![]`", l.ch) {
+		position := l.position
+		for strings.ContainsRune("+-*/%&|^~<>=![]`", l.ch) {
+			l.readChar()
+		}
+		if l.ch == '@' {
+			l.readChar()
+		}
+		return Token{
+			Type:    SYMBOL,
+			Literal: ":" + l.input[position:l.position],
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+
 	return newToken(COLON, ':')
+}
+
+func (l *Lexer) colonFollowsIdentifier() bool {
+	colonPos := l.position - 1
+	if colonPos <= 0 || colonPos > len(l.input) || l.input[colonPos] != ':' {
+		return false
+	}
+	prev, _ := utf8.DecodeLastRuneInString(l.input[:colonPos])
+	return isLetter(prev) || isDigit(prev) || prev == '_'
+}
+
+func (l *Lexer) readQuotedSymbol() Token {
+	quote := l.ch
+	l.readChar()
+	position := l.position
+	for l.ch != quote && l.ch != 0 {
+		if l.ch == '\\' && l.peekChar() == quote {
+			l.readChar()
+		}
+		l.readChar()
+	}
+
+	lit := l.input[position:l.position]
+	if l.ch == quote {
+		l.readChar()
+	}
+
+	return Token{
+		Type:    SYMBOL,
+		Literal: ":" + lit,
+		Line:    l.line,
+		Column:  l.column,
+	}
 }
 
 func endsWith(s, suffix string) bool {

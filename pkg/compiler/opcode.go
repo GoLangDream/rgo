@@ -38,6 +38,7 @@ const (
 	OpHash
 
 	OpIndex
+	OpSliceIndex
 	OpIndexAssign
 
 	OpGetGlobal
@@ -93,6 +94,7 @@ const (
 	OpBreak
 	OpBreakValue
 	OpSetWhileEnd
+	OpRedo
 
 	OpMatch
 	OpNotMatch
@@ -149,6 +151,10 @@ const (
 
 	OpSplat
 
+	OpRange
+	OpBlockGiven
+	OpRationalNew
+
 	OpDebug
 )
 
@@ -189,6 +195,7 @@ var definitions = map[Opcode]Definition{
 	OpHash:  {"OpHash", []int{2}},
 
 	OpIndex:       {"OpIndex", []int{}},
+	OpSliceIndex:  {"OpSliceIndex", []int{}},
 	OpIndexAssign: {"OpIndexAssign", []int{}},
 
 	OpGetGlobal: {"OpGetGlobal", []int{2}},
@@ -236,13 +243,14 @@ var definitions = map[Opcode]Definition{
 	OpOpenClass:          {"OpOpenClass", []int{2}},
 	OpOpenClassWithSuper: {"OpOpenClassWithSuper", []int{2}},
 
-	OpLambda:       {"OpLambda", []int{2}},
+	OpLambda:       {"OpLambda", []int{2, 1}},
 	OpBlock:        {"OpBlock", []int{2}},
 	OpBlockWithArg: {"OpBlockWithArg", []int{2, 1}},
 
 	OpBreak:       {"OpBreak", []int{}},
 	OpBreakValue:  {"OpBreakValue", []int{}},
 	OpSetWhileEnd: {"OpSetWhileEnd", []int{2}},
+	OpRedo:        {"OpRedo", []int{}},
 
 	OpMatch:    {"OpMatch", []int{}},
 	OpNotMatch: {"OpNotMatch", []int{}},
@@ -264,13 +272,13 @@ var definitions = map[Opcode]Definition{
 	OpYield:          {"OpYield", []int{}},
 	OpYieldWithValue: {"OpYieldWithValue", []int{1}},
 
-	OpRescue:      {"OpRescue", []int{2}},
+	OpRescue:      {"OpRescue", []int{}},
 	OpRescueMatch: {"OpRescueMatch", []int{}},
 	OpRetry:       {"OpRetry", []int{}},
 	OpRaise:       {"OpRaise", []int{}},
 	OpThrow:       {"OpThrow", []int{}},
-	OpBeginRescue: {"OpBeginRescue", []int{4}},
-	OpEnsure:      {"OpEnsure", []int{1}},
+	OpBeginRescue: {"OpBeginRescue", []int{2, 2, 2}},
+	OpEnsure:      {"OpEnsure", []int{}},
 	OpCatch:       {"OpCatch", []int{2}},
 
 	OpExtend:  {"OpExtend", []int{}},
@@ -279,16 +287,19 @@ var definitions = map[Opcode]Definition{
 	OpAlias: {"OpAlias", []int{}},
 	OpUndef: {"OpUndef", []int{}},
 
-	OpDefined:    {"OpDefined", []int{2}},
-	OpCaseEq:     {"OpCaseEq", []int{}},
-	OpIsA:        {"OpIsA", []int{}},
-	OpKindOf:     {"OpKindOf", []int{}},
-	OpInstanceOf: {"OpInstanceOf", []int{}},
-	OpRespondTo:  {"OpRespondTo", []int{}},
-	OpClassOf:    {"OpClassOf", []int{}},
-	OpFreeze:     {"OpFreeze", []int{}},
-	OpSplat:      {"OpSplat", []int{}},
-	OpDebug:      {"OpDebug", []int{}},
+	OpDefined:     {"OpDefined", []int{2}},
+	OpCaseEq:      {"OpCaseEq", []int{}},
+	OpIsA:         {"OpIsA", []int{}},
+	OpKindOf:      {"OpKindOf", []int{}},
+	OpInstanceOf:  {"OpInstanceOf", []int{}},
+	OpRespondTo:   {"OpRespondTo", []int{}},
+	OpClassOf:     {"OpClassOf", []int{}},
+	OpFreeze:      {"OpFreeze", []int{}},
+	OpSplat:       {"OpSplat", []int{}},
+	OpRange:       {"OpRange", []int{1}},
+	OpBlockGiven:  {"OpBlockGiven", []int{}},
+	OpRationalNew: {"OpRationalNew", []int{}},
+	OpDebug:       {"OpDebug", []int{}},
 }
 
 func Lookup(op byte) (Definition, bool) {

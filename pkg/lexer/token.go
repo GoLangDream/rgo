@@ -6,12 +6,13 @@ const (
 	ILLEGAL TokenType = "ILLEGAL"
 	EOF     TokenType = "EOF"
 
-	IDENT  TokenType = "IDENT"
-	INT    TokenType = "INT"
-	FLOAT  TokenType = "FLOAT"
-	STRING TokenType = "STRING"
-	SYMBOL TokenType = "SYMBOL"
-	REGEXP TokenType = "REGEXP"
+	IDENT    TokenType = "IDENT"
+	INT      TokenType = "INT"
+	FLOAT    TokenType = "FLOAT"
+	RATIONAL TokenType = "RATIONAL"
+	STRING   TokenType = "STRING"
+	SYMBOL   TokenType = "SYMBOL"
+	REGEXP   TokenType = "REGEXP"
 
 	ASSIGN   TokenType = "="
 	PLUS     TokenType = "+"
@@ -27,6 +28,13 @@ const (
 	DIVIDE_ASSIGN   TokenType = "/="
 	MOD_ASSIGN      TokenType = "%="
 	POW_ASSIGN      TokenType = "**="
+	OR_ASSIGN       TokenType = "||="
+	AND_ASSIGN      TokenType = "&&="
+	BIT_OR_ASSIGN   TokenType = "|="
+	BIT_AND_ASSIGN  TokenType = "&="
+	BIT_XOR_ASSIGN  TokenType = "^="
+	LSHIFT_ASSIGN   TokenType = "<<="
+	RSHIFT_ASSIGN   TokenType = ">>="
 
 	BANG       TokenType = "!"
 	BANG_EQUAL TokenType = "!="
@@ -58,9 +66,10 @@ const (
 	BIT_XOR TokenType = "^"
 	BIT_NOT TokenType = "~"
 
-	DOT  TokenType = "."
-	DOT2 TokenType = ".."
-	DOT3 TokenType = "..."
+	DOT      TokenType = "."
+	DOT2     TokenType = ".."
+	DOT3     TokenType = "..."
+	SAFE_NAV TokenType = "&."
 
 	COMMA       TokenType = ","
 	COLON       TokenType = ":"
@@ -195,6 +204,7 @@ var keywords = map[string]TokenType{
 	"nil":       NIL,
 	"and":       AND2,
 	"or":        OR2,
+	"not":       BANG,
 	"defined?":  DEFINED,
 	"END":       END,
 	"alias":     ALIAS,

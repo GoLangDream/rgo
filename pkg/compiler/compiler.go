@@ -2,6 +2,8 @@ package compiler
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/core"
@@ -59,7 +61,7 @@ func NewEnclosedSymbolTable(outer *SymbolTable) *SymbolTable {
 }
 
 func (s *SymbolTable) Define(name string) Symbol {
-	symbol := Symbol{Name: name, Index: len(s.store), Scope: ScopeLocal}
+	symbol := Symbol{Name: name, Index: s.MaxSymbols, Scope: ScopeLocal}
 	s.store[name] = symbol
 	s.MaxSymbols++
 	return symbol
@@ -72,7 +74,7 @@ func (s *SymbolTable) DefineBuiltin(index int, name string) Symbol {
 }
 
 func (s *SymbolTable) DefineGlobal(name string) Symbol {
-	symbol := Symbol{Name: name, Index: len(s.store), Scope: ScopeGlobal}
+	symbol := Symbol{Name: name, Index: s.MaxSymbols, Scope: ScopeGlobal}
 	s.store[name] = symbol
 	s.MaxSymbols++
 	return symbol
@@ -96,12 +98,22 @@ func (s *SymbolTable) DefineFree(original Symbol) Symbol {
 func (s *SymbolTable) Resolve(name string) (Symbol, bool) {
 	obj, ok := s.store[name]
 	if !ok && s.Outer != nil {
+		if outerObj, found := s.Outer.store[name]; found && outerObj.Scope == ScopeLocal {
+			return Symbol{
+				Name:       outerObj.Name,
+				Index:      outerObj.Index,
+				Scope:      ScopeOuter,
+				ScopeIndex: outerObj.Index,
+			}, true
+		}
+	}
+	if !ok && s.Outer != nil {
 		obj, ok = s.Outer.Resolve(name)
 		if !ok {
 			return obj, ok
 		}
 
-		if obj.Scope == ScopeLocal || obj.Scope == ScopeBuiltin {
+		if obj.Scope == ScopeGlobal || obj.Scope == ScopeBuiltin {
 			return obj, ok
 		}
 
@@ -124,7 +136,9 @@ type CompilationScope struct {
 	previousInstruction EmittedInstruction
 	breakTarget         int
 	nextPatchPos        []int
+	redoTarget          int
 	breakValuePatchPos  []int
+	retryTarget         int
 }
 
 type Compiler struct {
@@ -137,6 +151,9 @@ type Compiler struct {
 func New() *Compiler {
 	mainScope := CompilationScope{
 		instructions: Instructions{},
+		breakTarget:  -1,
+		redoTarget:   -1,
+		retryTarget:  -1,
 	}
 
 	symbolTable := NewSymbolTable()
@@ -150,6 +167,14 @@ func New() *Compiler {
 		scopes:      []CompilationScope{mainScope},
 		symbolTable: symbolTable,
 	}
+}
+
+func (c *Compiler) globalSymbolIndex(name string) int {
+	if sym, ok := c.symbolTable.Resolve(name); ok && sym.Scope == ScopeGlobal {
+		return sym.Index
+	}
+	sym := c.symbolTable.DefineGlobal(name)
+	return sym.Index
 }
 
 func (c *Compiler) Compile(node interface{}) error {
@@ -172,13 +197,64 @@ func (c *Compiler) Compile(node interface{}) error {
 			Class: core.R.Classes["Integer"],
 		})
 	case *ast.RangeExpression:
-		c.Emit(OpNil)
+		if err := c.compileRangeExpression(node); err != nil {
+			return err
+		}
+	case *ast.TernaryExpression:
+		if err := c.Compile(node.Condition); err != nil {
+			return err
+		}
+		jumpNotTruthyPos := c.emit(OpJumpNotTruthy, 9999)
+		if err := c.Compile(node.Consequent); err != nil {
+			return err
+		}
+		jumpPos := c.emit(OpJump, 9999)
+		afterConsequent := len(c.currentInstructions())
+		c.changeOperand(jumpNotTruthyPos, afterConsequent)
+		if err := c.Compile(node.Alternative); err != nil {
+			return err
+		}
+		afterAlternative := len(c.currentInstructions())
+		c.changeOperand(jumpPos, afterAlternative)
 	case *ast.FloatLiteral:
 		c.EmitConstant(&object.EmeraldValue{
 			Type:  object.ValueFloat,
 			Data:  node.Value,
 			Class: core.R.Classes["Float"],
 		})
+	case *ast.RationalLiteral:
+		parts := strings.Split(node.Value, ".")
+		num := int64(0)
+		den := int64(1)
+		if len(parts) == 1 {
+			n, _ := strconv.ParseInt(parts[0], 10, 64)
+			num = n
+		} else if len(parts) == 2 {
+			n, _ := strconv.ParseInt(parts[0], 10, 64)
+			d, _ := strconv.ParseInt(parts[1], 10, 64)
+			if d == 0 {
+				num = n
+			} else {
+				places := len(parts[1])
+				mul := int64(1)
+				for i := 0; i < places; i++ {
+					mul *= 10
+				}
+				num = n*mul + d
+				den = mul
+			}
+		}
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  num,
+			Class: core.R.Classes["Integer"],
+		})
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  den,
+			Class: core.R.Classes["Integer"],
+		})
+		c.emit(OpRationalNew)
 	case *ast.StringLiteral:
 		val := node.Value
 		if !strings.Contains(val, "#{") {
@@ -193,10 +269,23 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 	case *ast.SymbolLiteral:
+		val := node.Value
+		if len(val) > 0 && val[0] == ':' {
+			val = val[1:]
+		}
 		c.EmitConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  node.Value,
-			Class: core.R.Classes["String"],
+			Type:  object.ValueSymbol,
+			Data:  val,
+			Class: core.R.Classes["Symbol"],
+		})
+	case *ast.RegexpLiteral:
+		c.EmitConstant(&object.EmeraldValue{
+			Type: object.ValueRegexp,
+			Data: &object.RRegexp{
+				Pattern: node.Pattern,
+				Options: node.Options,
+			},
+			Class: core.R.Classes["Regexp"],
 		})
 	case *ast.Boolean:
 		if node.Value {
@@ -206,14 +295,25 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.NilExpression:
 		c.Emit(OpNil)
+	case *ast.DefinedExpression:
+		c.compileDefinedExpression(node)
 	case *ast.Identifier:
 		if node.Value == "self" {
 			c.Emit(OpSelf)
 			return nil
 		}
+		if node.Value == "block_given?" {
+			c.Emit(OpBlockGiven)
+			return nil
+		}
 		sym, ok := c.symbolTable.Resolve(node.Value)
 		if !ok {
-			c.Emit(OpNil)
+			c.Emit(OpSelf)
+			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Value,
+				Class: core.R.Classes["String"],
+			}), 0, 0)
 			return nil
 		}
 		switch sym.Scope {
@@ -235,7 +335,19 @@ func (c *Compiler) Compile(node interface{}) error {
 			Class: core.R.Classes["String"],
 		}))
 	case *ast.ConstantResolution:
-		c.Emit(OpNil)
+		if left, ok := node.Left.(*ast.Constant); ok && left.Name == "Float" && node.Name.Value == "INFINITY" {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueFloat,
+				Data:  math.Inf(1),
+				Class: core.R.Classes["Float"],
+			})
+			return nil
+		}
+		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.String(),
+			Class: core.R.Classes["String"],
+		}))
 	case *ast.InstanceVariable:
 		c.emit(OpGetInstanceVar, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
@@ -243,11 +355,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Class: core.R.Classes["String"],
 		}))
 	case *ast.GlobalVariable:
-		c.emit(OpGetGlobal, c.addConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  node.Name,
-			Class: core.R.Classes["String"],
-		}))
+		c.emit(OpGetGlobal, c.globalSymbolIndex(node.Name))
 	case *ast.ClassVariable:
 		c.emit(OpGetClassVar, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
@@ -324,6 +432,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpLessThan)
 		case "<=":
 			c.Emit(OpLessThanOrEqual)
+		case "<=>":
+			methodNameIdx := c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "<=>",
+				Class: core.R.Classes["String"],
+			})
+			c.emit(OpSend, methodNameIdx, 0, 1)
 		case "&":
 			c.Emit(OpBitAnd)
 		case "|":
@@ -338,12 +453,30 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpBitRightShift)
 		}
 	case *ast.PrefixExpression:
+		if node.Operator == "-" {
+			if call, ok := node.Right.(*ast.MethodCall); ok && call.Receiver != nil {
+				switch receiver := call.Receiver.(type) {
+				case *ast.IntegerLiteral:
+					copyCall := *call
+					copyReceiver := *receiver
+					copyReceiver.Value = -copyReceiver.Value
+					copyCall.Receiver = &copyReceiver
+					return c.Compile(&copyCall)
+				case *ast.FloatLiteral:
+					copyCall := *call
+					copyReceiver := *receiver
+					copyReceiver.Value = -copyReceiver.Value
+					copyCall.Receiver = &copyReceiver
+					return c.Compile(&copyCall)
+				}
+			}
+		}
 		if err := c.Compile(node.Right); err != nil {
 			return err
 		}
 
 		switch node.Operator {
-		case "!":
+		case "!", "not":
 			c.Emit(OpBang)
 		case "-":
 			c.Emit(OpNeg)
@@ -355,7 +488,11 @@ func (c *Compiler) Compile(node interface{}) error {
 			return err
 		}
 
-		jumpNotTruthyPos := c.emit(OpJumpNotTruthy, 9999)
+		jumpOp := OpJumpNotTruthy
+		if node.IsUnless {
+			jumpOp = OpJumpTruthy
+		}
+		jumpNotTruthyPos := c.emit(jumpOp, 9999)
 
 		if err := c.compileBlockAsValue(node.Consequent); err != nil {
 			return err
@@ -465,6 +602,14 @@ func (c *Compiler) Compile(node interface{}) error {
 		for _, pos := range jumpToEndPositions {
 			c.changeOperand(pos, afterAll)
 		}
+	case *ast.PatternMatchExpression:
+		if node.Left != nil {
+			if err := c.Compile(node.Left); err != nil {
+				return err
+			}
+			c.Emit(OpPop)
+		}
+		c.Emit(OpTrue)
 	case *ast.ArrayLiteral:
 		for _, e := range node.Elements {
 			if err := c.Compile(e); err != nil {
@@ -490,21 +635,48 @@ func (c *Compiler) Compile(node interface{}) error {
 		if err := c.Compile(node.Index); err != nil {
 			return err
 		}
-		c.Emit(OpIndex)
+		if node.End != nil {
+			if err := c.Compile(node.End); err != nil {
+				return err
+			}
+			c.emit(OpSliceIndex)
+		} else {
+			c.Emit(OpIndex)
+		}
 	case *ast.AssignExpression:
-		if err := c.Compile(node.Value); err != nil {
+		if node.Index != nil {
+			target := ast.Expression(node.Name)
+			if node.Target != nil {
+				target = node.Target
+			}
+			if err := c.Compile(target); err != nil {
+				return err
+			}
+			if err := c.Compile(node.Index); err != nil {
+				return err
+			}
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+			c.Emit(OpIndexAssign)
+			return nil
+		}
+
+		if op, ok := compoundAssignmentOpcode(node.Token.Type); ok {
+			if err := c.compileAssignmentCurrentValue(node.Name); err != nil {
+				return err
+			}
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+			c.Emit(op)
+		} else if err := c.Compile(node.Value); err != nil {
 			return err
 		}
 
 		// Check if the name is a global variable (starts with $)
 		if len(node.Name.Value) > 0 && node.Name.Value[0] == '$' {
-			// Define in symbol table and use index
-			if _, ok := c.symbolTable.Resolve(node.Name.Value); !ok {
-				c.symbolTable.Define(node.Name.Value)
-			}
-			sym, _ := c.symbolTable.Resolve(node.Name.Value)
-			c.symbolTable.DefineGlobal(node.Name.Value)
-			c.emit(OpSetGlobal, sym.Index)
+			c.emit(OpSetGlobal, c.globalSymbolIndex(node.Name.Value))
 			return nil
 		}
 
@@ -528,8 +700,17 @@ func (c *Compiler) Compile(node interface{}) error {
 			return nil
 		}
 
+		if len(node.Name.Value) > 0 && node.Name.Value[0] >= 'A' && node.Name.Value[0] <= 'Z' {
+			c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
+			return nil
+		}
+
 		sym, ok := c.symbolTable.Resolve(node.Name.Value)
-		if !ok {
+		if !ok || sym.Scope == ScopeBuiltin {
 			c.symbolTable.Define(node.Name.Value)
 			sym, _ = c.symbolTable.Resolve(node.Name.Value)
 		}
@@ -539,44 +720,94 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.emit(OpSetGlobal, sym.Index)
 		case ScopeLocal:
 			c.emit(OpSetLocal, sym.Index)
+		case ScopeOuter:
+			c.emit(OpSetOuter, 0, sym.ScopeIndex)
+		case ScopeFree:
+			c.emit(OpSetFree, sym.Index)
 		}
 	case *ast.MultiAssignExpression:
-		for _, val := range node.Values {
-			if err := c.Compile(val); err != nil {
+		if len(node.Values) == 1 && len(node.Names) > 1 {
+			if err := c.Compile(node.Values[0]); err != nil {
 				return err
 			}
-		}
-		for i := len(node.Names) - 1; i >= 0; i-- {
-			name := node.Names[i]
-			if len(name.Value) > 0 && name.Value[0] == '$' {
-				sym, _ := c.symbolTable.Resolve(name.Value)
-				c.symbolTable.DefineGlobal(name.Value)
-				c.emit(OpSetGlobal, sym.Index)
-			} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
-				c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
-					Type:  object.ValueString,
-					Data:  name.Value,
-					Class: core.R.Classes["String"],
-				}))
-			} else if len(name.Value) > 0 && name.Value[0] == '@' {
-				c.emit(OpSetInstanceVar, c.addConstant(&object.EmeraldValue{
-					Type:  object.ValueString,
-					Data:  name.Value,
-					Class: core.R.Classes["String"],
-				}))
-			} else {
-				if _, ok := c.symbolTable.Resolve(name.Value); !ok {
-					c.symbolTable.Define(name.Value)
-				}
-				sym, _ := c.symbolTable.Resolve(name.Value)
-				switch sym.Scope {
-				case ScopeGlobal:
+			for i := 0; i < len(node.Names); i++ {
+				c.Emit(OpDup)
+				c.EmitConstant(&object.EmeraldValue{
+					Type:  object.ValueInteger,
+					Data:  int64(i),
+					Class: core.R.Classes["Integer"],
+				})
+				c.Emit(OpIndex)
+				name := node.Names[i]
+				if len(name.Value) > 0 && name.Value[0] == '$' {
+					sym, _ := c.symbolTable.Resolve(name.Value)
+					c.symbolTable.DefineGlobal(name.Value)
 					c.emit(OpSetGlobal, sym.Index)
-				case ScopeLocal:
-					c.emit(OpSetLocal, sym.Index)
+				} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
+					c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  name.Value,
+						Class: core.R.Classes["String"],
+					}))
+				} else if len(name.Value) > 0 && name.Value[0] == '@' {
+					c.emit(OpSetInstanceVar, c.addConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  name.Value,
+						Class: core.R.Classes["String"],
+					}))
+				} else {
+					if _, ok := c.symbolTable.Resolve(name.Value); !ok {
+						c.symbolTable.Define(name.Value)
+					}
+					sym, _ := c.symbolTable.Resolve(name.Value)
+					switch sym.Scope {
+					case ScopeGlobal:
+						c.emit(OpSetGlobal, sym.Index)
+					case ScopeLocal:
+						c.emit(OpSetLocal, sym.Index)
+					}
 				}
+				c.Emit(OpPop)
 			}
 			c.Emit(OpPop)
+		} else {
+			for _, val := range node.Values {
+				if err := c.Compile(val); err != nil {
+					return err
+				}
+			}
+			for i := len(node.Names) - 1; i >= 0; i-- {
+				name := node.Names[i]
+				if len(name.Value) > 0 && name.Value[0] == '$' {
+					sym, _ := c.symbolTable.Resolve(name.Value)
+					c.symbolTable.DefineGlobal(name.Value)
+					c.emit(OpSetGlobal, sym.Index)
+				} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
+					c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  name.Value,
+						Class: core.R.Classes["String"],
+					}))
+				} else if len(name.Value) > 0 && name.Value[0] == '@' {
+					c.emit(OpSetInstanceVar, c.addConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  name.Value,
+						Class: core.R.Classes["String"],
+					}))
+				} else {
+					if _, ok := c.symbolTable.Resolve(name.Value); !ok {
+						c.symbolTable.Define(name.Value)
+					}
+					sym, _ := c.symbolTable.Resolve(name.Value)
+					switch sym.Scope {
+					case ScopeGlobal:
+						c.emit(OpSetGlobal, sym.Index)
+					case ScopeLocal:
+						c.emit(OpSetLocal, sym.Index)
+					}
+				}
+				c.Emit(OpPop)
+			}
 		}
 	case *ast.MethodCall:
 		if node.Receiver != nil {
@@ -592,6 +823,14 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  node.Method.Value,
 			Class: core.R.Classes["String"],
 		})
+
+		var jumpEnd int
+		if node.Safe {
+			c.Emit(OpDup)
+			jumpCall := c.emit(OpJumpNotNil, 9999)
+			jumpEnd = c.emit(OpJump, 9999)
+			c.changeOperand(jumpCall, len(c.currentInstructions()))
+		}
 
 		for _, arg := range node.Args {
 			if err := c.Compile(arg); err != nil {
@@ -619,12 +858,30 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		blockArg := 0
 		if node.Block != nil {
-			if err := c.Compile(node.Block); err != nil {
+			if err := c.compileBlockAsClosure(node.Block); err != nil {
 				return err
 			}
 			blockArg = 1
 		}
 		c.emit(OpSend, methodNameIdx, blockArg, argCount)
+		if node.Safe {
+			c.changeOperand(jumpEnd, len(c.currentInstructions()))
+		}
+	case *ast.IncludeExpression:
+		c.Emit(OpSelf)
+		if err := c.Compile(node.Module); err != nil {
+			return err
+		}
+		methodNameIdx := c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "include",
+			Class: core.R.Classes["String"],
+		})
+		c.emit(OpSend, methodNameIdx, 0, 1)
+	case *ast.UndefExpression:
+		c.Emit(OpNil)
+	case *ast.AliasExpression:
+		c.Emit(OpNil)
 	case *ast.ReturnExpression:
 		if node.ReturnValue != nil {
 			if err := c.Compile(node.ReturnValue); err != nil {
@@ -649,13 +906,18 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.symbolTable.Define(kp.Name)
 		}
 
+		if node.BlockParam != nil {
+			c.symbolTable.Define(node.BlockParam.Value)
+		}
+
 		if err := c.compileBlockAsValue(node.Body); err != nil {
 			return err
 		}
 
-		c.Emit(OpReturnValue)
+		c.replaceLastPopWithReturn()
 
 		free := c.symbolTable.FreeSymbols
+		numLocals := c.symbolTable.MaxSymbols
 
 		instructions := c.LeaveScope()
 
@@ -670,21 +932,30 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 			kwParams[i] = info
 		}
-
-		numLocals := len(node.Params) + len(node.KeywordParams)
-		if node.RestParam != nil {
-			numLocals++
+		paramDefaults := make([]*object.EmeraldValue, len(node.Params))
+		for i, defaultExpr := range node.ParamDefaults {
+			if i >= len(paramDefaults) {
+				break
+			}
+			if defaultExpr != nil {
+				paramDefaults[i] = c.compileDefaultValue(defaultExpr)
+			}
 		}
 
 		fnObj := &object.Function{
 			Name:          node.Name.Value,
 			Instructions:  instructions,
 			NumLocals:     numLocals,
+			ParamDefaults: paramDefaults,
 			KeywordParams: kwParams,
 		}
 		if node.RestParam != nil {
 			fnObj.HasRestParam = true
 			fnObj.RestParamIndex = len(node.Params)
+		}
+		if node.BlockParam != nil {
+			fnObj.HasBlockParam = true
+			fnObj.BlockParamIndex = numLocals - 1
 		}
 
 		fn := &object.EmeraldValue{
@@ -694,14 +965,10 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		fnIdx := c.addConstant(fn)
 
-		c.emit(OpClosure, fnIdx, len(free))
 		for _, s := range free {
-			if s.Scope == ScopeLocal {
-				c.emit(OpGetLocal, s.Index)
-			} else {
-				c.emit(OpGetFree, s.Index)
-			}
+			c.emitCaptureSymbol(s)
 		}
+		c.emit(OpClosure, fnIdx, len(free))
 
 		c.emit(OpDefineMethod, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
@@ -710,8 +977,16 @@ func (c *Compiler) Compile(node interface{}) error {
 		}))
 	case *ast.ClassExpression:
 		if node.SuperClass != nil {
-			if err := c.Compile(node.SuperClass); err != nil {
-				return err
+			if node.SuperClass.Token.Type == lexer.CONSTANT || strings.Contains(node.SuperClass.Value, "::") {
+				c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  node.SuperClass.Value,
+					Class: core.R.Classes["String"],
+				}))
+			} else {
+				if err := c.Compile(node.SuperClass); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -791,12 +1066,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpReturnValue)
 
 			free := c.symbolTable.FreeSymbols
+			numLocals := c.symbolTable.MaxSymbols
 			instructions := c.LeaveScope()
 
 			fnObj := &object.Function{
 				Name:         "__block__",
 				Instructions: instructions,
-				NumLocals:    len(node.Params),
+				NumLocals:    numLocals,
 			}
 
 			fn := &object.EmeraldValue{
@@ -806,14 +1082,10 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 			fnIdx := c.addConstant(fn)
 
-			c.emit(OpClosure, fnIdx, len(free))
 			for _, s := range free {
-				if s.Scope == ScopeLocal {
-					c.emit(OpGetLocal, s.Index)
-				} else {
-					c.emit(OpGetFree, s.Index)
-				}
+				c.emitCaptureSymbol(s)
 			}
+			c.emit(OpClosure, fnIdx, len(free))
 		} else {
 			// No params - compile inline (for if/while bodies)
 			for _, s := range node.Statements {
@@ -823,14 +1095,9 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 	case *ast.ProcLiteral:
-		if node.Body != nil {
-			for _, s := range node.Body.Statements {
-				if err := c.Compile(s); err != nil {
-					return err
-				}
-			}
+		if err := c.compileProcLiteral(node); err != nil {
+			return err
 		}
-		c.Emit(OpNil)
 	case *ast.WhileExpression:
 		loopStart := len(c.currentInstructions())
 
@@ -844,8 +1111,10 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.scopes[c.scopeIndex].nextPatchPos = []int{}
 		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
 
-		endOfWhilePos := len(c.currentInstructions()) + 3 + 1 + 3
-		c.emit(OpSetWhileEnd, endOfWhilePos)
+		setWhileEndPos := c.emit(OpSetWhileEnd, 0)
+		bodyStart := len(c.currentInstructions())
+		previousRedoTarget := c.scopes[c.scopeIndex].redoTarget
+		c.scopes[c.scopeIndex].redoTarget = bodyStart
 
 		if err := c.Compile(node.Body); err != nil {
 			return err
@@ -855,13 +1124,13 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		afterBody := len(c.currentInstructions())
 		c.changeOperand(jumpNotTruthyPos, afterBody)
+		c.changeOperand(setWhileEndPos, afterBody)
 
 		c.scopes[c.scopeIndex].breakTarget = afterBody
 
 		c.Emit(OpNil)
 
 		endOfWhile := len(c.currentInstructions())
-		c.Emit(OpReturnValue)
 
 		for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
 			c.changeOperand(patchPos, loopStart)
@@ -872,6 +1141,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.scopes[c.scopeIndex].breakTarget = -1
 		c.scopes[c.scopeIndex].nextPatchPos = []int{}
 		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
+		c.scopes[c.scopeIndex].redoTarget = previousRedoTarget
 	case *ast.UntilExpression:
 		// until is like while with negated condition
 		loopStart := len(c.currentInstructions())
@@ -882,6 +1152,9 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		// Jump out if condition is TRUE (opposite of while)
 		jumpTruthyPos := c.emit(OpJumpTruthy, 9999)
+		bodyStart := len(c.currentInstructions())
+		previousRedoTarget := c.scopes[c.scopeIndex].redoTarget
+		c.scopes[c.scopeIndex].redoTarget = bodyStart
 
 		if err := c.Compile(node.Body); err != nil {
 			return err
@@ -894,6 +1167,11 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		// until returns nil in Ruby
 		c.Emit(OpNil)
+		c.scopes[c.scopeIndex].redoTarget = previousRedoTarget
+	case *ast.ForExpression:
+		if err := c.compileForExpression(node); err != nil {
+			return err
+		}
 	case *ast.BreakExpression:
 		if node.Value != nil {
 			if err := c.Compile(node.Value); err != nil {
@@ -914,14 +1192,42 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		pos := c.emit(OpJump, 0)
 		c.scopes[c.scopeIndex].nextPatchPos = append(c.scopes[c.scopeIndex].nextPatchPos, pos)
+	case *ast.RedoExpression:
+		if c.scopes[c.scopeIndex].redoTarget >= 0 {
+			c.emit(OpJump, c.scopes[c.scopeIndex].redoTarget)
+		} else {
+			c.Emit(OpRedo)
+		}
+	case *ast.RetryExpression:
+		if c.scopes[c.scopeIndex].retryTarget >= 0 {
+			c.emit(OpJump, c.scopes[c.scopeIndex].retryTarget)
+		} else {
+			c.Emit(OpRetry)
+		}
 	case *ast.YieldExpression:
-		if len(node.Args) > 0 {
+		if len(node.Args) > 0 || len(node.KeywordArgs) > 0 {
 			for _, arg := range node.Args {
 				if err := c.Compile(arg); err != nil {
 					return err
 				}
 			}
-			c.emit(OpYieldWithValue, len(node.Args))
+			argCount := len(node.Args)
+			if len(node.KeywordArgs) > 0 {
+				for i := len(node.KeywordArgs) - 1; i >= 0; i-- {
+					kwa := node.KeywordArgs[i]
+					if err := c.Compile(kwa.Value); err != nil {
+						return err
+					}
+					c.EmitConstant(&object.EmeraldValue{
+						Type:  object.ValueString,
+						Data:  ":" + kwa.Name,
+						Class: core.R.Classes["String"],
+					})
+				}
+				c.emit(OpHash, len(node.KeywordArgs))
+				argCount++
+			}
+			c.emit(OpYieldWithValue, argCount)
 		} else {
 			c.Emit(OpYield)
 		}
@@ -956,6 +1262,8 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Value); err != nil {
 				return err
 			}
+		} else {
+			c.Emit(OpNil)
 		}
 		c.Emit(OpThrow)
 	case *ast.CatchExpression:
@@ -971,6 +1279,25 @@ func (c *Compiler) Compile(node interface{}) error {
 			return err
 		}
 		c.Emit(OpSplat)
+	case *ast.SuperExpression:
+		c.Emit(OpSelf)
+		for _, arg := range node.Args {
+			if err := c.Compile(arg); err != nil {
+				return err
+			}
+		}
+		blockArg := 0
+		if node.Block != nil {
+			if err := c.compileBlockAsClosure(node.Block); err != nil {
+				return err
+			}
+			blockArg = 1
+		}
+		c.emit(OpSendSuper, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "__super__",
+			Class: core.R.Classes["String"],
+		}), blockArg, len(node.Args))
 	default:
 		return fmt.Errorf("unknown node type: %T", node)
 	}
@@ -978,10 +1305,104 @@ func (c *Compiler) Compile(node interface{}) error {
 	return nil
 }
 
+func (c *Compiler) compileDefinedExpression(node *ast.DefinedExpression) {
+	if node == nil || node.Expression == nil {
+		c.Emit(OpNil)
+		return
+	}
+	result, ok := c.definedDescription(node.Expression)
+	if !ok {
+		c.Emit(OpNil)
+		return
+	}
+	c.emitString(result)
+}
+
+func (c *Compiler) definedDescription(exp ast.Expression) (string, bool) {
+	switch node := exp.(type) {
+	case *ast.SelfExpression:
+		return "self", true
+	case *ast.Identifier:
+		switch node.Value {
+		case "self":
+			return "self", true
+		case "nil":
+			return "nil", true
+		case "true":
+			return "true", true
+		case "false":
+			return "false", true
+		}
+		sym, ok := c.symbolTable.Resolve(node.Value)
+		if !ok {
+			return "", false
+		}
+		if sym.Scope == ScopeBuiltin {
+			return "method", true
+		}
+		return "local-variable", true
+	case *ast.NilExpression:
+		return "nil", true
+	case *ast.Boolean:
+		if node.Value {
+			return "true", true
+		}
+		return "false", true
+	case *ast.AssignExpression, *ast.MultiAssignExpression:
+		return "assignment", true
+	case *ast.Constant:
+		if _, ok := core.R.Classes[node.Name]; ok {
+			return "constant", true
+		}
+		return "", false
+	case *ast.ConstantResolution:
+		return "constant", true
+	case *ast.MethodCall:
+		if node.Receiver == nil {
+			if _, ok := c.symbolTable.Resolve(node.Method.Value); ok {
+				return "method", true
+			}
+			return "", false
+		}
+		if _, ok := c.definedDescription(node.Receiver); !ok {
+			return "", false
+		}
+		return "method", true
+	case *ast.ArrayLiteral:
+		for _, element := range node.Elements {
+			if _, ok := c.definedDescription(element); !ok {
+				return "", false
+			}
+		}
+		return "expression", true
+	case *ast.HashLiteral:
+		for _, key := range node.Order {
+			if _, ok := c.definedDescription(key); !ok {
+				return "", false
+			}
+			if _, ok := c.definedDescription(node.Pairs[key]); !ok {
+				return "", false
+			}
+		}
+		return "expression", true
+	default:
+		return "expression", true
+	}
+}
+
+func (c *Compiler) emitString(value string) {
+	c.EmitConstant(&object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  value,
+		Class: core.R.Classes["String"],
+	})
+}
+
 func (c *Compiler) Bytecode() *Bytecode {
 	return &Bytecode{
 		Instructions: c.currentInstructions(),
 		Constants:    c.constants,
+		NumLocals:    c.symbolTable.MaxSymbols,
 	}
 }
 
@@ -993,6 +1414,44 @@ func (c *Compiler) currentInstructions() Instructions {
 // For blocks with params, this is called within an EnterScope/LeavaScope pair
 // so the block body's instructions are in the block scope.
 // For blocks without params, the statements are compiled inline in the parent scope.
+func (c *Compiler) compileBlockAsClosure(block *ast.BlockExpression) error {
+	c.EnterScope()
+
+	for _, param := range block.Params {
+		c.symbolTable.Define(param.Value)
+	}
+
+	if err := c.compileBlockAsValue(block); err != nil {
+		return err
+	}
+
+	c.replaceLastPopWithReturn()
+
+	free := c.symbolTable.FreeSymbols
+	numLocals := c.symbolTable.MaxSymbols
+	instructions := c.LeaveScope()
+
+	fnObj := &object.Function{
+		Name:         "__block__",
+		Instructions: instructions,
+		NumLocals:    numLocals,
+	}
+
+	fn := &object.EmeraldValue{
+		Type:  object.ValueFunction,
+		Data:  fnObj,
+		Class: core.R.Classes["Class"],
+	}
+
+	fnIdx := c.addConstant(fn)
+
+	for _, s := range free {
+		c.emitCaptureSymbol(s)
+	}
+	c.emit(OpClosure, fnIdx, len(free))
+	return nil
+}
+
 func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 	if block == nil || len(block.Statements) == 0 {
 		c.Emit(OpNil)
@@ -1011,6 +1470,7 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 			return err
 		}
 	}
+	c.removeLastPop()
 	endPos := len(c.currentInstructions())
 	for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
 		c.changeOperand(patchPos, endPos)
@@ -1028,7 +1488,7 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		return c.compileBlockAsValue(node.Body)
 	}
 
-	c.emit(OpBeginRescue, 0, 0, 0)
+	beginPos := c.emit(OpBeginRescue, 0, 0, 0)
 
 	if err := c.compileBlockAsValue(node.Body); err != nil {
 		return err
@@ -1036,9 +1496,13 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 
 	jumpToEnd := c.emit(OpJump, 0)
 
+	rescueStart := 0
 	rescueOffsets := make([]int, len(node.Rescue))
 	for i, rescue := range node.Rescue {
 		rescueOffsets[i] = len(c.currentInstructions())
+		if i == 0 {
+			rescueStart = rescueOffsets[i]
+		}
 
 		for _, exc := range rescue.Exceptions {
 			if err := c.Compile(exc); err != nil {
@@ -1046,6 +1510,17 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 			}
 		}
 		c.Emit(OpRescue)
+		if rescue.Variable != nil {
+			if _, ok := c.symbolTable.Resolve(rescue.Variable.Value); !ok {
+				c.symbolTable.Define(rescue.Variable.Value)
+			}
+			sym, _ := c.symbolTable.Resolve(rescue.Variable.Value)
+			if sym.Scope == ScopeLocal {
+				c.emit(OpSetLocal, sym.Index)
+			}
+		} else {
+			c.Emit(OpPop)
+		}
 
 		if err := c.compileBlockAsValue(rescue.Body); err != nil {
 			return err
@@ -1058,10 +1533,11 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 
 	ensureStart := len(c.currentInstructions())
 	if hasEnsure {
-		c.emit(OpEnsure, 0)
+		c.Emit(OpEnsure)
 		if err := c.compileBlockAsValue(node.Ensure); err != nil {
 			return err
 		}
+		c.Emit(OpPop)
 	}
 
 	if hasElse {
@@ -1072,11 +1548,14 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 
 	endStart := len(c.currentInstructions())
 
-	if len(node.Rescue) > 0 {
-		c.changeOperand(rescueOffsets[len(rescueOffsets)-1], ensureStart)
+	if hasEnsure {
+		c.changeOperand(jumpToEnd, ensureStart)
+	} else {
+		c.changeOperand(jumpToEnd, endStart)
 	}
-
-	c.changeOperand(jumpToEnd, endStart)
+	c.changeOperandAt(beginPos, 0, rescueStart)
+	c.changeOperandAt(beginPos, 1, ensureStart)
+	c.changeOperandAt(beginPos, 2, endStart)
 
 	return nil
 }
@@ -1135,6 +1614,28 @@ func (c *Compiler) setLastInstruction(op Opcode, pos int) {
 	c.scopes[c.scopeIndex].lastInstruction = EmittedInstruction{Opcode: op, Position: pos}
 }
 
+func (c *Compiler) replaceLastPopWithReturn() {
+	last := c.scopes[c.scopeIndex].lastInstruction
+	if last.Opcode == OpPop {
+		c.scopes[c.scopeIndex].instructions[last.Position] = byte(OpReturnValue)
+		c.scopes[c.scopeIndex].lastInstruction.Opcode = OpReturnValue
+		return
+	}
+	if last.Opcode != OpReturnValue {
+		c.Emit(OpReturnValue)
+	}
+}
+
+func (c *Compiler) removeLastPop() {
+	last := c.scopes[c.scopeIndex].lastInstruction
+	if last.Opcode != OpPop {
+		return
+	}
+	c.scopes[c.scopeIndex].instructions = c.scopes[c.scopeIndex].instructions[:last.Position]
+	c.scopes[c.scopeIndex].lastInstruction = c.scopes[c.scopeIndex].previousInstruction
+	c.scopes[c.scopeIndex].previousInstruction = EmittedInstruction{}
+}
+
 func (c *Compiler) changeOperand(opPos int, operand int) {
 	op := c.currentInstructions()[opPos]
 	def, _ := Lookup(byte(op))
@@ -1149,12 +1650,32 @@ func (c *Compiler) changeOperand(opPos int, operand int) {
 	}
 }
 
+func (c *Compiler) changeOperandAt(opPos int, operandIndex int, operand int) {
+	op := c.currentInstructions()[opPos]
+	def, _ := Lookup(byte(op))
+	offset := 1
+	for i, width := range def.OperandWidths {
+		if i == operandIndex {
+			if width == 2 {
+				c.currentInstructions()[opPos+offset] = byte(operand >> 8)
+				c.currentInstructions()[opPos+offset+1] = byte(operand)
+			} else if width == 1 {
+				c.currentInstructions()[opPos+offset] = byte(operand)
+			}
+			return
+		}
+		offset += width
+	}
+}
+
 func (c *Compiler) EnterScope() {
 	scope := CompilationScope{
 		instructions:       Instructions{},
 		breakTarget:        -1,
 		nextPatchPos:       []int{},
+		redoTarget:         -1,
 		breakValuePatchPos: []int{},
+		retryTarget:        -1,
 	}
 	c.scopes = append(c.scopes, scope)
 	c.scopeIndex++
@@ -1173,6 +1694,7 @@ func (c *Compiler) LeaveScope() Instructions {
 type Bytecode struct {
 	Instructions Instructions
 	Constants    []*object.EmeraldValue
+	NumLocals    int
 }
 
 func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue {
@@ -1304,4 +1826,202 @@ func splitStringInterpolation(s string) []interpPart {
 		parts = append(parts, interpPart{text: s[start:], isExpr: false})
 	}
 	return parts
+}
+
+func compoundAssignmentOpcode(token lexer.TokenType) (Opcode, bool) {
+	switch token {
+	case lexer.PLUS_ASSIGN:
+		return OpAdd, true
+	case lexer.MINUS_ASSIGN:
+		return OpSub, true
+	case lexer.MULTIPLY_ASSIGN:
+		return OpMul, true
+	case lexer.DIVIDE_ASSIGN:
+		return OpDiv, true
+	case lexer.MOD_ASSIGN:
+		return OpMod, true
+	case lexer.POW_ASSIGN:
+		return OpPow, true
+	case lexer.BIT_AND_ASSIGN:
+		return OpBitAnd, true
+	case lexer.BIT_OR_ASSIGN:
+		return OpBitOr, true
+	case lexer.BIT_XOR_ASSIGN:
+		return OpBitXor, true
+	case lexer.LSHIFT_ASSIGN:
+		return OpBitLeftShift, true
+	case lexer.RSHIFT_ASSIGN:
+		return OpBitRightShift, true
+	default:
+		return 0, false
+	}
+}
+
+func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
+	if name == nil {
+		c.Emit(OpNil)
+		return nil
+	}
+	if len(name.Value) > 0 && name.Value[0] == '$' {
+		c.emit(OpGetGlobal, c.globalSymbolIndex(name.Value))
+		return nil
+	}
+	if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
+		c.emit(OpGetClassVar, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  name.Value,
+			Class: core.R.Classes["String"],
+		}))
+		return nil
+	}
+	if len(name.Value) > 0 && name.Value[0] == '@' {
+		c.emit(OpGetInstanceVar, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  name.Value,
+			Class: core.R.Classes["String"],
+		}))
+		return nil
+	}
+	if len(name.Value) > 0 && name.Value[0] >= 'A' && name.Value[0] <= 'Z' {
+		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  name.Value,
+			Class: core.R.Classes["String"],
+		}))
+		return nil
+	}
+
+	sym, ok := c.symbolTable.Resolve(name.Value)
+	if !ok || sym.Scope == ScopeBuiltin {
+		c.symbolTable.Define(name.Value)
+		sym, _ = c.symbolTable.Resolve(name.Value)
+	}
+	switch sym.Scope {
+	case ScopeGlobal:
+		c.emit(OpGetGlobal, sym.Index)
+	case ScopeLocal:
+		c.emit(OpGetLocal, sym.Index)
+	case ScopeOuter:
+		c.emit(OpGetOuter, sym.ScopeIndex)
+	case ScopeFree:
+		c.emit(OpGetFree, sym.Index)
+	default:
+		c.Emit(OpNil)
+	}
+	return nil
+}
+
+func (c *Compiler) emitCaptureSymbol(sym Symbol) {
+	switch sym.Scope {
+	case ScopeLocal:
+		c.emit(OpGetLocal, sym.Index)
+	case ScopeOuter:
+		c.emit(OpGetOuter, sym.ScopeIndex)
+	case ScopeFree:
+		c.emit(OpGetFree, sym.Index)
+	case ScopeGlobal:
+		c.emit(OpGetGlobal, sym.Index)
+	default:
+		c.Emit(OpNil)
+	}
+}
+
+func (c *Compiler) compileRangeExpression(node *ast.RangeExpression) error {
+	if err := c.Compile(node.Left); err != nil {
+		return err
+	}
+	if err := c.Compile(node.Right); err != nil {
+		return err
+	}
+	exclusive := 0
+	if node.Exclusive {
+		exclusive = 1
+	}
+	c.emit(OpRange, exclusive)
+	return nil
+}
+
+func (c *Compiler) compileForExpression(node *ast.ForExpression) error {
+	c.EnterScope()
+	c.symbolTable.Define(node.Variable.Value)
+
+	if err := c.compileBlockAsValue(node.Body); err != nil {
+		return err
+	}
+
+	c.replaceLastPopWithReturn()
+
+	free := c.symbolTable.FreeSymbols
+	numLocals := c.symbolTable.MaxSymbols
+	instructions := c.LeaveScope()
+
+	fnObj := &object.Function{
+		Name:         "__for_block__",
+		Instructions: instructions,
+		NumLocals:    numLocals,
+	}
+
+	fn := &object.EmeraldValue{
+		Type:  object.ValueFunction,
+		Data:  fnObj,
+		Class: core.R.Classes["Class"],
+	}
+	fnIdx := c.addConstant(fn)
+	for _, s := range free {
+		c.emitCaptureSymbol(s)
+	}
+	c.emit(OpClosure, fnIdx, len(free))
+
+	if err := c.Compile(node.Collection); err != nil {
+		return err
+	}
+
+	eachIdx := c.addConstant(&object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  "each",
+		Class: core.R.Classes["String"],
+	})
+	c.emit(OpSend, eachIdx, 1, 0)
+
+	return nil
+}
+
+func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
+	c.EnterScope()
+	for _, param := range node.Params {
+		c.symbolTable.Define(param.Value)
+	}
+
+	if node.Body != nil {
+		for _, s := range node.Body.Statements {
+			if err := c.Compile(s); err != nil {
+				return err
+			}
+		}
+	}
+
+	c.replaceLastPopWithReturn()
+
+	free := c.symbolTable.FreeSymbols
+	numLocals := c.symbolTable.MaxSymbols
+	instructions := c.LeaveScope()
+
+	fnObj := &object.Function{
+		Name:         "__lambda__",
+		Instructions: instructions,
+		NumLocals:    numLocals,
+	}
+
+	fn := &object.EmeraldValue{
+		Type:  object.ValueFunction,
+		Data:  fnObj,
+		Class: core.R.Classes["Class"],
+	}
+	fnIdx := c.addConstant(fn)
+	for _, s := range free {
+		c.emitCaptureSymbol(s)
+	}
+	c.emit(OpLambda, fnIdx, len(free))
+
+	return nil
 }
