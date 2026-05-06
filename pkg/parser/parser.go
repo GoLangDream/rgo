@@ -1768,7 +1768,7 @@ func (p *Parser) hasSpaceBetween(left, right lexer.Token) bool {
 func (p *Parser) peekTokenCanBeMethodName() bool {
 	switch p.peekToken.Type {
 	case lexer.IDENT, lexer.CLASS, lexer.BEGIN, lexer.END, lexer.PREPEND, lexer.THEN, lexer.YIELD, lexer.MATCH, lexer.NOT_EQUAL,
-		lexer.TRUE, lexer.FALSE, lexer.NIL:
+		lexer.TRUE, lexer.FALSE, lexer.NIL, lexer.EXTEND, lexer.INCLUDE:
 		return true
 	default:
 		return false
