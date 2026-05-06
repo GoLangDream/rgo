@@ -97,12 +97,25 @@
 ### Language timeout reduction blocker（2026-05-06）
 
 - [x] Task 4 后 `vendor/ruby/spec/language/optional_assignments_spec.rb` timeout 已解除
-  - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
-  - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
-  - Task 1 follow-up 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
-  - 最新 language dashboard：75 pass, 2 timeout, 1 runtime_error, 0 nonzero_failures, 2 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
-  - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass；duration 为易变值不在 TODO 固定记录。
-  - selected blocker 已解除；剩余 language dashboard 问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
+   - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
+   - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
+   - Task 1 follow-up 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
+   - 最新 language dashboard：75 pass, 2 timeout, 1 runtime_error, 0 nonzero_failures, 2 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
+   - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass；duration 为易变值不在 TODO 固定记录。
+   - selected blocker 已解除；剩余 language dashboard 问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
+- [ ] `keyword_arguments_spec.rb` keyword shorthand (`m(a:, b:)`) parse error
+   - 根因：`IDENT COLON` 在 call args 中缺少 peek-ahead，消耗 COLON 后停在 COMMA 但无 prefix parse fn
+   - 尝试添加 `peekToken2` 三缓冲方案，但 `nextToken()` 链式推进导致现有 tests 大面积失败（100+ failures）
+   - 需重新设计：或改用 `peekToken.Line == 0` 判定 COLON 是否为 label shorthand，或在 `parseOneCallArg` 开头 peek-ahead
+   - 风险：高。涉及 parser token buffer 核心机制，贸然修改 broke 100+ existing tests
+- [ ] `predefined_spec.rb` 和 `rescue_spec.rb` timeout
+   - 实测：两个 spec 在 RGo 中运行均需 ~30 秒，远超 2 秒 timeout threshold
+   - 根因未定位，可能与 regex/exception 处理性能相关
+   - 下一步：需 bounded profiling 确定哪部分代码慢
+- [ ] `method_spec.rb` parse error
+   - 与 `keyword_arguments_spec.rb` 共享 keyword shorthand 根因（`call(a:, b:)`）
+   - 额外问题：endless method `def greet(person) = ...` 不支持
+   - 额外问题：`super(...)` 参数转发语法
 
 ### Codex/Go test OOM（2026-05-04）
 
