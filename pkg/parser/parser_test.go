@@ -2016,6 +2016,46 @@ func TestParseSuperWithBraceBlock(t *testing.T) {
 	parse(t, `super { break 1 }`)
 }
 
+func TestParseSuperWithEmptyParenthesesTerminates(t *testing.T) {
+	result := make(chan []string, 1)
+
+	go func() {
+		l := lexer.New("super()")
+		p := New(l)
+		p.ParseProgram()
+		result <- p.Errors()
+	}()
+
+	select {
+	case errors := <-result:
+		if len(errors) > 0 {
+			t.Fatalf("parse errors: %v", errors)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("super() parse did not terminate")
+	}
+}
+
+func TestParseSuperWithParenthesizedArgumentsTerminates(t *testing.T) {
+	result := make(chan []string, 1)
+
+	go func() {
+		l := lexer.New("super(1 + 2)")
+		p := New(l)
+		p.ParseProgram()
+		result <- p.Errors()
+	}()
+
+	select {
+	case errors := <-result:
+		if len(errors) > 0 {
+			t.Fatalf("parse errors: %v", errors)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("super with parenthesized arguments parse did not terminate")
+	}
+}
+
 func TestParseClassWithMultipleMethodsAndImplicitEnsure(t *testing.T) {
 	parse(t, `class BreakTest2
   def one

@@ -2266,6 +2266,43 @@ func (p *Parser) parseSuperExpression() ast.Expression {
 	}
 
 	p.nextToken()
+	if p.curTokenIs(lexer.LPAREN) {
+		p.skipPeekNewlines()
+		if p.peekTokenIs(lexer.RPAREN) {
+			p.nextToken()
+		} else {
+			p.nextToken()
+			arg := p.parseExpression(LOWEST)
+			if arg != nil {
+				exp.Args = append(exp.Args, arg)
+			}
+
+			for p.peekTokenIs(lexer.COMMA) {
+				p.nextToken()
+				p.skipPeekNewlines()
+				if p.peekTokenIs(lexer.RPAREN) {
+					break
+				}
+				p.nextToken()
+				arg := p.parseExpression(LOWEST)
+				if arg != nil {
+					exp.Args = append(exp.Args, arg)
+				}
+			}
+
+			if !p.curTokenIs(lexer.RPAREN) {
+				p.skipPeekNewlines()
+			}
+			if !p.consumeExpectedRParen() {
+				return nil
+			}
+		}
+		if p.peekTokenIs(lexer.LBRACE) || (p.peekTokenIs(lexer.DO) && !p.stopAtDo) {
+			p.nextToken()
+			exp.Block = p.parseBlockExpression()
+		}
+		return exp
+	}
 	if p.curTokenIs(lexer.LBRACE) || (p.curTokenIs(lexer.DO) && !p.stopAtDo) {
 		exp.Block = p.parseBlockExpression()
 		return exp

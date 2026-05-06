@@ -94,6 +94,16 @@
 
 ## 新发现的问题（2025-03-04）
 
+### Language timeout reduction blocker（2026-05-06）
+
+- [ ] Task 4 后 `vendor/ruby/spec/language/optional_assignments_spec.rb` 仍 timeout
+  - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
+  - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
+  - Task 6 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
+  - 最新 language dashboard：74 pass, 6 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
+  - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status remains timeout；复查命令见上一行，duration 为易变值不在 TODO 固定记录。
+  - 后续需要继续定位该 selected language target 的剩余 timeout 根因；当前已排除 `super()` 和 parenthesized `super(args)` parser parse hang。
+
 ### Codex/Go test OOM（2026-05-04）
 
 - [ ] Codex 会话运行测试时触发系统 OOM killer
@@ -204,18 +214,18 @@
 ### Language spec gate（2026-05-03）
 
 - [ ] 建立 `vendor/ruby/spec/language` 基线
-  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：74 pass, 6 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
+  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：74 pass, 6 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-06 refreshed）。
   - 当前观测到 2230 examples / 0 failures。
-  - `rescue_spec.rb` 已从 parse_error/nonzero_failures 推进到 timeout；`variables_spec.rb` 已通过，剩余为 timeout 类执行语义缺口。
+  - `variables_spec.rb`、`next_spec.rb` 和 `or_spec.rb` 已通过；剩余 timeout 为 `keyword_arguments_spec.rb`、`method_spec.rb`、`optional_assignments_spec.rb`、`predefined_spec.rb`、`rescue_spec.rb` 和 `super_spec.rb`。
   - 第一批 parser 目标：
     - [x] `vendor/ruby/spec/language/and_spec.rb` 已通过 10 examples / 0 failures；已支持布尔表达式 RHS 赋值，如 `true && false && x = 1`。
     - [x] `vendor/ruby/spec/language/or_spec.rb` 已通过 15 examples / 0 failures；受 lambda/proc literal 中 `next` 跳转回填修复影响，`next true or false` 控制流不再卡住。
     - [x] `vendor/ruby/spec/language/unless_spec.rb` 已通过 6 examples / 0 failures；已支持 `unless ... then` 与单行 `unless ... then ... else ... end`。
     - [x] `vendor/ruby/spec/language/class_variable_spec.rb` 当前通过 14 examples / 0 failures。
     - [x] `vendor/ruby/spec/language/comment_spec.rb` 已通过 1 example / 0 failures；已支持 `<<~HEREDOC` 和 heredoc marker 行 suffix token，如 `eval(<<~RUBY).should`。
-    - [x] `vendor/ruby/spec/language/it_parameter_spec.rb` 已通过 6 examples / 0 failures；已新增最小 runtime `eval`，能通过 VM 执行 heredoc 字符串里的 Ruby source。
+    - [x] `vendor/ruby/spec/language/it_parameter_spec.rb` 已通过 11 examples / 0 failures；已新增最小 runtime `eval`，能通过 VM 执行 heredoc 字符串里的 Ruby source。
     - [x] `vendor/ruby/spec/language/if_spec.rb` 已通过 52 examples / 0 failures；已支持括号内 postfix `if/unless` 后接 trailing call，如 `(123 if true).should == 123`，并修复无括号方法调用的空格数组参数，如 `ScratchPad.record [a, b]` 不再被误解析为下标访问。
-    - [x] `vendor/ruby/spec/language/alias_spec.rb` 已通过 30 examples / 0 failures；已支持 `%Q{...#{...}...}` 嵌套分隔符扫描、`public/private/protected :name` 裸调用解析、`alias $b $a` 和 `alias [] old_name`。
+    - [x] `vendor/ruby/spec/language/alias_spec.rb` 已通过 34 examples / 0 failures；已支持 `%Q{...#{...}...}` 嵌套分隔符扫描、`public/private/protected :name` 裸调用解析、`alias $b $a` 和 `alias [] old_name`。
     - [x] `vendor/ruby/spec/language/safe_navigator_spec.rb` 已通过 13 examples / 0 failures；已支持 `&.` safe call token/parser、nil receiver 参数/块短路、非 nil receiver 普通调用和 `&&=` token。
     - [x] `vendor/ruby/spec/language/symbol_spec.rb` 已通过 13 examples / 0 failures。
     - [x] `vendor/ruby/spec/language/regexp/character_classes_spec.rb` 已通过 126 examples / 0 failures；已支持 leading-dot continuation，如换行后 `.to_a` 继续上一表达式链。
@@ -225,7 +235,7 @@
     - [x] `vendor/ruby/spec/language/yield_spec.rb` 已通过 39 examples / 0 failures；已支持 `yield(a, b, c)`、`yield(*a, b: true)`、block-pass lambda 参数如 `&-> *a { a }`，以及其后的外层链式调用 `.should`。
     - [x] `vendor/ruby/spec/language/delegation_spec.rb` 当前通过 14 examples / 0 failures。
     - [x] `vendor/ruby/spec/language/execution_spec.rb` 已通过 4 examples / 0 failures；已支持反引号 operator symbol `:\``，使 `define_method(:\`)` 可解析。
-    - [ ] `vendor/ruby/spec/language/lambda_spec.rb` 已从 parse_error 推进到 runtime_error；已支持 call argument double splat 解析，如 `@a.call(**{a: 1})`。当前 blocker 是 keyword/rest lambda 语义进入 compiler/VM 后的 nil method panic。
+    - [x] `vendor/ruby/spec/language/lambda_spec.rb` 当前通过 15 examples / 0 failures；已支持 call argument double splat 解析，如 `@a.call(**{a: 1})`。
     - [x] `vendor/ruby/spec/language/next_spec.rb` 已通过 35 examples / 0 failures；已修复 lambda/proc literal 中 `next` 跳转目标未回填导致的循环。
     - [x] `vendor/ruby/spec/language/return_spec.rb` 已通过 43 examples / 0 failures；已修复 heredoc marker 行 suffix 后缺少 statement separator 的问题，支持 block 内 `ruby_exe(<<-CODE, args: "...")` 后继续解析下一条语句。
     - [x] `vendor/ruby/spec/language/case_spec.rb` 已通过 48 examples / 0 failures；已支持 `def ===(o)` operator method、`raise if ...` 作为表达式、以及 `self.then { ... }` 方法名解析。
@@ -243,17 +253,17 @@
     - [x] `vendor/ruby/spec/language/string_spec.rb` 已通过 10 examples / 0 failures；已支持 bare percent string 的更多分隔符如 `%^...^`、`%_..._`，并修复 `%@...#{@ivar}...@` 这类分隔符出现在 interpolation 内部时提前截断导致 compiler panic。
     - [x] `vendor/ruby/spec/language/hash_spec.rb` 当前通过 39 examples / 0 failures；已支持 hash 尾逗号、`{() => ()}`、quoted label key 如 `{"d": 4}`、hash literal `**` 展开元素的 parse-only 支持、omitted value 如 `{a:}`、float hash rocket key 如 `{1.0 => :bar}`，方法体首表达式为 hash literal 的 `def h.to_hash; {:b => 2}; end`，以及多行 lambda/proc body 中 hash literal `}` 后继续解析 `}.should_not complain` 这类 trailing call。
     - [x] `vendor/ruby/spec/language/match_spec.rb` 当前通过 8 examples / 0 failures；已支持 `.` 后显式 operator method call，如 `@regexp.=~(@string)` / `@regexp.!~(@string)`。
-    - [x] `vendor/ruby/spec/language/predefined_spec.rb` 当前通过 170 examples / 0 failures；已修复 block body implicit rescue、`$"` 特殊全局变量扫描、`Fiber.yield` dot-method 解析、未初始化全局变量读取为 Ruby `nil`、内建名局部赋值遮蔽（如 `p = -> {}`）、裸标识符无参方法调用（如 `make_value`）以及方法内 lambda/free-variable 捕获路径。
+    - [ ] `vendor/ruby/spec/language/predefined_spec.rb` 当前为 timeout；已修复 block body implicit rescue、`$"` 特殊全局变量扫描、`Fiber.yield` dot-method 解析、未初始化全局变量读取为 Ruby `nil`、内建名局部赋值遮蔽（如 `p = -> {}`）、裸标识符无参方法调用（如 `make_value`）以及方法内 lambda/free-variable 捕获路径。当前仍有执行语义路径卡住。
     - [x] `vendor/ruby/spec/language/redo_spec.rb` 当前通过 5 examples / 0 failures；已修复 `Array#each` 忽略 block `break` 的问题、block `break` 后继续执行后续指令导致 `redo` 无限重启的问题，以及 begin/rescue 编译器错误修改 rescue 首条 `OpGetConstant` 操作数的问题。
-    - [x] `vendor/ruby/spec/language/defined_spec.rb` 当前通过 258 examples / 0 failures；已修复 brace-form `catch(:out) { ... }` 解析循环、`throw` 作为 `defined?` 内表达式、fully-qualified constant assignment、`defined?(yield/break/next/return/while/until)`、裸方法空参数调用后接空 block 与 trailing call（如 `call_defined() { }.should`），以及 `while/until ... do` 条件不再把 `do` 误解析为方法 block。
+    - [x] `vendor/ruby/spec/language/defined_spec.rb` 当前通过 259 examples / 0 failures；已修复 brace-form `catch(:out) { ... }` 解析循环、`throw` 作为 `defined?` 内表达式、fully-qualified constant assignment、`defined?(yield/break/next/return/while/until)`、裸方法空参数调用后接空 block 与 trailing call（如 `call_defined() { }.should`），以及 `while/until ... do` 条件不再把 `do` 误解析为方法 block。
     - [x] `vendor/ruby/spec/language/throw_spec.rb` 当前通过 10 examples / 0 failures；已修复 `OpCatch` VM 操作数读取不一致、`throw` label/value 出栈顺序、无第二参数默认 nil、`throw ... if` 走 postfix modifier、block 内复合赋值 `i += 1`、outer-local 写回、block locals 栈空间预留，以及迭代器消费 `LastBlockResult` 后清理，避免污染后续 spec examples。
     - [x] `vendor/ruby/spec/language/ensure_spec.rb` 当前通过 31 examples / 0 failures；受 catch/throw 和 block locals 修复影响，class/module ensure 场景不再常量索引越界 panic。
     - [x] `vendor/ruby/spec/language/send_spec.rb` 当前通过 76 examples / 0 failures；已修复闭包创建捕获 `ScopeOuter` 符号时误发 `OpGetFree` 导致 `it` block 读取外层 `specs` panic。
     - [x] `vendor/ruby/spec/language/break_spec.rb` 当前通过 39 examples / 0 failures；已支持 `def ... ensure ... end` 方法体隐式 begin/ensure、`super { ... }` block 解析/传递、无参 `yield` 后接 `}` 的终止判断、嵌套 class/for/block 的 `end` 边界推进，以及 `break` block 终止符不再被后续换行吞掉。
     - [ ] runtime `eval` 仍是最小实现：当前能执行顶层 Ruby source 并复用全局/spec runtime，但尚未完整支持 binding locals、当前 lexical scope、文件名/行号和异常语义。
     - [x] `vendor/ruby/spec/language/while_spec.rb` 当前通过 37 examples / 0 failures；已支持括号内 `while/until` modifier、赋值 RHS 跨行、括号内多语句表达式、`:m=` setter symbol、while 内 `redo` 跳回循环体、while 结束后继续执行后续表达式，以及 `break` 位于 grouped assignment RHS 时正确跳出循环。
-    - [ ] `vendor/ruby/spec/language/loop_spec.rb` 已从 parse_error 推进到 timeout；已修复 `break if (i += 1) >= 5` 这类 postfix modifier 后接 grouped condition 的 Pratt 解析，并消除 `RedoExpression` compile error。当前 blocker 是 block/control-flow execution 卡住。
-    - [ ] `vendor/ruby/spec/language/private_spec.rb` 已从 parse_error 推进到 timeout；已支持顶层常量路径 `::Private::G` 和 `module ::Private` 解析。当前 blocker 在 private visibility/runtime 执行路径。
+    - [x] `vendor/ruby/spec/language/loop_spec.rb` 当前通过 7 examples / 0 failures；已修复 `break if (i += 1) >= 5` 这类 postfix modifier 后接 grouped condition 的 Pratt 解析，并消除 `RedoExpression` compile error。
+    - [x] `vendor/ruby/spec/language/private_spec.rb` 当前通过 7 examples / 0 failures；已支持顶层常量路径 `::Private::G` 和 `module ::Private` 解析。
   - 较大目标先记录：
     - `END_spec.rb` 涉及 heredoc + `ruby_exe`/外部进程语义。
     - `for_spec.rb` 已通过，后续若继续加强需要补真实 for-scope 语义覆盖而不是 parse-only 占位。
@@ -799,15 +809,15 @@ RGo 当前状态：
 - [x] 函数调用: `puts()`, `puts(1, 2)`
 - [x] 方法调用: `"hello".upcase`, `"hello".slice(0, 3)`
 
-- [x] `vendor/ruby/spec/language/predefined_spec.rb` 当前通过 170 examples / 0 failures；已修复 `Fiber.yield` dot-method 解析、未初始化全局变量返回 Go nil 的 VM panic、内建名局部赋值遮蔽（如 `p = -> {}`）、裸标识符无参方法调用（如 `make_value`）以及方法内 lambda/free-variable 捕获路径。
+- [ ] `vendor/ruby/spec/language/predefined_spec.rb` 当前为 timeout；已修复 `Fiber.yield` dot-method 解析、未初始化全局变量返回 Go nil 的 VM panic、内建名局部赋值遮蔽（如 `p = -> {}`）、裸标识符无参方法调用（如 `make_value`）以及方法内 lambda/free-variable 捕获路径。当前仍有执行语义路径卡住。
 
 - [ ] `&block` 方法参数已有最小实现：解析器保留 `BlockParam`，编译器记录 block 局部槽，VM 调用方法时把当前 block 写入该局部变量，并支持 `p.call` 常量 block。剩余 bug：当方法定义出现在外层局部变量赋值之前时，后续 `call_proc { x + 1 }` 的 block 捕获到的 `x` 仍为 nil；已用 `TestBlockPassedAsProcCapturesOuterLocal` 标记 skip，需继续排查 block closure 创建时的 free value 捕获时序。
 
-- [ ] language dashboard 当前为 74 pass / 6 timeout / 0 runtime_error / 0 nonzero_failures / 0 parse_error / 0 compile_error。`variables_spec.rb`、`next_spec.rb` 和 `or_spec.rb` 已通过；剩余 timeout 包括 `keyword_arguments_spec.rb`、`method_spec.rb`、`optional_assignments_spec.rb`、`predefined_spec.rb`、`rescue_spec.rb` 和 `super_spec.rb`。
+- [ ] language dashboard 当前为 74 pass / 6 timeout / 0 runtime_error / 0 nonzero_failures / 0 parse_error / 0 compile_error / 0 zero_examples，2230 examples / 0 failures out of 80 files（2026-05-06 refreshed）。`variables_spec.rb`、`next_spec.rb` 和 `or_spec.rb` 已通过；剩余 timeout 包括 `keyword_arguments_spec.rb`、`method_spec.rb`、`optional_assignments_spec.rb`、`predefined_spec.rb`、`rescue_spec.rb` 和 `super_spec.rb`。
 
 - [x] `vendor/ruby/spec/language/block_spec.rb` 当前通过 172 examples / 0 failures；已修复空 block 参数 `||`、匿名 block forwarding 参数/调用如 `def f(..., &); inner(&); end`、grouped comma sequence、destructured block 参数，以及 eval child VM 调用 parent block/method 时常量表错配。
 
-- [ ] `vendor/ruby/spec/language/regexp/modifiers_spec.rb` / `regexp_spec.rb` 当前仍是 parse_error；已修复 unterminated regexp lexer 越界 panic，但剩余涉及复杂 regexp literal grammar（inline modifiers、lookaround、POSIX classes、conditional captures）与 `/` 除法/regexp disambiguation，需要单独正则解析阶段系统处理。
+- [x] `vendor/ruby/spec/language/regexp/modifiers_spec.rb` 当前通过 11 examples / 0 failures，`regexp_spec.rb` 当前通过 25 examples / 0 failures；已修复 unterminated regexp lexer 越界 panic，复杂 regexp literal grammar 仍需后续系统处理。
 
 - [x] `vendor/ruby/spec/language/send_spec.rb` 当前通过 76 examples / 0 failures；已修复 `obj.()` / `q.(1)` 解析为 `call`，并在 VM `send`/`pop` 边界把 Go nil 规范化为 Ruby nil，避免宿主 panic 中断方法派发 spec。
 
