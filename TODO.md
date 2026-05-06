@@ -215,7 +215,7 @@
 
 - [ ] 建立 `vendor/ruby/spec/language` 基线
   - 当前 `RGO_SPEC_TIMEOUT=1` 结果：75 pass, 2 timeout, 1 runtime_error, 0 nonzero_failures, 2 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-07 refreshed）。
-  - 当前观测到 2230 examples / 0 failures。
+  - 当前观测到 2304 examples / 0 failures。
   - `variables_spec.rb`、`next_spec.rb`、`or_spec.rb` 和 `optional_assignments_spec.rb` 已通过；剩余问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
   - 第一批 parser 目标：
     - [x] `vendor/ruby/spec/language/and_spec.rb` 已通过 10 examples / 0 failures；已支持布尔表达式 RHS 赋值，如 `true && false && x = 1`。
@@ -813,7 +813,7 @@ RGo 当前状态：
 
 - [ ] `&block` 方法参数已有最小实现：解析器保留 `BlockParam`，编译器记录 block 局部槽，VM 调用方法时把当前 block 写入该局部变量，并支持 `p.call` 常量 block。剩余 bug：当方法定义出现在外层局部变量赋值之前时，后续 `call_proc { x + 1 }` 的 block 捕获到的 `x` 仍为 nil；已用 `TestBlockPassedAsProcCapturesOuterLocal` 标记 skip，需继续排查 block closure 创建时的 free value 捕获时序。
 
-- [ ] language dashboard 当前为 75 pass / 2 timeout / 1 runtime_error / 0 nonzero_failures / 2 parse_error / 0 compile_error / 0 zero_examples，2230 examples / 0 failures out of 80 files（2026-05-07 refreshed）。`variables_spec.rb`、`next_spec.rb`、`or_spec.rb` 和 `optional_assignments_spec.rb` 已通过；剩余问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
+- [ ] language dashboard 当前为 75 pass / 2 timeout / 1 runtime_error / 0 nonzero_failures / 2 parse_error / 0 compile_error / 0 zero_examples，2304 examples / 0 failures out of 80 files（2026-05-07 refreshed）。`variables_spec.rb`、`next_spec.rb`、`or_spec.rb` 和 `optional_assignments_spec.rb` 已通过；剩余问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
 
 - [x] `vendor/ruby/spec/language/block_spec.rb` 当前通过 172 examples / 0 failures；已修复空 block 参数 `||`、匿名 block forwarding 参数/调用如 `def f(..., &); inner(&); end`、grouped comma sequence、destructured block 参数，以及 eval child VM 调用 parent block/method 时常量表错配。
 
