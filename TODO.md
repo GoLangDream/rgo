@@ -96,13 +96,13 @@
 
 ### Language timeout reduction blocker（2026-05-06）
 
-- [ ] Task 4 后 `vendor/ruby/spec/language/optional_assignments_spec.rb` 仍 timeout
+- [x] Task 4 后 `vendor/ruby/spec/language/optional_assignments_spec.rb` timeout 已解除
   - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
   - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
-  - Task 6 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
-  - 最新 language dashboard：74 pass, 6 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
-  - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status remains timeout；复查命令见上一行，duration 为易变值不在 TODO 固定记录。
-  - 后续需要继续定位该 selected language target 的剩余 timeout 根因；当前已排除 `super()` 和 parenthesized `super(args)` parser parse hang。
+  - Task 1 follow-up 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
+  - 最新 language dashboard：75 pass, 2 timeout, 1 runtime_error, 0 nonzero_failures, 2 parse_error, 0 compile_error, 0 zero_examples out of 80 files。
+  - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass；duration 为易变值不在 TODO 固定记录。
+  - selected blocker 已解除；剩余 language dashboard 问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
 
 ### Codex/Go test OOM（2026-05-04）
 
@@ -214,9 +214,9 @@
 ### Language spec gate（2026-05-03）
 
 - [ ] 建立 `vendor/ruby/spec/language` 基线
-  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：74 pass, 6 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-06 refreshed）。
+  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：75 pass, 2 timeout, 1 runtime_error, 0 nonzero_failures, 2 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-07 refreshed）。
   - 当前观测到 2230 examples / 0 failures。
-  - `variables_spec.rb`、`next_spec.rb` 和 `or_spec.rb` 已通过；剩余 timeout 为 `keyword_arguments_spec.rb`、`method_spec.rb`、`optional_assignments_spec.rb`、`predefined_spec.rb`、`rescue_spec.rb` 和 `super_spec.rb`。
+  - `variables_spec.rb`、`next_spec.rb`、`or_spec.rb` 和 `optional_assignments_spec.rb` 已通过；剩余问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
   - 第一批 parser 目标：
     - [x] `vendor/ruby/spec/language/and_spec.rb` 已通过 10 examples / 0 failures；已支持布尔表达式 RHS 赋值，如 `true && false && x = 1`。
     - [x] `vendor/ruby/spec/language/or_spec.rb` 已通过 15 examples / 0 failures；受 lambda/proc literal 中 `next` 跳转回填修复影响，`next true or false` 控制流不再卡住。
@@ -813,7 +813,7 @@ RGo 当前状态：
 
 - [ ] `&block` 方法参数已有最小实现：解析器保留 `BlockParam`，编译器记录 block 局部槽，VM 调用方法时把当前 block 写入该局部变量，并支持 `p.call` 常量 block。剩余 bug：当方法定义出现在外层局部变量赋值之前时，后续 `call_proc { x + 1 }` 的 block 捕获到的 `x` 仍为 nil；已用 `TestBlockPassedAsProcCapturesOuterLocal` 标记 skip，需继续排查 block closure 创建时的 free value 捕获时序。
 
-- [ ] language dashboard 当前为 74 pass / 6 timeout / 0 runtime_error / 0 nonzero_failures / 0 parse_error / 0 compile_error / 0 zero_examples，2230 examples / 0 failures out of 80 files（2026-05-06 refreshed）。`variables_spec.rb`、`next_spec.rb` 和 `or_spec.rb` 已通过；剩余 timeout 包括 `keyword_arguments_spec.rb`、`method_spec.rb`、`optional_assignments_spec.rb`、`predefined_spec.rb`、`rescue_spec.rb` 和 `super_spec.rb`。
+- [ ] language dashboard 当前为 75 pass / 2 timeout / 1 runtime_error / 0 nonzero_failures / 2 parse_error / 0 compile_error / 0 zero_examples，2230 examples / 0 failures out of 80 files（2026-05-07 refreshed）。`variables_spec.rb`、`next_spec.rb`、`or_spec.rb` 和 `optional_assignments_spec.rb` 已通过；剩余问题为 `predefined_spec.rb`/`rescue_spec.rb` timeout、`super_spec.rb` runtime_error、`keyword_arguments_spec.rb`/`method_spec.rb` parse_error。
 
 - [x] `vendor/ruby/spec/language/block_spec.rb` 当前通过 172 examples / 0 failures；已修复空 block 参数 `||`、匿名 block forwarding 参数/调用如 `def f(..., &); inner(&); end`、grouped comma sequence、destructured block 参数，以及 eval child VM 调用 parent block/method 时常量表错配。
 
