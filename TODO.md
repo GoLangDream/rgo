@@ -223,6 +223,14 @@
   - 当前 `RGO_SPEC_TIMEOUT=1` 结果：129 pass, 0 runtime_error, 0 timeout, 0 parse_error, 0 nonzero_failures, 0 zero_examples out of 129 files。
   - 当前观测到 3182 examples / 0 failures。
 
+### Kernel spec gate（2026-05-07）
+
+- [x] Refresh Kernel spec gate — 99/118 PASS (+5 from 94)
+   - Fix: `peekTokenCanBeMethodName` now includes `EXTEND` and `INCLUDE`
+   - Fixed: `methods_spec.rb`, `private_methods_spec.rb`, `protected_methods_spec.rb`, `singleton_method_spec.rb`
+   - `extend_spec.rb` now shows `compile_error` instead of `parse_error` (progress)
+   - Remaining: 19 non-pass (1 compile_error, 3 runtime_error, 14 parse_error, 1 timeout)
+
 ### Language spec gate（2026-05-03）
 
 - [ ] 建立 `vendor/ruby/spec/language` 基线
