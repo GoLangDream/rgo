@@ -2380,6 +2380,17 @@ func TestParseDefinedWithoutParentheses(t *testing.T) {
 	parse(t, `(not defined? qqq).should == true`)
 }
 
+func TestParseKeywordLiteralMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `VariablesSpecs.false`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "false" {
+		t.Fatalf("expected false method name, got %#v", call.Method)
+	}
+}
+
 func TestParseBitwiseAndShiftCompoundAssignments(t *testing.T) {
 	parse(t, `a |= b
 a &= b

@@ -2000,6 +2000,12 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		}
 	}
 
+	endPos := len(c.currentInstructions())
+	for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
+		c.changeOperand(patchPos, endPos)
+	}
+	c.scopes[c.scopeIndex].nextPatchPos = []int{}
+
 	c.replaceLastPopWithReturn()
 
 	free := c.symbolTable.FreeSymbols
