@@ -1,0 +1,16 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/queue/append_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/queue/clear_spec.rb,pass,1,0,,4
+vendor/ruby/spec/core/queue/closed_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/queue/close_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/queue/deq_spec.rb,timeout,0,0,timeout,1029
+vendor/ruby/spec/core/queue/empty_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/queue/enq_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/queue/freeze_spec.rb,pass,1,0,,2
+vendor/ruby/spec/core/queue/initialize_spec.rb,pass,8,0,,3
+vendor/ruby/spec/core/queue/length_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/queue/num_waiting_spec.rb,timeout,0,0,timeout,1033
+vendor/ruby/spec/core/queue/pop_spec.rb,timeout,0,0,timeout,1029
+vendor/ruby/spec/core/queue/push_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/queue/shift_spec.rb,timeout,0,0,timeout,1029
+vendor/ruby/spec/core/queue/size_spec.rb,pass,1,0,,4

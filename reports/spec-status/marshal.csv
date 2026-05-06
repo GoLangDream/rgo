@@ -1,0 +1,7 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/marshal/dump_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/marshal/float_spec.rb,pass,18,0,,3
+vendor/ruby/spec/core/marshal/load_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/marshal/major_version_spec.rb,pass,1,0,,2
+vendor/ruby/spec/core/marshal/minor_version_spec.rb,pass,1,0,,4
+vendor/ruby/spec/core/marshal/restore_spec.rb,parse_error,0,0,parse_error,4

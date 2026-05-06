@@ -1,0 +1,2 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/builtin_constants/builtin_constants_spec.rb,pass,27,0,,3

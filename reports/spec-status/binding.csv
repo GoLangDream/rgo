@@ -1,0 +1,10 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/binding/clone_spec.rb,pass,5,0,,4
+vendor/ruby/spec/core/binding/dup_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/binding/eval_spec.rb,pass,15,0,,4
+vendor/ruby/spec/core/binding/local_variable_defined_spec.rb,pass,7,0,,4
+vendor/ruby/spec/core/binding/local_variable_get_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/binding/local_variable_set_spec.rb,parse_error,0,0,parse_error,4
+vendor/ruby/spec/core/binding/local_variables_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/binding/receiver_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/binding/source_location_spec.rb,pass,2,0,,4

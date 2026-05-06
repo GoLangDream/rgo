@@ -1,0 +1,14 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/data/constants_spec.rb,pass,2,0,,4
+vendor/ruby/spec/core/data/deconstruct_keys_spec.rb,pass,8,0,,4
+vendor/ruby/spec/core/data/deconstruct_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/data/define_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/data/eql_spec.rb,pass,8,0,,4
+vendor/ruby/spec/core/data/equal_value_spec.rb,pass,8,0,,2
+vendor/ruby/spec/core/data/hash_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/data/initialize_spec.rb,pass,18,0,,14
+vendor/ruby/spec/core/data/inspect_spec.rb,pass,8,0,,4
+vendor/ruby/spec/core/data/members_spec.rb,pass,3,0,,4
+vendor/ruby/spec/core/data/to_h_spec.rb,pass,7,0,,4
+vendor/ruby/spec/core/data/to_s_spec.rb,pass,8,0,,4
+vendor/ruby/spec/core/data/with_spec.rb,pass,6,0,,4

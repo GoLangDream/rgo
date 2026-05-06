@@ -1,0 +1,2 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/language/rescue_spec.rb,timeout,0,0,timeout,1003

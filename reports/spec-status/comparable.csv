@@ -1,0 +1,8 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/comparable/between_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/comparable/clamp_spec.rb,pass,26,0,,5
+vendor/ruby/spec/core/comparable/equal_value_spec.rb,pass,14,0,,3
+vendor/ruby/spec/core/comparable/gte_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/comparable/gt_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/comparable/lte_spec.rb,pass,3,0,,4
+vendor/ruby/spec/core/comparable/lt_spec.rb,pass,4,0,,3

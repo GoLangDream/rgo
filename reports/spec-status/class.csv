@@ -1,0 +1,9 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/class/allocate_spec.rb,pass,5,0,,4
+vendor/ruby/spec/core/class/attached_object_spec.rb,pass,4,0,,4
+vendor/ruby/spec/core/class/dup_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/class/inherited_spec.rb,pass,9,0,,4
+vendor/ruby/spec/core/class/initialize_spec.rb,pass,4,0,,3
+vendor/ruby/spec/core/class/new_spec.rb,pass,15,0,,2
+vendor/ruby/spec/core/class/subclasses_spec.rb,runtime_error,0,0,runtime_error,5
+vendor/ruby/spec/core/class/superclass_spec.rb,pass,3,0,,3

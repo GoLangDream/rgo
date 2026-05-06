@@ -1,0 +1,4 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/signal/list_spec.rb,pass,3,0,,2
+vendor/ruby/spec/core/signal/signame_spec.rb,pass,5,0,,4
+vendor/ruby/spec/core/signal/trap_spec.rb,pass,3,0,,13

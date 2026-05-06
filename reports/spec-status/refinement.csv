@@ -1,0 +1,9 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/refinement/append_features_spec.rb,runtime_error,0,0,runtime_error,5
+vendor/ruby/spec/core/refinement/extend_object_spec.rb,parse_error,0,0,parse_error,2
+vendor/ruby/spec/core/refinement/import_methods_spec.rb,timeout,0,0,timeout,1050
+vendor/ruby/spec/core/refinement/include_spec.rb,pass,1,0,,4
+vendor/ruby/spec/core/refinement/prepend_features_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/refinement/prepend_spec.rb,compile_error,0,0,compile_error,3
+vendor/ruby/spec/core/refinement/refined_class_spec.rb,pass,2,0,,4
+vendor/ruby/spec/core/refinement/target_spec.rb,pass,1,0,,3

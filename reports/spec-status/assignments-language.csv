@@ -1,0 +1,2 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/language/assignments_spec.rb,pass,42,0,,4

@@ -1,0 +1,2 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/language/variables_spec.rb,runtime_error,0,0,runtime_error,7

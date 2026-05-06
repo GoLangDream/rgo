@@ -1,0 +1,2 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/rails/rails/activesupport/test/core_ext/string_ext_test.rb,pass,144,0,,5

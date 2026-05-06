@@ -1,0 +1,6 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/warning/categories_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/warning/element_reference_spec.rb,pass,4,0,,2
+vendor/ruby/spec/core/warning/element_set_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/warning/performance_warning_spec.rb,pass,1,0,,2
+vendor/ruby/spec/core/warning/warn_spec.rb,pass,18,0,,13

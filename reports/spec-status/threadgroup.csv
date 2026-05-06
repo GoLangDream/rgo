@@ -1,0 +1,6 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/threadgroup/add_spec.rb,zero_examples,0,0,zero_examples,3
+vendor/ruby/spec/core/threadgroup/default_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/threadgroup/enclosed_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/threadgroup/enclose_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/threadgroup/list_spec.rb,pass,1,0,,4

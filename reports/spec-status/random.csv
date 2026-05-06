@@ -1,0 +1,11 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/random/bytes_spec.rb,pass,11,0,,4
+vendor/ruby/spec/core/random/default_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/random/equal_value_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/random/new_seed_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/random/new_spec.rb,pass,8,0,,3
+vendor/ruby/spec/core/random/random_number_spec.rb,pass,4,0,,3
+vendor/ruby/spec/core/random/rand_spec.rb,pass,39,0,,14
+vendor/ruby/spec/core/random/seed_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/random/srand_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/random/urandom_spec.rb,pass,5,0,,4

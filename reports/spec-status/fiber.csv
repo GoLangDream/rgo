@@ -1,0 +1,14 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/fiber/alive_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/fiber/blocking_spec.rb,pass,13,0,,4
+vendor/ruby/spec/core/fiber/current_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/fiber/inspect_spec.rb,pass,6,0,,4
+vendor/ruby/spec/core/fiber/kill_spec.rb,parse_error,0,0,parse_error,4
+vendor/ruby/spec/core/fiber/new_spec.rb,pass,5,0,,4
+vendor/ruby/spec/core/fiber/raise_spec.rb,parse_error,0,0,parse_error,4
+vendor/ruby/spec/core/fiber/resume_spec.rb,runtime_error,0,0,runtime_error,5
+vendor/ruby/spec/core/fiber/scheduler_spec.rb,pass,5,0,,4
+vendor/ruby/spec/core/fiber/set_scheduler_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/fiber/storage_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/fiber/transfer_spec.rb,runtime_error,0,0,runtime_error,6
+vendor/ruby/spec/core/fiber/yield_spec.rb,pass,6,0,,4

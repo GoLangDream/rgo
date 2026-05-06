@@ -1,0 +1,10 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/true/and_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/true/case_compare_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/true/dup_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/true/inspect_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/true/or_spec.rb,pass,1,0,,2
+vendor/ruby/spec/core/true/singleton_method_spec.rb,parse_error,0,0,parse_error,3
+vendor/ruby/spec/core/true/to_s_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/true/trueclass_spec.rb,pass,2,0,,3
+vendor/ruby/spec/core/true/xor_spec.rb,pass,1,0,,3

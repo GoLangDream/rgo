@@ -1,0 +1,5 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/conditionvariable/broadcast_spec.rb,timeout,0,0,timeout,1049
+vendor/ruby/spec/core/conditionvariable/marshal_dump_spec.rb,pass,1,0,,4
+vendor/ruby/spec/core/conditionvariable/signal_spec.rb,timeout,0,0,timeout,1055
+vendor/ruby/spec/core/conditionvariable/wait_spec.rb,parse_error,0,0,parse_error,4

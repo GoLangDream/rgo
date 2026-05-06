@@ -1,0 +1,3 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/systemexit/initialize_spec.rb,pass,4,0,,3
+vendor/ruby/spec/core/systemexit/success_spec.rb,pass,2,0,,4

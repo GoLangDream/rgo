@@ -1,0 +1,8 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/main/define_method_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/main/include_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/main/private_spec.rb,pass,5,0,,2
+vendor/ruby/spec/core/main/public_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/main/ruby2_keywords_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/main/to_s_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/main/using_spec.rb,pass,10,0,,3

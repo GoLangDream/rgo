@@ -1,0 +1,15 @@
+file,status,examples,failures,error_kind,duration_ms
+vendor/ruby/spec/core/basicobject/basicobject_spec.rb,pass,14,0,,3
+vendor/ruby/spec/core/basicobject/equal_spec.rb,pass,13,0,,3
+vendor/ruby/spec/core/basicobject/equal_value_spec.rb,pass,9,0,,2
+vendor/ruby/spec/core/basicobject/__id__spec.rb,pass,15,0,,3
+vendor/ruby/spec/core/basicobject/initialize_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/basicobject/instance_eval_spec.rb,parse_error,0,0,parse_error,13
+vendor/ruby/spec/core/basicobject/instance_exec_spec.rb,parse_error,0,0,parse_error,2
+vendor/ruby/spec/core/basicobject/method_missing_spec.rb,pass,30,0,,2
+vendor/ruby/spec/core/basicobject/not_equal_spec.rb,pass,8,0,,3
+vendor/ruby/spec/core/basicobject/not_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/basicobject/__send___spec.rb,timeout,0,0,timeout,1028
+vendor/ruby/spec/core/basicobject/singleton_method_added_spec.rb,pass,11,0,,3
+vendor/ruby/spec/core/basicobject/singleton_method_removed_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/basicobject/singleton_method_undefined_spec.rb,pass,2,0,,3
