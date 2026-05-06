@@ -128,12 +128,11 @@
 
 ### Array spec gate（2026-05-03）
 
-- [ ] Refresh Array spec gate to latest ruby/spec `9b3f5ffd6`
-  - Current `RGO_SPEC_TIMEOUT=1` baseline: 37 pass, 90 parse_error, 1 runtime_error, 1 timeout out of 129 files.
-  - Current progress after empty bracket-call parser support: 83 pass, 37 parse_error, 6 runtime_error, 3 timeout out of 129 files.
-  - First runtime target: `vendor/ruby/spec/core/array/delete_at_spec.rb`.
-  - First parser target: `vendor/ruby/spec/core/array/any_spec.rb`.
-  - Cleared: `delete_at_spec.rb` and `any_spec.rb` now pass.
+- [x] Refresh Array spec gate to latest ruby/spec `9b3f5ffd6` — 129/129 PASS (2026-05-07)
+   - Baseline (2026-05-03): 37 pass, 90 parse_error, 1 runtime_error, 1 timeout out of 129 files.
+   - Previous progress: 83 pass, 37 parse_error, 6 runtime_error, 3 timeout out of 129 files.
+   - Current: 全部 129 个 array specs 通过，包含 `bsearch_spec.rb` 17 examples / `bsearch_index_spec.rb` 等。
+   - Cleared: `delete_at_spec.rb` and `any_spec.rb` now pass.
 - [ ] `vendor/ruby/spec/core/array/bsearch_index_spec.rb` 已从 compile_error 推进到 dashboard pass，但验证较弱
   - 当前 `rgo test` 输出 `2 examples, 0 failures`，未覆盖文件内所有 examples。
   - 触发语法包含 `include(@array.bsearch_index { ... })` matcher 形式。
