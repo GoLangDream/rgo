@@ -701,6 +701,11 @@ func (p *Parser) parseCatchExpression() ast.Expression {
 		exp.Label = p.parseExpression(LOWEST)
 	}
 
+	if !p.curTokenIs(lexer.DO) && !p.curTokenIs(lexer.LBRACE) && !p.peekTokenIs(lexer.DO) && !p.peekTokenIs(lexer.LBRACE) {
+		exp.Body = &ast.BlockExpression{Token: p.curToken}
+		return exp
+	}
+
 	if p.curTokenIs(lexer.DO) {
 		p.nextToken()
 		exp.Body = &ast.BlockExpression{Token: p.curToken}
@@ -734,6 +739,9 @@ func (p *Parser) parseCatchExpression() ast.Expression {
 		}
 		if p.curToken == before && !p.curTokenIs(endToken) && !p.curTokenIs(lexer.EOF) {
 			p.nextToken()
+		}
+		if p.curTokenIs(endToken) {
+			break
 		}
 		p.skipNewlines()
 		if !p.curTokenIs(endToken) && !p.curTokenIs(lexer.EOF) {

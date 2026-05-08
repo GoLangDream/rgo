@@ -152,6 +152,14 @@ func TestParseCatchWithBraceBlockAndThrowCallChainCompletes(t *testing.T) {
 	}
 }
 
+func TestParseCatchWithBraceBlockAndTrailingNewline(t *testing.T) {
+	parse(t, "catch(:out) { 1 }\n")
+}
+
+func TestParseCatchWithoutBlockInLambdaCallChain(t *testing.T) {
+	parse(t, `-> { catch :blah }.should raise_error(LocalJumpError)`)
+}
+
 func TestParseDefinedWithThrowCallChain(t *testing.T) {
 	parse(t, `defined?(throw(:out, 42).foo).should == :unreachable`)
 }
