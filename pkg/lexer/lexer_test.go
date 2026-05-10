@@ -105,6 +105,32 @@ func TestBackslashNewlineContinuesLine(t *testing.T) {
 	}
 }
 
+func TestLeftShiftAfterIdentifierIsNotHeredoc(t *testing.T) {
+	toks := tokenizeClean("r<<i")
+	expected := []TokenType{IDENT, LSHIFT, IDENT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
+func TestSpacedIndentedHeredocAfterBareCall(t *testing.T) {
+	toks := tokenizeClean("eval <<-CODE\n  case 4\n  else\n    true\n  when 4; false\n  end\n  CODE\n")
+	expected := []TokenType{IDENT, STRING}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
 func TestStringLiterals(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -193,6 +219,16 @@ func TestRegexpLiteral(t *testing.T) {
 	}
 	if toks[0].Literal != `/foo/i` {
 		t.Errorf("expected literal /foo/i, got %q", toks[0].Literal)
+	}
+}
+
+func TestRegexpWithBacktickQuoteCharClassAndEscapedGlobal(t *testing.T) {
+	toks := tokenizeClean("/warning: global variable [`']\\$specs_uninitialized_global_variable' not initialized/")
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != REGEXP {
+		t.Fatalf("expected REGEXP, got %s %q", toks[0].Type, toks[0].Literal)
 	}
 }
 
@@ -752,6 +788,35 @@ func TestInstanceVariable(t *testing.T) {
 	}
 }
 
+func TestUnicodeInstanceVariable(t *testing.T) {
+	toks := tokenizeClean("@💙 :@💙")
+	expected := []TokenType{AT, SYMBOL}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+	if toks[0].Literal != "@💙" || toks[1].Literal != ":@💙" {
+		t.Fatalf("unexpected literals: %q %q", toks[0].Literal, toks[1].Literal)
+	}
+}
+
+func TestSpecialGlobalVariableSymbols(t *testing.T) {
+	toks := tokenizeClean(":$~ :$_ :$0")
+	expected := []string{":$~", ":$_", ":$0"}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, lit := range expected {
+		if toks[i].Type != SYMBOL || toks[i].Literal != lit {
+			t.Fatalf("token %d: expected SYMBOL %q, got %s %q", i, lit, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
 func TestClassVariable(t *testing.T) {
 	toks := tokenizeClean("@@count")
 	if len(toks) != 1 {
@@ -966,6 +1031,18 @@ func TestCommentSkipping(t *testing.T) {
 	}
 }
 
+func TestCommentWithHexEscapesKeepsNextLineSeparate(t *testing.T) {
+	toks := tokenize(`send(@method, Encoding::EUC_JP, undef: :replace)
+    # testing for: "\xA4\xA2?\xA4\xA2"
+    xA4xA2 = [0xA4, 0xA2].pack('CC')`)
+	for i := 0; i < len(toks)-2; i++ {
+		if toks[i].Type == RPAREN && toks[i+1].Type == NEWLINE && toks[i+2].Type == IDENT && toks[i+2].Literal == "xA4xA2" {
+			return
+		}
+	}
+	t.Fatalf("expected RPAREN NEWLINE xA4xA2 token sequence, got %v", toks)
+}
+
 func TestStringInterpolation(t *testing.T) {
 	toks := tokenizeClean(`"hello #{name}"`)
 	if len(toks) != 1 {
@@ -1000,6 +1077,35 @@ func TestQuestionMark(t *testing.T) {
 	}
 }
 
+func TestCharacterLiteral(t *testing.T) {
+	toks := tokenizeClean("?V ?\\n")
+	expected := []string{"V", "\n"}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, lit := range expected {
+		if toks[i].Type != STRING || toks[i].Literal != lit {
+			t.Fatalf("token %d: expected STRING %q, got %s %q", i, lit, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
+func TestBacktickAfterDotIsMethodName(t *testing.T) {
+	toks := tokenizeClean("Kernel.`(obj)")
+	expected := []TokenType{CONSTANT, DOT, IDENT, LPAREN, IDENT, RPAREN}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+	if toks[2].Literal != "`" {
+		t.Fatalf("expected backtick method name, got %q", toks[2].Literal)
+	}
+}
+
 func TestLambdaArrow(t *testing.T) {
 	toks := tokenizeClean("->")
 	if len(toks) != 1 {
@@ -1007,5 +1113,67 @@ func TestLambdaArrow(t *testing.T) {
 	}
 	if toks[0].Type != MINUS_ARROW {
 		t.Errorf("expected MINUS_ARROW, got %s", toks[0].Type)
+	}
+}
+
+func TestImaginaryNumericSuffixTokens(t *testing.T) {
+	tests := []struct {
+		input   string
+		typ     TokenType
+		literal string
+	}{
+		{"1i", INT, "1"},
+		{"0.0i", FLOAT, "0.0"},
+		{"1.0e2i", FLOAT, "1.0e2"},
+	}
+
+	for _, tt := range tests {
+		toks := tokenizeClean(tt.input)
+		if len(toks) != 1 {
+			t.Fatalf("%s: expected 1 token, got %d: %v", tt.input, len(toks), toks)
+		}
+		if toks[0].Type != tt.typ {
+			t.Fatalf("%s: expected %s, got %s", tt.input, tt.typ, toks[0].Type)
+		}
+		if toks[0].Literal != tt.literal {
+			t.Fatalf("%s: expected literal %q, got %q", tt.input, tt.literal, toks[0].Literal)
+		}
+	}
+}
+
+func TestEndlessRangeBeforeBracketTokens(t *testing.T) {
+	toks := tokenizeClean("3..]")
+	expected := []TokenType{INT, DOT2, RBRACKET}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
+func TestSymbolInspectLiteralTokens(t *testing.T) {
+	tests := []struct {
+		input   string
+		literal string
+	}{
+		{":$-w", ":$-w"},
+		{`:"$\\"`, `:$\\`},
+		{`:"\<\<"`, `:\<\<`},
+		{`:"\$"`, `:\$`},
+		{`:[]`, `:[]`},
+		{`:[]=`, `:[]=`},
+	}
+
+	for _, tt := range tests {
+		toks := tokenizeClean(tt.input)
+		if len(toks) == 0 {
+			t.Fatalf("%s: expected tokens", tt.input)
+		}
+		if toks[0].Literal != tt.literal {
+			t.Fatalf("%s: expected literal %q, got %q (%s)", tt.input, tt.literal, toks[0].Literal, toks[0].Type)
+		}
 	}
 }

@@ -1,8 +1,8 @@
 file,status,examples,failures,error_kind,duration_ms
-vendor/ruby/spec/core/mutex/locked_spec.rb,timeout,0,0,timeout,1027
-vendor/ruby/spec/core/mutex/lock_spec.rb,parse_error,0,0,parse_error,4
-vendor/ruby/spec/core/mutex/owned_spec.rb,timeout,0,0,timeout,1023
-vendor/ruby/spec/core/mutex/sleep_spec.rb,parse_error,0,0,parse_error,4
-vendor/ruby/spec/core/mutex/synchronize_spec.rb,timeout,0,0,timeout,1019
-vendor/ruby/spec/core/mutex/try_lock_spec.rb,pass,4,0,,4
-vendor/ruby/spec/core/mutex/unlock_spec.rb,timeout,0,0,timeout,1021
+vendor/ruby/spec/core/mutex/lock_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/mutex/locked_spec.rb,pass,3,0,,3
+vendor/ruby/spec/core/mutex/owned_spec.rb,pass,4,0,,4
+vendor/ruby/spec/core/mutex/sleep_spec.rb,timeout,0,0,timeout,1004
+vendor/ruby/spec/core/mutex/synchronize_spec.rb,timeout,0,0,timeout,1006
+vendor/ruby/spec/core/mutex/try_lock_spec.rb,pass,4,0,,6
+vendor/ruby/spec/core/mutex/unlock_spec.rb,timeout,0,0,timeout,1004

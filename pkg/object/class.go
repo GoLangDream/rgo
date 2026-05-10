@@ -31,32 +31,37 @@ func (c *Class) DefineClassMethod(name string, method *Method) {
 }
 
 func (c *Class) GetMethod(name string) (*Method, bool) {
+	method, _, ok := c.GetMethodWithOwner(name)
+	return method, ok
+}
+
+func (c *Class) GetMethodWithOwner(name string) (*Method, *Class, bool) {
 	// Check prepended modules first (highest priority)
 	for _, mod := range c.PrependedModules {
 		if method, ok := mod.GetMethod(name); ok {
-			return method, true
+			return method, c, true
 		}
 	}
 
 	// Check class methods
 	method, ok := c.Methods[name]
 	if ok {
-		return method, ok
+		return method, c, true
 	}
 
 	// Check included modules
 	for _, mod := range c.IncludedModules {
 		if method, ok := mod.GetMethod(name); ok {
-			return method, true
+			return method, c, true
 		}
 	}
 
 	// Check superclass
 	if c.SuperClass != nil {
-		return c.SuperClass.GetMethod(name)
+		return c.SuperClass.GetMethodWithOwner(name)
 	}
 
-	return nil, false
+	return nil, nil, false
 }
 
 func (c *Class) DefineConstant(name string, value *EmeraldValue) {
@@ -102,16 +107,18 @@ func (c *Class) NewInstance() *EmeraldValue {
 }
 
 type Object struct {
-	Class        *Class
-	InstanceVars map[string]*EmeraldValue
-	ClassVars    map[string]*EmeraldValue
+	Class            *Class
+	InstanceVars     map[string]*EmeraldValue
+	ClassVars        map[string]*EmeraldValue
+	SingletonMethods map[string]*Method
 }
 
 func NewObject(class *Class) *Object {
 	return &Object{
-		Class:        class,
-		InstanceVars: make(map[string]*EmeraldValue),
-		ClassVars:    make(map[string]*EmeraldValue),
+		Class:            class,
+		InstanceVars:     make(map[string]*EmeraldValue),
+		ClassVars:        make(map[string]*EmeraldValue),
+		SingletonMethods: make(map[string]*Method),
 	}
 }
 

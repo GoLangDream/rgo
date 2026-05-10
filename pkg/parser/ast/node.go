@@ -558,9 +558,10 @@ func (y *YieldExpression) String() string {
 }
 
 type SuperExpression struct {
-	Token lexer.Token
-	Args  []Expression
-	Block *BlockExpression
+	Token        lexer.Token
+	Args         []Expression
+	Block        *BlockExpression
+	ImplicitArgs bool
 }
 
 func (s *SuperExpression) expressionNode()      {}
@@ -747,6 +748,7 @@ type MethodCall struct {
 	KeywordArgs []*KeywordArg
 	Block       *BlockExpression
 	Safe        bool
+	ParenthesizedArgs bool
 }
 
 func (m *MethodCall) expressionNode()      {}
@@ -870,9 +872,10 @@ func (c *CatchExpression) String() string {
 }
 
 type ThrowExpression struct {
-	Token lexer.Token
-	Label Expression
-	Value Expression
+	Token     lexer.Token
+	Label     Expression
+	Value     Expression
+	ExtraArgs []Expression
 }
 
 func (t *ThrowExpression) statementNode()       {}
@@ -880,7 +883,11 @@ func (t *ThrowExpression) expressionNode()      {}
 func (t *ThrowExpression) TokenLiteral() string { return t.Token.Literal }
 func (t *ThrowExpression) String() string {
 	if t.Value != nil {
-		return "throw " + t.Label.String() + ", " + t.Value.String()
+		out := "throw " + t.Label.String() + ", " + t.Value.String()
+		for _, arg := range t.ExtraArgs {
+			out += ", " + arg.String()
+		}
+		return out
 	}
 	return "throw " + t.Label.String()
 }

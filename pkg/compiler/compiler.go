@@ -818,6 +818,10 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpSelf)
 		}
 
+		if node.Method == nil {
+			return fmt.Errorf("method call missing method name at line %d column %d after %q (receiver %T)", node.Token.Line, node.Token.Column, node.Token.Literal, node.Receiver)
+		}
+
 		methodNameIdx := c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  node.Method.Value,
@@ -875,6 +879,28 @@ func (c *Compiler) Compile(node interface{}) error {
 		methodNameIdx := c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  "include",
+			Class: core.R.Classes["String"],
+		})
+		c.emit(OpSend, methodNameIdx, 0, 1)
+	case *ast.ExtendExpression:
+		c.Emit(OpSelf)
+		if err := c.Compile(node.Module); err != nil {
+			return err
+		}
+		methodNameIdx := c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "extend",
+			Class: core.R.Classes["String"],
+		})
+		c.emit(OpSend, methodNameIdx, 0, 1)
+	case *ast.PrependExpression:
+		c.Emit(OpSelf)
+		if err := c.Compile(node.Module); err != nil {
+			return err
+		}
+		methodNameIdx := c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "prepend",
 			Class: core.R.Classes["String"],
 		})
 		c.emit(OpSend, methodNameIdx, 0, 1)
@@ -965,12 +991,22 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		fnIdx := c.addConstant(fn)
 
+		if node.Receiver != nil {
+			if err := c.Compile(node.Receiver); err != nil {
+				return err
+			}
+		}
+
 		for _, s := range free {
 			c.emitCaptureSymbol(s)
 		}
 		c.emit(OpClosure, fnIdx, len(free))
 
-		c.emit(OpDefineMethod, c.addConstant(&object.EmeraldValue{
+		op := OpDefineMethod
+		if node.Receiver != nil {
+			op = OpDefineSingletonMethod
+		}
+		c.emit(op, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  node.Name.Value,
 			Class: core.R.Classes["String"],
@@ -1046,8 +1082,30 @@ func (c *Compiler) Compile(node interface{}) error {
 			return err
 		}
 
-		c.Emit(OpReturn)
-		c.LeaveScope()
+		c.Emit(OpReturnValue)
+		instructions := c.LeaveScope()
+
+		bodyFn := &object.EmeraldValue{
+			Type: object.ValueFunction,
+			Data: &object.Function{
+				Name:         node.Name.Value + "#body",
+				Instructions: instructions,
+				NumLocals:    0,
+			},
+			Class: core.R.Classes["Class"],
+		}
+		fnIdx := c.addConstant(bodyFn)
+		c.emit(OpClosure, fnIdx, 0)
+		c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "__exec_class_body__",
+			Class: core.R.Classes["String"],
+		}), 1, 0)
+		c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  node.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 		c.Emit(OpPop)
 	case *ast.BlockExpression:
 		// If block has params, compile as closure
@@ -1247,6 +1305,15 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		c.Emit(OpRaise)
 	case *ast.ThrowExpression:
+		if len(node.ExtraArgs) > 0 {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueClass,
+				Data:  core.R.Classes["ArgumentError"],
+				Class: core.R.Classes["Class"],
+			})
+			c.Emit(OpRaise)
+			return nil
+		}
 		if node.Label != nil {
 			if err := c.Compile(node.Label); err != nil {
 				return err
@@ -1293,11 +1360,15 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 			blockArg = 1
 		}
+		argCount := len(node.Args)
+		if node.ImplicitArgs {
+			argCount = 255
+		}
 		c.emit(OpSendSuper, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  "__super__",
 			Class: core.R.Classes["String"],
-		}), blockArg, len(node.Args))
+		}), blockArg, argCount)
 	default:
 		return fmt.Errorf("unknown node type: %T", node)
 	}
@@ -1498,8 +1569,13 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 
 	rescueStart := 0
 	rescueOffsets := make([]int, len(node.Rescue))
+	var pendingNoMatchJump int
+	rescueEndJumps := []int{}
 	for i, rescue := range node.Rescue {
 		rescueOffsets[i] = len(c.currentInstructions())
+		if pendingNoMatchJump > 0 {
+			c.changeOperand(pendingNoMatchJump, rescueOffsets[i])
+		}
 		if i == 0 {
 			rescueStart = rescueOffsets[i]
 		}
@@ -1509,6 +1585,8 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 				return err
 			}
 		}
+		c.emit(OpRescueMatch, len(rescue.Exceptions))
+		pendingNoMatchJump = c.emit(OpJumpNotTruthy, 0)
 		c.Emit(OpRescue)
 		if rescue.Variable != nil {
 			if _, ok := c.symbolTable.Resolve(rescue.Variable.Value); !ok {
@@ -1526,9 +1604,18 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 			return err
 		}
 
-		if i < len(node.Rescue)-1 {
-			c.emit(OpJump, 0)
+		rescueEndJumps = append(rescueEndJumps, c.emit(OpJump, 0))
+	}
+
+	unmatchedEnsureStart := 0
+	if hasEnsure && pendingNoMatchJump > 0 {
+		unmatchedEnsureStart = len(c.currentInstructions())
+		c.Emit(OpEnsure)
+		if err := c.compileBlockAsValue(node.Ensure); err != nil {
+			return err
 		}
+		c.Emit(OpPop)
+		c.Emit(OpReraise)
 	}
 
 	ensureStart := len(c.currentInstructions())
@@ -1552,6 +1639,20 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		c.changeOperand(jumpToEnd, ensureStart)
 	} else {
 		c.changeOperand(jumpToEnd, endStart)
+	}
+	if pendingNoMatchJump > 0 {
+		if hasEnsure {
+			c.changeOperand(pendingNoMatchJump, unmatchedEnsureStart)
+		} else {
+			c.changeOperand(pendingNoMatchJump, endStart)
+		}
+	}
+	for _, jump := range rescueEndJumps {
+		if hasEnsure {
+			c.changeOperand(jump, ensureStart)
+		} else {
+			c.changeOperand(jump, endStart)
+		}
 	}
 	c.changeOperandAt(beginPos, 0, rescueStart)
 	c.changeOperandAt(beginPos, 1, ensureStart)

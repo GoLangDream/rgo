@@ -88,10 +88,23 @@ func (l *Lexer) skipComment() {
 	}
 }
 
+func (l *Lexer) skipWhitespaceAndCommentLines() {
+	for {
+		l.skipWhitespace()
+		if l.ch != '#' {
+			return
+		}
+		l.skipComment()
+		if l.ch != '\n' {
+			return
+		}
+		l.readChar()
+	}
+}
+
 func (l *Lexer) NewLine() Token {
 	l.readChar()
-	l.skipWhitespace()
-	l.skipComment()
+	l.skipWhitespaceAndCommentLines()
 	return Token{
 		Type:    NEWLINE,
 		Literal: "\n",
@@ -124,8 +137,7 @@ func (l *Lexer) NextToken() Token {
 		tok.Literal = ""
 	case '\n':
 		l.readChar()
-		l.skipWhitespace()
-		l.skipComment()
+		l.skipWhitespaceAndCommentLines()
 		if l.ch == '.' {
 			return l.NextToken()
 		}
@@ -139,6 +151,10 @@ func (l *Lexer) NextToken() Token {
 		tok = l.readString(true)
 		// readString stops at closing quote; readChar() below consumes it
 	case '`':
+		if l.backtickCanStartMethodName() {
+			tok = newToken(IDENT, l.ch)
+			break
+		}
 		tok = l.readRawString()
 		return tok // readRawString already consumed closing backtick
 	case '[':
@@ -307,6 +323,10 @@ func (l *Lexer) NextToken() Token {
 	case '~':
 		tok = newToken(BIT_NOT, l.ch)
 	case '?':
+		if l.peekChar() != 0 && l.peekChar() != ' ' && l.peekChar() != '\t' && l.peekChar() != '\r' && l.peekChar() != '\n' {
+			tok = l.readCharacterLiteral()
+			return tok
+		}
 		tok = newToken(QUESTION, l.ch)
 	case '\\':
 		if l.peekChar() == '\n' {
@@ -426,7 +446,7 @@ func (l *Lexer) readVariable() Token {
 	if l.ch == '@' {
 		l.readChar()
 		position := l.position
-		for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+		for isVariableNameChar(l.ch) {
 			l.readChar()
 		}
 
@@ -444,7 +464,7 @@ func (l *Lexer) readVariable() Token {
 	}
 
 	position := l.position
-	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+	for isVariableNameChar(l.ch) {
 		l.readChar()
 	}
 
@@ -588,6 +608,17 @@ func (l *Lexer) readDecimalNumber(position int) Token {
 			Column:  l.column,
 		}
 	}
+	if l.ch == 'i' {
+		lit := l.input[position:l.position]
+		lit = removeUnderscores(lit)
+		l.readChar()
+		return Token{
+			Type:    INT,
+			Literal: lit,
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
 
 	lit := l.input[position:l.position]
 	lit = removeUnderscores(lit)
@@ -671,6 +702,17 @@ func (l *Lexer) readFloat(position int) Token {
 			Column:  l.column,
 		}
 	}
+	if l.ch == 'i' {
+		lit := l.input[position:l.position]
+		lit = removeUnderscores(lit)
+		l.readChar()
+		return Token{
+			Type:    FLOAT,
+			Literal: lit,
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
 
 	lit := l.input[position:l.position]
 	lit = removeUnderscores(lit)
@@ -698,6 +740,17 @@ func (l *Lexer) readExponent(position int) Token {
 		l.position = start
 		l.ch = 'e'
 		lit := l.input[position:l.position]
+		return Token{
+			Type:    FLOAT,
+			Literal: lit,
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+	if l.ch == 'i' {
+		lit := l.input[position:l.position]
+		lit = removeUnderscores(lit)
+		l.readChar()
 		return Token{
 			Type:    FLOAT,
 			Literal: lit,
@@ -983,6 +1036,47 @@ func (l *Lexer) readRawString() Token {
 	}
 }
 
+func (l *Lexer) readCharacterLiteral() Token {
+	line := l.line
+	column := l.column
+
+	l.readChar() // consume ?
+	var lit string
+	if l.ch == '\\' {
+		l.readChar()
+		switch l.ch {
+		case 'n':
+			lit = "\n"
+		case 't':
+			lit = "\t"
+		case 'r':
+			lit = "\r"
+		case 'f':
+			lit = "\f"
+		case 'v':
+			lit = "\v"
+		case 'a':
+			lit = "\a"
+		case 'b':
+			lit = "\b"
+		case 'e':
+			lit = "\x1b"
+		default:
+			lit = string(l.ch)
+		}
+	} else {
+		lit = string(l.ch)
+	}
+	l.readChar()
+
+	return Token{
+		Type:    STRING,
+		Literal: lit,
+		Line:    line,
+		Column:  column,
+	}
+}
+
 func (l *Lexer) readPercentString() Token {
 	l.readChar()
 
@@ -1215,9 +1309,24 @@ func (l *Lexer) percentCanStartString() bool {
 	return true
 }
 
+func (l *Lexer) backtickCanStartMethodName() bool {
+	pos := l.position
+	for pos > 0 {
+		r, size := utf8.DecodeLastRuneInString(l.input[:pos])
+		pos -= size
+		if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+			continue
+		}
+		return r == '.'
+	}
+	return false
+}
+
 func (l *Lexer) readLeftShift() Token {
 	line := l.line
 	column := l.column
+	previousCharIsWhitespace := l.previousCharIsWhitespace()
+	canStartHeredoc := !l.previousCharCanEndExpression()
 
 	l.readChar()
 	if l.ch == '<' {
@@ -1233,7 +1342,7 @@ func (l *Lexer) readLeftShift() Token {
 			}
 		}
 
-		if l.ch == '-' || l.ch == '~' || isLetter(l.ch) || l.ch == '"' || l.ch == '\'' {
+		if (canStartHeredoc || (previousCharIsWhitespace && canStartSpacedCallHeredoc(l.ch))) && (l.ch == '-' || l.ch == '~' || isLetter(l.ch) || l.ch == '"' || l.ch == '\'') {
 			return l.readHeredoc(line, column)
 		}
 
@@ -1251,6 +1360,32 @@ func (l *Lexer) readLeftShift() Token {
 		Line:    line,
 		Column:  column,
 	}
+}
+
+func (l *Lexer) previousCharIsWhitespace() bool {
+	if l.position == 0 {
+		return false
+	}
+	ch := rune(l.input[l.position-1])
+	return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+}
+
+func canStartSpacedCallHeredoc(ch rune) bool {
+	return ch == '-' || ch == '~' || ch == '"' || ch == '\'' || (ch >= 'A' && ch <= 'Z')
+}
+
+func (l *Lexer) previousCharCanEndExpression() bool {
+	pos := l.position
+	for pos > 0 {
+		pos--
+		ch := rune(l.input[pos])
+		switch ch {
+		case ' ', '\t', '\r', '\n':
+			continue
+		}
+		return isLetter(ch) || isDigit(ch) || ch == '_' || ch == ')' || ch == ']' || ch == '}'
+	}
+	return false
 }
 
 func (l *Lexer) readHeredoc(line, column int) Token {
@@ -1363,7 +1498,7 @@ func (l *Lexer) readSymbolOrColon() Token {
 
 	if isLetter(l.ch) || l.ch == '_' {
 		position := l.position
-		for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+		for isVariableNameChar(l.ch) {
 			l.readChar()
 		}
 
@@ -1402,7 +1537,28 @@ func (l *Lexer) readSymbolOrColon() Token {
 			l.readChar()
 		}
 		l.readChar()
-		for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+		if l.input[position] == '$' && l.ch == '-' {
+			l.readChar()
+			for isVariableNameChar(l.ch) {
+				l.readChar()
+			}
+			return Token{
+				Type:    SYMBOL,
+				Literal: ":" + l.input[position:l.position],
+				Line:    l.line,
+				Column:  l.column,
+			}
+		}
+		if l.input[position] == '$' && isSpecialGlobalChar(l.ch) {
+			l.readChar()
+			return Token{
+				Type:    SYMBOL,
+				Literal: ":" + l.input[position:l.position],
+				Line:    l.line,
+				Column:  l.column,
+			}
+		}
+		for isVariableNameChar(l.ch) {
 			l.readChar()
 		}
 		return Token{
@@ -1417,9 +1573,24 @@ func (l *Lexer) readSymbolOrColon() Token {
 		return newToken(COLON, ':')
 	}
 
-	if strings.ContainsRune("+-*/%&|^~<>=![]`", l.ch) {
+	if l.ch == '[' && l.peekChar() == ']' {
 		position := l.position
-		for strings.ContainsRune("+-*/%&|^~<>=![]`", l.ch) {
+		l.readChar()
+		l.readChar()
+		if l.ch == '=' {
+			l.readChar()
+		}
+		return Token{
+			Type:    SYMBOL,
+			Literal: ":" + l.input[position:l.position],
+			Line:    l.line,
+			Column:  l.column,
+		}
+	}
+
+	if strings.ContainsRune("+-*/%&|^~<>=!`", l.ch) {
+		position := l.position
+		for strings.ContainsRune("+-*/%&|^~<>=!`", l.ch) {
 			l.readChar()
 		}
 		if l.ch == '@' {
@@ -1450,7 +1621,7 @@ func (l *Lexer) readQuotedSymbol() Token {
 	l.readChar()
 	position := l.position
 	for l.ch != quote && l.ch != 0 {
-		if l.ch == '\\' && l.peekChar() == quote {
+		if l.ch == '\\' && l.peekChar() != 0 {
 			l.readChar()
 		}
 		l.readChar()
@@ -1478,6 +1649,10 @@ func endsWith(s, suffix string) bool {
 
 func isLetter(ch rune) bool {
 	return unicode.IsLetter(ch) || ch == '_'
+}
+
+func isVariableNameChar(ch rune) bool {
+	return isLetter(ch) || isDigit(ch) || ch >= 128
 }
 
 func isDigit(ch rune) bool {

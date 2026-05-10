@@ -339,6 +339,7 @@ type RRange struct {
 type RException struct {
 	Message   string
 	Backtrace []string
+	Result    *EmeraldValue
 }
 
 type RBinding struct {

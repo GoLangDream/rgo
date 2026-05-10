@@ -74,6 +74,7 @@ const (
 	OpSendSuper
 
 	OpDefineMethod
+	OpDefineSingletonMethod
 	OpDefineClassMethod
 	OpDefineFunction
 
@@ -124,6 +125,7 @@ const (
 
 	OpRetry
 	OpRaise
+	OpReraise
 	OpThrow
 	OpBeginRescue
 	OpEnsure
@@ -229,9 +231,10 @@ var definitions = map[Opcode]Definition{
 	OpSendWithBlock: {"OpSendWithBlock", []int{2, 1, 1, 2}},
 	OpSendSuper:     {"OpSendSuper", []int{2, 1, 1}},
 
-	OpDefineMethod:      {"OpDefineMethod", []int{2}},
-	OpDefineClassMethod: {"OpDefineClassMethod", []int{2}},
-	OpDefineFunction:    {"OpDefineFunction", []int{2}},
+	OpDefineMethod:          {"OpDefineMethod", []int{2}},
+	OpDefineSingletonMethod: {"OpDefineSingletonMethod", []int{2}},
+	OpDefineClassMethod:     {"OpDefineClassMethod", []int{2}},
+	OpDefineFunction:        {"OpDefineFunction", []int{2}},
 
 	OpClass:  {"OpClass", []int{2}},
 	OpModule: {"OpModule", []int{2}},
@@ -273,9 +276,10 @@ var definitions = map[Opcode]Definition{
 	OpYieldWithValue: {"OpYieldWithValue", []int{1}},
 
 	OpRescue:      {"OpRescue", []int{}},
-	OpRescueMatch: {"OpRescueMatch", []int{}},
+	OpRescueMatch: {"OpRescueMatch", []int{1}},
 	OpRetry:       {"OpRetry", []int{}},
 	OpRaise:       {"OpRaise", []int{}},
+	OpReraise:     {"OpReraise", []int{}},
 	OpThrow:       {"OpThrow", []int{}},
 	OpBeginRescue: {"OpBeginRescue", []int{2, 2, 2}},
 	OpEnsure:      {"OpEnsure", []int{}},

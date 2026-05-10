@@ -157,6 +157,50 @@ func assertNilResult(t *testing.T, result *object.EmeraldValue) {
 	}
 }
 
+func assertArrayOfSymbols(t *testing.T, result *object.EmeraldValue, expected []string) {
+	t.Helper()
+	if result == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	elements := result.Data.([]*object.EmeraldValue)
+	if len(elements) != len(expected) {
+		t.Fatalf("expected %d elements, got %d (%v)", len(expected), len(elements), result.Inspect())
+	}
+	for i, elem := range elements {
+		if elem.Type != object.ValueSymbol {
+			t.Fatalf("expected element %d to be Symbol, got %s (%v)", i, elem.TypeName(), elem.Inspect())
+		}
+		if elem.Data.(string) != expected[i] {
+			t.Fatalf("expected element %d to be :%s, got :%s", i, expected[i], elem.Data.(string))
+		}
+	}
+}
+
+func assertArrayOfStrings(t *testing.T, result *object.EmeraldValue, expected []string) {
+	t.Helper()
+	if result == nil {
+		t.Fatal("expected result, got nil")
+	}
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	elements := result.Data.([]*object.EmeraldValue)
+	if len(elements) != len(expected) {
+		t.Fatalf("expected %d elements, got %d (%v)", len(expected), len(elements), result.Inspect())
+	}
+	for i, elem := range elements {
+		if elem.Type != object.ValueString {
+			t.Fatalf("expected element %d to be String, got %s (%v)", i, elem.TypeName(), elem.Inspect())
+		}
+		if elem.Data.(string) != expected[i] {
+			t.Fatalf("expected element %d to be %q, got %q", i, expected[i], elem.Data.(string))
+		}
+	}
+}
+
 // === Integer Arithmetic ===
 
 func TestIntegerAddition(t *testing.T) {
@@ -1050,6 +1094,13 @@ func TestStringSliceWithNegativeLengthReturnsNil(t *testing.T) {
 	}
 }
 
+func TestSymbolSliceWithNegativeLengthReturnsNil(t *testing.T) {
+	result, _ := runRuby(t, `:symbol.slice(0, -1)`)
+	if result.Type != object.ValueNil {
+		t.Fatalf("expected Nil, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+}
+
 // === Nil ===
 
 func TestNilLiteral(t *testing.T) {
@@ -1196,6 +1247,16 @@ QualifiedInheritanceChild.new.marker`)
 	assertIntResult(t, result, 42)
 }
 
+func TestClassInheritanceFromStructNewSuperclass(t *testing.T) {
+	result, _ := runRuby(t, `PaymentForInheritance = Struct.new(:price)
+
+class StructInheritanceChild < PaymentForInheritance
+end
+
+StructInheritanceChild.new(5).price`)
+	assertIntResult(t, result, 5)
+}
+
 func TestActiveSupportTestCaseSuperclassIsAvailable(t *testing.T) {
 	result, _ := runRuby(t, `class RailsLikeTestCase < ActiveSupport::TestCase
 end
@@ -1215,6 +1276,20 @@ end`)
 
 func TestMinitestStyleTestMethodsExecute(t *testing.T) {
 	_, output := runRuby(t, `class MethodStyleTest < ActiveSupport::TestCase
+  def test_runs_method
+    puts "ran method"
+  end
+end`)
+	if output != "  ✓ test_runs_method\nran method\n" {
+		t.Fatalf("expected minitest method output, got %q", output)
+	}
+}
+
+func TestMinitestStyleTestMethodsExecuteWithNestedClass(t *testing.T) {
+	_, output := runRuby(t, `class NestedClassStyleTest < ActiveSupport::TestCase
+  class Decorator < SimpleDelegator
+  end
+
   def test_runs_method
     puts "ran method"
   end
@@ -1903,6 +1978,143 @@ func TestMethodBlockParameterCallReturnsValue(t *testing.T) {
   p.call
 end
 call_proc { 42 }`)
+	assertIntResult(t, result, 42)
+}
+
+func TestSingletonMethodSuperStartsAfterReceiverClass(t *testing.T) {
+	result, _ := runRuby(t, `class Base
+  def foobar(array)
+    array << :base
+  end
+end
+
+class Foo < Base
+  def foobar(array)
+    array << :foo
+    super
+  end
+end
+
+obj = Foo.new
+def obj.foobar(array)
+  array << :singleton
+  super
+end
+
+obj.foobar([])`)
+	assertArrayOfSymbols(t, result, []string{"singleton", "foo", "base"})
+}
+
+func TestSingletonMethodOverridesReceiverClassMethod(t *testing.T) {
+	result, _ := runRuby(t, `class Foo
+  def value
+    1
+  end
+end
+
+obj = Foo.new
+def obj.value
+  2
+end
+
+obj.value`)
+	assertIntResult(t, result, 2)
+}
+
+func TestStringSplitRegexpWithLimit(t *testing.T) {
+	result, _ := runRuby(t, `"1 2 ".split(/ /, 3)`)
+	assertArrayOfStrings(t, result, []string{"1", "2", ""})
+}
+
+func TestStringGsubEmptyStringPatternTerminates(t *testing.T) {
+	result, _ := runRuby(t, `"hello".gsub("", ".")`)
+	assertStringResult(t, result, ".h.e.l.l.o.")
+}
+
+func TestStringGsubLineStartRegexpTerminates(t *testing.T) {
+	result, _ := runRuby(t, `"Text\nFoo".gsub(/^/, " ")`)
+	assertStringResult(t, result, " Text\n Foo")
+}
+
+func TestKernelLoopRescuesStopIteration(t *testing.T) {
+	result, _ := runRuby(t, `loop do
+  raise StopIteration
+end
+42`)
+	assertIntResult(t, result, 42)
+}
+
+func TestKernelLoopReturnsEnumeratorStopResult(t *testing.T) {
+	result, _ := runRuby(t, `e = Enumerator.new { |y|
+  y << 1
+  y << 2
+  :stopped
+}
+loop { e.next }`)
+	if result.Type != object.ValueSymbol {
+		t.Fatalf("expected Symbol, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	if result.Data.(string) != "stopped" {
+		t.Fatalf("expected :stopped, got :%s", result.Data.(string))
+	}
+}
+
+func TestRescueMultipleClausesJumpsToEndAfterMatchingClause(t *testing.T) {
+	result, _ := runRuby(t, `begin
+  raise StandardError
+rescue RuntimeError
+  :runtime_error
+rescue StandardError
+  :standard_error
+rescue Exception
+  :exception
+end`)
+	if result.Type != object.ValueSymbol {
+		t.Fatalf("expected Symbol, got %s (%v)", result.TypeName(), result.Inspect())
+	}
+	if result.Data.(string) != "standard_error" {
+		t.Fatalf("expected :standard_error, got :%s", result.Data.(string))
+	}
+}
+
+func TestUnmatchedRescueRunsEnsureBeforeOuterRescue(t *testing.T) {
+	result, _ := runRuby(t, `events = []
+begin
+  begin
+    raise StandardError
+  rescue TypeError
+    events << :wrong
+  ensure
+    events << :ensure
+  end
+rescue
+  events << :rescued
+end
+events`)
+	assertArrayOfSymbols(t, result, []string{"ensure", "rescued"})
+}
+
+func TestThreadNewRunsBlockAndJoinReturnsThread(t *testing.T) {
+	result, _ := runRuby(t, `running = false
+thr = Thread.new do
+  running = true
+end
+Thread.pass until running
+thr.join
+running`)
+	assertBoolResult(t, result, true)
+}
+
+func TestKernelExtendAddsModuleMethodsToObject(t *testing.T) {
+	result, _ := runRuby(t, `module M
+  def value
+    42
+  end
+end
+
+obj = Object.new
+obj.extend M
+obj.value`)
 	assertIntResult(t, result, 42)
 }
 

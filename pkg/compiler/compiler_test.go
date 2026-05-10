@@ -1,12 +1,14 @@
 package compiler
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/lexer"
 	"github.com/GoLangDream/rgo/pkg/object"
 	"github.com/GoLangDream/rgo/pkg/parser"
+	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
 
 func init() {
@@ -58,6 +60,30 @@ func functionConstants(bytecode *Bytecode) []*object.Function {
 		}
 	}
 	return functions
+}
+
+func TestCompileMethodCallWithoutMethodNameReturnsError(t *testing.T) {
+	program := &ast.Program{
+		Statements: []ast.Statement{
+			&ast.ExpressionStatement{
+				Expression: &ast.MethodCall{
+					Token: lexer.Token{Type: lexer.DOT, Literal: ".", Line: 1, Column: 4},
+					Receiver: &ast.Identifier{
+						Token: lexer.Token{Type: lexer.IDENT, Literal: "obj", Line: 1, Column: 1},
+						Value: "obj",
+					},
+				},
+			},
+		},
+	}
+
+	err := New().Compile(program)
+	if err == nil {
+		t.Fatal("expected compile error")
+	}
+	if !strings.Contains(err.Error(), "method call missing method name") {
+		t.Fatalf("unexpected error: %s", err)
+	}
 }
 
 func TestBlockPassedToMethodCapturesOuterLocalWithLocalOpcode(t *testing.T) {
@@ -125,6 +151,12 @@ func TestCompileInterpolatedRegexpWithEncodingModifierCall(t *testing.T) {
 	compile(t, `/#{/./}/e.encoding.should == Encoding::EUC_JP`)
 }
 
+func TestCompileMethodNameOnLineAfterDot(t *testing.T) {
+	compile(t, `Encoding::Converter.
+  asciicompat_encoding(Encoding.find("ISO-2022-JP")).
+  should == Encoding::Converter.asciicompat_encoding("ISO-2022-JP")`)
+}
+
 func TestCompileKeywordLiteralMethodNameAfterDot(t *testing.T) {
 	compile(t, `module VariablesSpecs
   def self.false
@@ -139,6 +171,16 @@ end
 1.times do
   defined?(a).should == "local-variable"
 end`)
+}
+
+func TestCompilePrependExpression(t *testing.T) {
+	compile(t, `wrapper = Module.new do
+  def initialize(...)
+    super(...)
+  end
+end
+
+klass = Class.new(Struct.new(:a)) { prepend wrapper }`)
 }
 
 func countOpcode(instructions Instructions, op Opcode) int {

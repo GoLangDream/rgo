@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -167,6 +168,74 @@ func TestParseDefinedWithThrowCallChain(t *testing.T) {
 func TestParseThrowWithBareSecondArgument(t *testing.T) {
 	parse(t, `throw :exit, :msg`)
 	parse(t, `catch(1) { throw 1, 2 }.should == 2`)
+}
+
+func TestParseThrowWithTooManyBareArguments(t *testing.T) {
+	parse(t, `throw :exit, :msg, 1`)
+	parse(t, `catch(:exit) { throw :exit, :msg, 1, 2, 3 }`)
+}
+
+func TestParseKeywordMatcherWithMultilineArguments(t *testing.T) {
+	parse(t, `list.should include(
+  :a, :b, :c)`)
+}
+
+func TestParseShouldWithParenthesizedBlockMatcher(t *testing.T) {
+	parse(t, `-> {
+  require_relative(path)
+}.should(raise_error(LoadError) { |e|
+  e.path.should == File.expand_path(path, @abs_dir)
+})`)
+}
+
+func TestParseBlockWithShouldParenthesizedBlockMatcher(t *testing.T) {
+	parse(t, `it "sets path" do
+  -> {
+    require_relative(path)
+  }.should(raise_error(LoadError) { |e|
+    e.path.should == File.expand_path(path, @abs_dir)
+  })
+end`)
+}
+
+func TestParseBlockCallArgumentWithBlockAndOuterCallChain(t *testing.T) {
+	parse(t, `it "respects Hash default" do
+  @method.call("%{foo}", Hash.new { nil }).should == "123"
+end`)
+}
+
+func TestParseParenthesizedChainedCallAssignment(t *testing.T) {
+	parse(t, `a = ("".encode(Encoding::US_ASCII).send(@method, 128))`)
+}
+
+func TestParseParenthesizedBlockCallReceiverChain(t *testing.T) {
+	parse(t, `(s.each_byte {}).should equal(s)`)
+}
+
+func TestParseParenthesizedBlockCallReceiverChainInsideBlock(t *testing.T) {
+	parse(t, `it "returns self" do
+  s = "hello"
+  (s.each_byte {}).should equal(s)
+end`)
+}
+
+func TestParseParenthesizedSendBlockCallReceiverChainInsideBlock(t *testing.T) {
+	parse(t, `it "returns self" do
+  s = "hello"
+  (s.send(@method) {}).should equal(s)
+end`)
+}
+
+func TestParseLambdaWithCallArgumentAndEmptyBlock(t *testing.T) {
+	parse(t, `-> { "hello world".send(@method, false) {} }.should raise_error(TypeError)`)
+}
+
+func TestParseNestedBlockCallChainWithSymbolProcArgument(t *testing.T) {
+	parse(t, `10.times.map { Thread.new { x = nil; 100.times { x = p.call }; x } }.map(&:value)`)
+}
+
+func TestParseBareBlockCallChain(t *testing.T) {
+	parse(t, `loop { e.next }.should == :stopped`)
 }
 
 func TestParseDefinedWithQualifiedConstantAssignment(t *testing.T) {
@@ -420,6 +489,10 @@ func TestParseConstantIndexCallWithMultipleArguments(t *testing.T) {
 	}
 }
 
+func TestParseConstantBracketCallWithNestedArrayArguments(t *testing.T) {
+	parse(t, `Set[[:b, 2], [:a, 1]]`)
+}
+
 func TestParseRaiseWithExceptionClassAndMessage(t *testing.T) {
 	input := "raise StandardError, 'Oops'"
 
@@ -433,6 +506,22 @@ func TestParseRaiseWithExceptionClassAndMessage(t *testing.T) {
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
 	}
+}
+
+func TestParseRaiseWithPostfixUnless(t *testing.T) {
+	parse(t, `raise "subprocesses leaked" unless leaked.empty?`)
+}
+
+func TestParseIfWithBeginEnsureBeforeElse(t *testing.T) {
+	parse(t, `if io
+  begin
+    io.gets
+  ensure
+    io.close
+  end
+else
+  puts "child"
+end`)
 }
 
 func TestParseCallArgumentsAcrossNewlines(t *testing.T) {
@@ -556,6 +645,10 @@ func TestParseOperatorSymbolArgument(t *testing.T) {
 	}
 }
 
+func TestParseAnonymousParameterSymbolArrays(t *testing.T) {
+	parse(t, `[[:rest, :*], [:keyrest, :**], [:block, :&]]`)
+}
+
 func TestParseQuotedSymbolArgument(t *testing.T) {
 	input := `raise_error(TypeError, :"foo")`
 
@@ -571,6 +664,17 @@ func TestParseQuotedSymbolArgument(t *testing.T) {
 	}
 }
 
+func TestParseSymbolInspectLiteralHash(t *testing.T) {
+	parse(t, `{
+  :$-w => ":$-w",
+  :"\<\<" => ":\<\<",
+  :"\$" => ":\"$\"",
+  :[] => ":[]",
+  :[]= => ":[]=",
+  :"ê" => [":ê", ":\"\\u00EA\""]
+}`)
+}
+
 func TestParseInstanceVariableSymbolArgument(t *testing.T) {
 	input := `obj.instance_variable_set(:@hash, hash)`
 
@@ -584,6 +688,16 @@ func TestParseInstanceVariableSymbolArgument(t *testing.T) {
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
 	}
+}
+
+func TestParseUnicodeInstanceVariableSymbolArgument(t *testing.T) {
+	parse(t, `obj.instance_variable_set(:@💙, 42)`)
+	parse(t, `obj.instance_variable_get(:@💙).should == 42`)
+}
+
+func TestParseSpecialGlobalVariableSymbolArgument(t *testing.T) {
+	parse(t, `bind.local_variable_get(:$~)`)
+	parse(t, `bind.local_variable_set(:$_, "")`)
 }
 
 func TestParseArrayClassBracketMethodCall(t *testing.T) {
@@ -798,6 +912,49 @@ func TestParseSingletonOperatorMethodDefinition(t *testing.T) {
 	}
 }
 
+func TestParseSingletonEqualityMethodDefinitionWithLiteralBody(t *testing.T) {
+	parse(t, `def x.==(o) false end`)
+}
+
+func TestParseMethodDefinitionWithBareParameter(t *testing.T) {
+	parse(t, `def eql? other
+  ByValueKey === other and @n == other.n
+end`)
+	parse(t, `class ByValueKey
+  def eql? other
+    ByValueKey === other and @n == other.n
+  end
+end`)
+}
+
+func TestParseHashFixturesClasses(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/hash/fixtures/classes.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parse(t, string(input))
+}
+
+func TestParseHashEqualValueSpecWithRequires(t *testing.T) {
+	paths := []string{
+		"../../vendor/ruby/spec/spec_helper.rb",
+		"../../vendor/ruby/spec/core/hash/fixtures/classes.rb",
+		"../../vendor/ruby/spec/core/hash/shared/eql.rb",
+		"../../vendor/ruby/spec/core/hash/equal_value_spec.rb",
+	}
+	var input string
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input += string(data) + "\n"
+	}
+
+	parse(t, input)
+}
+
 func TestParseTripleEqualsMethodDefinition(t *testing.T) {
 	parse(t, `def ===(other)
   true
@@ -828,6 +985,28 @@ func TestParseYieldAsMethodName(t *testing.T) {
 
 func TestParseBacktickOperatorSymbolArgument(t *testing.T) {
 	parse(t, "runner.singleton_class.define_method(:`) do |str|\nend")
+}
+
+func TestParseBacktickMethodCall(t *testing.T) {
+	expr := parseExpr(t, "Kernel.`(obj)")
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "`" {
+		t.Fatalf("expected backtick method name, got %#v", call.Method)
+	}
+}
+
+func TestParseConstantMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, "Kernel.Integer(10)")
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "Integer" {
+		t.Fatalf("expected Integer method name, got %#v", call.Method)
+	}
 }
 
 func TestParseAliasWithSpaceshipMethodNames(t *testing.T) {
@@ -912,6 +1091,18 @@ func TestParseInstanceVariableSingletonMethodDefinition(t *testing.T) {
 	}
 }
 
+func TestParseInstanceVariableSingletonKeywordMethodDefinition(t *testing.T) {
+	parse(t, `def @obj.class
+  Integer
+end`)
+}
+
+func TestParseConstantLikeMethodDefinition(t *testing.T) {
+	parse(t, `def Data?
+  !self.Data.nil?
+end`)
+}
+
 func TestParseSingletonClassExpression(t *testing.T) {
 	input := "class << obj; undef :to_s; end"
 
@@ -948,6 +1139,30 @@ end`
 	if len(program.Statements) != 2 {
 		t.Fatalf("expected consumer describe to remain top-level, got %d statements: %s", len(program.Statements), program.String())
 	}
+}
+
+func TestParseLambdaWithInlineSingletonClassExpressionCallChain(t *testing.T) {
+	parse(t, `-> { class << dup; CLONE; end }.should raise_error(NameError)`)
+}
+
+func TestParseLambdaWithInlineSingletonMethodDefinitionCallChain(t *testing.T) {
+	parse(t, `-> { def obj.foo; end }.should raise_error(FrozenError)`)
+}
+
+func TestParseEvalHeredocCaseElseBeforeWhen(t *testing.T) {
+	parse(t, `-> {
+  eval <<-CODE
+  case 4
+  else
+    true
+  when 4; false
+  end
+  CODE
+}.should raise_error(SyntaxError)`)
+}
+
+func TestParseComplainMatcherWithBacktickRegexp(t *testing.T) {
+	parse(t, "-> { obj.foobar }.should complain(/warning: global variable [`']\\$specs_uninitialized_global_variable' not initialized/, verbose: true)")
 }
 
 func TestParseUnlessWithThen(t *testing.T) {
@@ -1085,6 +1300,31 @@ func TestParseEndlessRangeMethodCallArgument(t *testing.T) {
 	}
 }
 
+func TestParseEndlessRangeIndexArgument(t *testing.T) {
+	parse(t, `obj[3..].should == []`)
+	parse(t, `/a/.match("a")[3..].should == []`)
+}
+
+func TestParseRangeWithMethodCallBounds(t *testing.T) {
+	parse(t, `(RangeSpecs::TenfoldSucc.new(0)..RangeSpecs::TenfoldSucc.new(100)).should be_false`)
+}
+
+func TestParseEndlessRangeAssignment(t *testing.T) {
+	parse(t, `range = (@x..)`)
+}
+
+func TestParseExclusiveEndlessRangeAssignment(t *testing.T) {
+	parse(t, `range = (@x...)`)
+}
+
+func TestParseBeginlessRangeAssignment(t *testing.T) {
+	parse(t, `range = (..@x)`)
+}
+
+func TestParseExclusiveBeginlessRangeAssignment(t *testing.T) {
+	parse(t, `range = (...@x)`)
+}
+
 func TestParseNegativeBeginlessRangeArgument(t *testing.T) {
 	input := `a.send(:[], (..-2))`
 
@@ -1130,6 +1370,22 @@ func TestParseArrayLiteralWithTrailingComma(t *testing.T) {
 	}
 }
 
+func TestParseArrayLiteralWithBlockCallAndLambdaElements(t *testing.T) {
+	parse(t, `[Proc.new{}, -> {}, proc {}]`)
+	parse(t, `[Proc.new{}, -> {}, proc {}].each { |p| p.binding }`)
+}
+
+func TestParseMultilineNestedArrayLiteral(t *testing.T) {
+	parse(t, `[[:TEXT, "Posts: "],
+  [:OPEN, "<%="],
+  [:CODE, " @post.length "],
+]`)
+	parse(t, `assert_equal [[:TEXT, "Posts: "],
+              [:OPEN, "<%="],
+              [:CODE, " @post.length "],
+], actual_tokens`)
+}
+
 // === Literals ===
 
 func TestParseIntegerLiteral(t *testing.T) {
@@ -1166,6 +1422,11 @@ func TestParseFloatLiteral(t *testing.T) {
 	if lit.Value != 3.14 {
 		t.Errorf("expected 3.14, got %f", lit.Value)
 	}
+}
+
+func TestParseImaginaryNumericSuffix(t *testing.T) {
+	parse(t, `(1+1i).should.finite?`)
+	parse(t, `Complex.polar(1.0+0.0i, Math::PI/2+0.0i)`)
 }
 
 func TestParseStringLiteral(t *testing.T) {
@@ -1307,6 +1568,117 @@ func TestParseLambdaWithBareParameterInsideBlock(t *testing.T) {
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
 	}
+}
+
+func TestParseRaiseIfModifierInsideSemicolonLambda(t *testing.T) {
+	expr := parseExpr(t, `-> { times += 1; raise if times > 1; "done" }`)
+	proc, ok := expr.(*ast.ProcLiteral)
+	if !ok {
+		t.Fatalf("expected ProcLiteral, got %T", expr)
+	}
+	if proc.Body == nil {
+		t.Fatal("expected lambda body")
+	}
+	if len(proc.Body.Statements) != 3 {
+		t.Fatalf("expected 3 lambda statements, got %d: %s", len(proc.Body.Statements), proc.Body.String())
+	}
+	if _, ok := proc.Body.Statements[1].(*ast.ExpressionStatement).Expression.(*ast.IfExpression); !ok {
+		t.Fatalf("expected second statement to be if modifier, got %T", proc.Body.Statements[1])
+	}
+}
+
+func TestParseReturnIfModifierInsideMethod(t *testing.T) {
+	program := parse(t, `def obj.eql?(o)
+  return true if self.equal?(o)
+  false
+end
+
+describe "consumer" do
+  it "runs" do
+  end
+end`)
+	if len(program.Statements) != 2 {
+		t.Fatalf("expected 2 top-level statements, got %d: %s", len(program.Statements), program.String())
+	}
+	def, ok := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected first statement to be DefExpression, got %T", program.Statements[0])
+	}
+	if def.Body == nil || len(def.Body.Statements) != 2 {
+		t.Fatalf("expected method body with 2 statements, got %#v", def.Body)
+	}
+	if _, ok := def.Body.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.IfExpression); !ok {
+		t.Fatalf("expected first method statement to be if modifier, got %T", def.Body.Statements[0])
+	}
+}
+
+func TestParseBareReturnIfModifierDoesNotConsumeFollowingStatement(t *testing.T) {
+	program := parse(t, `describe :shared, shared: true do
+  it "runs" do
+    return if done?
+    ScratchPad << :ran
+  end
+end
+
+describe "consumer" do
+end`)
+	if len(program.Statements) != 2 {
+		t.Fatalf("expected 2 top-level statements, got %d: %s", len(program.Statements), program.String())
+	}
+}
+
+func TestParseIfElseWithAssignedLambdaConsequents(t *testing.T) {
+	parse(t, `if RUBY_ENGINE == 'truffleruby'
+  sclass = -> io { Primitive.singleton_class(io) }
+else
+  sclass = -> io { io.singleton_class }
+end`)
+}
+
+func TestParseSingletonClassSpecIoContextSnippet(t *testing.T) {
+	parse(t, `it "looks up singleton methods" do
+  proxy = -> io { io.foo }
+  if RUBY_ENGINE == 'truffleruby'
+    sclass = -> io { Primitive.singleton_class(io) }
+  else
+    sclass = -> io { io.singleton_class }
+  end
+
+  io = File.new(__FILE__)
+  io.define_singleton_method(:foo) { "old" }
+ensure
+  io.close
+end`)
+}
+
+func TestParseBlockWithIfElseAssignedLambda(t *testing.T) {
+	parse(t, `it "x" do
+  if RUBY_ENGINE == 'truffleruby'
+    sclass = -> io { Primitive.singleton_class(io) }
+  else
+    sclass = -> io { io.singleton_class }
+  end
+end`)
+}
+
+func TestParseBlockWithLeadingLambdaThenIfElseAssignedLambda(t *testing.T) {
+	parse(t, `it "x" do
+  proxy = -> io { io.foo }
+  if RUBY_ENGINE == 'truffleruby'
+    sclass = -> io { Primitive.singleton_class(io) }
+  else
+    sclass = -> io { io.singleton_class }
+  end
+end`)
+}
+
+func TestParseLeadingLambdaThenIfElseAssignedLambda(t *testing.T) {
+	parse(t, `proxy = -> io { io.foo }
+if RUBY_ENGINE == 'truffleruby'
+  sclass = -> io { Primitive.singleton_class(io) }
+else
+  sclass = -> io { io.singleton_class }
+end`)
 }
 
 // === Infix Expressions ===
@@ -1556,6 +1928,25 @@ func TestParseStringIndex(t *testing.T) {
 	assertIntLit(t, idx.Index, 0)
 }
 
+func TestParseIndexArgumentArrayLiteralMethodCall(t *testing.T) {
+	expr := parseExpr(t, `@h[[1].dup].should be_nil`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected outer MethodCall, got %T", expr)
+	}
+	idx, ok := call.Receiver.(*ast.IndexExpression)
+	if !ok {
+		t.Fatalf("expected receiver IndexExpression, got %T", call.Receiver)
+	}
+	arg, ok := idx.Index.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected index argument MethodCall, got %T", idx.Index)
+	}
+	if arg.Method == nil || arg.Method.Value != "dup" {
+		t.Fatalf("expected dup index argument call, got %#v", arg.Method)
+	}
+}
+
 // === helpers ===
 
 func assertIntLit(t *testing.T, expr ast.Expression, expected int64) {
@@ -1802,6 +2193,16 @@ func TestParseHashWithSymbolShorthand(t *testing.T) {
 	}
 }
 
+func TestParseHashShorthandReceiverWithMultiplePairs(t *testing.T) {
+	parse(t, `{a: 1, b: 2}.all?(pattern).should == true`)
+	parse(t, `pattern = EnumerableSpecs::Pattern.new { |x| Array === x }
+{a: 1, b: 2}.all?(pattern).should == true`)
+	parse(t, `it "x" do
+  pattern = EnumerableSpecs::Pattern.new { |x| Array === x }
+  {a: 1, b: 2}.all?(pattern).should == true
+end`)
+}
+
 func TestParseHashWithArrow(t *testing.T) {
 	expr := parseExpr(t, `{"a" => 1}`)
 	hash, ok := expr.(*ast.HashLiteral)
@@ -1811,6 +2212,53 @@ func TestParseHashWithArrow(t *testing.T) {
 	if len(hash.Pairs) != 1 {
 		t.Errorf("expected 1 pair, got %d", len(hash.Pairs))
 	}
+}
+
+func TestParseGroupedHashEqualityExpression(t *testing.T) {
+	parse(t, `({ 1 => l_val } == { 1 => r_val }).should be_true`)
+}
+
+func TestParseHashWithSignedNumericArrowKeys(t *testing.T) {
+	parse(t, `{ -2.2 => -2, -0.1 => 0, 5.5 => 5 }`)
+}
+
+func TestParseHashRocketWithConstantResolutionCallKey(t *testing.T) {
+	parse(t, `{ObjectSpaceFixtures::ObjectToBeFound.new(:hash_key) => :value}`)
+}
+
+func TestParseHashRocketWithMethodCallKey(t *testing.T) {
+	parse(t, `{
+  1.minute => 60,
+  1.hour + 15.minutes => 4500
+}`)
+}
+
+func TestParseMethodCallBlockWithUnaryMinusExpression(t *testing.T) {
+	parse(t, `(@x...@y).minmax { |x, y| - (x <=> y) }.should == [@x, @x]`)
+}
+
+func TestParseInclusiveMethodCallBlockWithUnaryMinusExpression(t *testing.T) {
+	parse(t, `(@x..@y).minmax { |x, y| - (x <=> y) }.should == [@y, @x]`)
+}
+
+func TestParseCallWithRegexpArgumentAfterCommaNewline(t *testing.T) {
+	parse(t, `-> { range.minmax }.should raise_error(RangeError,
+  /cannot get the maximum of beginless range with custom comparison method|cannot get the minimum of beginless range/)`)
+}
+
+func TestParseBareDoBlockWithEndlessRangeAssignment(t *testing.T) {
+	parse(t, `foo do
+  range = (@x..)
+end`)
+}
+
+func TestParseRangeMinmaxSpec(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/range/minmax_spec.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parse(t, string(input))
 }
 
 func TestParseHashLiteralWithTrailingComma(t *testing.T) {
@@ -2064,6 +2512,24 @@ func TestParseSuperWithParenthesizedArgumentsTerminates(t *testing.T) {
 	}
 }
 
+func TestParseBareSuperWithInfixOperatorTerminates(t *testing.T) {
+	expr := parseExpr(t, `super + 1`)
+	if _, ok := expr.(*ast.InfixExpression); !ok {
+		t.Fatalf("expected bare super operator call to parse as InfixExpression, got %T", expr)
+	}
+}
+
+func TestParseBareSuperAtArrayElementEndTerminates(t *testing.T) {
+	parse(t, `["m", super]`)
+}
+
+func TestParseBareSuperWithShiftOperatorTerminates(t *testing.T) {
+	expr := parseExpr(t, `super << :m1`)
+	if _, ok := expr.(*ast.InfixExpression); !ok {
+		t.Fatalf("expected bare super shift call to parse as InfixExpression, got %T", expr)
+	}
+}
+
 func TestParseClassWithMultipleMethodsAndImplicitEnsure(t *testing.T) {
 	parse(t, `class BreakTest2
   def one
@@ -2174,6 +2640,10 @@ func TestParseGroupedAnonymousSplatAssignment(t *testing.T) {
 	parse(t, `(* = 1).should == 1`)
 }
 
+func TestParseNestedGroupedAnonymousSplatAssignmentCallChain(t *testing.T) {
+	parse(t, `((*) = *1).should == [1]`)
+}
+
 func TestParseGroupedMultiAssignExpressionWithSplat(t *testing.T) {
 	parse(t, `(a, *b, (c, d) = 1, 2, 3, *x).should == [1, 2, 3, 4, 5]`)
 }
@@ -2199,9 +2669,27 @@ func TestParseMultiAssignWithInlineRescueValue(t *testing.T) {
 	parse(t, `a, b = raise rescue [1, 2]`)
 }
 
+func TestParseMultiAssignValueWithBlockCall(t *testing.T) {
+	parse(t, `thread, line = Thread.new { "hello" }, __LINE__`)
+	parse(t, `describe :thread_to_s, shared: true do
+  it "returns a description including file and line number" do
+    thread, line = Thread.new { "hello" }, __LINE__
+    thread.join
+  end
+end`)
+}
+
 func TestParseBareCallArgumentsAcrossNewlineAfterComma(t *testing.T) {
 	parse(t, `assert_equal "__#{safe_char}_",
              ERB::Util.xml_name_escape("#{unsafe_char * 2}#{safe_char}#{unsafe_char}")`)
+}
+
+func TestParseReceiverBareCallWithMultipleArguments(t *testing.T) {
+	parse(t, `Regexp.send @method, /hi/, Regexp::IGNORECASE`)
+}
+
+func TestParseBareCallArgumentStartingWithSelf(t *testing.T) {
+	parse(t, `assert_equal self, exc.receiver`)
 }
 
 func TestParseBareCallArgumentStartingWithConstant(t *testing.T) {
@@ -2264,6 +2752,30 @@ func TestParseBlockPassLambdaArgumentWithMultipleParams(t *testing.T) {
 	parse(t, `@y.s(1, &-> a, b { [a, b] })`)
 }
 
+func TestParseCallArgumentProcBlockBeforeKeywordArgument(t *testing.T) {
+	parse(t, `string = Marshal.send(@method, Marshal.dump("foo"), proc { |o| o.upcase }, freeze: true)`)
+}
+
+func TestParseCallArgumentParenthesizedCallWithBlock(t *testing.T) {
+	parse(t, `assert_equal SummablePayment.new(20), payments.sum(SummablePayment.new(0)) { |p| p }`)
+}
+
+func TestParseBangMethodCallWithParenthesizedArgsAndBlock(t *testing.T) {
+	parse(t, `hash_1.deep_merge!(hash_2) { |k, o, n| [k, o, n] }`)
+}
+
+func TestParseBlockCallAsParenthesizedCallArgumentBeforeNextStatement(t *testing.T) {
+	parse(t, `assert_equal(expected, hash_1.deep_merge(hash_2) { |k, o, n| [k, o, n] })
+
+hash_1.deep_merge!(hash_2) { |k, o, n| [k, o, n] }`)
+}
+
+func TestParseMethodCallWithNestedParenthesizedArgsAndDoBlock(t *testing.T) {
+	parse(t, `DateTime.stub(:current, DateTime.civil(2005, 2, 10, 15, 30, 45, Rational(-18000, 86400))) do
+  assert_equal true, DateTime.civil(2005, 2, 10, 15, 30, 44, Rational(-18000, 86400)).past?
+end`)
+}
+
 func TestParseMethodBodyAfterLambdaLiteral(t *testing.T) {
 	program := parse(t, `def make_value
   p = -> { 42 }
@@ -2313,6 +2825,16 @@ func TestParseAnonymousBlockForwardingParameter(t *testing.T) {
 
 func TestParseChainedCallAfterBlockPassLambdaArgument(t *testing.T) {
 	parse(t, "@y.s([], &-> *a { a }).should == [[]]\n")
+}
+
+func TestParseInfixAfterBraceBlockCall(t *testing.T) {
+	parse(t, "`id -G`.scan(/\\d+/).map {|i| i.to_i} << gid")
+	parse(t, "augmented_groups = `id -G`.scan(/\\d+/).map {|i| i.to_i} << gid")
+	parse(t, `describe "Process.initgroups" do
+  as_user do
+    augmented_groups = `+"`id -G`"+`.scan(/\d+/).map {|i| i.to_i} << gid
+  end
+end`)
 }
 
 func TestParseTernaryConsequentMethodCall(t *testing.T) {
@@ -2396,6 +2918,44 @@ func TestParseCallKeywordArgsWithTrailingComma(t *testing.T) {
 	parse(t, "specs.fooM1(rbx: 'cool', specs: :fail_sometimes, non_sym: 1234,).should == []")
 }
 
+func TestParseKeywordArgNamedIn(t *testing.T) {
+	parse(t, `Time.now(in: "W").utc_offset.should == -36000`)
+}
+
+func TestParseKeywordArgNamedPrepend(t *testing.T) {
+	parse(t, `concerning(:Foo, prepend: true) { }`)
+}
+
+func TestParseCommentWithHexEscapesAfterKeywordArgCall(t *testing.T) {
+	parse(t, `describe "when passed to, options" do
+  it "x" do
+    result = "あ?あ".send(@method, Encoding::EUC_JP, undef: :replace)
+    # testing for: "\xA4\xA2?\xA4\xA2"
+    xA4xA2 = [0xA4, 0xA2].pack('CC')
+  end
+end`)
+}
+
+func TestParseCallKeywordShorthandArgs(t *testing.T) {
+	expr := parseExpr(t, "foo(a:, b:)")
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.KeywordArgs) != 2 {
+		t.Fatalf("expected 2 keyword args, got %d", len(call.KeywordArgs))
+	}
+	for _, kw := range call.KeywordArgs {
+		ident, ok := kw.Value.(*ast.Identifier)
+		if !ok {
+			t.Fatalf("expected shorthand value for %s to be Identifier, got %T", kw.Name, kw.Value)
+		}
+		if ident.Value != kw.Name {
+			t.Fatalf("expected shorthand %s value to reference %s, got %s", kw.Name, kw.Name, ident.Value)
+		}
+	}
+}
+
 func TestParseForExpressionWithDestructuredTargets(t *testing.T) {
 	parse(t, `for i, *j, k in [[1, 2, 3]]
   i
@@ -2423,6 +2983,109 @@ func TestParseMatchOperatorMethodDefinition(t *testing.T) {
 end`)
 }
 
+func TestParseEndlessMethodDefinition(t *testing.T) {
+	parse(t, `def greet(person) = "Hi, ".dup.concat person`)
+}
+
+func TestParsePrivateEndlessMethodDefinition(t *testing.T) {
+	parse(t, `private def instance_variables_to_inspect = []`)
+}
+
+func TestParseSuperForwardArguments(t *testing.T) {
+	parse(t, `def m(...)
+  super(...)
+end`)
+}
+
+func TestParseDefReceiverOnlyForSingletonMethod(t *testing.T) {
+	regular := parseExpr(t, `def regular
+end`)
+	regularDef, ok := regular.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected DefExpression, got %T", regular)
+	}
+	if regularDef.Receiver != nil {
+		t.Fatalf("expected regular method receiver to be nil, got %T", regularDef.Receiver)
+	}
+
+	singleton := parseExpr(t, `def obj.singleton
+end`)
+	singletonDef, ok := singleton.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected DefExpression, got %T", singleton)
+	}
+	if singletonDef.Receiver == nil {
+		t.Fatal("expected singleton method receiver")
+	}
+}
+
+func TestParseParenthesizedLiteralSingletonMethodDefinition(t *testing.T) {
+	parse(t, `def (false).foo; end`)
+	parse(t, `def (true).foo; end`)
+	parse(t, `def (nil).foo; end`)
+}
+
+func TestParseSingletonMethodDefinitionWithEmptyParamsAndInlineBody(t *testing.T) {
+	parse(t, `def source_code.to_str() "1" end`)
+	parse(t, `def source_code.to_str() :symbol end`)
+	parse(t, `def lineno.to_int() 15 end`)
+	parse(t, `def lineno.to_int() :symbol end`)
+}
+
+func TestParseBareHeredocCallArgumentAssignment(t *testing.T) {
+	parse(t, `prc = instance_eval <<-CODE
+  proc do |x, prc|
+    x
+  end
+CODE
+
+prc.call`)
+}
+
+func TestParseBasicObjectInstanceEvalSpec(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/basicobject/instance_eval_spec.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse(t, string(input))
+}
+
+func TestParseBasicObjectInstanceExecSpec(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/basicobject/instance_exec_spec.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse(t, string(input))
+}
+
+func TestParseCallArgumentRegexpWithApostrophe(t *testing.T) {
+	parse(t, `-> { a.instance_eval(source_code) }.should raise_consistent_error(TypeError, /can't convert Object into String/)`)
+}
+
+func TestParsePercentBraceStringArgument(t *testing.T) {
+	parse(t, `obj.instance_eval %{
+  class B; end
+  B
+}`)
+}
+
+func TestParseGroupedBlockCallEqualityReceiver(t *testing.T) {
+	parse(t, `(s == s.instance_eval { self }).should be_true`)
+	parse(t, `(o == o.instance_eval("self")).should be_true`)
+}
+
+func TestParseGroupedRangeMethodCallInGroupedEquality(t *testing.T) {
+	parse(t, `((1..10).step == (1..11).step).should == false`)
+	parse(t, `((1..10).step == (1...10).step).should == false`)
+	parse(t, `((1..10).step == (1..10).step(2)).should == false`)
+	parse(t, `((1..10).step.hash == (1..10).step(2).hash).should == false`)
+}
+
+func TestParseEndlessRangeStepEndMethodChain(t *testing.T) {
+	parse(t, `(1..).step(1).end.should == nil`)
+	parse(t, `(1...).step(1).end.should == nil`)
+}
+
 func TestParseDefinedWithoutParentheses(t *testing.T) {
 	parse(t, `(defined? a = 10).should == "assignment"`)
 	parse(t, `(not defined? qqq).should == true`)
@@ -2436,6 +3099,84 @@ func TestParseKeywordLiteralMethodNameAfterDot(t *testing.T) {
 	}
 	if call.Method == nil || call.Method.Value != "false" {
 		t.Fatalf("expected false method name, got %#v", call.Method)
+	}
+}
+
+func TestParseForKeywordMethodNameAfterDot(t *testing.T) {
+	parse(t, `IO::Buffer.for(+"12345") do |buffer|
+  buffer.size
+end`)
+}
+
+func TestParseUntilKeywordMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `1.month.until(@now)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "until" {
+		t.Fatalf("expected until method name, got %#v", call.Method)
+	}
+}
+
+func TestParseDoKeywordMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `obj.do`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "do" {
+		t.Fatalf("expected do method name, got %#v", call.Method)
+	}
+}
+
+func TestParseInKeywordMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `@twz.in(1)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "in" {
+		t.Fatalf("expected in method name, got %#v", call.Method)
+	}
+}
+
+func TestParseLShiftOperatorMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `y.<<(1)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "<<" {
+		t.Fatalf("expected << method name, got %#v", call.Method)
+	}
+}
+
+func TestParseSelfMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `tp.self`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "self" {
+		t.Fatalf("expected self method name, got %#v", call.Method)
+	}
+}
+
+func TestParseMethodNameOnLineAfterDot(t *testing.T) {
+	parse(t, `Encoding::Converter.
+  asciicompat_encoding(Encoding.find("ISO-2022-JP")).
+  should == Encoding::Converter.asciicompat_encoding("ISO-2022-JP")`)
+}
+
+func TestParseOperatorMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `1.+(2)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "+" {
+		t.Fatalf("expected + method name, got %#v", call.Method)
 	}
 }
 
@@ -2529,6 +3270,17 @@ func TestParseMethodCallWithKeywordName(t *testing.T) {
 	if len(call.Args) != 1 {
 		t.Errorf("expected 1 arg, got %d", len(call.Args))
 	}
+}
+
+func TestParseBareIncludeWithMultipleArguments(t *testing.T) {
+	parse(t, `class B < A; include U, V, W; end`)
+	parse(t, `module V; include X, U, Y; end`)
+}
+
+func TestParseBareIncludeWithNoArguments(t *testing.T) {
+	parse(t, `Module.new do
+  include
+end`)
 }
 
 // === Prefix minus (regression test) ===

@@ -42,6 +42,8 @@ type Frame struct {
 	Closure *object.Closure
 
 	MethodName string
+	SuperStart *object.Class
+	Args       []*object.EmeraldValue
 
 	BlockBreakAddr int
 	WhileStart     int
@@ -505,11 +507,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		nameIdx := vm.readUint16()
 		name := constants[nameIdx].Data.(string)
 		value := vm.peek(0)
-		if len(vm.classStack) > 0 {
-			top := vm.classStack[len(vm.classStack)-1]
-			if top.Type == object.ValueClass && top.Data.(*object.Class).Name == name {
-				value = top
-				vm.classStack = vm.classStack[:len(vm.classStack)-1]
+		if idx, top := vm.findClassStackEntry(name); top != nil {
+			value = top
+			vm.classStack = append(vm.classStack[:idx], vm.classStack[idx+1:]...)
+			if top.Type == object.ValueClass {
 				vm.runMinitestMethods(top)
 			}
 		}
@@ -726,11 +727,42 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		if len(vm.classStack) > 0 {
 			classVal := vm.classStack[len(vm.classStack)-1]
-			cls := classVal.Data.(*object.Class)
-			cls.DefineMethod(name, method)
+			if classVal.Type == object.ValueClass {
+				cls := classVal.Data.(*object.Class)
+				cls.DefineMethod(name, method)
+			} else if classVal.Type == object.ValueModule {
+				mod := classVal.Data.(*object.Module)
+				mod.DefineMethod(name, method)
+			}
 		} else {
 			mainObj := core.R.Main.Data.(*object.Object)
 			mainObj.Class.DefineMethod(name, method)
+		}
+
+		vm.push(closureVal)
+
+	case compiler.OpDefineSingletonMethod:
+		nameIdx := vm.readUint16()
+		name := constants[nameIdx].Data.(string)
+
+		closureVal := vm.pop()
+		closure, ok := closureVal.Data.(*object.Closure)
+		if !ok {
+			return fmt.Errorf("expected closure, got %T", closureVal.Data)
+		}
+		receiver := vm.pop()
+
+		method := &object.Method{
+			Name: name,
+			Fn:   closure.Fn,
+		}
+
+		if receiver != nil && receiver.Type == object.ValueObject {
+			obj := receiver.Data.(*object.Object)
+			obj.SingletonMethods[name] = method
+		} else if receiver != nil && receiver.Type == object.ValueClass {
+			cls := receiver.Data.(*object.Class)
+			cls.DefineClassMethod(name, method)
 		}
 
 		vm.push(closureVal)
@@ -793,13 +825,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		nameIdx := vm.readUint16()
 		name := constants[nameIdx].Data.(string)
 
-		module := object.NewModule(name)
+		var module *object.Module
+		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueModule {
+			module = existing.Data.(*object.Module)
+		} else {
+			module = object.NewModule(name)
+		}
 
-		vm.push(&object.EmeraldValue{
+		moduleVal := &object.EmeraldValue{
 			Type:  object.ValueModule,
 			Data:  module,
 			Class: core.R.Classes["Module"],
-		})
+		}
+		vm.rubyConsts[name] = moduleVal
+		vm.classStack = append(vm.classStack, moduleVal)
+		vm.push(moduleVal)
 
 	case compiler.OpDup:
 		vm.push(vm.peek(0))
@@ -933,19 +973,34 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		args := make([]*object.EmeraldValue, int(numArgs))
-		for i := 0; i < int(numArgs); i++ {
-			args[int(numArgs)-1-i] = vm.pop()
+		if numArgs == 255 {
+			args = append([]*object.EmeraldValue(nil), frame.Args...)
+		} else {
+			for i := 0; i < int(numArgs); i++ {
+				args[int(numArgs)-1-i] = vm.pop()
+			}
 		}
-		vm.pop()
+		if numArgs != 255 {
+			vm.pop()
+		} else {
+			vm.pop()
+		}
 
 		self := vm.stack[frame.Bp]
-		if self.Class == nil || self.Class.SuperClass == nil {
+		if self.Class == nil {
 			vm.push(core.R.NilVal)
 			return nil
 		}
 
-		superClass := self.Class.SuperClass
-		methodObj, ok := superClass.GetMethod(frame.MethodName)
+		superClass := frame.SuperStart
+		if superClass == nil {
+			superClass = self.Class.SuperClass
+		}
+		if superClass == nil {
+			vm.push(core.R.NilVal)
+			return nil
+		}
+		methodObj, owner, ok := superClass.GetMethodWithOwner(frame.MethodName)
 		if !ok {
 			vm.push(core.R.NilVal)
 			return nil
@@ -1004,6 +1059,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				Ip:         -1,
 				Bp:         bp,
 				MethodName: frame.MethodName,
+				SuperStart: owner.SuperClass,
+				Args:       args,
 			}
 			vm.frames = append(vm.frames, newFrame)
 			vm.fp++
@@ -1122,33 +1179,36 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		if exception == nil || exception.Type != object.ValueException {
 			message := "RuntimeError"
+			exceptionClass := core.R.Classes["RuntimeError"]
 			if exception != nil {
 				if s, ok := exception.Data.(string); ok {
 					message = s
+				} else if exception.Type == object.ValueClass {
+					exceptionClass = exception.Data.(*object.Class)
+					message = exceptionClass.Name
 				}
 			}
 			exception = &object.EmeraldValue{
 				Type:  object.ValueException,
 				Data:  &object.RException{Message: message},
+				Class: exceptionClass,
+			}
+		}
+		if vm.raiseException(frame, exception) {
+			return nil
+		}
+
+	case compiler.OpReraise:
+		exception := core.LastException
+		if exception == nil {
+			exception = &object.EmeraldValue{
+				Type:  object.ValueException,
+				Data:  &object.RException{Message: "RuntimeError"},
 				Class: core.R.Classes["RuntimeError"],
 			}
 		}
-		core.LastException = exception
-
-		if len(vm.rescueStack) > 0 {
-			handler := vm.rescueStack[len(vm.rescueStack)-1]
-			if handler.Frame == frame {
-				vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
-				if handler.RescueOffset > 0 {
-					handler.Frame.Ip = handler.RescueOffset - 1
-				} else if handler.EnsureOffset > 0 {
-					handler.Frame.Ip = handler.EnsureOffset - 1
-				} else {
-					handler.Frame.Ip = handler.EndOffset - 1
-				}
-				vm.ensureActive = false
-				return nil
-			}
+		if vm.raiseException(frame, exception) {
+			return nil
 		}
 
 	case compiler.OpRescue:
@@ -1157,6 +1217,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		vm.push(core.LastException)
+
+	case compiler.OpRescueMatch:
+		count := int(vm.readUint8())
+		classes := make([]*object.EmeraldValue, count)
+		for i := count - 1; i >= 0; i-- {
+			classes[i] = vm.pop()
+		}
+		vm.push(boolValue(rescueMatches(core.LastException, classes)))
 
 	case compiler.OpCatch:
 		endOffset := vm.readUint16()
@@ -1709,27 +1777,39 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	if receiver == nil {
 		receiver = core.R.NilVal
 	}
-	if method == "__exec_class_body__" && receiver.Type == object.ValueClass && vm.currentBlock != nil {
+	if method == "__exec_class_body__" && (receiver.Type == object.ValueClass || receiver.Type == object.ValueModule) && vm.currentBlock != nil {
 		block := vm.currentBlock
 		vm.currentBlock = nil
 		return vm.callBlock(block, receiver)
 	}
 
 	var methodObj *object.Method
+	var methodOwner *object.Class
 	var ok bool
 
 	methodName := method
+
+	if receiver.Type == object.ValueObject {
+		if obj, isObject := receiver.Data.(*object.Object); isObject {
+			if m, found := obj.SingletonMethods[method]; found {
+				methodObj = m
+				methodOwner = nil
+				ok = true
+			}
+		}
+	}
 
 	if receiver.Type == object.ValueClass {
 		cls := receiver.Data.(*object.Class)
 		if m, found := cls.ClassMethods[method]; found {
 			methodObj = m
+			methodOwner = cls
 			ok = true
 		}
 	}
 
 	if !ok {
-		methodObj, ok = receiver.Class.GetMethod(method)
+		methodObj, methodOwner, ok = receiver.Class.GetMethodWithOwner(method)
 	}
 
 	if !ok {
@@ -1855,6 +1935,12 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			Ip:         -1,
 			Bp:         bp,
 			MethodName: methodName,
+			Args:       args,
+		}
+		if methodOwner == nil {
+			newFrame.SuperStart = receiver.Class
+		} else {
+			newFrame.SuperStart = methodOwner.SuperClass
 		}
 		vm.frames = append(vm.frames, newFrame)
 		vm.fp++
@@ -1920,9 +2006,99 @@ func (vm *VM) runMinitestMethods(classVal *object.EmeraldValue) {
 	}
 }
 
+func (vm *VM) findClassStackEntry(name string) (int, *object.EmeraldValue) {
+	for i := len(vm.classStack) - 1; i >= 0; i-- {
+		entry := vm.classStack[i]
+		switch entry.Type {
+		case object.ValueClass:
+			if entry.Data.(*object.Class).Name == name {
+				return i, entry
+			}
+		case object.ValueModule:
+			if entry.Data.(*object.Module).Name == name {
+				return i, entry
+			}
+		}
+	}
+	return -1, nil
+}
+
 func inheritsFrom(cls *object.Class, name string) bool {
 	for current := cls; current != nil; current = current.SuperClass {
 		if current.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool {
+	core.LastException = exception
+	if len(vm.rescueStack) == 0 {
+		return false
+	}
+	handler := vm.rescueStack[len(vm.rescueStack)-1]
+	if handler.Frame != frame {
+		return false
+	}
+	vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
+	if handler.RescueOffset > 0 {
+		handler.Frame.Ip = handler.RescueOffset - 1
+	} else if handler.EnsureOffset > 0 {
+		handler.Frame.Ip = handler.EnsureOffset - 1
+	} else {
+		handler.Frame.Ip = handler.EndOffset - 1
+	}
+	vm.ensureActive = false
+	return true
+}
+
+func boolValue(value bool) *object.EmeraldValue {
+	if value {
+		return core.R.TrueVal
+	}
+	return core.R.FalseVal
+}
+
+func rescueMatches(exception *object.EmeraldValue, classes []*object.EmeraldValue) bool {
+	if exception == nil || exception.Class == nil {
+		return false
+	}
+	if len(classes) == 0 {
+		return classInheritsFrom(exception.Class, core.R.Classes["StandardError"])
+	}
+	for _, classVal := range classes {
+		if rescueClassMatches(exception.Class, classVal) {
+			return true
+		}
+	}
+	return false
+}
+
+func rescueClassMatches(exceptionClass *object.Class, classVal *object.EmeraldValue) bool {
+	if classVal == nil {
+		return false
+	}
+	if classVal.Type == object.ValueArray {
+		for _, elem := range classVal.Data.([]*object.EmeraldValue) {
+			if rescueClassMatches(exceptionClass, elem) {
+				return true
+			}
+		}
+		return false
+	}
+	if classVal.Type != object.ValueClass {
+		return false
+	}
+	return classInheritsFrom(exceptionClass, classVal.Data.(*object.Class))
+}
+
+func classInheritsFrom(cls, target *object.Class) bool {
+	if cls == nil || target == nil {
+		return false
+	}
+	for current := cls; current != nil; current = current.SuperClass {
+		if current == target || current.Name == target.Name {
 			return true
 		}
 	}

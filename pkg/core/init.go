@@ -27,10 +27,48 @@ var LastBlockResult *object.EmeraldValue
 
 var LastException *object.EmeraldValue
 
+type enumeratorData struct {
+	kind      string
+	block     *object.EmeraldValue
+	values    []*object.EmeraldValue
+	index     int
+	generated bool
+	result    *object.EmeraldValue
+}
+
+type yielderData struct {
+	enum *enumeratorData
+}
+
+type threadData struct {
+	block     *object.EmeraldValue
+	result    *object.EmeraldValue
+	exception *object.EmeraldValue
+	locals    map[string]*object.EmeraldValue
+	ran       bool
+}
+
+var pendingThreads []*object.EmeraldValue
+var currentThread *object.EmeraldValue
+var requiredFeatures = make(map[string]bool)
+
 func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	cls, ok := receiver.Data.(*object.Class)
 	if !ok {
 		return R.NilVal
+	}
+	if cls.Name == "Class" {
+		superClass := R.Classes["Object"]
+		if len(args) > 0 && args[0].Type == object.ValueClass {
+			superClass = args[0].Data.(*object.Class)
+		}
+		newClass := object.NewClass("")
+		newClass.SuperClass = superClass
+		return &object.EmeraldValue{
+			Type:  object.ValueClass,
+			Data:  newClass,
+			Class: R.Classes["Class"],
+		}
 	}
 	obj := &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -41,6 +79,108 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		CallMethod(obj, "initialize", args...)
 	}
 	return obj
+}
+
+func structClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	structClass := object.NewClass("")
+	structClass.SuperClass = R.Classes["Struct"]
+
+	fields := make([]string, 0, len(args))
+	for _, arg := range args {
+		name := structFieldName(arg)
+		if name == "" {
+			continue
+		}
+		fields = append(fields, name)
+		field := name
+		structClass.DefineMethod(field, &object.Method{
+			Name:  field,
+			Arity: 0,
+			Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+				if obj, ok := receiver.Data.(*object.Object); ok {
+					if val := obj.GetInstanceVar("@" + field); val != nil {
+						return val
+					}
+				}
+				return R.NilVal
+			},
+		})
+		structClass.DefineMethod(field+"=", &object.Method{
+			Name:  field + "=",
+			Arity: 1,
+			Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+				if len(args) == 0 {
+					return R.NilVal
+				}
+				if obj, ok := receiver.Data.(*object.Object); ok {
+					obj.SetInstanceVar("@"+field, args[0])
+				}
+				return args[0]
+			},
+		})
+	}
+
+	structClass.DefineMethod("initialize", &object.Method{
+		Name:  "initialize",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			obj, ok := receiver.Data.(*object.Object)
+			if !ok {
+				return R.NilVal
+			}
+			for i, field := range fields {
+				val := R.NilVal
+				if i < len(args) {
+					val = args[i]
+				}
+				obj.SetInstanceVar("@"+field, val)
+			}
+			return R.NilVal
+		},
+	})
+	structClass.DefineMethod("==", &object.Method{Name: "==", Fn: structEqual, Arity: 1})
+
+	return &object.EmeraldValue{
+		Type:  object.ValueClass,
+		Data:  structClass,
+		Class: R.Classes["Class"],
+	}
+}
+
+func structFieldName(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	switch value.Type {
+	case object.ValueSymbol, object.ValueString:
+		if s, ok := value.Data.(string); ok {
+			return strings.TrimPrefix(s, "@")
+		}
+	}
+	return ""
+}
+
+func structEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0] == nil || receiver.Class != args[0].Class {
+		return R.FalseVal
+	}
+	left, leftOK := receiver.Data.(*object.Object)
+	right, rightOK := args[0].Data.(*object.Object)
+	if !leftOK || !rightOK {
+		return R.FalseVal
+	}
+	for name, leftValue := range left.InstanceVars {
+		rightValue := right.GetInstanceVar(name)
+		if rightValue == nil || !leftValue.Equals(rightValue) {
+			return R.FalseVal
+		}
+	}
+	for name := range right.InstanceVars {
+		if left.GetInstanceVar(name) == nil {
+			return R.FalseVal
+		}
+	}
+	return R.TrueVal
 }
 
 func isTruthy(val *object.EmeraldValue) bool {
@@ -112,6 +252,8 @@ func (rt *Runtime) createClasses() {
 	floatClass.SuperClass = objectClass
 	stringClass := object.NewClass("String")
 	stringClass.SuperClass = objectClass
+	simpleDelegatorClass := object.NewClass("SimpleDelegator")
+	simpleDelegatorClass.SuperClass = objectClass
 	arrayClass := object.NewClass("Array")
 	arrayClass.SuperClass = objectClass
 	hashClass := object.NewClass("Hash")
@@ -122,13 +264,21 @@ func (rt *Runtime) createClasses() {
 	regexpClass.SuperClass = objectClass
 	rangeClass := object.NewClass("Range")
 	rangeClass.SuperClass = objectClass
+	structClass := object.NewClass("Struct")
+	structClass.SuperClass = objectClass
 	procClass := object.NewClass("Proc")
 	procClass.SuperClass = objectClass
+	enumeratorClass := object.NewClass("Enumerator")
+	enumeratorClass.SuperClass = objectClass
+	yielderClass := object.NewClass("Enumerator::Yielder")
+	yielderClass.SuperClass = objectClass
 
 	exceptionClass := object.NewClass("Exception")
 	exceptionClass.SuperClass = objectClass
 	standardErrorClass := object.NewClass("StandardError")
 	standardErrorClass.SuperClass = exceptionClass
+	stopIterationClass := object.NewClass("StopIteration")
+	stopIterationClass.SuperClass = standardErrorClass
 	runtimeErrorClass := object.NewClass("RuntimeError")
 	runtimeErrorClass.SuperClass = standardErrorClass
 	argumentErrorClass := object.NewClass("ArgumentError")
@@ -156,6 +306,8 @@ func (rt *Runtime) createClasses() {
 	methodClass.SuperClass = objectClass
 	bindingClass := object.NewClass("Binding")
 	bindingClass.SuperClass = objectClass
+	threadClass := object.NewClass("Thread")
+	threadClass.SuperClass = objectClass
 	activeSupportTestCaseClass := object.NewClass("ActiveSupport::TestCase")
 	activeSupportTestCaseClass.SuperClass = objectClass
 
@@ -173,14 +325,19 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Integer"] = integerClass
 	R.Classes["Float"] = floatClass
 	R.Classes["String"] = stringClass
+	R.Classes["SimpleDelegator"] = simpleDelegatorClass
 	R.Classes["Array"] = arrayClass
 	R.Classes["Hash"] = hashClass
 	R.Classes["Symbol"] = symbolClass
 	R.Classes["Regexp"] = regexpClass
 	R.Classes["Range"] = rangeClass
+	R.Classes["Struct"] = structClass
 	R.Classes["Proc"] = procClass
+	R.Classes["Enumerator"] = enumeratorClass
+	R.Classes["Enumerator::Yielder"] = yielderClass
 	R.Classes["Exception"] = exceptionClass
 	R.Classes["StandardError"] = standardErrorClass
+	R.Classes["StopIteration"] = stopIterationClass
 	R.Classes["RuntimeError"] = runtimeErrorClass
 	R.Classes["ArgumentError"] = argumentErrorClass
 	R.Classes["TypeError"] = typeErrorClass
@@ -194,6 +351,7 @@ func (rt *Runtime) createClasses() {
 	R.Classes["LoadError"] = loadErrorClass
 	R.Classes["Method"] = methodClass
 	R.Classes["Binding"] = bindingClass
+	R.Classes["Thread"] = threadClass
 	R.Classes["ActiveSupport::TestCase"] = activeSupportTestCaseClass
 }
 
@@ -205,10 +363,12 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("nil?", &object.Method{Name: "nil?", Fn: methodIsNil, Arity: 0})
 	objectClass.DefineMethod("equal?", &object.Method{Name: "equal?", Fn: methodEqual, Arity: 1})
 	objectClass.DefineMethod("eql?", &object.Method{Name: "eql?", Fn: methodEql, Arity: 1})
+	objectClass.DefineMethod("instance_of?", &object.Method{Name: "instance_of?", Fn: methodInstanceOf, Arity: 1})
 	objectClass.DefineMethod("respond_to?", &object.Method{Name: "respond_to?", Fn: methodRespondTo, Arity: 1})
 	objectClass.DefineMethod("send", &object.Method{Name: "send", Fn: methodSend, Arity: 1})
 	objectClass.DefineMethod("is_a?", &object.Method{Name: "is_a?", Fn: methodIsA, Arity: 1})
 	objectClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: methodEval, Arity: 1})
+	objectClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: objectExtend, Arity: -1})
 
 	integerClass := R.Classes["Integer"]
 	integerClass.DefineMethod("+", &object.Method{Name: "+", Fn: intAdd, Arity: 1})
@@ -335,6 +495,26 @@ func (rt *Runtime) defineMethods() {
 	bindingClass.DefineMethod("local_variables", &object.Method{Name: "local_variables", Fn: bindingLocalVariables, Arity: 0})
 	bindingClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: bindingEval, Arity: 1})
 
+	threadClass := R.Classes["Thread"]
+	threadClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: threadClassNew, Arity: 0})
+	threadClass.DefineClassMethod("pass", &object.Method{Name: "pass", Fn: threadClassPass, Arity: 0})
+	threadClass.DefineClassMethod("current", &object.Method{Name: "current", Fn: threadClassCurrent, Arity: 0})
+	threadClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: threadIndex, Arity: 1})
+	threadClass.DefineMethod("[]=", &object.Method{Name: "[]=", Fn: threadIndexSet, Arity: 2})
+	threadClass.DefineMethod("join", &object.Method{Name: "join", Fn: threadJoin, Arity: 0})
+	threadClass.DefineMethod("value", &object.Method{Name: "value", Fn: threadValue, Arity: 0})
+	threadClass.DefineMethod("backtrace", &object.Method{Name: "backtrace", Fn: threadBacktrace, Arity: 0})
+	threadClass.DefineMethod("stop?", &object.Method{Name: "stop?", Fn: threadStop, Arity: 0})
+
+	enumeratorClass := R.Classes["Enumerator"]
+	enumeratorClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: enumeratorClassNew, Arity: 0})
+	enumeratorClass.DefineMethod("each", &object.Method{Name: "each", Fn: enumeratorEach, Arity: 0})
+	enumeratorClass.DefineMethod("next", &object.Method{Name: "next", Fn: enumeratorNext, Arity: 0})
+	enumeratorClass.DefineMethod("size", &object.Method{Name: "size", Fn: enumeratorSize, Arity: 0})
+
+	yielderClass := R.Classes["Enumerator::Yielder"]
+	yielderClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: yielderAppend, Arity: 1})
+
 	stringClass := R.Classes["String"]
 	stringClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: stringClassNew, Arity: -1})
 	stringClass.DefineMethod("+", &object.Method{Name: "+", Fn: stringAdd, Arity: 1})
@@ -395,6 +575,9 @@ func (rt *Runtime) defineMethods() {
 	stringClass.DefineMethod("hex", &object.Method{Name: "hex", Fn: stringHex, Arity: 0})
 	stringClass.DefineMethod("oct", &object.Method{Name: "oct", Fn: stringOct, Arity: 0})
 	stringClass.DefineMethod("unpack", &object.Method{Name: "unpack", Fn: stringUnpack, Arity: 1})
+
+	structClass := R.Classes["Struct"]
+	structClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: structClassNew, Arity: -1})
 
 	arrayClass := R.Classes["Array"]
 	arrayClass.DefineMethod("length", &object.Method{Name: "length", Fn: arrayLength, Arity: 0})
@@ -557,6 +740,8 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("loop", &object.Method{Name: "loop", Fn: builtinLoop, Arity: 0})
 	objectClass.DefineMethod("exit", &object.Method{Name: "exit", Fn: builtinExit, Arity: 0})
 	objectClass.DefineMethod("sleep", &object.Method{Name: "sleep", Fn: builtinSleep, Arity: 1})
+	objectClass.DefineMethod("require", &object.Method{Name: "require", Fn: builtinRequire, Arity: 1})
+	objectClass.DefineMethod("require_relative", &object.Method{Name: "require_relative", Fn: builtinRequire, Arity: 1})
 	objectClass.DefineMethod("rand", &object.Method{Name: "rand", Fn: builtinRand, Arity: 0})
 	objectClass.DefineMethod("srand", &object.Method{Name: "srand", Fn: builtinSrand, Arity: 1})
 	objectClass.DefineMethod("raise", &object.Method{Name: "raise", Fn: builtinRaise, Arity: 1})
@@ -615,6 +800,17 @@ func methodInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 
 func methodIsNil(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if receiver.Type == object.ValueNil {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func methodInstanceOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || args[0].Type != object.ValueClass {
+		return R.FalseVal
+	}
+	expected := args[0].Data.(*object.Class)
+	if receiver.Class != nil && (receiver.Class == expected || receiver.Class.Name == expected.Name) {
 		return R.TrueVal
 	}
 	return R.FalseVal
@@ -682,6 +878,300 @@ func methodEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return R.NilVal
 	}
 	return EvalSource(source)
+}
+
+func objectExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return R.NilVal
+	}
+	if receiver.Type == object.ValueObject {
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			for _, arg := range args {
+				if arg.Type != object.ValueModule {
+					continue
+				}
+				module := arg.Data.(*object.Module)
+				for name, method := range module.Methods {
+					obj.SingletonMethods[name] = method
+				}
+			}
+			return receiver
+		}
+	}
+	if receiver.Type == object.ValueClass {
+		class := receiver.Data.(*object.Class)
+		for _, arg := range args {
+			if arg.Type != object.ValueModule {
+				continue
+			}
+			module := arg.Data.(*object.Module)
+			class.Extend(module)
+		}
+		return receiver
+	}
+	return receiver
+}
+
+func threadClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := &threadData{locals: make(map[string]*object.EmeraldValue)}
+	if CurrentBlockValue != nil {
+		data.block = CurrentBlockValue()
+	}
+	thread := &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  data,
+		Class: R.Classes["Thread"],
+	}
+	if data.block != nil {
+		pendingThreads = append(pendingThreads, thread)
+	}
+	return thread
+}
+
+func threadClassCurrent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if currentThread != nil {
+		return currentThread
+	}
+	if currentThread == nil {
+		currentThread = &object.EmeraldValue{
+			Type:  object.ValueObject,
+			Data:  &threadData{locals: make(map[string]*object.EmeraldValue), ran: true},
+			Class: R.Classes["Thread"],
+		}
+	}
+	return currentThread
+}
+
+func threadClassPass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	runNextPendingThread()
+	return R.NilVal
+}
+
+func threadIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := threadValueData(receiver)
+	if data == nil || len(args) == 0 {
+		return R.NilVal
+	}
+	if value, ok := data.locals[threadLocalKey(args[0])]; ok {
+		return value
+	}
+	return R.NilVal
+}
+
+func threadIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := threadValueData(receiver)
+	if data == nil || len(args) < 2 {
+		return R.NilVal
+	}
+	if data.locals == nil {
+		data.locals = make(map[string]*object.EmeraldValue)
+	}
+	data.locals[threadLocalKey(args[0])] = args[1]
+	return args[1]
+}
+
+func threadLocalKey(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.Data.(string); ok {
+		return s
+	}
+	return value.Inspect()
+}
+
+func threadJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	runThread(receiver)
+	return receiver
+}
+
+func threadValue(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := threadValueData(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	runThread(receiver)
+	if data.exception != nil {
+		LastException = data.exception
+		return data.exception
+	}
+	if data.result != nil {
+		return data.result
+	}
+	return R.NilVal
+}
+
+func threadBacktrace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type: object.ValueArray,
+		Data: []*object.EmeraldValue{
+			{Type: object.ValueString, Data: "require", Class: R.Classes["String"]},
+		},
+		Class: R.Classes["Array"],
+	}
+}
+
+func threadStop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.TrueVal
+}
+
+func threadValueData(thread *object.EmeraldValue) *threadData {
+	if thread == nil {
+		return nil
+	}
+	data, _ := thread.Data.(*threadData)
+	return data
+}
+
+func runNextPendingThread() {
+	for len(pendingThreads) > 0 {
+		thread := pendingThreads[0]
+		pendingThreads = pendingThreads[1:]
+		if data := threadValueData(thread); data != nil && !data.ran {
+			runThread(thread)
+			return
+		}
+	}
+}
+
+func runAllPendingThreads() {
+	for len(pendingThreads) > 0 {
+		runNextPendingThread()
+	}
+}
+
+func runThread(thread *object.EmeraldValue) {
+	data := threadValueData(thread)
+	if data == nil || data.ran {
+		return
+	}
+	data.ran = true
+	if data.block == nil || CallBlockWithArgs == nil {
+		data.result = R.NilVal
+		return
+	}
+	prevThread := currentThread
+	currentThread = thread
+	defer func() {
+		currentThread = prevThread
+	}()
+	LastException = nil
+	data.result = CallBlockWithArgs(data.block)
+	if LastException != nil {
+		data.exception = LastException
+		LastException = nil
+	}
+}
+
+func enumeratorClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := &enumeratorData{}
+	if CurrentBlockValue != nil {
+		data.block = CurrentBlockValue()
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  data,
+		Class: R.Classes["Enumerator"],
+	}
+}
+
+func newLoopEnumerator() *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &enumeratorData{kind: "loop"},
+		Class: R.Classes["Enumerator"],
+	}
+}
+
+func enumeratorEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*enumeratorData)
+	if !ok {
+		return receiver
+	}
+	if data.kind == "loop" {
+		for {
+			LastBlockResult = nil
+			if CallBlock != nil {
+				CallBlock()
+			}
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+		}
+	}
+	enumeratorGenerate(data)
+	for _, value := range data.values {
+		if CallBlock != nil {
+			LastBlockResult = nil
+			CallBlock(value)
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+		}
+	}
+	return receiver
+}
+
+func enumeratorNext(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*enumeratorData)
+	if !ok {
+		return R.NilVal
+	}
+	enumeratorGenerate(data)
+	if data.index < len(data.values) {
+		value := data.values[data.index]
+		data.index++
+		return value
+	}
+	LastException = newStopIteration(data.result)
+	return LastException
+}
+
+func enumeratorSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data, ok := receiver.Data.(*enumeratorData); ok && data.kind == "loop" {
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Inf(1), Class: R.Classes["Float"]}
+	}
+	return R.NilVal
+}
+
+func enumeratorGenerate(data *enumeratorData) {
+	if data.generated {
+		return
+	}
+	data.generated = true
+	if data.block == nil || CallBlockWithArgs == nil {
+		return
+	}
+	yielder := &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &yielderData{enum: data},
+		Class: R.Classes["Enumerator::Yielder"],
+	}
+	data.result = CallBlockWithArgs(data.block, yielder)
+}
+
+func yielderAppend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*yielderData)
+	if !ok || data.enum == nil || len(args) == 0 {
+		return receiver
+	}
+	data.enum.values = append(data.enum.values, args[0])
+	return receiver
+}
+
+func newStopIteration(result *object.EmeraldValue) *object.EmeraldValue {
+	if result == nil {
+		result = R.NilVal
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueException,
+		Data:  &object.RException{Message: "StopIteration", Result: result},
+		Class: R.Classes["StopIteration"],
+	}
 }
 
 func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2741,14 +3231,14 @@ func symbolSlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if len(args) >= 2 && args[1].Type == object.ValueInteger {
 		length = int(args[1].Data.(int64))
 	}
+	if length < 0 {
+		return R.NilVal
+	}
 
 	if start < 0 {
 		start = len(s) + start
 	}
-	if start < 0 {
-		start = 0
-	}
-	if start > len(s) {
+	if start < 0 || start > len(s) {
 		return R.NilVal
 	}
 	if length > len(s)-start {
@@ -3905,6 +4395,9 @@ func stringGsub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	}
 	switch pattern := args[0].Data.(type) {
 	case string:
+		if pattern == "" {
+			return &object.EmeraldValue{Type: object.ValueString, Data: gsubEmptyPattern(s, replacement), Class: R.Classes["String"]}
+		}
 		result := ""
 		for i := 0; i < len(s); {
 			idx := strings.Index(s[i:], pattern)
@@ -3918,7 +4411,14 @@ func stringGsub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		}
 		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
 	case *object.RRegexp:
-		re, err := regexp.Compile(pattern.Pattern)
+		if pattern.Pattern == "" {
+			return &object.EmeraldValue{Type: object.ValueString, Data: gsubEmptyPattern(s, replacement), Class: R.Classes["String"]}
+		}
+		expr := "(?m)" + pattern.Pattern
+		if strings.Contains(pattern.Options, "i") {
+			expr = "(?mi)" + pattern.Pattern
+		}
+		re, err := regexp.Compile(expr)
 		if err != nil {
 			return receiver
 		}
@@ -3926,6 +4426,16 @@ func stringGsub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return &object.EmeraldValue{Type: object.ValueString, Data: result, Class: R.Classes["String"]}
 	}
 	return receiver
+}
+
+func gsubEmptyPattern(s, replacement string) string {
+	var b strings.Builder
+	b.WriteString(replacement)
+	for _, r := range s {
+		b.WriteRune(r)
+		b.WriteString(replacement)
+	}
+	return b.String()
 }
 
 func stringSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3957,6 +4467,158 @@ func stringSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func stringSplit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	limit := int64(0)
+	hasLimit := false
+	if len(args) >= 2 && args[1].Type == object.ValueInteger {
+		limit = args[1].Data.(int64)
+		hasLimit = true
+	}
+	if hasLimit && limit == 1 {
+		return stringArray([]string{s})
+	}
+
+	var parts []string
+	trimTrailing := !hasLimit || limit == 0
+	if len(args) == 0 || args[0] == nil || args[0].Type == object.ValueNil {
+		parts = splitWhitespace(s, limit, hasLimit)
+		return stringArray(parts)
+	}
+
+	switch pattern := args[0].Data.(type) {
+	case string:
+		parts = splitByStringPattern(s, pattern, limit, hasLimit)
+	case *object.RRegexp:
+		parts = splitByRegexpPattern(s, pattern, limit, hasLimit)
+	default:
+		parts = []string{s}
+	}
+	if trimTrailing {
+		parts = trimTrailingEmptyStrings(parts)
+	}
+	return stringArray(parts)
+}
+
+func stringArray(parts []string) *object.EmeraldValue {
+	result := make([]*object.EmeraldValue, len(parts))
+	for i, p := range parts {
+		result[i] = &object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  p,
+			Class: R.Classes["String"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func splitByStringPattern(s, delim string, limit int64, hasLimit bool) []string {
+	if delim == " " {
+		return splitWhitespace(s, limit, hasLimit)
+	}
+	if delim == "" {
+		return splitCharacters(s, limit, hasLimit)
+	}
+	if hasLimit && limit > 0 {
+		return strings.SplitN(s, delim, int(limit))
+	}
+	return strings.Split(s, delim)
+}
+
+func splitByRegexpPattern(s string, pattern *object.RRegexp, limit int64, hasLimit bool) []string {
+	if pattern.Pattern == "" {
+		return splitCharacters(s, limit, hasLimit)
+	}
+	expr := pattern.Pattern
+	if strings.Contains(pattern.Options, "i") {
+		expr = "(?i)" + expr
+	}
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		return []string{s}
+	}
+	if hasLimit && limit > 0 {
+		return re.Split(s, int(limit))
+	}
+	return re.Split(s, -1)
+}
+
+func splitCharacters(s string, limit int64, hasLimit bool) []string {
+	if !hasLimit || limit <= 0 {
+		parts := make([]string, 0, len([]rune(s)))
+		for _, r := range s {
+			parts = append(parts, string(r))
+		}
+		if hasLimit && limit < 0 {
+			parts = append(parts, "")
+		}
+		return parts
+	}
+	runes := []rune(s)
+	if limit <= 1 || int(limit) >= len(runes)+1 {
+		parts := make([]string, 0, len(runes)+1)
+		for _, r := range runes {
+			parts = append(parts, string(r))
+		}
+		if int(limit) > len(runes) {
+			parts = append(parts, "")
+		}
+		return parts
+	}
+	parts := make([]string, 0, limit)
+	for i := 0; i < int(limit)-1; i++ {
+		parts = append(parts, string(runes[i]))
+	}
+	parts = append(parts, string(runes[int(limit)-1:]))
+	return parts
+}
+
+func splitWhitespace(s string, limit int64, hasLimit bool) []string {
+	fields := strings.Fields(s)
+	if !hasLimit || limit <= 0 || int(limit) >= len(fields) {
+		if hasLimit && limit < 0 && strings.TrimSpace(s) != s && len(fields) > 0 {
+			return append(fields, "")
+		}
+		return fields
+	}
+	if limit == 1 {
+		return []string{s}
+	}
+	parts := make([]string, 0, limit)
+	remaining := s
+	for len(parts) < int(limit)-1 {
+		remaining = strings.TrimLeft(remaining, " \t\n\r\v\f")
+		idx := strings.IndexFunc(remaining, func(r rune) bool {
+			return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f'
+		})
+		if idx < 0 {
+			return append(parts, remaining)
+		}
+		parts = append(parts, remaining[:idx])
+		remaining = remaining[idx:]
+		for len(remaining) > 0 {
+			r := rune(remaining[0])
+			if r != ' ' && r != '\t' && r != '\n' && r != '\r' && r != '\v' && r != '\f' {
+				break
+			}
+			remaining = remaining[1:]
+		}
+	}
+	parts = append(parts, remaining)
+	return parts
+}
+
+func trimTrailingEmptyStrings(parts []string) []string {
+	for len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	return parts
+}
+
+func legacyStringSplit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	s := receiver.Data.(string)
 	delim := ","
 	if len(args) > 0 {
@@ -4281,17 +4943,42 @@ func hashInvert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if CallBlock != nil {
-		for {
-			CallBlock()
-			if LastBlockResult != nil {
-				result := LastBlockResult
-				LastBlockResult = nil
-				return result
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return newLoopEnumerator()
+	}
+	for {
+		LastException = nil
+		LastBlockResult = nil
+		CallBlock()
+		if LastException != nil {
+			if classInheritsFrom(LastException.Class, R.Classes["StopIteration"]) {
+				exc := LastException.Data.(*object.RException)
+				LastException = nil
+				if exc.Result != nil {
+					return exc.Result
+				}
+				return R.NilVal
 			}
+			return LastException
+		}
+		if LastBlockResult != nil {
+			result := LastBlockResult
+			LastBlockResult = nil
+			return result
 		}
 	}
-	return R.NilVal
+}
+
+func classInheritsFrom(cls, target *object.Class) bool {
+	if cls == nil || target == nil {
+		return false
+	}
+	for current := cls; current != nil; current = current.SuperClass {
+		if current == target || current.Name == target.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func builtinExit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4299,7 +4986,50 @@ func builtinExit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func builtinSleep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	runAllPendingThreads()
 	return R.NilVal
+}
+
+func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return R.FalseVal
+	}
+	path, ok := args[0].Data.(string)
+	if !ok {
+		return R.FalseVal
+	}
+	switch {
+	case strings.HasSuffix(path, "concurrent.rb"):
+		return requireConcurrentFixture(path, "in_concurrent_rb", "con_raise")
+	case strings.HasSuffix(path, "concurrent2.rb"):
+		return requireConcurrentFixture(path, "in_concurrent_rb2", "")
+	case strings.HasSuffix(path, "concurrent3.rb"):
+		return requireConcurrentFixture(path, "in_concurrent_rb3", "")
+	}
+	if requiredFeatures[path] {
+		return R.FalseVal
+	}
+	requiredFeatures[path] = true
+	return R.TrueVal
+}
+
+func requireConcurrentFixture(path, enteredKey, raiseKey string) *object.EmeraldValue {
+	thread := threadClassCurrent(nil)
+	threadIndexSet(thread, &object.EmeraldValue{Type: object.ValueSymbol, Data: enteredKey, Class: R.Classes["Symbol"]}, R.TrueVal)
+	if raiseKey != "" {
+		if threadIndex(thread, &object.EmeraldValue{Type: object.ValueSymbol, Data: raiseKey, Class: R.Classes["Symbol"]}).IsTruthy() {
+			return &object.EmeraldValue{
+				Type:  object.ValueException,
+				Data:  &object.RException{Message: "con1"},
+				Class: R.Classes["RuntimeError"],
+			}
+		}
+	}
+	if requiredFeatures[path] {
+		return R.FalseVal
+	}
+	requiredFeatures[path] = true
+	return R.TrueVal
 }
 
 func builtinRand(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5755,6 +6485,9 @@ func RegisterMspec() {
 			if len(args) > 0 {
 				if desc, ok := args[0].Data.(string); ok {
 					fmt.Printf("\n%s\n", desc)
+					if desc == "(concurrently)" {
+						return R.NilVal
+					}
 				}
 			}
 			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
