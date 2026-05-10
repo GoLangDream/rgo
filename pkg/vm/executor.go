@@ -1462,6 +1462,16 @@ func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
 	case int64:
 		switch r := right.Data.(type) {
 		case int64:
+			if l == 1 || l == -1 {
+				result := int64(1)
+				if l == -1 && r%2 != 0 {
+					result = -1
+				}
+				if r < 0 {
+					return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(result), Class: core.R.Classes["Float"]}
+				}
+				return &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: core.R.Classes["Integer"]}
+			}
 			if r < 0 {
 				return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / vm.powInt(l, -int(r)), Class: core.R.Classes["Float"]}
 			}

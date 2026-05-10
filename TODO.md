@@ -203,6 +203,17 @@
 - [ ] 剩余 String blockers
   - zero_examples：`chilled_string_spec.rb` 当前全部 examples 位于 Ruby 3.4 chilled string guard 下，未执行。
 
+### Integer spec gate（2026-05-11）
+
+- [x] `vendor/ruby/spec/core/integer/exponent_spec.rb` timeout 已解除
+  - 已为 `(-1) ** huge_integer` / `(-1).send(:**, huge_integer)` 增加快速路径，避免按指数绝对值循环。
+  - 已验证：`exponent_spec.rb` 21 examples / 0 failures。
+- [x] `vendor/ruby/spec/core/integer/div_spec.rb` parse_error 已解除
+  - 已支持括号参数内部的 grouped prefix receiver chain，例如 `@bignum.div((-bignum_value(88)).to_f)`。
+  - 已避免把外层 `.should` / `.first` 链误归入单个参数。
+  - 已验证：`div_spec.rb` 18 examples / 0 failures。
+- [x] 最新 Integer dashboard：68 pass, 0 parse_error, 0 runtime_error, 0 timeout out of 68 files（2026-05-11 refreshed）。
+
 ### Codex/Go test OOM（2026-05-04）
 
 - [ ] Codex 会话运行测试时触发系统 OOM killer

@@ -3081,6 +3081,12 @@ func TestParseGroupedRangeMethodCallInGroupedEquality(t *testing.T) {
 	parse(t, `((1..10).step.hash == (1..10).step(2).hash).should == false`)
 }
 
+func TestParseGroupedPrefixCallReceiverChainAsArgument(t *testing.T) {
+	parse(t, `@bignum.div((-bignum_value(88)).to_f).should eql(-1)`)
+	parse(t, `(-(10**50)).div(-(10**40 + 1)).should == 9999999999`)
+	parse(t, `@bignum.div(-(@bignum+1)).should == (@bignum / -(@bignum+1)).floor`)
+}
+
 func TestParseEndlessRangeStepEndMethodChain(t *testing.T) {
 	parse(t, `(1..).step(1).end.should == nil`)
 	parse(t, `(1...).step(1).end.should == nil`)

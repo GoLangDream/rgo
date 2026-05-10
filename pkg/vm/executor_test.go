@@ -233,6 +233,14 @@ func TestIntegerPower(t *testing.T) {
 	assertIntResult(t, result, 1024)
 }
 
+func TestIntegerPowerNegativeOneHugeExponentFastPath(t *testing.T) {
+	result, _ := runRuby(t, "(-1) ** 4611686018427387904")
+	assertIntResult(t, result, 1)
+
+	result, _ = runRuby(t, "(-1).send(:**, 4611686018427387905)")
+	assertIntResult(t, result, -1)
+}
+
 func TestIntegerLeftShift(t *testing.T) {
 	result, _ := runRuby(t, "2 << 3")
 	assertIntResult(t, result, 16)

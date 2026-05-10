@@ -1276,6 +1276,16 @@ func intPow(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 	lf := valueToInt64(receiver)
 	switch r := args[0].Data.(type) {
 	case int64:
+		if lf == 1 || lf == -1 {
+			result := int64(1)
+			if lf == -1 && r%2 != 0 {
+				result = -1
+			}
+			if r < 0 {
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(result), Class: R.Classes["Float"]}
+			}
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: R.Classes["Integer"]}
+		}
 		if r < 0 {
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / powInt(lf, -int(r)), Class: R.Classes["Float"]}
 		}

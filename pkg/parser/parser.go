@@ -1855,6 +1855,7 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 			if p.curTokenIs(lexer.RBRACE) && p.peekTokenIs(lexer.RPAREN) {
 				p.nextToken()
 			}
+			p.parseSingleArgumentDotChain(call)
 			if !p.curTokenIs(lexer.RPAREN) {
 				p.skipPeekNewlines()
 			}
@@ -1970,6 +1971,7 @@ func (p *Parser) parseCallExpression(fn ast.Expression) ast.Expression {
 				p.parseOneCallArgStoppingAtRParen(call)
 			}
 
+			p.parseSingleArgumentDotChain(call)
 			if !p.curTokenIs(lexer.RPAREN) {
 				p.skipPeekNewlines()
 			}
@@ -1977,15 +1979,6 @@ func (p *Parser) parseCallExpression(fn ast.Expression) ast.Expression {
 				return nil
 			}
 		}
-	}
-
-	if p.peekTokenIs(lexer.DOT) && len(call.Args) == 1 {
-		arg := call.Args[0]
-		for p.peekTokenIs(lexer.DOT) {
-			p.nextToken()
-			arg = p.parseMethodCall(arg)
-		}
-		call.Args[0] = arg
 	}
 
 	if p.peekTokenIs(lexer.LBRACE) {
@@ -2003,6 +1996,83 @@ func (p *Parser) parseCallExpression(fn ast.Expression) ast.Expression {
 	}
 
 	return call
+}
+
+func (p *Parser) parseSingleArgumentDotChain(call *ast.MethodCall) {
+	if len(call.Args) != 1 || !p.curTokenIs(lexer.RPAREN) || !p.peekTokenIs(lexer.DOT) {
+		return
+	}
+	if !p.currentTokenClosedChildGroup() {
+		return
+	}
+	next := p.tokenAfterPeek()
+	if next.Literal == "should" || next.Literal == "should_not" {
+		return
+	}
+	if !p.dotChainCanStayWithinArgument() {
+		return
+	}
+	arg := call.Args[0]
+	if !argumentCanContinueWithDot(arg) {
+		return
+	}
+	for p.peekTokenIs(lexer.DOT) {
+		p.nextToken()
+		arg = p.parseMethodCall(arg)
+	}
+	call.Args[0] = arg
+}
+
+func (p *Parser) tokenAfterPeek() lexer.Token {
+	lexerCopy := *p.l
+	return lexerCopy.NextToken()
+}
+
+func (p *Parser) dotChainCanStayWithinArgument() bool {
+	lexerCopy := *p.l
+	for {
+		method := lexerCopy.NextToken()
+		if method.Type == lexer.EOF {
+			return false
+		}
+		next := lexerCopy.NextToken()
+		if next.Type == lexer.LPAREN {
+			next = scanAfterBalancedParen(&lexerCopy)
+		}
+		switch next.Type {
+		case lexer.RPAREN, lexer.COMMA:
+			return true
+		case lexer.DOT:
+			continue
+		default:
+			return false
+		}
+	}
+}
+
+func scanAfterBalancedParen(l *lexer.Lexer) lexer.Token {
+	depth := 1
+	for depth > 0 {
+		tok := l.NextToken()
+		switch tok.Type {
+		case lexer.EOF:
+			return tok
+		case lexer.LPAREN:
+			depth++
+		case lexer.RPAREN:
+			depth--
+		}
+	}
+	return l.NextToken()
+}
+
+func argumentCanContinueWithDot(expr ast.Expression) bool {
+	switch expr.(type) {
+	case *ast.PrefixExpression, *ast.InfixExpression, *ast.AssignExpression, *ast.RangeExpression, *ast.PatternMatchExpression, *ast.BeginExpression:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Parser) parseOneCallArg(call *ast.MethodCall) {
