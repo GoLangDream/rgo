@@ -2113,6 +2113,17 @@ running`)
 	assertBoolResult(t, result, true)
 }
 
+func TestThreadStartRunsBlockLikeNew(t *testing.T) {
+	result, _ := runRuby(t, `running = false
+thr = Thread.start do
+  running = true
+end
+Thread.pass until running
+thr.join
+running`)
+	assertBoolResult(t, result, true)
+}
+
 func TestKernelExtendAddsModuleMethodsToObject(t *testing.T) {
 	result, _ := runRuby(t, `module M
   def value

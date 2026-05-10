@@ -497,6 +497,7 @@ func (rt *Runtime) defineMethods() {
 
 	threadClass := R.Classes["Thread"]
 	threadClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: threadClassNew, Arity: 0})
+	threadClass.DefineClassMethod("start", &object.Method{Name: "start", Fn: threadClassNew, Arity: 0})
 	threadClass.DefineClassMethod("pass", &object.Method{Name: "pass", Fn: threadClassPass, Arity: 0})
 	threadClass.DefineClassMethod("current", &object.Method{Name: "current", Fn: threadClassCurrent, Arity: 0})
 	threadClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: threadIndex, Arity: 1})

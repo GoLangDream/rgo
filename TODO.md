@@ -214,6 +214,21 @@
   - 已验证：`div_spec.rb` 18 examples / 0 failures。
 - [x] 最新 Integer dashboard：68 pass, 0 parse_error, 0 runtime_error, 0 timeout out of 68 files（2026-05-11 refreshed）。
 
+### Thread/concurrency spec gate（2026-05-11）
+
+- [x] `Thread.start` 缺失导致的 timeout 已解除
+  - 根因：runtime 只注册了 `Thread.new`，`Thread.start do ... end` 返回 nil，随后 `Thread.pass until th.stop?` 这类循环永不结束。
+  - 已将 `Thread.start` 接到现有 `Thread.new` 协作式线程路径，并新增 VM 回归。
+  - 已验证：`vendor/ruby/spec/core/mutex/sleep_spec.rb` 9 examples / 0 failures。
+- [x] 最新并发相关 dashboard timeout reduction（2026-05-11 refreshed）
+  - `mutex`：5 pass, 2 runtime_error, 0 timeout out of 7 files。
+  - `queue`：11 pass, 4 runtime_error, 0 timeout out of 15 files。
+  - `sizedqueue`：10 pass, 6 runtime_error, 0 timeout out of 16 files。
+  - `conditionvariable`：1 pass, 3 runtime_error, 0 timeout out of 4 files。
+  - `thread`：46 pass, 5 runtime_error, 2 zero_examples, 0 timeout out of 53 files。
+- [ ] 剩余并发 blockers
+  - `Mutex#synchronize` / `Mutex#unlock`、Queue/SizedQueue blocking pop/push、ConditionVariable wait/signal/broadcast、Thread wakeup/run/raise/priority/abort_on_exception 现在都已从 timeout 推进到 runtime_error；后续需要实现真正的协作式阻塞、唤醒、线程状态和异常注入语义。
+
 ### Codex/Go test OOM（2026-05-04）
 
 - [ ] Codex 会话运行测试时触发系统 OOM killer
@@ -984,11 +999,11 @@ RGo 当前状态：
   - 根因：index 参数内的数组字面量链式调用（如 `@h[[1].dup]`）被 `stopAtRBracket` 提前截断。
   - 已新增 `TestParseIndexArgumentArrayLiteralMethodCall`，只放行数组字面量后接点号的子表达式链。
   - 已验证：`compare_by_identity_spec.rb` 18 examples / 0 failures；`hash` dashboard 刷新为 69 pass / 0 parse_error / 0 zero_examples。
-- [ ] `vendor/ruby/spec/core/mutex/sleep_spec.rb` timeout。
-  - 复现：`timeout 8 ./rgo test vendor/ruby/spec/core/mutex/sleep_spec.rb` 已执行到多个 example 通过，但后续卡住并被 timeout 终止。
-  - 按项目规则先记录，后续集中处理 Mutex sleep / Thread 唤醒语义。
-- [ ] `vendor/ruby/spec/core/conditionvariable/wait_spec.rb` timeout。
-  - 复现：`timeout 8 ./rgo test vendor/ruby/spec/core/conditionvariable/wait_spec.rb` 已通过前两个 examples，随后在 ConditionVariable wait/signal/run 相关并发语义中卡住。
+- [x] `vendor/ruby/spec/core/mutex/sleep_spec.rb` timeout 已解除。
+  - 根因：`Thread.start` 未注册，导致 `Thread.pass until th.stop?` 在 nil receiver 上永远循环。
+  - 已验证：`sleep_spec.rb` 9 examples / 0 failures。
+- [ ] `vendor/ruby/spec/core/conditionvariable/wait_spec.rb` 已从 timeout 推进到 runtime_error。
+  - 当前仍缺真正的 ConditionVariable wait/signal/run 协作调度语义。
   - 按项目规则先记录，后续集中处理 ConditionVariable 与 Thread 调度/唤醒。
 - [x] `vendor/ruby/spec/core/fiber/{resume,transfer}_spec.rb` compiler panic 已解除。
   - 根因：dot 后关键字方法名缺少 `do`，例如 `obj.do` 被解析成 nil `MethodCall.Method`。
