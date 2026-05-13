@@ -1,5 +1,9 @@
 # RGO Makefile
 
+GOCACHE ?= /tmp/rgo-go-build-cache
+GOMODCACHE ?= /tmp/rgo-go-mod-cache
+GOENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
+
 .PHONY: help test clean build fmt lint check
 
 help:
@@ -14,16 +18,16 @@ help:
 	@echo "  make clean   Remove build artifacts"
 
 build:
-	go build -o rgo ./cmd/rgo
+	$(GOENV) go build -o rgo ./cmd/rgo
 
 test:
-	go test ./...
+	scripts/safe_go_test.sh ./...
 
 fmt:
-	go fmt ./...
+	$(GOENV) go fmt ./...
 
 lint:
-	go vet ./...
+	$(GOENV) go vet ./...
 
 check: fmt lint test
 

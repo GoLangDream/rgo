@@ -22,7 +22,7 @@ if [ "$grep_code" -eq 2 ]; then
   exit 2
 fi
 
-mapfile -t TESTS < <(cd "$ROOT" && go test ./pkg/vm -list . | grep -E '^Test' | grep -E "$FILTER" | sort)
+mapfile -t TESTS < <(cd "$ROOT" && scripts/safe_go_test.sh ./pkg/vm -list . | grep -E '^Test' | grep -E "$FILTER" | sort)
 
 for test_name in "${TESTS[@]}"; do
   start=$(date +%s%3N)

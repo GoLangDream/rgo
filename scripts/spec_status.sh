@@ -33,7 +33,7 @@ TMPDIR=$(mktemp -d /tmp/rgo_spec_status_XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 if [ ! -x "$ROOT/rgo" ]; then
-  (cd "$ROOT" && go build -o rgo ./cmd/rgo)
+  (cd "$ROOT" && GOCACHE="${GOCACHE:-/tmp/rgo-go-build-cache}" GOMODCACHE="${GOMODCACHE:-/tmp/rgo-go-mod-cache}" go build -o rgo ./cmd/rgo)
 fi
 
 mkdir -p "$(dirname "$OUT")"

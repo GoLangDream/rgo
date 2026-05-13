@@ -145,6 +145,7 @@ func TestStringLiterals(t *testing.T) {
 		{"escape newline", `"hello\nworld"`, "hello\nworld"},
 		{"escape tab", `"hello\tworld"`, "hello\tworld"},
 		{"escape quote", `"say \"hi\""`, `say "hi"`},
+		{"escape nul", `"hello\0world"`, "hello\x00world"},
 	}
 
 	for _, tt := range tests {

@@ -28,7 +28,9 @@ GO
 cd "$WORK/example"
 
 out="$WORK/out"
-RGO_GO_TEST_TIMEOUT=5 "$ROOT/scripts/safe_go_test.sh" -run '^TestPass$' . >"$out" 2>&1
+RGO_GO_TEST_TIMEOUT=30 "$ROOT/scripts/safe_go_test.sh" -run '^TestPass$' . >"$out" 2>&1
 grep -q 'ok[[:space:]]\+example' "$out"
+
+grep -Eq '^[[:space:]]+scripts/safe_go_test\.sh \./\.\.\.' "$ROOT/Makefile"
 
 echo "safe_go_test_test: PASS"

@@ -1,24 +1,36 @@
 package object
 
 type Class struct {
-	Name             string
-	SuperClass       *Class
-	Methods          map[string]*Method
-	Constants        map[string]*EmeraldValue
-	ClassMethods     map[string]*Method
-	InstanceVars     map[string]*EmeraldValue
-	IsSingleton      bool
-	IncludedModules  []*Module // Modules included via include
-	PrependedModules []*Module // Modules prepended via prepend
+	Name                string
+	NameValue           *EmeraldValue
+	TemporaryName       bool
+	SuperClass          *Class
+	Methods             map[string]*Method
+	Constants           map[string]*EmeraldValue
+	PrivateConstants    map[string]bool
+	DeprecatedConstants map[string]bool
+	Autoloads           map[string]string
+	ClassVars           map[string]*EmeraldValue
+	ClassMethods        map[string]*Method
+	InstanceVars        map[string]*EmeraldValue
+	IsSingleton         bool
+	SingletonOwner      *EmeraldValue
+	SingletonClass      *Class
+	IncludedModules     []*Module // Modules included via include
+	PrependedModules    []*Module // Modules prepended via prepend
 }
 
 func NewClass(name string) *Class {
 	return &Class{
-		Name:         name,
-		Methods:      make(map[string]*Method),
-		Constants:    make(map[string]*EmeraldValue),
-		ClassMethods: make(map[string]*Method),
-		InstanceVars: make(map[string]*EmeraldValue),
+		Name:                name,
+		Methods:             make(map[string]*Method),
+		Constants:           make(map[string]*EmeraldValue),
+		PrivateConstants:    make(map[string]bool),
+		DeprecatedConstants: make(map[string]bool),
+		Autoloads:           make(map[string]string),
+		ClassVars:           make(map[string]*EmeraldValue),
+		ClassMethods:        make(map[string]*Method),
+		InstanceVars:        make(map[string]*EmeraldValue),
 	}
 }
 
@@ -111,6 +123,7 @@ type Object struct {
 	InstanceVars     map[string]*EmeraldValue
 	ClassVars        map[string]*EmeraldValue
 	SingletonMethods map[string]*Method
+	SingletonClass   *Class
 }
 
 func NewObject(class *Class) *Object {

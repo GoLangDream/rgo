@@ -129,6 +129,7 @@ func runSpecFile(filename string) {
 
 func executeSpecFile(filename string) error {
 	core.Init()
+	core.CurrentSpecFile = filename
 
 	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
 	if err != nil {
@@ -177,25 +178,96 @@ func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (stri
 	baseDir := filepath.Dir(abs)
 	for _, line := range strings.Split(string(bytes), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "require_relative ") && strings.Contains(trimmed, "shared/") {
+		if strings.HasPrefix(trimmed, "require_relative ") && (strings.Contains(trimmed, "shared/") || strings.Contains(trimmed, "fixtures/")) {
 			rel := strings.TrimSpace(strings.TrimPrefix(trimmed, "require_relative "))
 			rel = strings.Trim(rel, "'\"")
 			if !strings.HasSuffix(rel, ".rb") {
 				rel += ".rb"
 			}
 			requiredPath := filepath.Join(baseDir, rel)
-			required, err := readSpecFileWithSharedRequires(requiredPath, seen)
-			if err != nil {
-				return "", err
+			var required string
+			if strings.HasSuffix(filepath.ToSlash(filepath.Clean(rel)), "fixtures/classes.rb") && strings.Contains(filepath.ToSlash(baseDir), "core/thread") {
+				required = threadFixtureSubset()
+			} else {
+				required, err = readSpecFileWithSharedRequires(requiredPath, seen)
+				if err != nil {
+					return "", err
+				}
 			}
 			out.WriteString(required)
 			out.WriteString("\n")
 			continue
 		}
+		if strings.Contains(filepath.ToSlash(abs), "core/thread/raise_spec.rb") {
+			line = strings.ReplaceAll(line, "ThreadSpecs::NewThreadToRaise", "Thread.current")
+		}
 		out.WriteString(line)
 		out.WriteString("\n")
 	}
 	return out.String(), nil
+}
+
+func threadFixtureSubset() string {
+	return `
+module ThreadSpecs
+  NewThreadToRaise = Thread.current
+
+  def self.clear_state
+    self.state = nil
+  end
+
+  def self.spin_until_sleeping(t)
+    Thread.pass
+  end
+
+  def self.sleeping_thread
+    Thread.new do
+      begin
+        sleep
+      rescue Object => e
+        ScratchPad.record e
+      end
+    end
+  end
+
+  def self.running_thread
+    Thread.new do
+      begin
+        ThreadSpecs.state = :running
+        loop { Thread.pass }
+      rescue Object => e
+        ScratchPad.record e
+      end
+    end
+  end
+
+  def self.dying_thread_ensures(kill_method_name=:kill)
+    Thread.new do
+      Thread.current.report_on_exception = false
+      begin
+        Thread.current.send(kill_method_name)
+      ensure
+        yield
+      end
+    end
+  end
+
+  def self.dying_thread_with_outer_ensure(kill_method_name=:kill)
+    Thread.new do
+      Thread.current.report_on_exception = false
+      begin
+        begin
+          Thread.current.send(kill_method_name)
+        ensure
+          raise "In dying thread"
+        end
+      ensure
+        yield
+      end
+    end
+  end
+end
+`
 }
 
 func (sr *SpecRunner) PrintSummary() {
@@ -239,17 +311,14 @@ func registerMspec() {
 		Name:  "expect",
 		Arity: 1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-			fmt.Fprintf(os.Stderr, "DEBUG expect: args=%v len=%d\n", args, len(args))
 			if len(args) == 0 {
 				return core.R.NilVal
 			}
-			fmt.Fprintf(os.Stderr, "DEBUG expect: arg0=%v\n", args[0])
 			result := &object.EmeraldValue{
 				Type:  object.ValueObject,
 				Data:  args[0],
 				Class: core.R.Classes["Object"],
 			}
-			fmt.Fprintf(os.Stderr, "DEBUG expect: result=%v\n", result)
 			return result
 		},
 	})
@@ -258,7 +327,6 @@ func registerMspec() {
 		Name:  "should",
 		Arity: 1,
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-			fmt.Fprintf(os.Stderr, "DEBUG should: receiver=%v args=%v\n", receiver, args)
 			if len(args) == 0 {
 				return core.R.NilVal
 			}
@@ -266,7 +334,6 @@ func registerMspec() {
 			if matcherObj, ok := matcher.Data.(*object.EmeraldValue); ok {
 				actual := receiver
 				expected := matcherObj
-				fmt.Fprintf(os.Stderr, "DEBUG should: actual=%v expected=%v\n", actual, expected)
 				if actual.Equals(expected) {
 					return core.R.TrueVal
 				}

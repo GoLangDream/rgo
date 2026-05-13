@@ -132,18 +132,18 @@ i`)
 	foundGetOuter := false
 	foundSetOuter := false
 	for _, fn := range functionConstants(bytecode) {
-		if hasOpcode(fn.Instructions, OpGetOuter) {
+		if hasOpcode(fn.Instructions, OpGetFree) {
 			foundGetOuter = true
 		}
-		if hasOpcode(fn.Instructions, OpSetOuter) {
+		if hasOpcode(fn.Instructions, OpSetFree) {
 			foundSetOuter = true
 		}
 	}
 	if !foundGetOuter {
-		t.Fatal("expected block function to read i with OpGetOuter")
+		t.Fatal("expected block function to read captured i with OpGetFree")
 	}
 	if !foundSetOuter {
-		t.Fatal("expected block function to assign i with OpSetOuter")
+		t.Fatal("expected block function to assign captured i with OpSetFree")
 	}
 }
 

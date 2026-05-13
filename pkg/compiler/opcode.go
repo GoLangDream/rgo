@@ -46,12 +46,18 @@ const (
 
 	OpGetLocal
 	OpSetLocal
+	OpGetLocalCell
 
 	OpGetFree
 	OpSetFree
+	OpGetFreeCell
 
 	OpGetOuter
 	OpSetOuter
+	OpGetOuterFree
+	OpSetOuterFree
+	OpGetOuterCell
+	OpGetOuterFreeCell
 
 	OpGetInstanceVar
 	OpSetInstanceVar
@@ -61,6 +67,7 @@ const (
 
 	OpGetConstant
 	OpSetConstant
+	OpGetScopedConstant
 
 	OpClosure
 
@@ -203,14 +210,20 @@ var definitions = map[Opcode]Definition{
 	OpGetGlobal: {"OpGetGlobal", []int{2}},
 	OpSetGlobal: {"OpSetGlobal", []int{2}},
 
-	OpGetLocal: {"OpGetLocal", []int{1}},
-	OpSetLocal: {"OpSetLocal", []int{1}},
+	OpGetLocal:     {"OpGetLocal", []int{1}},
+	OpSetLocal:     {"OpSetLocal", []int{1}},
+	OpGetLocalCell: {"OpGetLocalCell", []int{1}},
 
-	OpGetFree: {"OpGetFree", []int{1}},
-	OpSetFree: {"OpSetFree", []int{1}},
+	OpGetFree:     {"OpGetFree", []int{1}},
+	OpSetFree:     {"OpSetFree", []int{1}},
+	OpGetFreeCell: {"OpGetFreeCell", []int{1}},
 
-	OpGetOuter: {"OpGetOuter", []int{1}},
-	OpSetOuter: {"OpSetOuter", []int{1, 1}},
+	OpGetOuter:         {"OpGetOuter", []int{1}},
+	OpSetOuter:         {"OpSetOuter", []int{1, 1}},
+	OpGetOuterFree:     {"OpGetOuterFree", []int{1}},
+	OpSetOuterFree:     {"OpSetOuterFree", []int{1}},
+	OpGetOuterCell:     {"OpGetOuterCell", []int{1}},
+	OpGetOuterFreeCell: {"OpGetOuterFreeCell", []int{1}},
 
 	OpGetInstanceVar: {"OpGetInstanceVar", []int{2}},
 	OpSetInstanceVar: {"OpSetInstanceVar", []int{2}},
@@ -218,8 +231,9 @@ var definitions = map[Opcode]Definition{
 	OpGetClassVar: {"OpGetClassVar", []int{2}},
 	OpSetClassVar: {"OpSetClassVar", []int{2}},
 
-	OpGetConstant: {"OpGetConstant", []int{2}},
-	OpSetConstant: {"OpSetConstant", []int{2}},
+	OpGetConstant:       {"OpGetConstant", []int{2}},
+	OpSetConstant:       {"OpSetConstant", []int{2}},
+	OpGetScopedConstant: {"OpGetScopedConstant", []int{2}},
 
 	OpClosure:        {"OpClosure", []int{2, 1}},
 	OpCurrentClosure: {"OpCurrentClosure", []int{}},

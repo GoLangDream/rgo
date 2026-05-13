@@ -224,9 +224,10 @@ func (r *RangeExpression) String() string {
 }
 
 type BlockExpression struct {
-	Token      lexer.Token
-	Params     []*Identifier
-	Statements []Statement
+	Token         lexer.Token
+	Params        []*Identifier
+	ParamDefaults []Expression
+	Statements    []Statement
 }
 
 func (b *BlockExpression) expressionNode()      {}
@@ -428,10 +429,11 @@ func (d *DefExpression) String() string {
 }
 
 type ClassExpression struct {
-	Token      lexer.Token
-	Name       *Identifier
-	SuperClass *Identifier
-	Body       *BlockExpression
+	Token             lexer.Token
+	Name              *Identifier
+	SuperClass        *Identifier
+	SingletonReceiver Expression
+	Body              *BlockExpression
 }
 
 func (c *ClassExpression) expressionNode()      {}
@@ -741,13 +743,13 @@ func (g *GlobalVarAssign) TokenLiteral() string { return g.Token.Literal }
 func (g *GlobalVarAssign) String() string       { return g.Name + " = " + g.Value.String() }
 
 type MethodCall struct {
-	Token       lexer.Token
-	Receiver    Expression
-	Method      *Identifier
-	Args        []Expression
-	KeywordArgs []*KeywordArg
-	Block       *BlockExpression
-	Safe        bool
+	Token             lexer.Token
+	Receiver          Expression
+	Method            *Identifier
+	Args              []Expression
+	KeywordArgs       []*KeywordArg
+	Block             *BlockExpression
+	Safe              bool
 	ParenthesizedArgs bool
 }
 
@@ -938,9 +940,12 @@ func (d *DefinedExpression) TokenLiteral() string { return d.Token.Literal }
 func (d *DefinedExpression) String() string       { return "defined?(" + d.Expression.String() + ")" }
 
 type ProcLiteral struct {
-	Token  lexer.Token
-	Params []*Identifier
-	Body   *BlockExpression
+	Token         lexer.Token
+	Params        []*Identifier
+	ParamDefaults []Expression
+	RestParam     *Identifier
+	BlockParam    *Identifier
+	Body          *BlockExpression
 }
 
 func (p *ProcLiteral) expressionNode()      {}

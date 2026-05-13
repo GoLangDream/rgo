@@ -1370,6 +1370,27 @@ func TestParseArrayLiteralWithTrailingComma(t *testing.T) {
 	}
 }
 
+func TestParsePercentWordArrayLiteral(t *testing.T) {
+	expr := parseExpr(t, `%w[alpha beta
+gamma]`)
+	arr, ok := expr.(*ast.ArrayLiteral)
+	if !ok {
+		t.Fatalf("expected ArrayLiteral, got %T", expr)
+	}
+	if len(arr.Elements) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(arr.Elements))
+	}
+	for i, want := range []string{"alpha", "beta", "gamma"} {
+		str, ok := arr.Elements[i].(*ast.StringLiteral)
+		if !ok {
+			t.Fatalf("element %d: expected StringLiteral, got %T", i, arr.Elements[i])
+		}
+		if str.Value != want {
+			t.Fatalf("element %d: expected %q, got %q", i, want, str.Value)
+		}
+	}
+}
+
 func TestParseArrayLiteralWithBlockCallAndLambdaElements(t *testing.T) {
 	parse(t, `[Proc.new{}, -> {}, proc {}]`)
 	parse(t, `[Proc.new{}, -> {}, proc {}].each { |p| p.binding }`)
@@ -1624,6 +1645,23 @@ describe "consumer" do
 end`)
 	if len(program.Statements) != 2 {
 		t.Fatalf("expected 2 top-level statements, got %d: %s", len(program.Statements), program.String())
+	}
+}
+
+func TestParseUntilModifierInsideBraceBlockDoesNotConsumeFollowingStatement(t *testing.T) {
+	expr := parseExpr(t, `Thread.new { Thread.pass until go; foo }`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Block == nil {
+		t.Fatal("expected block")
+	}
+	if len(call.Block.Statements) != 2 {
+		t.Fatalf("expected 2 block statements, got %d: %s", len(call.Block.Statements), call.Block.String())
+	}
+	if _, ok := call.Block.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.UntilExpression); !ok {
+		t.Fatalf("expected first statement to be until modifier, got %T", call.Block.Statements[0])
 	}
 }
 
@@ -2165,6 +2203,106 @@ func TestParseArrayLiteralAsBareMethodArgument(t *testing.T) {
 	}
 }
 
+func TestParseBareMethodCallWithArrayArgumentAndDoBlock(t *testing.T) {
+	expr := parseExpr(t, `argf ["input.txt"] do
+  value = true
+end`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method.Value != "argf" {
+		t.Fatalf("expected argf, got %s", call.Method.Value)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected 1 arg, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[0].(*ast.ArrayLiteral); !ok {
+		t.Fatalf("expected ArrayLiteral argument, got %T", call.Args[0])
+	}
+	if call.Block == nil {
+		t.Fatal("expected do block")
+	}
+}
+
+func TestParseDottedBareMethodCallWithIdentifierArgumentAndDoBlock(t *testing.T) {
+	expr := parseExpr(t, `Dir.chdir dir1 do
+  Dir.chdir(dir2) { Dir.unlink dir1 }
+end`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method.Value != "chdir" {
+		t.Fatalf("expected chdir, got %s", call.Method.Value)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected 1 arg, got %d", len(call.Args))
+	}
+	if ident, ok := call.Args[0].(*ast.Identifier); !ok || ident.Value != "dir1" {
+		t.Fatalf("expected dir1 identifier argument, got %T %#v", call.Args[0], call.Args[0])
+	}
+	if call.Block == nil {
+		t.Fatal("expected do block")
+	}
+}
+
+func TestParseDottedSendWithSymbolAndLocalArguments(t *testing.T) {
+	expr := parseExpr(t, `Dir.send(:glob, pattern)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method.Value != "send" {
+		t.Fatalf("expected send, got %s", call.Method.Value)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[0].(*ast.SymbolLiteral); !ok {
+		t.Fatalf("expected symbol first arg, got %T", call.Args[0])
+	}
+	if ident, ok := call.Args[1].(*ast.Identifier); !ok || ident.Value != "pattern" {
+		t.Fatalf("expected pattern identifier second arg, got %T %#v", call.Args[1], call.Args[1])
+	}
+}
+
+func TestParseDottedNoArgCallBeforeMinusAsInfix(t *testing.T) {
+	expr := parseExpr(t, `Time.now - "1"`)
+	infix, ok := expr.(*ast.InfixExpression)
+	if !ok {
+		t.Fatalf("expected InfixExpression, got %T", expr)
+	}
+	if infix.Operator != "-" {
+		t.Fatalf("expected '-' operator, got %q", infix.Operator)
+	}
+	call, ok := infix.Left.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected left MethodCall, got %T", infix.Left)
+	}
+	if call.Method == nil || call.Method.Value != "now" || len(call.Args) != 0 {
+		t.Fatalf("expected Time.now with no args, got %s args=%d", call.String(), len(call.Args))
+	}
+}
+
+func TestParseCallSplatWithInfixArrayExpression(t *testing.T) {
+	expr := parseExpr(t, `Time.send(:gm, *[0]*8)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(call.Args))
+	}
+	splat, ok := call.Args[1].(*ast.SplatExpression)
+	if !ok {
+		t.Fatalf("expected splat arg, got %T", call.Args[1])
+	}
+	if _, ok := splat.Value.(*ast.InfixExpression); !ok {
+		t.Fatalf("expected splat value infix expression, got %T", splat.Value)
+	}
+}
+
 func TestParseHashIndexAssignment(t *testing.T) {
 	parse(t, "h = {}; h[:x] = 42")
 }
@@ -2512,6 +2650,32 @@ func TestParseSuperWithParenthesizedArgumentsTerminates(t *testing.T) {
 	}
 }
 
+func TestParseSuperWithBareArgumentTerminates(t *testing.T) {
+	result := make(chan *ast.Program, 1)
+	errors := make(chan []string, 1)
+
+	go func() {
+		l := lexer.New("def require(name)\n  super name\nend")
+		p := New(l)
+		program := p.ParseProgram()
+		errors <- p.Errors()
+		result <- program
+	}()
+
+	select {
+	case parseErrors := <-errors:
+		if len(parseErrors) > 0 {
+			t.Fatalf("parse errors: %v", parseErrors)
+		}
+		program := <-result
+		if len(program.Statements) != 1 {
+			t.Fatalf("expected 1 statement, got %d", len(program.Statements))
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("super with bare argument parse did not terminate")
+	}
+}
+
 func TestParseBareSuperWithInfixOperatorTerminates(t *testing.T) {
 	expr := parseExpr(t, `super + 1`)
 	if _, ok := expr.(*ast.InfixExpression); !ok {
@@ -2527,6 +2691,23 @@ func TestParseBareSuperWithShiftOperatorTerminates(t *testing.T) {
 	expr := parseExpr(t, `super << :m1`)
 	if _, ok := expr.(*ast.InfixExpression); !ok {
 		t.Fatalf("expected bare super shift call to parse as InfixExpression, got %T", expr)
+	}
+}
+
+func TestParseBareYieldWithInfixOperator(t *testing.T) {
+	program := parse(t, `while yield == :retry
+  :ok
+end`)
+	stmt, ok := program.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected ExpressionStatement, got %T", program.Statements[0])
+	}
+	whileExpr, ok := stmt.Expression.(*ast.WhileExpression)
+	if !ok {
+		t.Fatalf("expected WhileExpression, got %T", stmt.Expression)
+	}
+	if _, ok := whileExpr.Condition.(*ast.InfixExpression); !ok {
+		t.Fatalf("expected yield comparison condition, got %T", whileExpr.Condition)
 	}
 }
 
@@ -2798,6 +2979,21 @@ func TestParseBareMethodCallWithTrailingBlock(t *testing.T) {
 	}
 }
 
+func TestParseBareMethodCallWithLambdaArgumentAndDoBlock(t *testing.T) {
+	program := parse(t, `guard -> { true } do
+  it "x" do
+    1
+  end
+end`)
+	call, ok := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", program.Statements[0])
+	}
+	if call.Method.Value != "guard" || len(call.Args) != 1 || call.Block == nil {
+		t.Fatalf("expected guard with lambda argument and trailing block, got %s", call.String())
+	}
+}
+
 func TestParseBlockWithEmptyPipes(t *testing.T) {
 	parse(t, "@y.z { || 1 }")
 }
@@ -3058,6 +3254,142 @@ func TestParseBasicObjectInstanceExecSpec(t *testing.T) {
 	parse(t, string(input))
 }
 
+func TestParseProcessGroupsSpec(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/process/groups_spec.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse(t, string(input))
+}
+
+func TestParseTimeComparisonSpec(t *testing.T) {
+	input, err := os.ReadFile("../../vendor/ruby/spec/core/time/comparison_spec.rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse(t, string(input))
+}
+
+func TestParseSingletonSpaceshipMethodDefinition(t *testing.T) {
+	parse(t, `def r.<=>(other); other <=> self; end`)
+}
+
+func TestParseGroupedSpaceshipFollowedByBareCall(t *testing.T) {
+	parse(t, `(t <=> r).should be_nil`)
+}
+
+func TestParseTimeInverseComparisonExample(t *testing.T) {
+	parse(t, `it "returns nil if argument also uses an inverse comparison for <=>" do
+  t = Time.now
+  r = mock('r')
+  def r.<=>(other); other <=> self; end
+  r.should_receive(:<=>).once
+
+  (t <=> r).should be_nil
+end`)
+}
+
+func TestParseTimeIntegerComparisonLambdaExample(t *testing.T) {
+	parse(t, `it "returns nil when compared to an Integer because Time does not respond to #coerce" do
+  time = Time.at(1)
+  time.respond_to?(:coerce).should == false
+  time.should_receive(:respond_to?).exactly(2).and_return(false)
+  -> {
+    (time <=> 2).should == nil
+    (2 <=> time).should == nil
+  }.should_not complain
+end`)
+}
+
+func TestParseTimeNonTimeArgumentContext(t *testing.T) {
+	parse(t, `describe "given a non-Time argument" do
+  it "returns nil if argument <=> self returns nil" do
+    t = Time.now
+    obj = mock('time')
+    obj.should_receive(:<=>).with(t).and_return(nil)
+    (t <=> obj).should == nil
+  end
+
+  it "returns -1 if argument <=> self is greater than 0" do
+    t = Time.now
+    r = mock('r')
+    r.should_receive(:>).with(0).and_return(true)
+    obj = mock('time')
+    obj.should_receive(:<=>).with(t).and_return(r)
+    (t <=> obj).should == -1
+  end
+
+  it "returns 1 if argument <=> self is not greater than 0 and is less than 0" do
+    t = Time.now
+    r = mock('r')
+    r.should_receive(:>).with(0).and_return(false)
+    r.should_receive(:<).with(0).and_return(true)
+    obj = mock('time')
+    obj.should_receive(:<=>).with(t).and_return(r)
+    (t <=> obj).should == 1
+  end
+
+  it "returns 0 if argument <=> self is neither greater than 0 nor less than 0" do
+    t = Time.now
+    r = mock('r')
+    r.should_receive(:>).with(0).and_return(false)
+    r.should_receive(:<).with(0).and_return(false)
+    obj = mock('time')
+    obj.should_receive(:<=>).with(t).and_return(r)
+    (t <=> obj).should == 0
+  end
+
+  it "returns nil if argument also uses an inverse comparison for <=>" do
+    t = Time.now
+    r = mock('r')
+    def r.<=>(other); other <=> self; end
+    r.should_receive(:<=>).once
+
+    (t <=> r).should be_nil
+  end
+end`)
+}
+
+func TestParseTimeComparisonLeadingExamples(t *testing.T) {
+	parse(t, `describe "Time#<=>" do
+  it "returns 1 if the first argument is a point in time after the second argument" do
+    (Time.now <=> Time.at(0)).should == 1
+  end
+
+  it "returns 1 if the first argument is a fraction of a microsecond after the second argument" do
+    (Time.at(100, Rational(1,1000)) <=> Time.at(100, 0)).should == 1
+  end
+
+  context "given different timezones" do
+    it "returns 0 if time is the same as other" do
+      time_utc = Time.new(2000, 1, 1, 0, 0, 0, 0)
+      time_cet = Time.new(2000, 1, 1, 1, 0, 0, '+01:00')
+      time_brt = Time.new(1999, 12, 31, 21, 0, 0, '-03:00')
+      (time_utc <=> time_cet).should == 0
+      (time_utc <=> time_brt).should == 0
+      (time_cet <=> time_brt).should == 0
+    end
+  end
+end`)
+}
+
+func TestParseGroupedSpaceshipWithRationalCallOnRight(t *testing.T) {
+	parse(t, `(Time.at(100, Rational(1,1000)) <=> Time.at(100, Rational(1,1000))).should == 0`)
+	parse(t, `(Time.at(100, 0) <=> Time.at(100, Rational(1,1000))).should == -1`)
+}
+
+func TestParseBareCallWithMultipleArgsAndDoBlock(t *testing.T) {
+	parse(t, `platform_is_not :windows, :android do
+  as_superuser do
+    Process.groups = []
+  end
+end`)
+}
+
+func TestParseGroupedCompoundAssignmentWithRescueModifier(t *testing.T) {
+	parse(t, "(groups |= `/usr/bin/id -G`.scan(/\\d+/).map { |i| i.to_i }) rescue nil")
+}
+
 func TestParseCallArgumentRegexpWithApostrophe(t *testing.T) {
 	parse(t, `-> { a.instance_eval(source_code) }.should raise_consistent_error(TypeError, /can't convert Object into String/)`)
 }
@@ -3166,6 +3498,21 @@ func TestParseSelfMethodNameAfterDot(t *testing.T) {
 	}
 	if call.Method == nil || call.Method.Value != "self" {
 		t.Fatalf("expected self method name, got %#v", call.Method)
+	}
+}
+
+func TestParseAliasKeywordMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `c.new.alias.should`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected outer MethodCall, got %T", expr)
+	}
+	inner, ok := call.Receiver.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected inner MethodCall, got %T", call.Receiver)
+	}
+	if inner.Method == nil || inner.Method.Value != "alias" {
+		t.Fatalf("expected alias method name, got %#v", inner.Method)
 	}
 }
 
@@ -3287,6 +3634,13 @@ func TestParseBareIncludeWithNoArguments(t *testing.T) {
 	parse(t, `Module.new do
   include
 end`)
+}
+
+func TestParseBlockCallFollowedByIndex(t *testing.T) {
+	expr := parseExpr(t, `proc { |a| a }["sometext"]`)
+	if _, ok := expr.(*ast.IndexExpression); !ok {
+		t.Fatalf("expected IndexExpression, got %T", expr)
+	}
 }
 
 // === Prefix minus (regression test) ===

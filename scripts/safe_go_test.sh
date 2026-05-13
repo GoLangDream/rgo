@@ -25,6 +25,8 @@ fi
 
 run_go_test() {
   export GOMAXPROCS=${GOMAXPROCS:-1}
+  export GOCACHE=${GOCACHE:-/tmp/rgo-go-build-cache}
+  export GOMODCACHE=${GOMODCACHE:-/tmp/rgo-go-mod-cache}
   if [ -n "$MEMORY_KB" ]; then
     ulimit -v "$MEMORY_KB"
   fi

@@ -2,6 +2,7 @@ package lexer
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -909,16 +910,25 @@ func (l *Lexer) readOctalEscape() string {
 		seq += string(l.ch)
 		l.readChar()
 	}
-	return seq
+	value, err := strconv.ParseInt(seq, 8, 32)
+	if err != nil {
+		return seq
+	}
+	return string(rune(value))
 }
 
 func (l *Lexer) readHexEscape() string {
+	l.readChar()
 	var seq string
 	for i := 0; i < 2 && isHexDigit(l.ch); i++ {
 		seq += string(l.ch)
 		l.readChar()
 	}
-	return seq
+	value, err := strconv.ParseInt(seq, 16, 32)
+	if err != nil {
+		return seq
+	}
+	return string(rune(value))
 }
 
 func (l *Lexer) readUnicodeEscape() string {
@@ -1080,31 +1090,40 @@ func (l *Lexer) readCharacterLiteral() Token {
 func (l *Lexer) readPercentString() Token {
 	l.readChar()
 
+	kind := rune(0)
 	delimiter := l.ch
 
 	switch delimiter {
 	case 'q':
+		kind = 'q'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'Q':
+		kind = 'Q'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'w':
+		kind = 'w'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'W':
+		kind = 'W'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'i':
+		kind = 'i'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'I':
+		kind = 'I'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 'r':
+		kind = 'r'
 		delimiter = l.peekChar()
 		l.readChar()
 	case 's':
+		kind = 's'
 		delimiter = l.peekChar()
 		l.readChar()
 	}
@@ -1173,8 +1192,12 @@ func (l *Lexer) readPercentString() Token {
 	lit := l.input[position:l.position]
 	l.readChar()
 
+	tokenType := STRING
+	if kind == 'w' || kind == 'W' {
+		tokenType = WORDS
+	}
 	tok := Token{
-		Type:    STRING,
+		Type:    tokenType,
 		Literal: lit,
 		Line:    l.line,
 		Column:  l.column,

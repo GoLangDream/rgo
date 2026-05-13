@@ -36,9 +36,10 @@ const (
 )
 
 type EmeraldValue struct {
-	Type  ValueType
-	Data  interface{}
-	Class *Class
+	Type   ValueType
+	Data   interface{}
+	Class  *Class
+	Frozen bool
 }
 
 func NewValue(t ValueType, data interface{}, class *Class) *EmeraldValue {
@@ -240,12 +241,30 @@ func (v *EmeraldValue) Equals(other *EmeraldValue) bool {
 		return v.Data.(string) == other.Data.(string)
 	case ValueSymbol:
 		return v.Data.(string) == other.Data.(string)
+	case ValueArray:
+		left := v.Data.([]*EmeraldValue)
+		right := other.Data.([]*EmeraldValue)
+		if len(left) != len(right) {
+			return false
+		}
+		for i := range left {
+			if !left[i].Equals(right[i]) {
+				return false
+			}
+		}
+		return true
 	case ValueRange:
 		r1 := v.Data.(*RRange)
 		r2 := other.Data.(*RRange)
 		return r1.Start == r2.Start && r1.End == r2.End && r1.Exclusive == r2.Exclusive
 	case ValueClass:
 		return v.Data == other.Data
+	case ValueModule:
+		return v.Data == other.Data
+	case ValueMethod:
+		left := v.Data.(*Method)
+		right := other.Data.(*Method)
+		return left.Name == right.Name && left.Owner == right.Owner && left.Receiver == right.Receiver
 	default:
 		return v == other
 	}
@@ -267,6 +286,7 @@ type Function struct {
 	Instructions    []byte
 	Constants       []*EmeraldValue
 	NumLocals       int
+	LocalNames      map[string]int
 	HasRestParam    bool
 	RestParamIndex  int
 	HasBlockParam   bool
@@ -280,15 +300,28 @@ type BuiltinFunction struct {
 }
 
 type Method struct {
-	Name  string
-	Fn    interface{}
-	Arity int
+	Name          string
+	Fn            interface{}
+	Arity         int
+	Receiver      *EmeraldValue
+	Owner         *EmeraldValue
+	Visibility    string
+	Ruby2Keywords bool
+	EnforceArity  bool
 }
 
 type Proc struct {
-	Fn       *Function
-	Env      []*EmeraldValue
-	IsLambda bool
+	Fn           *Function
+	Env          []*EmeraldValue
+	Block        *EmeraldValue
+	Binding      *RBinding
+	InstanceVars map[string]*EmeraldValue
+	Native       func(args ...*EmeraldValue) *EmeraldValue
+	AutoSplat    bool
+	IsLambda     bool
+	CurryTarget  *EmeraldValue
+	CurryArgs    []*EmeraldValue
+	CurryArity   int
 }
 
 type ControlFlow struct {
@@ -297,8 +330,11 @@ type ControlFlow struct {
 }
 
 type Closure struct {
-	Fn   *Function
-	Free []*EmeraldValue
+	Fn        *Function
+	Free      []*EmeraldValue
+	Block     *EmeraldValue
+	Binding   *RBinding
+	AutoSplat bool
 }
 
 type RInteger struct {
@@ -340,6 +376,7 @@ type RException struct {
 	Message   string
 	Backtrace []string
 	Result    *EmeraldValue
+	Status    *int64
 }
 
 type RBinding struct {

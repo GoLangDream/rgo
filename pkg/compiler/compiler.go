@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	ScopeGlobal  = "global"
-	ScopeLocal   = "local"
-	ScopeBuiltin = "builtin"
-	ScopeFree    = "free"
-	ScopeOuter   = "outer"
+	ScopeGlobal    = "global"
+	ScopeLocal     = "local"
+	ScopeBuiltin   = "builtin"
+	ScopeFree      = "free"
+	ScopeOuter     = "outer"
+	ScopeOuterFree = "outer_free"
 )
 
 type Symbol struct {
@@ -99,10 +100,14 @@ func (s *SymbolTable) Resolve(name string) (Symbol, bool) {
 	obj, ok := s.store[name]
 	if !ok && s.Outer != nil {
 		if outerObj, found := s.Outer.store[name]; found && outerObj.Scope == ScopeLocal {
+			free := s.DefineFree(outerObj)
+			return free, true
+		}
+		if outerObj, found := s.Outer.store[name]; found && outerObj.Scope == ScopeFree {
 			return Symbol{
 				Name:       outerObj.Name,
 				Index:      outerObj.Index,
-				Scope:      ScopeOuter,
+				Scope:      ScopeOuterFree,
 				ScopeIndex: outerObj.Index,
 			}, true
 		}
@@ -170,10 +175,14 @@ func New() *Compiler {
 }
 
 func (c *Compiler) globalSymbolIndex(name string) int {
-	if sym, ok := c.symbolTable.Resolve(name); ok && sym.Scope == ScopeGlobal {
+	root := c.symbolTable
+	for root.Outer != nil {
+		root = root.Outer
+	}
+	if sym, ok := root.Resolve(name); ok && sym.Scope == ScopeGlobal {
 		return sym.Index
 	}
-	sym := c.symbolTable.DefineGlobal(name)
+	sym := root.DefineGlobal(name)
 	return sym.Index
 }
 
@@ -327,6 +336,8 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.emit(OpGetFree, sym.Index)
 		case ScopeOuter:
 			c.emit(OpGetOuter, sym.ScopeIndex)
+		case ScopeOuterFree:
+			c.emit(OpGetOuterFree, sym.ScopeIndex)
 		}
 	case *ast.Constant:
 		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
@@ -341,6 +352,17 @@ func (c *Compiler) Compile(node interface{}) error {
 				Data:  math.Inf(1),
 				Class: core.R.Classes["Float"],
 			})
+			return nil
+		}
+		if _, ok := node.Left.(*ast.Constant); !ok && node.Left != nil {
+			if err := c.Compile(node.Left); err != nil {
+				return err
+			}
+			c.emit(OpGetScopedConstant, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
 			return nil
 		}
 		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
@@ -436,6 +458,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			methodNameIdx := c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  "<=>",
+				Class: core.R.Classes["String"],
+			})
+			c.emit(OpSend, methodNameIdx, 0, 1)
+		case "=~":
+			methodNameIdx := c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "=~",
 				Class: core.R.Classes["String"],
 			})
 			c.emit(OpSend, methodNameIdx, 0, 1)
@@ -662,6 +691,26 @@ func (c *Compiler) Compile(node interface{}) error {
 			return nil
 		}
 
+		if node.Target != nil && len(node.Name.Value) > 0 && node.Name.Value[0] >= 'A' && node.Name.Value[0] <= 'Z' {
+			if err := c.Compile(node.Target); err != nil {
+				return err
+			}
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			})
+			if err := c.Compile(node.Value); err != nil {
+				return err
+			}
+			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "const_set",
+				Class: core.R.Classes["String"],
+			}), 0, 2)
+			return nil
+		}
+
 		if op, ok := compoundAssignmentOpcode(node.Token.Type); ok {
 			if err := c.compileAssignmentCurrentValue(node.Name); err != nil {
 				return err
@@ -722,6 +771,8 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.emit(OpSetLocal, sym.Index)
 		case ScopeOuter:
 			c.emit(OpSetOuter, 0, sym.ScopeIndex)
+		case ScopeOuterFree:
+			c.emit(OpSetOuterFree, sym.ScopeIndex)
 		case ScopeFree:
 			c.emit(OpSetFree, sym.Index)
 		}
@@ -836,13 +887,26 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.changeOperand(jumpCall, len(c.currentInstructions()))
 		}
 
-		for _, arg := range node.Args {
-			if err := c.Compile(arg); err != nil {
+		args := node.Args
+		var blockPass ast.Expression
+		if len(args) > 0 {
+			if splat, ok := args[len(args)-1].(*ast.SplatExpression); ok && splat.Token.Type == lexer.BIT_AND {
+				blockPass = splat.Value
+				args = args[:len(args)-1]
+			}
+		}
+
+		for _, arg := range args {
+			compileArg := arg
+			if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type != lexer.BIT_AND {
+				compileArg = splat.Value
+			}
+			if err := c.Compile(compileArg); err != nil {
 				return err
 			}
 		}
 
-		argCount := len(node.Args)
+		argCount := len(args)
 
 		if len(node.KeywordArgs) > 0 {
 			for i := len(node.KeywordArgs) - 1; i >= 0; i-- {
@@ -861,7 +925,12 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		blockArg := 0
-		if node.Block != nil {
+		if blockPass != nil {
+			if err := c.Compile(blockPass); err != nil {
+				return err
+			}
+			blockArg = 1
+		} else if node.Block != nil {
 			if err := c.compileBlockAsClosure(node.Block); err != nil {
 				return err
 			}
@@ -907,7 +976,22 @@ func (c *Compiler) Compile(node interface{}) error {
 	case *ast.UndefExpression:
 		c.Emit(OpNil)
 	case *ast.AliasExpression:
-		c.Emit(OpNil)
+		c.Emit(OpSelf)
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  node.New.String(),
+			Class: core.R.Classes["Symbol"],
+		})
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  node.Old.String(),
+			Class: core.R.Classes["Symbol"],
+		})
+		c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "alias_method",
+			Class: core.R.Classes["String"],
+		}), 0, 2)
 	case *ast.ReturnExpression:
 		if node.ReturnValue != nil {
 			if err := c.Compile(node.ReturnValue); err != nil {
@@ -944,6 +1028,7 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		free := c.symbolTable.FreeSymbols
 		numLocals := c.symbolTable.MaxSymbols
+		localNames := c.localNames()
 
 		instructions := c.LeaveScope()
 
@@ -967,11 +1052,17 @@ func (c *Compiler) Compile(node interface{}) error {
 				paramDefaults[i] = c.compileDefaultValue(defaultExpr)
 			}
 		}
+		params := make([]string, len(node.Params))
+		for i, param := range node.Params {
+			params[i] = param.Value
+		}
 
 		fnObj := &object.Function{
 			Name:          node.Name.Value,
+			Params:        params,
 			Instructions:  instructions,
 			NumLocals:     numLocals,
+			LocalNames:    localNames,
 			ParamDefaults: paramDefaults,
 			KeywordParams: kwParams,
 		}
@@ -1012,7 +1103,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			Class: core.R.Classes["String"],
 		}))
 	case *ast.ClassExpression:
-		if node.SuperClass != nil {
+		if node.SingletonReceiver != nil {
+			if err := c.Compile(node.SingletonReceiver); err != nil {
+				return err
+			}
+			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "singleton_class",
+				Class: core.R.Classes["String"],
+			}), 0, 0)
+		} else if node.SuperClass != nil {
 			if node.SuperClass.Token.Type == lexer.CONSTANT || strings.Contains(node.SuperClass.Value, "::") {
 				c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
 					Type:  object.ValueString,
@@ -1026,14 +1126,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 
-		c.emit(OpClass, c.addConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  node.Name.Value,
-			Class: core.R.Classes["String"],
-		}))
+		if node.SingletonReceiver == nil {
+			c.emit(OpClass, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
 
-		if node.SuperClass != nil {
-			c.Emit(OpInherited)
+			if node.SuperClass != nil {
+				c.Emit(OpInherited)
+			}
 		}
 
 		c.EnterScope()
@@ -1062,11 +1164,13 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  "__exec_class_body__",
 			Class: core.R.Classes["String"],
 		}), 1, 0)
-		c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  node.Name.Value,
-			Class: core.R.Classes["String"],
-		}))
+		if node.SingletonReceiver == nil {
+			c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
+		}
 		c.Emit(OpPop)
 	case *ast.ModuleExpression:
 		c.emit(OpModule, c.addConstant(&object.EmeraldValue{
@@ -1125,12 +1229,14 @@ func (c *Compiler) Compile(node interface{}) error {
 
 			free := c.symbolTable.FreeSymbols
 			numLocals := c.symbolTable.MaxSymbols
+			localNames := c.localNames()
 			instructions := c.LeaveScope()
 
 			fnObj := &object.Function{
 				Name:         "__block__",
 				Instructions: instructions,
 				NumLocals:    numLocals,
+				LocalNames:   localNames,
 			}
 
 			fn := &object.EmeraldValue{
@@ -1470,11 +1576,29 @@ func (c *Compiler) emitString(value string) {
 }
 
 func (c *Compiler) Bytecode() *Bytecode {
+	globalNames := make(map[string]int)
+	for name, symbol := range c.symbolTable.store {
+		if symbol.Scope == ScopeGlobal {
+			globalNames[name] = symbol.Index
+		}
+	}
 	return &Bytecode{
 		Instructions: c.currentInstructions(),
 		Constants:    c.constants,
 		NumLocals:    c.symbolTable.MaxSymbols,
+		GlobalNames:  globalNames,
+		LocalNames:   c.localNames(),
 	}
+}
+
+func (c *Compiler) localNames() map[string]int {
+	localNames := make(map[string]int)
+	for name, symbol := range c.symbolTable.store {
+		if symbol.Scope == ScopeLocal {
+			localNames[name] = symbol.Index
+		}
+	}
+	return localNames
 }
 
 func (c *Compiler) currentInstructions() Instructions {
@@ -1500,12 +1624,26 @@ func (c *Compiler) compileBlockAsClosure(block *ast.BlockExpression) error {
 
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
+	localNames := c.localNames()
 	instructions := c.LeaveScope()
 
+	paramDefaults := make([]*object.EmeraldValue, len(block.Params))
+	for i, defaultExpr := range block.ParamDefaults {
+		if i >= len(paramDefaults) {
+			break
+		}
+		if defaultExpr != nil {
+			paramDefaults[i] = c.compileDefaultValue(defaultExpr)
+		}
+	}
+
 	fnObj := &object.Function{
-		Name:         "__block__",
-		Instructions: instructions,
-		NumLocals:    numLocals,
+		Name:          "__block__",
+		Params:        identifierNames(block.Params),
+		ParamDefaults: paramDefaults,
+		Instructions:  instructions,
+		NumLocals:     numLocals,
+		LocalNames:    localNames,
 	}
 
 	fn := &object.EmeraldValue{
@@ -1796,6 +1934,8 @@ type Bytecode struct {
 	Instructions Instructions
 	Constants    []*object.EmeraldValue
 	NumLocals    int
+	GlobalNames  map[string]int
+	LocalNames   map[string]int
 }
 
 func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue {
@@ -1825,6 +1965,16 @@ func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue
 		return core.R.FalseVal
 	case *ast.NilExpression:
 		return core.R.NilVal
+	case *ast.ArrayLiteral:
+		elements := make([]*object.EmeraldValue, 0, len(node.Elements))
+		for _, element := range node.Elements {
+			elements = append(elements, c.compileDefaultValue(element))
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  elements,
+			Class: core.R.Classes["Array"],
+		}
 	default:
 		return core.R.NilVal
 	}
@@ -2004,6 +2154,8 @@ func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
 		c.emit(OpGetLocal, sym.Index)
 	case ScopeOuter:
 		c.emit(OpGetOuter, sym.ScopeIndex)
+	case ScopeOuterFree:
+		c.emit(OpGetOuterFree, sym.ScopeIndex)
 	case ScopeFree:
 		c.emit(OpGetFree, sym.Index)
 	default:
@@ -2015,11 +2167,13 @@ func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
 func (c *Compiler) emitCaptureSymbol(sym Symbol) {
 	switch sym.Scope {
 	case ScopeLocal:
-		c.emit(OpGetLocal, sym.Index)
+		c.emit(OpGetLocalCell, sym.Index)
 	case ScopeOuter:
-		c.emit(OpGetOuter, sym.ScopeIndex)
+		c.emit(OpGetOuterCell, sym.ScopeIndex)
+	case ScopeOuterFree:
+		c.emit(OpGetOuterFreeCell, sym.ScopeIndex)
 	case ScopeFree:
-		c.emit(OpGetFree, sym.Index)
+		c.emit(OpGetFreeCell, sym.Index)
 	case ScopeGlobal:
 		c.emit(OpGetGlobal, sym.Index)
 	default:
@@ -2054,12 +2208,14 @@ func (c *Compiler) compileForExpression(node *ast.ForExpression) error {
 
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
+	localNames := c.localNames()
 	instructions := c.LeaveScope()
 
 	fnObj := &object.Function{
 		Name:         "__for_block__",
 		Instructions: instructions,
 		NumLocals:    numLocals,
+		LocalNames:   localNames,
 	}
 
 	fn := &object.EmeraldValue{
@@ -2092,6 +2248,12 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 	for _, param := range node.Params {
 		c.symbolTable.Define(param.Value)
 	}
+	if node.RestParam != nil {
+		c.symbolTable.Define(node.RestParam.Value)
+	}
+	if node.BlockParam != nil {
+		c.symbolTable.Define(node.BlockParam.Value)
+	}
 
 	if node.Body != nil {
 		for _, s := range node.Body.Statements {
@@ -2111,12 +2273,34 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
+	localNames := c.localNames()
 	instructions := c.LeaveScope()
 
+	paramDefaults := make([]*object.EmeraldValue, len(node.Params))
+	for i, defaultExpr := range node.ParamDefaults {
+		if i >= len(paramDefaults) {
+			break
+		}
+		if defaultExpr != nil {
+			paramDefaults[i] = c.compileDefaultValue(defaultExpr)
+		}
+	}
+
 	fnObj := &object.Function{
-		Name:         "__lambda__",
-		Instructions: instructions,
-		NumLocals:    numLocals,
+		Name:          "__lambda__",
+		Params:        identifierNames(node.Params),
+		ParamDefaults: paramDefaults,
+		Instructions:  instructions,
+		NumLocals:     numLocals,
+		LocalNames:    localNames,
+	}
+	if node.RestParam != nil {
+		fnObj.HasRestParam = true
+		fnObj.RestParamIndex = len(node.Params)
+	}
+	if node.BlockParam != nil {
+		fnObj.HasBlockParam = true
+		fnObj.BlockParamIndex = numLocals - 1
 	}
 
 	fn := &object.EmeraldValue{
@@ -2131,4 +2315,12 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 	c.emit(OpLambda, fnIdx, len(free))
 
 	return nil
+}
+
+func identifierNames(params []*ast.Identifier) []string {
+	names := make([]string, len(params))
+	for i, param := range params {
+		names[i] = param.Value
+	}
+	return names
 }

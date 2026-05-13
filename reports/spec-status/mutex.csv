@@ -1,8 +1,8 @@
 file,status,examples,failures,error_kind,duration_ms
-vendor/ruby/spec/core/mutex/lock_spec.rb,pass,6,0,,3
+vendor/ruby/spec/core/mutex/lock_spec.rb,pass,6,0,,4
 vendor/ruby/spec/core/mutex/locked_spec.rb,pass,3,0,,2
 vendor/ruby/spec/core/mutex/owned_spec.rb,pass,4,0,,3
 vendor/ruby/spec/core/mutex/sleep_spec.rb,pass,9,0,,3
-vendor/ruby/spec/core/mutex/synchronize_spec.rb,runtime_error,0,0,runtime_error,292
-vendor/ruby/spec/core/mutex/try_lock_spec.rb,pass,4,0,,3
-vendor/ruby/spec/core/mutex/unlock_spec.rb,runtime_error,0,0,runtime_error,265
+vendor/ruby/spec/core/mutex/synchronize_spec.rb,pass,5,0,,3
+vendor/ruby/spec/core/mutex/try_lock_spec.rb,pass,4,0,,2
+vendor/ruby/spec/core/mutex/unlock_spec.rb,pass,3,0,,3

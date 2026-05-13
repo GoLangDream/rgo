@@ -1,9 +1,9 @@
 file,status,examples,failures,error_kind,duration_ms
 vendor/ruby/spec/core/refinement/append_features_spec.rb,pass,2,0,,3
-vendor/ruby/spec/core/refinement/extend_object_spec.rb,pass,2,0,,4
-vendor/ruby/spec/core/refinement/import_methods_spec.rb,timeout,0,0,timeout,8037
+vendor/ruby/spec/core/refinement/extend_object_spec.rb,pass,2,0,,2
+vendor/ruby/spec/core/refinement/import_methods_spec.rb,pass,15,0,,2
 vendor/ruby/spec/core/refinement/include_spec.rb,pass,1,0,,3
 vendor/ruby/spec/core/refinement/prepend_features_spec.rb,pass,2,0,,3
-vendor/ruby/spec/core/refinement/prepend_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/refinement/prepend_spec.rb,pass,1,0,,2
 vendor/ruby/spec/core/refinement/refined_class_spec.rb,pass,2,0,,3
-vendor/ruby/spec/core/refinement/target_spec.rb,pass,1,0,,3
+vendor/ruby/spec/core/refinement/target_spec.rb,pass,1,0,,2

@@ -11,6 +11,7 @@ const (
 	FLOAT    TokenType = "FLOAT"
 	RATIONAL TokenType = "RATIONAL"
 	STRING   TokenType = "STRING"
+	WORDS    TokenType = "WORDS"
 	SYMBOL   TokenType = "SYMBOL"
 	REGEXP   TokenType = "REGEXP"
 
