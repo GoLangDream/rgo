@@ -32,6 +32,8 @@ var CallBlockWithSelf func(block *object.EmeraldValue, self *object.EmeraldValue
 
 var SetGlobalVariable func(name string, value *object.EmeraldValue)
 
+var GetGlobalVariable func(name string) *object.EmeraldValue
+
 var EvalSource func(source string) *object.EmeraldValue
 
 var RequirePath func(path string) *object.EmeraldValue
@@ -233,6 +235,59 @@ var currentFiber *object.EmeraldValue
 var threadReportOnExceptionDefault = true
 var threadAbortOnExceptionDefault = false
 var requiredFeatures = make(map[string]bool)
+var loadingFeatures = make(map[string]bool)
+
+func FeatureLoading(path string) bool {
+	return loadingFeatures[path]
+}
+
+func loadedFeaturesGlobal() *object.EmeraldValue {
+	if GetGlobalVariable == nil {
+		return nil
+	}
+	if value := GetGlobalVariable("$\""); value != nil && value.Type == object.ValueArray {
+		return value
+	}
+	if value := GetGlobalVariable("$LOADED_FEATURES"); value != nil && value.Type == object.ValueArray {
+		return value
+	}
+	return nil
+}
+
+func syncRequiredFeaturesFromLoadedFeatures() {
+	features := loadedFeaturesGlobal()
+	if features == nil {
+		return
+	}
+	next := make(map[string]bool)
+	for _, feature := range features.Data.([]*object.EmeraldValue) {
+		if feature != nil && feature.Type == object.ValueString {
+			next[feature.Data.(string)] = true
+		}
+	}
+	requiredFeatures = next
+}
+
+func featureRequired(path string) bool {
+	syncRequiredFeaturesFromLoadedFeatures()
+	return requiredFeatures[path] || requiredFeatures[path+".rb"]
+}
+
+func markFeatureRequired(path string) {
+	requiredFeatures[path] = true
+	features := loadedFeaturesGlobal()
+	if features == nil {
+		return
+	}
+	arr := features.Data.([]*object.EmeraldValue)
+	for _, feature := range arr {
+		if feature != nil && feature.Type == object.ValueString && feature.Data.(string) == path {
+			return
+		}
+	}
+	features.Data = append(arr, &object.EmeraldValue{Type: object.ValueString, Data: path, Class: R.Classes["String"]})
+}
+
 var scratchPadRecorded *object.EmeraldValue
 var defaultThreadGroup *object.EmeraldValue
 var evaluatingRaiseErrorMatcher bool
@@ -1715,6 +1770,9 @@ func (rt *Runtime) defineMethods() {
 			if matcher, ok := args[0].Data.(*raiseErrorMatcher); ok {
 				return evaluateRaiseErrorMatcher(payload, matcher)
 			}
+			if matcher, ok := args[0].Data.(*outputMatcher); ok {
+				return evaluateOutputMatcher(payload, matcher)
+			}
 		}
 		return &object.EmeraldValue{Type: object.ValueObject, Data: &payload, Class: R.Classes["Expectation"]}
 	}})
@@ -2327,7 +2385,7 @@ func moduleAutoload(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if path == "" {
 		return NewArgumentError("empty file name")
 	}
-	if requiredFeatures[path] || requiredFeatures[path+".rb"] {
+	if featureRequired(path) {
 		return R.NilVal
 	}
 	setAutoload(receiver, name, path)
@@ -3228,12 +3286,12 @@ func moduleDefineMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	name := names[0]
 	var method *object.Method
 	if len(args) > 1 {
-		method, errVal = methodFromDefineMethodValue(name, args[1])
+		method, errVal = methodFromDefineMethodValue(receiver, name, args[1])
 	} else {
 		if CurrentBlockValue == nil || CurrentBlockValue() == nil {
 			return NewArgumentError("tried to create Proc object without a block")
 		}
-		method, errVal = methodFromDefineMethodValue(name, CurrentBlockValue())
+		method, errVal = methodFromDefineMethodValue(receiver, name, CurrentBlockValue())
 	}
 	if errVal != nil {
 		return errVal
@@ -3254,14 +3312,14 @@ func moduleDefineMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	return &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: R.Classes["Symbol"]}
 }
 
-func methodFromDefineMethodValue(name string, value *object.EmeraldValue) (*object.Method, *object.EmeraldValue) {
+func methodFromDefineMethodValue(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) (*object.Method, *object.EmeraldValue) {
 	if value == nil {
 		return nil, typeError("wrong argument type NilClass (expected Proc/Method/UnboundMethod)")
 	}
 	switch value.Type {
 	case object.ValueClosure:
 		closure := value.Data.(*object.Closure)
-		return &object.Method{Name: name, Fn: closure.Fn}, nil
+		return &object.Method{Name: name, Fn: closure.Fn, Closure: closure}, nil
 	case object.ValueProc:
 		proc := value.Data.(*object.Proc)
 		if proc.Native != nil {
@@ -3269,9 +3327,19 @@ func methodFromDefineMethodValue(name string, value *object.EmeraldValue) (*obje
 				return proc.Native(args...)
 			}}, nil
 		}
-		return &object.Method{Name: name, Fn: proc.Fn}, nil
+		return &object.Method{Name: name, Fn: proc.Fn, Closure: &object.Closure{
+			Fn:         proc.Fn,
+			Free:       proc.Env,
+			Block:      proc.Block,
+			Binding:    proc.Binding,
+			ClassStack: proc.ClassStack,
+			AutoSplat:  proc.AutoSplat,
+		}}, nil
 	case object.ValueMethod:
 		copy := *value.Data.(*object.Method)
+		if errVal := validateDefineMethodOwner(receiver, &copy); errVal != nil {
+			return nil, errVal
+		}
 		copy.Name = name
 		return &copy, nil
 	default:
@@ -3281,6 +3349,42 @@ func methodFromDefineMethodValue(name string, value *object.EmeraldValue) (*obje
 		}
 		return nil, typeError("wrong argument type " + typeName + " (expected Proc/Method/UnboundMethod)")
 	}
+}
+
+func validateDefineMethodOwner(receiver *object.EmeraldValue, method *object.Method) *object.EmeraldValue {
+	if receiver == nil || method == nil || method.Owner == nil {
+		return nil
+	}
+	if method.Owner.Type != object.ValueClass {
+		return nil
+	}
+	owner := method.Owner.Data.(*object.Class)
+	if owner == nil || owner.IsSingleton {
+		return nil
+	}
+	if receiver.Type != object.ValueClass {
+		return typeError("bind argument must be a subclass of " + owner.Name)
+	}
+	target := receiver.Data.(*object.Class)
+	if defineMethodClassInheritsFrom(target, owner) {
+		return nil
+	}
+	return typeError("bind argument must be a subclass of " + owner.Name)
+}
+
+func defineMethodClassInheritsFrom(cls, target *object.Class) bool {
+	if cls == nil || target == nil {
+		return false
+	}
+	for current := cls; current != nil; current = current.SuperClass {
+		if current == target {
+			return true
+		}
+		if current.Name != "" && current.Name == target.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func defineMethodVisibility(receiver *object.EmeraldValue, name string) string {
@@ -4151,13 +4255,17 @@ func methodObjectMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	} else if receiver.Type == object.ValueClass {
 		method, ok = receiver.Data.(*object.Class).ClassMethods[name]
 	}
+	var owner *object.Class
 	if !ok {
-		method, _, ok = receiver.Class.GetMethodWithOwner(name)
+		method, owner, ok = receiver.Class.GetMethodWithOwner(name)
 	}
 	if !ok || method == nil {
 		return NewNameError("undefined method `" + name + "'")
 	}
 	copy := *method
+	if copy.Owner == nil && owner != nil {
+		copy.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: owner, Class: R.Classes["Class"]}
+	}
 	copy.Receiver = receiver
 	return &object.EmeraldValue{Type: object.ValueMethod, Data: &copy, Class: R.Classes["Method"]}
 }
@@ -7982,6 +8090,9 @@ func arrayReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 	replacement := args[0].Data.([]*object.EmeraldValue)
 	receiver.Data = append([]*object.EmeraldValue(nil), replacement...)
+	if receiver == loadedFeaturesGlobal() {
+		syncRequiredFeaturesFromLoadedFeatures()
+	}
 	return receiver
 }
 
@@ -8035,6 +8146,9 @@ func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	receiver.Data = append(arr, args[0])
+	if receiver == loadedFeaturesGlobal() {
+		syncRequiredFeaturesFromLoadedFeatures()
+	}
 	return receiver
 }
 
@@ -10027,6 +10141,9 @@ func arrayDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		}
 	}
 	receiver.Data = newArr
+	if receiver == loadedFeaturesGlobal() {
+		syncRequiredFeaturesFromLoadedFeatures()
+	}
 	return result
 }
 
@@ -11113,12 +11230,14 @@ func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	case strings.HasSuffix(path, "concurrent3.rb"):
 		return requireConcurrentFixture(path, "in_concurrent_rb3", "")
 	}
-	if requiredFeatures[path] {
+	if featureRequired(path) || loadingFeatures[path] {
 		return R.FalseVal
 	}
 	if RequirePath != nil {
 		prevException := LastException
+		loadingFeatures[path] = true
 		result := RequirePath(path)
+		delete(loadingFeatures, path)
 		if result != nil && result.Type == object.ValueException {
 			return result
 		}
@@ -11126,7 +11245,7 @@ func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			return LastException
 		}
 	}
-	requiredFeatures[path] = true
+	markFeatureRequired(path)
 	return R.TrueVal
 }
 
@@ -11142,10 +11261,10 @@ func requireConcurrentFixture(path, enteredKey, raiseKey string) *object.Emerald
 			}
 		}
 	}
-	if requiredFeatures[path] {
+	if featureRequired(path) {
 		return R.FalseVal
 	}
-	requiredFeatures[path] = true
+	markFeatureRequired(path)
 	return R.TrueVal
 }
 
@@ -16885,7 +17004,7 @@ type kindOfMatcher struct {
 }
 
 type includeMatcher struct {
-	Expected *object.EmeraldValue
+	Expected []*object.EmeraldValue
 }
 
 var specRunner *SpecRunner
@@ -17033,26 +17152,35 @@ func evaluateKindOfMatcher(payload expectationData, matcher *kindOfMatcher) *obj
 func evaluateIncludeMatcher(payload expectationData, matcher *includeMatcher) *object.EmeraldValue {
 	matches := false
 	actual := payload.Value
-	expected := matcher.Expected
-	if actual != nil && expected != nil {
-		switch actual.Type {
-		case object.ValueArray:
-			for _, element := range actual.Data.([]*object.EmeraldValue) {
-				if element != nil && element.Equals(expected) {
-					matches = true
-					break
+	matches = len(matcher.Expected) > 0
+	if actual != nil {
+		for _, expected := range matcher.Expected {
+			found := false
+			if expected != nil {
+				switch actual.Type {
+				case object.ValueArray:
+					for _, element := range actual.Data.([]*object.EmeraldValue) {
+						if element != nil && element.Equals(expected) {
+							found = true
+							break
+						}
+					}
+				case object.ValueString:
+					if expected.Type == object.ValueString {
+						found = strings.Contains(actual.Data.(string), expected.Data.(string))
+					}
+				case object.ValueHash:
+					for key := range actual.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+						if key != nil && key.Equals(expected) {
+							found = true
+							break
+						}
+					}
 				}
 			}
-		case object.ValueString:
-			if expected.Type == object.ValueString {
-				matches = strings.Contains(actual.Data.(string), expected.Data.(string))
-			}
-		case object.ValueHash:
-			for key := range actual.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
-				if key != nil && key.Equals(expected) {
-					matches = true
-					break
-				}
+			if !found {
+				matches = false
+				break
 			}
 		}
 	}
@@ -17118,6 +17246,16 @@ func RegisterMspec() {
 
 			actualValue := expectationPayload(receiver).Value
 			matcher := args[0]
+			if matcher, ok := matcher.Data.(*raiseErrorMatcher); ok {
+				payload := expectationPayload(receiver)
+				payload.Negated = true
+				return evaluateRaiseErrorMatcher(payload, matcher)
+			}
+			if matcher, ok := matcher.Data.(*outputMatcher); ok {
+				payload := expectationPayload(receiver)
+				payload.Negated = true
+				return evaluateOutputMatcher(payload, matcher)
+			}
 
 			if !actualValue.Equals(matcher) {
 				specRunner.PassCount++
@@ -17316,7 +17454,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.NilVal
 			}
-			return evaluateIncludeMatcher(expectationPayload(receiver), &includeMatcher{Expected: args[0]})
+			return evaluateIncludeMatcher(expectationPayload(receiver), &includeMatcher{Expected: args})
 		},
 	})
 
@@ -17538,7 +17676,7 @@ func RegisterMspec() {
 			}
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
-				Data:  &includeMatcher{Expected: args[0]},
+				Data:  &includeMatcher{Expected: args},
 				Class: R.Classes["Expectation"],
 			}
 		},
@@ -17941,6 +18079,17 @@ func RegisterMspec() {
 			}
 		},
 	})
+	objClass.DefineMethod("complain", &object.Method{
+		Name:  "complain",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return &object.EmeraldValue{
+				Type:  object.ValueObject,
+				Data:  &outputMatcher{},
+				Class: R.Classes["Expectation"],
+			}
+		},
+	})
 
 	objClass.DefineMethod("be_kind_of", &object.Method{
 		Name:  "be_kind_of",
@@ -18329,6 +18478,7 @@ func procValueFromBlock(block *object.EmeraldValue, class *object.Class) *object
 				Env:          closure.Free,
 				Block:        closure.Block,
 				Binding:      closure.Binding,
+				ClassStack:   closure.ClassStack,
 				InstanceVars: make(map[string]*object.EmeraldValue),
 				AutoSplat:    true,
 				IsLambda:     false,

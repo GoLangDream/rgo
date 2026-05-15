@@ -1100,9 +1100,16 @@ RGo 当前状态：
   - 根因：`parseSuperExpression` 解析 `super name` 这类裸参数后没有在 `peekToken` 为换行时退出，反复解析同一个 identifier，导致大量分配和 GC assist。
   - 已新增 `TestParseSuperWithBareArgumentTerminates`，并修复裸 `super` 参数的逗号/换行推进逻辑。
   - 已验证：`autoload_spec.rb` 74 examples / 29 failures；`module` dashboard 刷新为 32 pass / 51 nonzero_failures / 1 zero_examples；全局 dashboard 0 timeout / 0 runtime_error。
-- [ ] `vendor/ruby/spec/core/module/define_method_spec.rb` 已从 nonzero_failures 推进到 timeout。
+- [x] `vendor/ruby/spec/core/module/autoload_spec.rb` 剩余 failures 已解除。
+  - 2026-05-15 已补 `complain` matcher 执行 block、require 正在加载 feature 的重入状态、autoload/closure 的词法 class stack 传递，以及 superclass mismatch 走可捕获异常路径；`autoload_spec.rb` 从 3 failures 推进到 2 failures。
+  - 剩余失败集中在 failed autoload 后的父作用域常量查找，以及 autoload 后重开 class 且 superclass 不一致时的 TypeError 场景；继续处理前需要梳理模块 namespace 父作用域和 class reopen/autoload 的交互。
+  - 已验证：`autoload_spec.rb` 74 examples / 2 failures；刷新 `module` dashboard 后为 82 pass / 1 nonzero_failures / 1 zero_examples。
+  - 2026-05-16 已修复 `$"` / `$LOADED_FEATURES` 与内部 require cache 不同步、类/模块内部常量误写入全局未限定名表、普通 `def` 未保留定义处 lexical class stack、以及 qualified class header 未通过当前/root 常量容器触发 autoload 的问题。
+  - 已验证：`autoload_spec.rb` 74 examples / 0 failures；刷新 `module` dashboard 后为 83 pass / 1 zero_examples（仅 `autoload_relative_spec.rb` 仍为 0 examples）。
+- [x] `vendor/ruby/spec/core/module/define_method_spec.rb` 已解除 timeout/nonzero_failures。
   - 已修复 `define_method(:m) { |a, b = 1| ... }` block 默认参数未保留的问题，并将 arity 检查限制在 `define_method` 生成的方法，避免破坏普通 `def` 当前缺参读 nil 的既有语义。
-  - 当前卡在文件末尾 `define_method` block “behaves exactly like a lambda” 的 `redo` 场景；按项目规则先记录，后续需要集中处理 define_method/lambda block 的 `redo` 控制流。
+  - 2026-05-14 修复 `define_method` 逃逸闭包的 captured local 脱离栈帧后失效、method frame 的 `break`/`redo` 非循环初始状态、`class_eval`/`module_eval` block 执行语义、class/module body 局部变量槽数量，以及 Method/UnboundMethod owner 绑定校验。
+  - 已验证：`define_method_spec.rb` 88 examples / 0 failures；刷新 `module` dashboard 后为 82 pass / 1 nonzero_failures / 1 zero_examples。
 - [x] MSpec `guard -> { ... }` zero_examples 问题已部分解除。
   - 根因：parser 不支持裸方法调用的 lambda 参数后接 `do` block（例如 `guard -> { platform_is_not :windows } do`），并且 `platform_is` / `platform_is_not` 无 block 调用没有返回布尔值。
   - 已新增 `TestParseBareMethodCallWithLambdaArgumentAndDoBlock` 与 `TestMspecGuardExecutesTruthyLambdaBlock`。

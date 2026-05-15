@@ -8008,6 +8008,115 @@ end
 	}
 }
 
+func TestDefineMethodRedoPreservesClosureState(t *testing.T) {
+	result, _ := runRuby(t, `
+klass = Class.new do
+  result = []
+  define_method(:foo) do
+    if result.empty?
+      result << :first
+      redo
+    else
+      result << :second
+      result
+    end
+  end
+end
+klass.new.foo`)
+	assertArrayOfSymbols(t, result, []string{"first", "second"})
+}
+
+func TestDefineMethodNextReturnsFromGeneratedMethod(t *testing.T) {
+	result, _ := runRuby(t, `
+klass = Class.new do
+  define_method(:foo) do
+    next 42
+  end
+end
+klass.new.foo`)
+	assertIntResult(t, result, 42)
+}
+
+func TestDefineMethodBreakReturnsFromGeneratedMethod(t *testing.T) {
+	result, _ := runRuby(t, `
+klass = Class.new do
+  define_method(:foo) do
+    break 42
+  end
+end
+klass.new.foo`)
+	assertIntResult(t, result, 42)
+}
+
+func TestClassBodyLocalsDoNotOverwriteSelf(t *testing.T) {
+	result, _ := runRuby(t, `
+class ClassBodyLocalSpec
+  value = 42
+  define_method(:value_from_body) { value }
+end
+ClassBodyLocalSpec.new.value_from_body`)
+	assertIntResult(t, result, 42)
+}
+
+func TestClassEvalDefineMethodDoesNotUseCallerBlock(t *testing.T) {
+	result, _ := runRuby(t, `
+obj = Object.new
+def obj.define(name)
+  self.class.class_eval do
+    define_method(name)
+  end
+end
+raised = false
+begin
+  obj.define(:foo) { :unused }
+rescue ArgumentError
+  raised = true
+end
+raised`)
+	assertBoolResult(t, result, true)
+}
+
+func TestDefineMethodWithProcBlockPassUsesClassBodyLocal(t *testing.T) {
+	result, _ := runRuby(t, `
+class DefineMethodProcBlockPassSpec
+  prc = Proc.new { || 123 }
+  define_method(:value_from_proc, &prc)
+end
+raised = false
+begin
+  DefineMethodProcBlockPassSpec.new.value_from_proc(:extra)
+rescue ArgumentError
+  raised = true
+end
+[DefineMethodProcBlockPassSpec.new.value_from_proc, raised]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+	assertIntResult(t, values[0], 123)
+	assertBoolResult(t, values[1], true)
+}
+
+func TestDefineMethodRejectsMethodFromUnrelatedClass(t *testing.T) {
+	result, _ := runRuby(t, `
+source = Class.new do
+  def foo
+  end
+end
+method = source.new.method(:foo)
+raised = false
+begin
+  Class.new { define_method(:bar, method) }
+rescue TypeError
+  raised = true
+end
+raised`)
+	assertBoolResult(t, result, true)
+}
+
 func TestSuperCall(t *testing.T) {
 	t.Skip("class inheritance has pre-existing bug (unknown opcode 53)")
 }

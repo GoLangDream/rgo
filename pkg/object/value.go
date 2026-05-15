@@ -302,6 +302,7 @@ type BuiltinFunction struct {
 type Method struct {
 	Name          string
 	Fn            interface{}
+	Closure       *Closure
 	Arity         int
 	Receiver      *EmeraldValue
 	Owner         *EmeraldValue
@@ -315,6 +316,7 @@ type Proc struct {
 	Env          []*EmeraldValue
 	Block        *EmeraldValue
 	Binding      *RBinding
+	ClassStack   []*EmeraldValue
 	InstanceVars map[string]*EmeraldValue
 	Native       func(args ...*EmeraldValue) *EmeraldValue
 	AutoSplat    bool
@@ -330,11 +332,12 @@ type ControlFlow struct {
 }
 
 type Closure struct {
-	Fn        *Function
-	Free      []*EmeraldValue
-	Block     *EmeraldValue
-	Binding   *RBinding
-	AutoSplat bool
+	Fn         *Function
+	Free       []*EmeraldValue
+	Block      *EmeraldValue
+	Binding    *RBinding
+	ClassStack []*EmeraldValue
+	AutoSplat  bool
 }
 
 type RInteger struct {

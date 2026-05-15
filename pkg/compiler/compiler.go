@@ -1146,6 +1146,8 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		c.Emit(OpReturnValue)
 
+		numLocals := c.symbolTable.MaxSymbols
+		localNames := c.localNames()
 		instructions := c.LeaveScope()
 
 		bodyFn := &object.EmeraldValue{
@@ -1153,7 +1155,8 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data: &object.Function{
 				Name:         node.Name.Value + "#body",
 				Instructions: instructions,
-				NumLocals:    0,
+				NumLocals:    numLocals,
+				LocalNames:   localNames,
 			},
 			Class: core.R.Classes["Class"],
 		}
@@ -1187,6 +1190,8 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		c.Emit(OpReturnValue)
+		numLocals := c.symbolTable.MaxSymbols
+		localNames := c.localNames()
 		instructions := c.LeaveScope()
 
 		bodyFn := &object.EmeraldValue{
@@ -1194,7 +1199,8 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data: &object.Function{
 				Name:         node.Name.Value + "#body",
 				Instructions: instructions,
-				NumLocals:    0,
+				NumLocals:    numLocals,
+				LocalNames:   localNames,
 			},
 			Class: core.R.Classes["Class"],
 		}
