@@ -6819,6 +6819,76 @@ m::DEFINED`)
 	assertIntResult(t, result, 1)
 }
 
+func TestUndefinedScopedConstantCompoundAssignmentsRaiseNameError(t *testing.T) {
+	result, _ := runRuby(t, `and_assign_raised = false
+begin
+	Object::MISSING &&= 10
+rescue NameError
+	and_assign_raised = true
+end
+
+Object::SCOPED_AND_FALSE = false
+Object::SCOPED_AND_FALSE &&= 10
+Object::SCOPED_AND_TRUE = true
+Object::SCOPED_AND_TRUE &&= 10
+module ScopedAssignSpecs
+	AND_TRUE = true
+end
+ScopedAssignSpecs::AND_TRUE &&= 10
+rhs_evaluations = 0
+Object::SCOPED_OR_TRUE = true
+Object::SCOPED_OR_TRUE ||= (rhs_evaluations += 1)
+Object::SCOPED_AND_FALSE &&= (rhs_evaluations += 1)
+
+plus_assign_raised = false
+begin
+	Object::MISSING += 10
+rescue NameError
+	plus_assign_raised = true
+end
+
+Object::SCOPED_PLUS = 1
+receiver_evaluations = 0
+(receiver_evaluations += 1; Object)::SCOPED_PLUS += 1
+
+anonymous = Module.new
+anonymous.const_set(:A, 1)
+anonymous::A += 1
+anonymous_leaked = defined?(A)
+
+frozen_raised = false
+frozen_mod = Module.new
+frozen_mod.const_set(:A, 1)
+frozen_mod.freeze
+begin
+  frozen_mod::A += 1
+rescue FrozenError
+  frozen_raised = true
+end
+
+[and_assign_raised, Object::SCOPED_AND_FALSE, Object::SCOPED_AND_TRUE, ScopedAssignSpecs::AND_TRUE, rhs_evaluations, plus_assign_raised, receiver_evaluations, Object::SCOPED_PLUS, anonymous::A, anonymous_leaked, frozen_raised]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 11 {
+		t.Fatalf("expected 11 values, got %d", len(values))
+	}
+	assertBoolResult(t, values[0], true)
+	assertBoolResult(t, values[1], false)
+	assertIntResult(t, values[2], 10)
+	assertIntResult(t, values[3], 10)
+	assertIntResult(t, values[4], 0)
+	assertBoolResult(t, values[5], true)
+	assertIntResult(t, values[6], 1)
+	assertIntResult(t, values[7], 2)
+	assertIntResult(t, values[8], 2)
+	if values[9].Type != object.ValueNil {
+		t.Fatalf("expected anonymous scoped assignment not to leak top-level A, got %s", values[9].Inspect())
+	}
+	assertBoolResult(t, values[10], true)
+}
+
 func TestModuleRuby2KeywordsReturnsNilAndRaisesRubyErrors(t *testing.T) {
 	result, _ := runRuby(t, `obj = Object.new
 returned_nil = false

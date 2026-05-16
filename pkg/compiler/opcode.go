@@ -68,6 +68,7 @@ const (
 	OpGetConstant
 	OpSetConstant
 	OpGetScopedConstant
+	OpSetScopedConstant
 
 	OpClosure
 
@@ -172,6 +173,13 @@ type Definition struct {
 	OperandWidths []int
 }
 
+const (
+	ScopedConstAssignPlain = iota
+	ScopedConstAssignOr
+	ScopedConstAssignAnd
+	ScopedConstAssignAdd
+)
+
 var definitions = map[Opcode]Definition{
 	OpConstant: {"OpConstant", []int{2}},
 	OpPop:      {"OpPop", []int{}},
@@ -234,6 +242,7 @@ var definitions = map[Opcode]Definition{
 	OpGetConstant:       {"OpGetConstant", []int{2}},
 	OpSetConstant:       {"OpSetConstant", []int{2}},
 	OpGetScopedConstant: {"OpGetScopedConstant", []int{2}},
+	OpSetScopedConstant: {"OpSetScopedConstant", []int{2, 1}},
 
 	OpClosure:        {"OpClosure", []int{2, 1}},
 	OpCurrentClosure: {"OpCurrentClosure", []int{}},

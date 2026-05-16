@@ -695,19 +695,40 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Target); err != nil {
 				return err
 			}
-			c.EmitConstant(&object.EmeraldValue{
+			name := &object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  node.Name.Value,
 				Class: core.R.Classes["String"],
-			})
-			if err := c.Compile(node.Value); err != nil {
+			}
+			mode := ScopedConstAssignPlain
+			switch node.Token.Type {
+			case lexer.OR_ASSIGN:
+				mode = ScopedConstAssignOr
+			case lexer.AND_ASSIGN:
+				mode = ScopedConstAssignAnd
+			case lexer.PLUS_ASSIGN:
+				mode = ScopedConstAssignAdd
+			}
+			if mode == ScopedConstAssignPlain {
+				c.EmitConstant(name)
+				if err := c.Compile(node.Value); err != nil {
+					return err
+				}
+				c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  "const_set",
+					Class: core.R.Classes["String"],
+				}), 0, 2)
+				return nil
+			}
+			if mode == ScopedConstAssignOr || mode == ScopedConstAssignAnd {
+				if err := c.compileExpressionThunk(node.Value); err != nil {
+					return err
+				}
+			} else if err := c.Compile(node.Value); err != nil {
 				return err
 			}
-			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
-				Type:  object.ValueString,
-				Data:  "const_set",
-				Class: core.R.Classes["String"],
-			}), 0, 2)
+			c.emit(OpSetScopedConstant, c.addConstant(name), mode)
 			return nil
 		}
 
@@ -2185,6 +2206,35 @@ func (c *Compiler) emitCaptureSymbol(sym Symbol) {
 	default:
 		c.Emit(OpNil)
 	}
+}
+
+func (c *Compiler) compileExpressionThunk(expr ast.Expression) error {
+	c.EnterScope()
+	if err := c.Compile(expr); err != nil {
+		return err
+	}
+	c.Emit(OpReturnValue)
+	free := c.symbolTable.FreeSymbols
+	numLocals := c.symbolTable.MaxSymbols
+	localNames := c.localNames()
+	instructions := c.LeaveScope()
+
+	fn := &object.EmeraldValue{
+		Type: object.ValueFunction,
+		Data: &object.Function{
+			Name:         "__scoped_const_rhs__",
+			Instructions: instructions,
+			NumLocals:    numLocals,
+			LocalNames:   localNames,
+		},
+		Class: core.R.Classes["Class"],
+	}
+	fnIdx := c.addConstant(fn)
+	for _, s := range free {
+		c.emitCaptureSymbol(s)
+	}
+	c.emit(OpClosure, fnIdx, len(free))
+	return nil
 }
 
 func (c *Compiler) compileRangeExpression(node *ast.RangeExpression) error {

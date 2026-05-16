@@ -115,9 +115,9 @@
    - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
    - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
    - Task 1 follow-up 刷新命令：`RGO_SPEC_TIMEOUT=1 scripts/spec_status.sh vendor/ruby/spec/language reports/spec-status/language.csv`，写入 80 个 specs。
-   - 最新 language dashboard：80 pass, 0 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-10 refreshed）。
-   - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass；duration 为易变值不在 TODO 固定记录。
-   - selected blocker 已解除；`vendor/ruby/spec/language` dashboard 已全部通过。
+   - 最新 language dashboard：25 pass, 0 timeout, 1 runtime_error, 51 nonzero_failures, 3 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-16 refreshed）。
+   - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass（74 examples / 0 failures）；duration 为易变值不在 TODO 固定记录。
+   - 2026-05-16 follow-up：新增 `TestUndefinedScopedConstantCompoundAssignmentsRaiseNameError`，修复 scoped constant `&&=` / compound assignment 对未定义常量应触发 `NameError` 的行为；selected blocker 已解除。
 - [x] `keyword_arguments_spec.rb` keyword shorthand (`m(a:, b:)`) parse error
    - 根因：`IDENT COLON` 在 call args 中缺少 peek-ahead，消耗 COLON 后停在 COMMA 但无 prefix parse fn
    - 已修复：`parseOneCallArg`/`parseOneYieldArg` 在 COLON 后遇到参数分隔符或右括号时，将 omitted value 解析为同名本地变量。
@@ -383,9 +383,9 @@
 ### Language spec gate（2026-05-03）
 
 - [x] 建立 `vendor/ruby/spec/language` 基线
-  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：80 pass, 0 timeout, 0 runtime_error, 0 nonzero_failures, 0 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-10 refreshed）。
-  - 当前观测到 2714 examples / 0 failures。
-  - `vendor/ruby/spec/language` dashboard 当前全部通过。
+  - 当前 `RGO_SPEC_TIMEOUT=1` 结果：25 pass, 0 timeout, 1 runtime_error, 51 nonzero_failures, 3 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-16 refreshed）。
+  - 当前观测到 2636 examples / 397 failures。
+  - `vendor/ruby/spec/language` dashboard 当前未全部通过。
   - 第一批 parser 目标：
     - [x] `vendor/ruby/spec/language/and_spec.rb` 已通过 10 examples / 0 failures；已支持布尔表达式 RHS 赋值，如 `true && false && x = 1`。
     - [x] `vendor/ruby/spec/language/or_spec.rb` 已通过 15 examples / 0 failures；受 lambda/proc literal 中 `next` 跳转回填修复影响，`next true or false` 控制流不再卡住。

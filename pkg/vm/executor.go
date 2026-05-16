@@ -730,6 +730,38 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.push(value)
 
+	case compiler.OpSetScopedConstant:
+		nameIdx := vm.readUint16()
+		mode := vm.readUint8()
+		name, ok := constants[nameIdx].Data.(string)
+		if !ok {
+			return fmt.Errorf("OpSetScopedConstant: expected string constant, got %T", constants[nameIdx].Data)
+		}
+		value := vm.pop()
+		receiver := vm.pop()
+		assigned, result := vm.scopedConstantAssignmentValue(receiver, name, value, mode)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		if assigned {
+			if receiver == nil || (receiver.Type != object.ValueClass && receiver.Type != object.ValueModule) {
+				if vm.raiseException(frame, core.NewTypeError("not a class/module")) {
+					return nil
+				}
+			}
+			if receiver.Frozen {
+				frozen := &object.EmeraldValue{Type: object.ValueException, Data: &object.RException{Message: "can't modify frozen class/module"}, Class: core.R.Classes["FrozenError"]}
+				if vm.raiseException(frame, frozen) {
+					return nil
+				}
+			}
+			defineConstantOn(receiver, name, result)
+			if qualified := qualifiedConstantName(receiver, name); strings.Contains(qualified, "::") {
+				vm.rubyConsts[qualified] = result
+			}
+		}
+		vm.push(result)
+
 	case compiler.OpGetLocal:
 		idx := vm.readUint8()
 		basePtr := frame.Bp
@@ -3890,6 +3922,44 @@ func (vm *VM) scopedConstantValue(receiver *object.EmeraldValue, constName strin
 		return nil, false
 	}
 	return nil, false
+}
+
+func (vm *VM) scopedConstantAssignmentValue(receiver *object.EmeraldValue, constName string, value *object.EmeraldValue, mode int) (bool, *object.EmeraldValue) {
+	current, found := vm.scopedConstantValue(receiver, constName)
+	if current != nil && current.Type == object.ValueException {
+		return false, current
+	}
+
+	switch mode {
+	case compiler.ScopedConstAssignOr:
+		if found && current.IsTruthy() {
+			return false, current
+		}
+		return true, vm.scopedConstantAssignmentRHS(value)
+	case compiler.ScopedConstAssignAnd:
+		if !found {
+			return false, core.NewNameError("uninitialized constant " + qualifiedConstantName(receiver, constName))
+		}
+		if !current.IsTruthy() {
+			return false, current
+		}
+		return true, vm.scopedConstantAssignmentRHS(value)
+	case compiler.ScopedConstAssignAdd:
+		if !found {
+			return false, core.NewNameError("uninitialized constant " + qualifiedConstantName(receiver, constName))
+		}
+		result := vm.add(current, value)
+		return true, result
+	default:
+		return true, value
+	}
+}
+
+func (vm *VM) scopedConstantAssignmentRHS(value *object.EmeraldValue) *object.EmeraldValue {
+	if value != nil && value.Type == object.ValueClosure {
+		return vm.callBlock(value)
+	}
+	return value
 }
 
 func (vm *VM) triggerAutoload(receiver *object.EmeraldValue, constName string) (*object.EmeraldValue, bool) {
