@@ -229,10 +229,11 @@ func (l *Lexer) NextToken() Token {
 			l.peekChar() == 'x' || l.peekChar() == 's' {
 			tok = l.readPercentString()
 			return tok // readPercentString already advanced past content
-		} else if l.peekChar() == '(' || l.peekChar() == '[' || l.peekChar() == '{' || l.peekChar() == '<' {
+		} else if (l.peekChar() == '(' || l.peekChar() == '[' || l.peekChar() == '{' || l.peekChar() == '<') &&
+			!l.previousNonWhitespaceCharIsDot() {
 			tok = l.readPercentString()
 			return tok
-		} else if isBarePercentDelimiter(l.peekChar()) {
+		} else if isBarePercentDelimiter(l.peekChar()) && !l.previousNonWhitespaceCharIsDot() {
 			tok = l.readPercentString()
 			return tok
 		} else {
@@ -423,6 +424,8 @@ func (l *Lexer) readHashArrow() Token {
 
 func (l *Lexer) readIdentifier() Token {
 	position := l.position
+	line := l.line
+	column := l.column
 	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
@@ -436,8 +439,8 @@ func (l *Lexer) readIdentifier() Token {
 	return Token{
 		Type:    LookupIdent(lit),
 		Literal: lit,
-		Line:    l.line,
-		Column:  l.column,
+		Line:    line,
+		Column:  column,
 	}
 }
 
@@ -780,10 +783,11 @@ func (l *Lexer) readString(singleQuote bool) Token {
 	if singleQuote {
 		lit := l.readSingleQuotedString(position, quote)
 		return Token{
-			Type:    STRING,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
+			Type:                STRING,
+			Literal:             lit,
+			AllowsInterpolation: false,
+			Line:                l.line,
+			Column:              l.column,
 		}
 	} else {
 		return l.readDoubleQuotedString(position, quote)
@@ -809,6 +813,15 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 
 	for l.ch != quote && l.ch != 0 {
 		if l.ch == '\\' {
+			if l.peekChar() == '#' && l.peekCharN(2) == '{' {
+				lit += l.input[position:l.position]
+				l.readChar() // skip '\'
+				l.readChar() // skip '#'
+				lit += EscapedHashInterpolation
+				position = l.position
+				continue
+			}
+
 			// Flush raw text before the backslash
 			lit += l.input[position:l.position]
 			l.readChar() // skip '\'
@@ -822,11 +835,9 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 			lit += l.input[position:l.position]
 			lit += l.readVarInterpolation()
 			position = l.position
-		} else if l.ch == '#' && isLetter(l.peekChar()) {
-			// # 后面的字母不是 { 或 $，说明不是插值，直接添加到字符串
-			lit += l.input[position:l.position]
+		} else if l.ch == '#' {
+			// # 后面的字符不是 { 或 $，说明不是插值，直接保留 # 字符
 			l.readChar()
-			position = l.position
 		} else if l.ch == quote {
 			// 遇到结束引号，退出循环
 			break
@@ -840,10 +851,11 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 	// 不在这里调用 l.readChar()，让 NextToken 函数处理
 
 	return Token{
-		Type:    STRING,
-		Literal: lit,
-		Line:    l.line,
-		Column:  l.column,
+		Type:                STRING,
+		AllowsInterpolation: true,
+		Literal:             lit,
+		Line:                l.line,
+		Column:              l.column,
 	}
 }
 
@@ -899,8 +911,9 @@ func (l *Lexer) readEscapeSequence() string {
 	case 'M':
 		return l.readMetaEscape()
 	default:
+		ch := l.ch
 		l.readChar()
-		return string(l.ch)
+		return string(ch)
 	}
 }
 
@@ -928,7 +941,7 @@ func (l *Lexer) readHexEscape() string {
 	if err != nil {
 		return seq
 	}
-	return string(rune(value))
+	return string([]byte{byte(value)})
 }
 
 func (l *Lexer) readUnicodeEscape() string {
@@ -1030,19 +1043,22 @@ func (l *Lexer) readRawString() Token {
 	l.readChar()
 
 	position := l.position
+	var lit string
 
 	for l.ch != '`' && l.ch != 0 {
 		l.readChar()
 	}
 
-	lit := l.input[position:l.position]
+	lit += l.input[position:l.position]
 	l.readChar()
 
 	return Token{
-		Type:    STRING,
-		Literal: "`" + lit + "`",
-		Line:    l.line,
-		Column:  l.column,
+		Type:                STRING,
+		Literal:             lit,
+		Line:                l.line,
+		Column:              l.column,
+		AllowsInterpolation: true,
+		CommandLiteral:      true,
 	}
 }
 
@@ -1129,6 +1145,7 @@ func (l *Lexer) readPercentString() Token {
 	}
 
 	openDelimiter := delimiter
+	interpolates := kind != 'q' && kind != 'i'
 	pairedDelimiter := true
 	if delimiter == '(' {
 		delimiter = ')'
@@ -1145,17 +1162,26 @@ func (l *Lexer) readPercentString() Token {
 	l.readChar()
 
 	position := l.position
+	lit := ""
 	depth := 1
 
 	for l.ch != 0 {
 		if l.ch == '\\' {
+			if interpolates && l.peekChar() == '#' && l.peekCharN(2) == '{' {
+				lit += l.input[position:l.position]
+				l.readChar() // skip '\\'
+				l.readChar() // skip '#'
+				lit += EscapedHashInterpolation
+				position = l.position
+				continue
+			}
 			l.readChar()
 			if l.ch != 0 {
 				l.readChar()
 			}
 			continue
 		}
-		if l.ch == '#' && l.peekChar() == '{' {
+		if interpolates && l.ch == '#' && l.peekChar() == '{' {
 			l.readChar()
 			l.readChar()
 			interpDepth := 1
@@ -1189,18 +1215,23 @@ func (l *Lexer) readPercentString() Token {
 		l.readChar()
 	}
 
-	lit := l.input[position:l.position]
+	lit += l.input[position:l.position]
 	l.readChar()
 
 	tokenType := STRING
 	if kind == 'w' || kind == 'W' {
 		tokenType = WORDS
 	}
+	if kind == 's' {
+		tokenType = SYMBOL
+		lit = ":" + lit
+	}
 	tok := Token{
-		Type:    tokenType,
-		Literal: lit,
-		Line:    l.line,
-		Column:  l.column,
+		Type:                tokenType,
+		Literal:             lit,
+		AllowsInterpolation: interpolates,
+		Line:                l.line,
+		Column:              l.column,
 	}
 
 	return tok
@@ -1264,20 +1295,31 @@ func (l *Lexer) readSlashOrRegexp() Token {
 	}
 
 	lit := l.input[position : l.position+1]
+	lit = strings.ReplaceAll(lit, `\c#{`, `\c`+EscapedHashInterpolation+"{")
 	l.readChar()
 
 	// Check for modifiers
-	for l.ch == 'i' || l.ch == 'm' || l.ch == 'x' || l.ch == 'o' || l.ch == 'e' || l.ch == 's' || l.ch == 'u' || l.ch == 'n' {
+	for l.ch == 'i' || l.ch == 'm' || l.ch == 'x' || l.ch == 'o' || l.ch == 'e' || l.ch == 's' || l.ch == 'u' || l.ch == 'n' || l.ch == 'a' {
 		lit += string(l.ch)
 		l.readChar()
 	}
 
 	return Token{
-		Type:    REGEXP,
-		Literal: lit,
-		Line:    l.line,
-		Column:  l.column,
+		Type:                REGEXP,
+		Literal:             lit,
+		AllowsInterpolation: containsUnescapedInterpolation(lit),
+		Line:                l.line,
+		Column:              l.column,
 	}
+}
+
+func containsUnescapedInterpolation(lit string) bool {
+	for i := 0; i+1 < len(lit); i++ {
+		if lit[i] == '#' && lit[i+1] == '{' && (i == 0 || lit[i-1] != EscapedHashInterpolation[0]) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Lexer) slashCanStartRegexp() bool {
@@ -1411,6 +1453,20 @@ func (l *Lexer) previousCharCanEndExpression() bool {
 	return false
 }
 
+func (l *Lexer) previousNonWhitespaceCharIsDot() bool {
+	for pos := l.position - 1; pos >= 0; {
+		if l.input[pos] == ' ' || l.input[pos] == '\t' || l.input[pos] == '\r' || l.input[pos] == '\n' {
+			if pos == 0 {
+				return false
+			}
+			pos--
+			continue
+		}
+		return l.input[pos] == '.'
+	}
+	return false
+}
+
 func (l *Lexer) readHeredoc(line, column int) Token {
 	allowIndentedTerminator := false
 	if l.ch == '-' || l.ch == '~' {
@@ -1476,10 +1532,11 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 
 	return Token{
-		Type:    STRING,
-		Literal: lit,
-		Line:    line,
-		Column:  column,
+		Type:                STRING,
+		Literal:             lit,
+		Line:                line,
+		Column:              column,
+		AllowsInterpolation: quote != '\'',
 	}
 }
 
@@ -1540,6 +1597,14 @@ func (l *Lexer) readSymbolOrColon() Token {
 		if l.ch == '?' || l.ch == '!' {
 			lit += string(l.ch)
 			l.readChar()
+			if l.ch == '=' && l.peekChar() == '>' {
+				return Token{
+					Type:    ILLEGAL,
+					Literal: ":" + lit + "=>",
+					Line:    l.line,
+					Column:  l.column,
+				}
+			}
 		}
 
 		return Token{

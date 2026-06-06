@@ -3,6 +3,7 @@ set -euo pipefail
 
 TIMEOUT_SECONDS=${RGO_GO_TEST_TIMEOUT:-60}
 MEMORY_KB=${RGO_TEST_MEMORY_KB:-}
+CPU_SECONDS=${RGO_GO_TEST_CPU_SECONDS:-}
 
 args=("$@")
 has_package_parallelism=0
@@ -29,6 +30,9 @@ run_go_test() {
   export GOMODCACHE=${GOMODCACHE:-/tmp/rgo-go-mod-cache}
   if [ -n "$MEMORY_KB" ]; then
     ulimit -v "$MEMORY_KB"
+  fi
+  if [ -n "$CPU_SECONDS" ]; then
+    ulimit -t "$CPU_SECONDS"
   fi
   exec go test "$@"
 }

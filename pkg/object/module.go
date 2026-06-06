@@ -14,6 +14,7 @@ type Module struct {
 	InstanceVars        map[string]*EmeraldValue
 	Parent              *Module
 	IncludedModules     []*Module
+	PrependedModules    []*Module // Modules prepended via prepend
 	SingletonClass      *Class
 }
 
@@ -75,4 +76,8 @@ func (m *Module) Extend(module *Module) {
 	for name, method := range module.Methods {
 		m.Methods[name] = method
 	}
+}
+
+func (m *Module) Prepend(module *Module) {
+	m.PrependedModules = append([]*Module{module}, m.PrependedModules...)
 }

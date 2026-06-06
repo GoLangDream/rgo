@@ -26,6 +26,18 @@ func mkArr(elems ...*object.EmeraldValue) *object.EmeraldValue {
 	return &object.EmeraldValue{Type: object.ValueArray, Data: elems, Class: R.Classes["Array"]}
 }
 
+func mkMapHash(pairs map[*object.EmeraldValue]*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{Type: object.ValueHash, Data: pairs, Class: R.Classes["Hash"]}
+}
+
+func mkRHash(pairs map[*object.EmeraldValue]*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueHash,
+		Data:  &object.RHash{Pairs: pairs},
+		Class: R.Classes["Hash"],
+	}
+}
+
 func callMethod(t *testing.T, receiver *object.EmeraldValue, name string, args ...*object.EmeraldValue) *object.EmeraldValue {
 	t.Helper()
 	method, ok := receiver.Class.GetMethod(name)
@@ -83,6 +95,19 @@ func assertNil(t *testing.T, val *object.EmeraldValue) {
 	t.Helper()
 	if val != R.NilVal {
 		t.Errorf("expected nil, got %v", val)
+	}
+}
+
+func assertExceptionType(t *testing.T, val *object.EmeraldValue, expected *object.Class) {
+	t.Helper()
+	if val == nil {
+		t.Fatalf("expected exception of type %s, got nil", expected.Name)
+	}
+	if val.Type != object.ValueException {
+		t.Fatalf("expected exception, got %v", val.Type)
+	}
+	if val.Class != expected {
+		t.Fatalf("expected exception class %s, got %s", expected.Name, val.Class.Name)
 	}
 }
 
@@ -202,6 +227,32 @@ func TestIntAbs(t *testing.T) {
 
 func TestIntToF(t *testing.T) {
 	assertFloat(t, callMethod(t, mkInt(5), "to_f"), 5.0)
+}
+
+func TestIntGcdTypeErrorForNonIntegerArg(t *testing.T) {
+	got := callMethod(t, mkInt(10), "gcd", mkFloat(2.5))
+	assertExceptionType(t, got, R.Classes["TypeError"])
+}
+
+func TestIntGcdWithLargerNumbers(t *testing.T) {
+	got := callMethod(t, mkInt(1152921504606846976), "gcd", mkInt(2))
+	assertInt(t, got, 2)
+}
+
+func TestIntGcdWithNegativeValues(t *testing.T) {
+	assertInt(t, callMethod(t, mkInt(-12), "gcd", mkInt(6)), 6)
+	assertInt(t, callMethod(t, mkInt(12), "gcd", mkInt(-6)), 6)
+	assertInt(t, callMethod(t, mkInt(-12), "gcd", mkInt(-6)), 6)
+}
+
+func TestIntLcmTypeErrorForNonIntegerArg(t *testing.T) {
+	got := callMethod(t, mkInt(10), "lcm", mkFloat(2.5))
+	assertExceptionType(t, got, R.Classes["TypeError"])
+}
+
+func TestIntLcmWithLargerNumbers(t *testing.T) {
+	got := callMethod(t, mkInt(1152921504606846976), "lcm", mkInt(2))
+	assertInt(t, got, 1152921504606846976)
 }
 
 // === Float Methods ===
@@ -414,6 +465,46 @@ func TestArrayDeleteAtNonIntegerDoesNotPanic(t *testing.T) {
 
 	result := callMethod(t, arr, "delete_at", arg)
 	assertNil(t, result)
+}
+
+func TestHashIndexSetNilMap(t *testing.T) {
+	hash := mkMapHash(nil)
+	key := mkStr("k")
+	assertInt(t, callMethod(t, hash, "[]=", key, mkInt(42)), 42)
+	h, ok := hash.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	if !ok {
+		t.Fatalf("expected map data, got %T", hash.Data)
+	}
+	if len(h) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(h))
+	}
+	assertInt(t, callMethod(t, hash, "[]", key), 42)
+}
+
+func TestHashIndexSetReplacesExistingKeyInRHash(t *testing.T) {
+	originalKey := mkStr("k")
+	otherKey := mkStr("k")
+	rHash := &object.RHash{
+		Pairs: map[*object.EmeraldValue]*object.EmeraldValue{
+			originalKey: mkInt(1),
+		},
+		Keys: []*object.EmeraldValue{originalKey},
+	}
+	hash := &object.EmeraldValue{
+		Type:  object.ValueHash,
+		Data:  rHash,
+		Class: R.Classes["Hash"],
+	}
+
+	assertInt(t, callMethod(t, hash, "[]=", otherKey, mkInt(2)), 2)
+	if len(rHash.Pairs) != 1 {
+		t.Fatalf("expected no growth when replacing equivalent key, got %d", len(rHash.Pairs))
+	}
+	if len(rHash.Keys) != 1 {
+		t.Fatalf("expected one tracked key after replacement, got %d", len(rHash.Keys))
+	}
+	assertInt(t, callMethod(t, hash, "[]", originalKey), 2)
+	assertInt(t, callMethod(t, hash, "[]", otherKey), 2)
 }
 
 // === Object Methods ===

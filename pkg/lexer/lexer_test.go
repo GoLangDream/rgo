@@ -146,6 +146,7 @@ func TestStringLiterals(t *testing.T) {
 		{"escape tab", `"hello\tworld"`, "hello\tworld"},
 		{"escape quote", `"say \"hi\""`, `say "hi"`},
 		{"escape nul", `"hello\0world"`, "hello\x00world"},
+		{"escape ordinary hash", `"\#@"`, "#@"},
 	}
 
 	for _, tt := range tests {
@@ -164,6 +165,19 @@ func TestStringLiterals(t *testing.T) {
 	}
 }
 
+func TestDoubleQuotedStringKeepsHashCharacter(t *testing.T) {
+	toks := tokenizeClean(`"Fiber#kill"`)
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != STRING {
+		t.Fatalf("expected STRING, got %s", toks[0].Type)
+	}
+	if toks[0].Literal != "Fiber#kill" {
+		t.Fatalf("expected %q, got %q", "Fiber#kill", toks[0].Literal)
+	}
+}
+
 func TestSquigglyHeredocToken(t *testing.T) {
 	toks := tokenizeClean("code = <<~CODE\n  10\nCODE\n")
 	if len(toks) != 3 {
@@ -171,6 +185,19 @@ func TestSquigglyHeredocToken(t *testing.T) {
 	}
 	if toks[2].Type != STRING {
 		t.Fatalf("expected heredoc STRING token, got %s %q", toks[2].Type, toks[2].Literal)
+	}
+}
+
+func TestHeredocInterpolationFlag(t *testing.T) {
+	toks := tokenizeClean("s = <<HERE\n#{value}\nHERE\nsingle = <<'TEXT'\n#{value}\nTEXT\n")
+	if len(toks) != 6 {
+		t.Fatalf("expected 6 tokens, got %d: %v", len(toks), toks)
+	}
+	if !toks[2].AllowsInterpolation {
+		t.Fatalf("expected unquoted heredoc to allow interpolation")
+	}
+	if toks[5].AllowsInterpolation {
+		t.Fatalf("expected single-quoted heredoc to disable interpolation")
 	}
 }
 
@@ -243,6 +270,19 @@ func TestInterpolatedRegexpWithNestedRegexp(t *testing.T) {
 	}
 	if toks[1].Type != DOT || toks[2].Literal != "encoding" {
 		t.Fatalf("expected .encoding after regexp, got %v", toks[1:3])
+	}
+}
+
+func TestRegexpControlEscapeTakesPrecedenceOverInterpolation(t *testing.T) {
+	toks := tokenizeClean(`/\c#{str}/`)
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != REGEXP {
+		t.Fatalf("expected REGEXP, got %s", toks[0].Type)
+	}
+	if toks[0].AllowsInterpolation {
+		t.Fatalf("expected control escape regexp not to interpolate, got %q", toks[0].Literal)
 	}
 }
 
@@ -530,6 +570,20 @@ func TestSymbols(t *testing.T) {
 			}
 			if toks[0].Literal != tt.literal {
 				t.Errorf("expected literal %q, got %q", tt.literal, toks[0].Literal)
+			}
+		})
+	}
+}
+
+func TestSymbolHashRocketWithoutSpaceAfterBangOrQuestionIsIllegal(t *testing.T) {
+	for _, input := range []string{":a!=> 1", ":a?=> 1"} {
+		t.Run(input, func(t *testing.T) {
+			toks := tokenizeClean(input)
+			if len(toks) == 0 {
+				t.Fatal("expected tokens")
+			}
+			if toks[0].Type != ILLEGAL {
+				t.Fatalf("expected ILLEGAL, got %s %q", toks[0].Type, toks[0].Literal)
 			}
 		})
 	}
@@ -927,6 +981,46 @@ func TestMethodCallExpression(t *testing.T) {
 	}
 }
 
+func TestMethodCallPercentMethod(t *testing.T) {
+	toks := tokenizeClean("obj.%(1)")
+	expected := []struct {
+		tokType TokenType
+		literal string
+	}{
+		{IDENT, "obj"},
+		{DOT, "."},
+		{MOD, "%"},
+		{LPAREN, "("},
+		{INT, "1"},
+		{RPAREN, ")"},
+	}
+
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, exp := range expected {
+		if toks[i].Type != exp.tokType {
+			t.Errorf("token[%d]: expected type %s, got %s", i, exp.tokType, toks[i].Type)
+		}
+		if toks[i].Literal != exp.literal {
+			t.Errorf("token[%d]: expected literal %q, got %q", i, exp.literal, toks[i].Literal)
+		}
+	}
+}
+
+func TestPercentLowercaseSCreatesSymbolToken(t *testing.T) {
+	toks := tokenizeClean("%s{foo bar}")
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != SYMBOL {
+		t.Fatalf("expected SYMBOL, got %s", toks[0].Type)
+	}
+	if toks[0].Literal != ":foo bar" {
+		t.Fatalf("expected %q, got %q", ":foo bar", toks[0].Literal)
+	}
+}
+
 func TestVariableAssignment(t *testing.T) {
 	toks := tokenizeClean("x = 5")
 	expected := []struct {
@@ -1058,6 +1152,32 @@ func TestStringInterpolation(t *testing.T) {
 	}
 }
 
+func TestEscapedInterpolationInString(t *testing.T) {
+	toks := tokenizeClean(`"value of \#{$DEBUG}"`)
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != STRING {
+		t.Errorf("expected STRING, got %s", toks[0].Type)
+	}
+	if toks[0].Literal != "value of "+EscapedHashInterpolation+"{$DEBUG}" {
+		t.Errorf("expected literal with escaped interpolation marker, got %q", toks[0].Literal)
+	}
+}
+
+func TestHexEscapeInStringPreservesRawByte(t *testing.T) {
+	toks := tokenizeClean(`"\xFF\xFE"`)
+	if len(toks) != 1 {
+		t.Fatalf("expected 1 token, got %d: %v", len(toks), toks)
+	}
+	if toks[0].Type != STRING {
+		t.Fatalf("expected STRING, got %s", toks[0].Type)
+	}
+	if toks[0].Literal != "\xff\xfe" {
+		t.Fatalf("expected raw bytes ff fe, got % x", []byte(toks[0].Literal))
+	}
+}
+
 func TestBangOperator(t *testing.T) {
 	toks := tokenizeClean("!")
 	if len(toks) != 1 {
@@ -1176,5 +1296,23 @@ func TestSymbolInspectLiteralTokens(t *testing.T) {
 		if toks[0].Literal != tt.literal {
 			t.Fatalf("%s: expected literal %q, got %q (%s)", tt.input, tt.literal, toks[0].Literal, toks[0].Type)
 		}
+	}
+}
+
+func TestIdentifierBeforeNewlineKeepsStartingLine(t *testing.T) {
+	l := New("line = __LINE__\np line\n")
+	var tokens []Token
+	for {
+		tok := l.NextToken()
+		tokens = append(tokens, tok)
+		if tok.Type == EOF {
+			break
+		}
+	}
+	if tokens[2].Literal != "__LINE__" || tokens[2].Line != 1 {
+		t.Fatalf("expected __LINE__ on line 1, got %q line %d", tokens[2].Literal, tokens[2].Line)
+	}
+	if tokens[4].Literal != "p" || tokens[4].Line != 2 {
+		t.Fatalf("expected p on line 2, got %q line %d", tokens[4].Literal, tokens[4].Line)
 	}
 }

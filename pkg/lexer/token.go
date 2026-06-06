@@ -1,10 +1,17 @@
 package lexer
 
+import (
+	"unicode"
+	"unicode/utf8"
+)
+
 type TokenType string
 
 const (
 	ILLEGAL TokenType = "ILLEGAL"
 	EOF     TokenType = "EOF"
+
+	EscapedHashInterpolation = "\x00#"
 
 	IDENT    TokenType = "IDENT"
 	INT      TokenType = "INT"
@@ -160,8 +167,12 @@ const (
 type Token struct {
 	Type    TokenType
 	Literal string
-	Line    int
-	Column  int
+	// AllowsInterpolation indicates whether this literal should be interpreted as an
+	// interpolated string (double-quoted style).
+	AllowsInterpolation bool
+	CommandLiteral      bool
+	Line                int
+	Column              int
 }
 
 func (t Token) String() string {
@@ -222,9 +233,17 @@ func LookupIdent(ident string) TokenType {
 	if tok, ok := keywords[ident]; ok {
 		return tok
 	}
-	// Constants start with uppercase letter
-	if len(ident) > 0 && ident[0] >= 'A' && ident[0] <= 'Z' {
+	// Constants start with an uppercase letter, including non-ASCII identifiers.
+	if startsWithUpper(ident) {
 		return CONSTANT
 	}
 	return IDENT
+}
+
+func startsWithUpper(ident string) bool {
+	if ident == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(ident)
+	return unicode.IsUpper(r)
 }

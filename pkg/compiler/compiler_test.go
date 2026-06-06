@@ -52,6 +52,37 @@ func hasOpcode(instructions Instructions, op Opcode) bool {
 	return false
 }
 
+func TestCompileRescueMatchMarksSplatExceptions(t *testing.T) {
+	bc := compile(t, `
+exceptions = [SecondError]
+begin
+  raise SecondError
+rescue FirstError, *exceptions
+  true
+end`)
+	found := false
+	for i := 0; i < len(bc.Instructions); i++ {
+		if Opcode(bc.Instructions[i]) != OpRescueMatch {
+			continue
+		}
+		found = true
+		count := int(bc.Instructions[i+1])
+		mask := int(bc.Instructions[i+2])<<8 | int(bc.Instructions[i+3])
+		if count != 2 {
+			t.Fatalf("expected rescue match count 2, got %d", count)
+		}
+		if mask != 2 {
+			t.Fatalf("expected splat mask 2, got %d", mask)
+		}
+	}
+	if !found {
+		t.Fatal("expected OpRescueMatch")
+	}
+	if hasOpcode(bc.Instructions, OpSplat) {
+		t.Fatal("rescue splat should be expanded by OpRescueMatch, not OpSplat")
+	}
+}
+
 func functionConstants(bytecode *Bytecode) []*object.Function {
 	functions := []*object.Function{}
 	for _, constant := range bytecode.Constants {

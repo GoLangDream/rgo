@@ -1,5 +1,11 @@
 # RGo 待办事项
 
+## 本次调试记录（2026-06-04）
+
+- [x] `rescue A, *[B]` 这类 rescue splat 数组字面量 parser 边界问题已修复；新增 parser/vm 回归测试覆盖数组字面量 splat rescue。
+- [x] `vendor/ruby/spec/core/array/fixtures/classes.rb` 通过 `require_relative` 动态加载时，正常 `begin ... rescue NameError ... end` 被动态语法校验误判为 `SyntaxError: unexpected rescue modifier`，导致 `ArraySpecs.frozen_array` fixture 未加载并连带影响 `append_spec` 等 frozen array 场景。已改为逐行校验 rescue 子句，并保留 `VM.New` 前设置的 `CurrentSpecFile`；已验证 `append_spec.rb` / `at_spec.rb`。
+- [ ] 2026-06-07 刷新 `vendor/ruby/spec/language` 后发现当前真实状态为 78 pass / 3 nonzero_failures / 2871 examples / 7 failures，失败文件为 `block_spec.rb`、`method_spec.rb`、`predefined_spec.rb`。日志已临时写到 `/tmp/rgo-language-fail-logs/`；按项目规则先记录，后续单独处理。
+
 ## 阶段 0：补测试（已完成）
 
 按依赖顺序从底层往上补：
@@ -35,6 +41,46 @@
 - [x] parseAssignExpression 支持 InstanceVariable
 - [x] 方法调用栈管理 (Bp 计算、fp 管理)
 - [x] 方法返回值处理 (OpReturnValue)
+
+## 阶段 2：Spec 全量执行检查（2026-06-02）
+
+### Language block follow-up（2026-06-02）
+
+- [x] `vendor/ruby/spec/language/block_spec.rb` 中 `to_ary` 自身 raise 的场景已解除（2026-06-04）：根因为 rescue exception expression 会吞掉 `=> e` 并丢失变量绑定；已补 parser 停止 hash rocket 与 rescue variable binding 回归。已验证：165 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/singleton_class_spec.rb` 已解除（2026-06-03）：已修复 singleton class `new/allocate` TypeError、对象/string/class singleton superclass 链、按需 effective singleton class、`Class#superclass`、Class/Module `==` 等价、mspec `be_kind_of` 对 singleton effective class 的判断、`require` 动态语法校验进入 class/module 时保留 method scope，以及 mspec `bignum_value` helper。已验证：53 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/variables_spec.rb` 已解除（2026-06-03）：已补多赋值 `to_ary` / `to_a` 非 Array TypeError、嵌套 MRHS splat coercion、非 ASCII 大写常量动态赋值 SyntaxError，以及 `respond_to?` 默认 `respond_to_missing?` 路径。已验证：118 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/numbered_parameters_spec.rb` 已解除（2026-06-03）：已补动态 eval 中 numbered parameter 赋值、显式 block 参数、嵌套 numbered block 的 SyntaxError 校验；`raise_error` message matcher 只对 numbered parameter 相关断言启用 message 校验，避免扩大既有 shim 文案差异。已验证：12 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/it_parameter_spec.rb` 已解除（2026-06-04）：已补 Ruby 3.4 隐式 `it` 参数检测、block/proc/lambda arity 与参数元数据、`it` 与 numbered parameter 混用 SyntaxError，以及动态 eval 语法检查忽略嵌套字符串字面量。已验证：15 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/constants_spec.rb` 回归已解除（2026-06-04）：`raise_error` matcher 中 scoped constant 缺失的 `NameError` 不再被后续 `::` 链覆盖成 `TypeError`。已验证：100 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/proc_spec.rb` 已解除（2026-06-04）：已补 `**nil` 拒收关键字语义，以及 lambda/proc 单解构参数 `|(a, b)|` 在 arity 检查前执行 `to_ary` coercion。已验证：40 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/lambda_spec.rb` 已解除（2026-06-04）：已补 `lambda` 方法必须有显式 block、匿名 keyword rest `**` 不接收位置参数、`**nil` 拒收关键字，以及单解构 lambda 参数的 autosplat/coercion 顺序。已验证：68 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/def_spec.rb` 已解除（2026-06-04）：已补 frozen 对象/类/singleton class 定义方法时的 `FrozenError`、`FrozenError#receiver`、重复 rest 参数 `SyntaxError`，以及 eval 中 class method 定义不污染实例方法表。已验证：73 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/pattern_matching_spec.rb` 已解除（2026-06-04）：已补 eval 中非法 pattern 的 `SyntaxError` 预检，并为 `Object[]` / `Object[a: ...]` pattern 增加 `deconstruct` / `deconstruct_keys` 返回类型校验。已验证：113 examples / 0 failures。
+- [x] `vendor/ruby/spec/language/method_spec.rb` 已解除（2026-06-04）：已补 method call splat 的 `to_a` 语义、空格方法调用参数列表动态 `SyntaxError`、匿名/命名 keyword rest、`**nil` 与空 keyword splat、裸 hash rocket / `**` keyword send 标记，以及普通位置 Hash 不应满足 keyword 方法 arity 的边界。已验证：168 examples / 0 failures。
+- [x] Language 历史刷新记录（2026-06-04）：当时已解除 `def_spec.rb`、`pattern_matching_spec.rb`、`method_spec.rb`、`class_spec.rb`、`predefined_spec.rb`、`regexp/back-references_spec.rb`、`rescue_spec.rb`、`block_spec.rb` 等收尾项，并刷新 `reports/spec-status/language-current.csv` 为 81 files pass / 0 failures。2026-06-07 重新刷新后见顶部调试记录，当前 dashboard 存在 3 个待处理回归。
+
+### Ruby Spec（`vendor/ruby/spec`）
+- 已新增并验证 `scripts/full_spec_gate.sh` 可稳定跑通所有 ruby spec 文件，报告写到 `reports/spec-status/ruby-spec-full.csv`。
+- 运行参数（当前验证）：`RGO_SPEC_TIMEOUT=10 RGO_SPEC_CPU_SECONDS=120 RGO_TEST_MEMORY_KB=2000000 ./scripts/full_spec_gate.sh`
+- 结果：
+  - `pass`: 2039
+  - `nonzero_failures`: 804
+  - `runtime_error`: 81
+  - `zero_examples`: 880
+  - `timeout`: 7
+- 阻塞点：
+  - 存在大量 `nonzero_failures` 与 `zero_examples`，多数文件仍未通过（总计 3,811 个 ruby spec 文件中 1,772 个非 pass），需按目录分批修复。
+
+### Rails Spec（`vendor/rails/rails`）
+- 已将全量 rails 任务接入 `scripts/full_spec_gate.sh`，默认任务为：
+  - `activesupport:test actionpack:test actionview:test activemodel:test activejob:test actionmailer:test actionmailbox:test actiontext:test actioncable:test activestorage:test activerecord:test:sqlite3:test railties:test`
+- 当前阻塞在依赖安装：`bundle check` 失败，未通过 `bundle exec rake` 启动，任务统一报 `bundle_missing`。
+- 报告状态：12 个任务全部 `bundle_missing`，日志写在 `reports/spec-status/rails-task-logs/bundle_check.log`。
+- 建议复位动作：
+  - 在 `vendor/rails/rails` 下执行 `bundle install` 后再继续 `./scripts/full_spec_gate.sh --rails-only`。
+  - 已复核：
+    - `bundle install --local`：当前系统无本地 gem 缓存可满足依赖清单。
+    - `bundle install`：当前环境无法访问 `index.rubygems.org`（`Could not reach host index.rubygems.org`）。
 
 ## 阶段 0.5：已修复的 bug
 
@@ -94,6 +140,11 @@
 
 ## 新发现的问题（2025-03-04）
 
+### IO class-method blockers（2026-05-19）
+
+- [x] `IO` 类方法可见性与检索不一致：`IO.methods` 当前未包含 `IO.pipe` / `IO.for_fd` / `IO.copy_stream` 等应有方法，`IO.respond_to?` 与 `IO.method(:name)` 行为与 `ClassMethods` 不一致。已补齐类方法枚举与类接收者查找链（`methodSingletonClass` 首次创建单例类时同步 `ClassMethods`）。
+- [x] `IO.copy_stream` 已与 Ruby spec 对齐边界行为核对：类方法可见性与路径分发稳定化，补齐偏移量不变更源位置、管道 offset 异常、对象 read/write 分发与长度行为等回归场景。
+
 ### Time spec dashboard（2026-05-12）
 
 - [x] `vendor/ruby/spec/core/time/now_spec.rb` 已解除：18 examples / 0 failures。
@@ -111,6 +162,108 @@
 
 ### Language timeout reduction blocker（2026-05-06）
 
+- [x] `vendor/ruby/spec/language/return_spec.rb` 剩余 1 个失败已解除（2026-05-23）
+   - 已修复动态源码中 `def m; next; end` / `def m; redo; end` 应匹配 `SyntaxError` 的路径，并补了 focused VM 回归。
+   - 已修复 `File.write` 类方法未注册导致临时 fixture 不落盘的问题；新增 `TestFileWriteClassMethodCreatesFile`。
+   - 已修复 “within a block within a class”：`{ return }` 不再误吞 block terminator，class body block 中的 `return` 匹配 `LocalJumpError`。
+   - 当前已验证：`vendor/ruby/spec/language/return_spec.rb` 43 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/source_encoding_spec.rb` 剩余 2 个失败已解除（2026-05-23）
+   - 已修复 `touch(path, "wb")` 可选 mode 不被接受、block 内 `f.write` 因 IO shim 缺少 writable mode 而不落盘的问题；新增 `TestTouchWithModeYieldsWritableFile`。
+   - 已补 `String#bytesize`、按 byte 返回的 `String#bytes`、`Array#pack('C*')`，并修复 `\xNN` 字符串 escape 保留 raw byte；新增 focused lexer/VM 回归。
+   - 已验证：`vendor/ruby/spec/language/source_encoding_spec.rb` 6 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/symbol_spec.rb` 中 block 参数解构已解除（2026-05-23）
+   - 已修复非 lambda block 多参数接收单个 Array 时的解构行为；新增 `TestBlockDestructuresSingleArrayArgumentForMultipleParams`。
+   - 已验证：`vendor/ruby/spec/language/symbol_spec.rb` 13 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/ensure_spec.rb` 剩余 2 个 backtrace 断言已解除（2026-05-23）
+   - 已修复 `lambda { raise; ensure; }` 在动态源码中应匹配 `SyntaxError` 的路径；新增 `TestEnsureInsideBraceBlockMatchesSyntaxErrorMatcher`。
+   - 已修复普通编译路径下 `__LINE__` 返回 `nil` 的问题；新增 `TestLineKeywordCompilesToSourceLine`。
+   - 已修复局部变量减数字面量被误编译为 bare method call 的窄场景；新增 `TestLocalVariableMinusLiteralCompilesAsSubtraction`。
+   - 已修复 `raiseException` 中 `ensureActive` 上报和回溯构造链路：避免异常分发后误清空状态，并将 ensure 回溯的第二帧收敛为 `block` 标签与正确源行映射。
+   - 当前已验证：`vendor/ruby/spec/language/ensure_spec.rb` 31 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/character_classes_spec.rb` 剩余 2 个失败已解除（2026-05-23）
+   - 已补 `RegexpError` 类与 `Regexp.new` 对未闭合 unicode property 的错误路径；新增 `TestRegexpNewUnterminatedUnicodePropertyRaisesRegexpError`。
+   - 已让动态 `eval('/[[:alpha:]-[:digit:]]/')` 的非法字符类范围匹配 `SyntaxError`；新增 `TestInvalidRegexpCharacterClassRangeMatchesSyntaxErrorMatcher`。
+   - 已验证：`vendor/ruby/spec/language/regexp/character_classes_spec.rb` 126 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/interpolation_spec.rb` 剩余 2 个失败已解除（2026-05-23）
+   - 已让 regexp literal 标记并编译 `#{...}` interpolation，通过 `Regexp.new` 在运行时构造 pattern。
+   - 已补 malformed interpolation 产生 `RegexpError` 的窄路径；新增 `TestInterpolatedRegexpMalformedPatternRaisesRegexpError`。
+   - 已验证：`vendor/ruby/spec/language/regexp/interpolation_spec.rb` 9 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/escapes_spec.rb` 剩余 3 个失败已解除（2026-05-23）
+   - 已补动态 regexp literal 中非法 `\x` / `\c` escape 的 `SyntaxError` 验证；新增 `TestInvalidRegexpEscapesMatchSyntaxErrorMatcher`。
+   - 已验证：`vendor/ruby/spec/language/regexp/escapes_spec.rb` 13 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/modifiers_spec.rb` 剩余 3 个失败已解除（2026-05-23）
+   - 已让 lexer 捕获 `/a` modifier 并在动态 regexp syntax validation 中拒绝 unsupported modifier。
+   - 已补 `(?o)` / `(?o:)` inline modifier 的 `SyntaxError` 验证；新增 `TestInvalidRegexpModifiersMatchSyntaxErrorMatcher`。
+   - 已验证：`vendor/ruby/spec/language/regexp/modifiers_spec.rb` 11 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/grouping_spec.rb` 剩余 3 个失败已解除（2026-05-23）
+   - 已补动态 regexp literal unbalanced grouping 的 `SyntaxError` 验证。
+   - 已补 `Regexp.new("(?<1a>a)")` / `Regexp.new("(?<-a>a)")` 的 `RegexpError` 验证；新增 `TestInvalidRegexpGroupingMatchesExpectedErrors`。
+   - 已验证：`vendor/ruby/spec/language/regexp/grouping_spec.rb` 7 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp/encoding_spec.rb` 剩余 6 个失败已解除（2026-05-23）
+   - 已补 regexp match/match?/=~ 对非 ASCII-compatible string encoding、fixed encoding mismatch、broken UTF-8 byte sequence 的错误路径。
+   - 已补 `Regexp::FIXEDENCODING` 与 `Regexp.new(..., FIXEDENCODING)` fixed encoding metadata；新增 `TestRegexpEncodingMismatchRaisesExpectedErrors`。
+   - 已验证：`vendor/ruby/spec/language/regexp/encoding_spec.rb` 32 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/regexp_spec.rb` 剩余 10 个失败已解除（2026-05-23）
+   - 已补动态 `%r` malformed delimiter 的 `SyntaxError` 验证；新增 `TestInvalidPercentRegexpDelimitersMatchSyntaxError`。
+   - 已补 mspec expectation `=~` 对 Regexp actual 的 dispatch，并把 spec 覆盖的 conditional regexp forms 规范化为可执行 pattern；新增 `TestConditionalRegexpPositiveMatches`。
+   - 已验证：`vendor/ruby/spec/language/regexp_spec.rb` 25 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/super_spec.rb` 剩余 3 个失败已解除（2026-05-23）
+   - 已让 missing super target 抛出带 `super` 文案的 `NoMethodError`，不再静默返回 `nil`。
+   - 已标记 `define_method` 生成的函数，并让 implicit-argument `super` 从该路径抛出 `RuntimeError`；新增 `TestSuperMissingAndDefineMethodImplicitArgsRaiseExpectedErrors`。
+   - 已验证：`vendor/ruby/spec/language/super_spec.rb` 61 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/class_variable_spec.rb` 剩余 3 个失败已解除（2026-05-23）
+   - 已让 top-level class variable read/write 抛出 `RuntimeError: class variable access from toplevel`。
+   - 已让祖先类后续定义同名 class variable 时，子类读取 overtaken class variable 抛出 `RuntimeError`；新增 `TestClassVariableToplevelAndOvertakenAccessRaiseRuntimeError`。
+   - 已验证：`vendor/ruby/spec/language/class_variable_spec.rb` 14 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/retry_spec.rb` 剩余 4 个失败已解除（2026-05-23）
+   - 已补动态 syntax validation：`retry` 只能出现在 rescue body 内，其他 eval 场景匹配 `SyntaxError`；新增 `TestInvalidRetryMatchesSyntaxErrorMatcher`。
+   - 已验证：`vendor/ruby/spec/language/retry_spec.rb` 3 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/throw_spec.rb` 剩余 4 个失败已解除（2026-05-23）
+   - 已让 unmatched throw 抛出 `ArgumentError`，并保持 catch/throw label 类型严格匹配（string 不匹配 symbol）。
+   - 已补 `UncaughtThrowError` 类，并隔离 Thread block 的 parent catch stack；新增 `TestThrowUnmatchedAndThreadExitRaiseExpectedErrors`。
+   - 已验证：`vendor/ruby/spec/language/throw_spec.rb` 10 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/metaclass_spec.rb` 剩余 4 个失败已解除（2026-05-23）
+   - 已让 `class << true/false/nil` 返回对应 immediate class，并让 integer/symbol singleton class 打开抛出 `TypeError`。
+   - 已补 scoped constant lookup 对非 class/module receiver 抛出 `TypeError`，并拆分 `Object#dup` / `Object#clone`：`dup` 丢弃 singleton class 常量，`clone` 保留。
+   - 已验证：`vendor/ruby/spec/language/metaclass_spec.rb` 21 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/module_spec.rb` 剩余 6 个失败已解除（2026-05-23）
+   - 已让 `module Existing::Const` 在 Const 已存在但不是 Module 时抛出 `TypeError`，不再覆盖为新模块。
+   - 已补 lambda 中 captured local 作为 scoped module root（如 `module container::Value`）的常量解析。
+   - 已验证：`vendor/ruby/spec/language/module_spec.rb` 16 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/assignments_spec.rb` 剩余 5 个失败已解除（2026-05-23）
+   - 已让 scoped constant plain assignment 走 `OpSetScopedConstant`，保证 RHS 先求值，再对非 class/module receiver 抛出 `TypeError`。
+   - 已补动态 eval 对 Ruby 3.4 index assignment 中 block arg / keyword arg 的 `SyntaxError` 验证。
+   - 已验证：`vendor/ruby/spec/language/assignments_spec.rb` 38 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/return_spec.rb` 剩余 1 个失败已解除（2026-05-23）
+   - 已修复 `{ return }` 中 `return` 后紧跟 `}` 时 parser 错误吞掉 block terminator 的问题。
+   - 已让 class/module body 中执行的 block 使用 `return` 时抛出 `LocalJumpError`，同时保留 class body 直接 `return` 的 `SyntaxError`。
+   - 已验证：`vendor/ruby/spec/language/return_spec.rb` 43 examples / 0 failures。
+
+- [x] `vendor/ruby/spec/language/constants_spec.rb` 剩余 2 个失败已解除（2026-05-23）
+   - 已修复 non-class/non-module top-level constant qualifier（如 `CS_CONST1::CS_CONST`）应抛出 `TypeError`。
+   - 已补动态 eval 中 method 内 constant assignment 的 `SyntaxError: dynamic constant assignment` 验证。
+   - 已移除按 `Class#name` 推断 lexical parent 的 constant fallback，避免 `class A::B; def self.x; C; end; end` 错误搜索 `A::C`。
+   - 已补 `NameError#receiver/#name` 元数据、private constant owner 追踪、bare namespace module 合成，以及 scoped lookup 对 core qualified constants / `Process::*` constants / autoload nested constants 的兼容。
+   - 已验证：`vendor/ruby/spec/language/constants_spec.rb` 100 examples / 0 failures。
+
 - [x] Task 4 后 `vendor/ruby/spec/language/optional_assignments_spec.rb` timeout 已解除
    - 已修复 `super()` parser 空参数列表不终止问题，focused regression PASS。
    - 已补充并修复 `super(1 + 2)` parenthesized args 不终止回归；新增 `TestParseSuperWithParenthesizedArgumentsTerminates`，先 RED timeout 后 PASS。
@@ -118,6 +271,7 @@
    - 最新 language dashboard：25 pass, 0 timeout, 1 runtime_error, 51 nonzero_failures, 3 parse_error, 0 compile_error, 0 zero_examples out of 80 files（2026-05-16 refreshed）。
    - 最新 selected blocker：`vendor/ruby/spec/language/optional_assignments_spec.rb` status is pass（74 examples / 0 failures）；duration 为易变值不在 TODO 固定记录。
    - 2026-05-16 follow-up：新增 `TestUndefinedScopedConstantCompoundAssignmentsRaiseNameError`，修复 scoped constant `&&=` / compound assignment 对未定义常量应触发 `NameError` 的行为；selected blocker 已解除。
+   - 2026-05-23 follow-up：新增 runtime scoped `defined?` 检查和 `remove_const` 清理 VM qualified constant cache，修复 `Object::A &&=` / `Object::A +=` 在 spec cleanup 后残留的问题；已验证 74 examples / 0 failures。
 - [x] `keyword_arguments_spec.rb` keyword shorthand (`m(a:, b:)`) parse error
    - 根因：`IDENT COLON` 在 call args 中缺少 peek-ahead，消耗 COLON 后停在 COMMA 但无 prefix parse fn
    - 已修复：`parseOneCallArg`/`parseOneYieldArg` 在 COLON 后遇到参数分隔符或右括号时，将 omitted value 解析为同名本地变量。
@@ -161,10 +315,11 @@
   - 已支持 hash rocket 中的 signed numeric key，例如 `{ -2.2 => -2 }`。
   - 已将 Thread shim 改为协作式延迟执行：`Thread.pass` / `sleep` / `join` / `value` 推进 pending thread，避免 `Thread.pass until ready` 在 `Thread.new` 内同步自旋。
   - 已验证：`exit_spec.rb` 30 examples / 0 failures。
-- [ ] `vendor/ruby/spec/core/kernel/require_spec.rb` 并发 require 分组为临时跳过
-  - 根因：当前闭包/线程 shim 对 `t2 = nil; t1 = Thread.new { Thread.pass until t2 }; t2 = Thread.new { ... }` 这类 sibling thread 后续赋值可见性支持不足，会在并发 require fixture 自旋。
-  - 当前处理：spec runner 临时跳过描述为 `(concurrently)` 的分组，先解除 dashboard timeout；后续需要实现真正的共享闭包 cell 或协作式线程调度再恢复该分组。
-  - 已验证：`require_spec.rb` 142 examples / 0 failures（当前 harness 下，含临时跳过并发分组）。
+- [ ] `vendor/ruby/spec/core/kernel/require_spec.rb`
+  - 根因：当前闭包/线程 shim 对 `t2 = nil; t1 = Thread.new { Thread.pass until t2 }; t2 = Thread.new { ... }` 这类 sibling thread 后续赋值可见性支持不足，会在并发 require fixture 里出现共享状态问题；并发分组目前仍未恢复且该文件仍有 51 例失败。
+  - 已修复：`Process::Status` 实例化对象在 `Process::Status#clone` 等共享路径上不再触发 `interface conversion` panic（`*core.processStatusData` 被误当成 `*object.Object` 的断言崩溃）。
+  - 已补救：`singleton_class` / `Class` 变量设置 / `Module#extend_object` 在 `ValueObject` 且非普通 `*object.Object` 时改为返回可恢复错误分支，不再直接 panic。
+  - 已修复：`require` / `require_relative` 参数处理改为严格的 `pathFromSingleArg + coercePath` 流程（单参数校验 + `to_path`/`to_str` 转换 + 类型报错），不再对非字符串/参数不足返回 `false`。
 - [x] `vendor/ruby/spec/core/kernel/dup_spec.rb` parse_error 已解除
   - 已支持 lambda body 内一行 singleton class expression 后继续外层 call chain，例如 `-> { class << dup; CLONE; end }.should ...`。
   - 已验证：`dup_spec.rb` 18 examples / 0 failures。
@@ -981,7 +1136,7 @@ RGo 当前状态：
 
 - [x] `vendor/ruby/spec/language/predefined_spec.rb` 已通过 170 examples / 0 failures。
 
-- [ ] `&block` 方法参数已有最小实现：解析器保留 `BlockParam`，编译器记录 block 局部槽，VM 调用方法时把当前 block 写入该局部变量，并支持 `p.call` 常量 block。剩余 bug：当方法定义出现在外层局部变量赋值之前时，后续 `call_proc { x + 1 }` 的 block 捕获到的 `x` 仍为 nil；已用 `TestBlockPassedAsProcCapturesOuterLocal` 标记 skip，需继续排查 block closure 创建时的 free value 捕获时序。
+- [x] `&block` 方法参数已有最小实现：解析器保留 `BlockParam`，编译器记录 block 局部槽，VM 调用方法时把当前 block 写入该局部变量，并支持 `p.call` 常量 block。`TestBlockPassedAsProcCapturesOuterLocal` 与 `TestBlockPassedAsProcCapturesEarlierOuterLocal` 已恢复执行，验证 `block` 能稳定捕获方法外层局部变量。
 
 - [x] language dashboard 当前为 80 pass / 0 timeout / 0 runtime_error / 0 nonzero_failures / 0 parse_error / 0 compile_error / 0 zero_examples，2714 examples / 0 failures out of 80 files（2026-05-10 refreshed）。
 
@@ -1091,6 +1246,11 @@ RGo 当前状态：
 - [ ] `Thread.current.raise` 在已激活 rescue body 内再次 raise 的语义仍不完整。
   - 复现来自 `vendor/ruby/spec/core/thread/raise_spec.rb` 的 same-thread no-args-inside-rescue 场景：目标线程中 `rescue ZeroDivisionError; Thread.current.raise; end` 后，`Thread#value` 未按 spec 暴露 RuntimeError。
   - 初步判断与 VM rescue handler 在 rescue body 内再次处理异常有关；按项目规则先记录，后续需要集中梳理 nested rescue/reraise 语义。
+
+- [ ] `File.open` FIFO 并发阻塞模型仍有阻塞回归。
+  - `ioWaitForFIFOPeer` 在 writer/reader 同时 `Thread.new` 的场景里仍会长期阻塞，不一定触发 `reader` 的调度执行。
+  - 复现：`RGO_SPEC_TIMEOUT=30 ./rgo test /tmp/file-open-fifo-x-no-clean2.rb`
+  - 标记：需继续优化 FIFO 条件等待与协作式线程调度/唤醒语义。
 - [x] `vendor/ruby/spec/core/time/comparison_spec.rb` 整文件 parse_error 已解除。
   - 2026-05-12 修复 grouped expression parser 在 `)` 后接 `rescue` 以及嵌套 parenthesized call 后接 outer `.should` 时的终止判断。
   - 已验证：`comparison_spec.rb` 19 examples / 0 failures；Time dashboard 不再有 parse_error。
@@ -1282,3 +1442,51 @@ RGo 当前状态：
   - 2026-05-12 已补 `File.open` mode/flag、fd、binary encoding、permission、read/write/pos/rewind/gets，以及 block close 基础语义。
   - 后续修正 `File::RDONLY|File::APPEND` 不应隐式可写、keyword `flags: File::EXCL` 不应向字符串 mode 合并 `r`，并让 `raise_error` matcher 评估期间的 native exception 从 `OpSend` 正确传播。
   - 已验证：`open_spec.rb` 84 examples / 0 failures；`reports/spec-status/file.csv` 刷新为 107 pass / 5 zero_examples / 0 nonzero_failures，合计 907 examples / 0 failures。
+
+### Kernel 并发 require blocker（2026-05-24）
+
+- [x] `vendor/ruby/spec/core/kernel/shared/require.rb` 的 `Thread.current[:...]=...` 下标赋值解析错误已修复。`vendor/ruby/spec/core/kernel/require.rb`/`shared/require.rb` 已通过纯 parser 验证，可复用的回归用例已加入 `pkg/parser/parser_test.go`。
+- [ ] `vendor/ruby/spec/core/kernel/require_spec.rb` 运行期仍在 `ProcessStatus#clone` 路径触发 panic（当前测试中止于 `interface conversion: interface {} is *core.processStatusData, not *object.Object`）；需补齐该运行时兼容分支后继续恢复并发分组行为验证。
+
+### 当前内部测试失败（2026-06-02，已修复）
+
+- [x] `pkg/vm` 的 `TestKernelLoopReturnsEnumeratorStopResult` 当前失败。
+  - 复现：`scripts/safe_go_test.sh ./...`
+  - 现象：`pkg/vm/executor_test.go:4306` 期望 `loop { e.next }` 在 Enumerator 结束时返回 `:stopped`，当前得到 `nil`。
+  - 根因：`core.Init()` 会重建 runtime，但没有清掉包级 `currentThread` / `currentFiber`，导致前序测试调用 `Thread.current` 后，后续顶层 `loop` 被误判为 thread/fiber 内执行并提前返回 `nil`。
+  - 修复：`core.Init()` 复位 `currentThread` / `currentFiber`；新增 `TestKernelLoopIgnoresPreviousThreadCurrentState` 覆盖顺序依赖。
+
+### Kernel loop timeout（2026-06-02，已修复）
+
+- [x] `vendor/ruby/spec/core/kernel/loop_spec.rb` timeout 已解除。
+  - 根因：`Enumerator#each` 的 loop enumerator 分支在 yielded block 设置 `LastException` 时没有返回异常，导致 `raise ... unless args.empty?` 这类 block 异常被无限循环吞掉。
+  - 修复：`enumeratorEach` 在 loop/static enumerator yield 后检查并返回 `LastException`；新增 `TestSpecRunnerLoopEnumeratorBreakDoesNotPoisonNextExample` 覆盖真实 spec runner 复现。
+  - 已验证：`RGO_SPEC_TIMEOUT=10 scripts/spec_status.sh vendor/ruby/spec/core/kernel/loop_spec.rb /tmp/rgo-loop-final.csv` 为 10 examples / 0 failures。
+
+### Language variables multiassign follow-up（2026-06-03，已修复）
+
+- [x] `vendor/ruby/spec/language/variables_spec.rb` nested MRHS splat coercion 失败已解除。
+  - 已修复单 RHS MLHS `to_ary` 非 Array TypeError、单 LHS splat `*a = x` 的 `to_ary` TypeError、MRHS splat `to_a` 非 Array TypeError，以及非 ASCII 大写常量动态赋值的 SyntaxError 识别。
+  - 最后一例定位：`-> { a, *b, (c, d) = 1, 2, 3, *x }.should raise_error(TypeError)`，其中 `x.should_receive(:to_ary).and_return(x)`。
+  - 根因：`respond_to?` 内部以普通 public call 调用默认 private `respond_to_missing?`，导致 MRHS splat 的 `to_a` 检查覆盖了前面的 TypeError；已补默认 `Object#respond_to_missing?` 并让 `respond_to?` 内部直接调用 builtin 默认实现。
+
+### Language break follow-up（2026-06-03）
+
+- [x] `vendor/ruby/spec/language/break_spec.rb` 已解除（2026-06-03）：captured block `&b` 转发、`yield` 作为裸调用参数、active Proc block break unwind、以及 super block forwarding 的 `break` 传播均已对齐。
+  - 已修复动态源码中非法 `break` 的 SyntaxError 校验：`def m; break; end` 与 class/module body 中 `break` 现在匹配 SyntaxError。
+  - 已修复 captured block 直接 `Proc#call` 的 `break`：非 lambda proc call 遇到 `BlockBreak` 时返回 `LocalJumpError`，对应 `break_spec.rb` 从 7 failures 降到 4 failures。
+  - 已修复 `note yield` 一类裸调用参数解析：`yield` 现在可作为 method-call argument，不再被拆成两个独立语句。
+  - 已为 `&block` 转成的 Proc 记录 break owner frame：owner 仍在栈上时 `break` 按 block unwind 传播；owner 已退出时转为 `LocalJumpError`。
+  - 已验证：`vendor/ruby/spec/language/break_spec.rb` 39 examples / 0 failures。
+
+### Array fixture dynamic require follow-up（2026-06-06，已修复）
+
+- [x] `vendor/ruby/spec/core/array/fixtures/classes.rb` 经 `require_relative` 动态加载后，`ArraySpecs` 模块存在但 `ArraySpecs::MyArray` 为 `nil`，导致 `ArraySpecs::MyArray[1, 2, 3]` 实际变成 `nil.[]` 并在 `select_spec.rb` 的 subclass example 卡住。
+  - 已确认最小 `module M; class C < Array; end; end` 在普通 `rgo run` 中可正常定义 `M::C`，问题限定在动态 require/eval fixture 路径。
+  - 根因是 VM `OpArray` 对数组字面量硬限制 `n > 100`，fixture 中 `CHI_SQUARED_CRITICAL_VALUES` 有 101 个元素，导致 module body 在该常量处中断，后续 `MyArray` 等常量没有执行。
+  - 已将限制调整为 `StackSize` 边界并新增 `TestLargeArrayLiteralConstantInModuleBodyContinuesExecution`；已验证 `select_spec.rb` 20 examples / 0 failures。
+
+### Command-call argument precedence follow-up（2026-06-06）
+
+- [ ] `puts (1..5).to_a.inspect` / `puts (1..5).include?(3)` 当前在 feature smoke 中会先输出 `1..5`，说明 command-call 参数后的 dot-chain 优先级仍与 Ruby 存在差异。
+  - 当前 `Range#to_a` / `Range#include?` 本身可用；`scripts/feature_test.sh` 已改为显式 `puts((1..5).to_a.inspect)` 和 `puts((1..5).include?(3))`，避免该 parser follow-up 阻塞 array gate。

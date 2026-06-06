@@ -5,6 +5,7 @@ GOMODCACHE ?= /tmp/rgo-go-mod-cache
 GOENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
 
 .PHONY: help test clean build fmt lint check
+.PHONY: full-spec full-ruby-spec full-rails-spec
 
 help:
 	@echo "RGo - Ruby VM in Go"
@@ -33,3 +34,12 @@ check: fmt lint test
 
 clean:
 	rm -f rgo
+
+full-spec:
+	scripts/full_spec_gate.sh
+
+full-ruby-spec:
+	scripts/full_spec_gate.sh --ruby-only
+
+full-rails-spec:
+	scripts/full_spec_gate.sh --rails-only

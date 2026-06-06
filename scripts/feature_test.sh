@@ -234,8 +234,8 @@ run_test "respond_to?" 'puts "hi".respond_to?(:upcase)' "true"
 # === Comparable / Range ===
 run_test "spaceship" 'puts(1 <=> 2)' "-1"
 run_test "range each" 'sum = 0; (1..5).each { |i| sum = sum + i }; puts sum' "15"
-run_test "range to_a" 'puts (1..5).to_a.inspect' "[1, 2, 3, 4, 5]"
-run_test "range include?" 'puts (1..5).include?(3)' "true"
+run_test "range to_a" 'puts((1..5).to_a.inspect)' "[1, 2, 3, 4, 5]"
+run_test "range include?" 'puts((1..5).include?(3))' "true"
 
 # === Multiple assignment ===
 run_test "multi assign" 'a, b = 1, 2; puts a; puts b' "1"

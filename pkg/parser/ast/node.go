@@ -86,8 +86,10 @@ func (r *RationalLiteral) TokenLiteral() string { return r.Token.Literal }
 func (r *RationalLiteral) String() string       { return r.Token.Literal }
 
 type StringLiteral struct {
-	Token lexer.Token
-	Value string
+	Token        lexer.Token
+	Value        string
+	Interpolates bool
+	Command      bool
 }
 
 func (s *StringLiteral) expressionNode()      {}
@@ -104,9 +106,10 @@ func (s *SymbolLiteral) TokenLiteral() string { return s.Token.Literal }
 func (s *SymbolLiteral) String() string       { return s.Token.Literal }
 
 type RegexpLiteral struct {
-	Token   lexer.Token
-	Pattern string
-	Options string
+	Token        lexer.Token
+	Pattern      string
+	Options      string
+	Interpolates bool
 }
 
 func (r *RegexpLiteral) expressionNode()      {}
@@ -224,10 +227,19 @@ func (r *RangeExpression) String() string {
 }
 
 type BlockExpression struct {
-	Token         lexer.Token
-	Params        []*Identifier
-	ParamDefaults []Expression
-	Statements    []Statement
+	Token             lexer.Token
+	Params            []*Identifier
+	BlockLocals       []string
+	ParamDefaults     []Expression
+	RestParam         *Identifier
+	RestParamIndex    int
+	TrailingComma     bool
+	RejectKeywords    bool
+	SingleDestructure bool
+	KeywordRestOnly   bool
+	KeywordParams     []*KeywordParam
+	BlockParam        *Identifier
+	Statements        []Statement
 }
 
 func (b *BlockExpression) expressionNode()      {}
@@ -280,8 +292,9 @@ type CaseExpression struct {
 }
 
 type PatternMatchExpression struct {
-	Token lexer.Token
-	Left  Expression
+	Token   lexer.Token
+	Left    Expression
+	Pattern string
 }
 
 func (p *PatternMatchExpression) expressionNode()      {}
@@ -346,15 +359,33 @@ func (u *UntilExpression) String() string {
 
 type ForExpression struct {
 	Token      lexer.Token
-	Variable   *Identifier
+	Variable   []Expression
 	Collection Expression
-	Body       *BlockExpression
+	// TupleTarget indicates the target list was written as a grouped/array tuple form
+	// like "(i, j)" or "[i, j]".
+	TupleTarget bool
+	Body        *BlockExpression
 }
 
 func (f *ForExpression) expressionNode()      {}
 func (f *ForExpression) TokenLiteral() string { return f.Token.Literal }
 func (f *ForExpression) String() string {
-	return "for " + f.Variable.String() + " in " + f.Collection.String() + "\n" + f.Body.String() + "\nend"
+	if len(f.Variable) == 0 {
+		return "for " + "_" + " in " + f.Collection.String() + "\n" + f.Body.String() + "\nend"
+	}
+
+	targets := ""
+	for i, variable := range f.Variable {
+		if i > 0 {
+			targets += ", "
+		}
+		if variable == nil {
+			targets += "_"
+		} else {
+			targets += variable.String()
+		}
+	}
+	return "for " + targets + " in " + f.Collection.String() + "\n" + f.Body.String() + "\nend"
 }
 
 // KeywordParam represents a keyword parameter in a method definition (e.g., a:, b: 1)
@@ -375,15 +406,18 @@ func (k *KeywordArg) TokenLiteral() string { return k.Token.Literal }
 func (k *KeywordArg) String() string       { return k.Name + ": " + k.Value.String() }
 
 type DefExpression struct {
-	Token         lexer.Token
-	Name          *Identifier
-	Params        []*Identifier
-	ParamDefaults []Expression
-	RestParam     *Identifier // *rest parameter, nil if none
-	BlockParam    *Identifier // &block parameter, nil if none
-	KeywordParams []*KeywordParam
-	Body          *BlockExpression
-	Receiver      Expression
+	Token            lexer.Token
+	Name             *Identifier
+	Params           []*Identifier
+	ParamDefaults    []Expression
+	RestParam        *Identifier // *rest parameter, nil if none
+	RejectKeywords   bool
+	KeywordRestOnly  bool
+	KeywordRestParam *Identifier
+	BlockParam       *Identifier // &block parameter, nil if none
+	KeywordParams    []*KeywordParam
+	Body             *BlockExpression
+	Receiver         Expression
 }
 
 func (d *DefExpression) expressionNode()      {}
@@ -431,7 +465,7 @@ func (d *DefExpression) String() string {
 type ClassExpression struct {
 	Token             lexer.Token
 	Name              *Identifier
-	SuperClass        *Identifier
+	SuperClass        Expression
 	SingletonReceiver Expression
 	Body              *BlockExpression
 }
@@ -603,8 +637,9 @@ func (n *NilExpression) TokenLiteral() string { return n.Token.Literal }
 func (n *NilExpression) String() string       { return "nil" }
 
 type SplatExpression struct {
-	Token lexer.Token
-	Value Expression
+	Token              lexer.Token
+	Value              Expression
+	AnonymousBlockPass bool
 }
 
 func (s *SplatExpression) expressionNode()      {}
@@ -688,9 +723,10 @@ func (a *AssignExpression) String() string {
 }
 
 type MultiAssignExpression struct {
-	Token  lexer.Token
-	Names  []*Identifier
-	Values []Expression
+	Token   lexer.Token
+	Names   []*Identifier
+	Targets []Expression
+	Values  []Expression
 }
 
 func (a *MultiAssignExpression) expressionNode() {}
@@ -819,6 +855,7 @@ type RescueClause struct {
 	Token      lexer.Token
 	Exceptions []Expression
 	Variable   *Identifier
+	Target     Expression
 	Body       *BlockExpression
 }
 
@@ -842,8 +879,9 @@ func (b *BeginExpression) String() string {
 }
 
 type RaiseExpression struct {
-	Token lexer.Token
-	Error Expression
+	Token   lexer.Token
+	Error   Expression
+	Message Expression
 }
 
 func (r *RaiseExpression) statementNode()       {}
@@ -851,6 +889,9 @@ func (r *RaiseExpression) expressionNode()      {}
 func (r *RaiseExpression) TokenLiteral() string { return r.Token.Literal }
 func (r *RaiseExpression) String() string {
 	if r.Error != nil {
+		if r.Message != nil {
+			return "raise " + r.Error.String() + ", " + r.Message.String()
+		}
 		return "raise " + r.Error.String()
 	}
 	return "raise"
@@ -940,12 +981,14 @@ func (d *DefinedExpression) TokenLiteral() string { return d.Token.Literal }
 func (d *DefinedExpression) String() string       { return "defined?(" + d.Expression.String() + ")" }
 
 type ProcLiteral struct {
-	Token         lexer.Token
-	Params        []*Identifier
-	ParamDefaults []Expression
-	RestParam     *Identifier
-	BlockParam    *Identifier
-	Body          *BlockExpression
+	Token          lexer.Token
+	Params         []*Identifier
+	ParamDefaults  []Expression
+	RestParam      *Identifier
+	RestParamIndex int
+	RejectKeywords bool
+	BlockParam     *Identifier
+	Body           *BlockExpression
 }
 
 func (p *ProcLiteral) expressionNode()      {}

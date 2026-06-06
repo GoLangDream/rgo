@@ -26,6 +26,11 @@ func TestInspect(t *testing.T) {
 		{"integer", &EmeraldValue{Type: ValueInteger, Data: int64(42)}, "42"},
 		{"float", &EmeraldValue{Type: ValueFloat, Data: 3.14}, "3.14"},
 		{"string", &EmeraldValue{Type: ValueString, Data: "hello"}, "hello"},
+		{"symbol bare", &EmeraldValue{Type: ValueSymbol, Data: "foo"}, ":foo"},
+		{"symbol spaced", &EmeraldValue{Type: ValueSymbol, Data: "foo bar"}, ":\"foo bar\""},
+		{"symbol repeated operator", &EmeraldValue{Type: ValueSymbol, Data: "++"}, ":\"++\""},
+		{"symbol single operator", &EmeraldValue{Type: ValueSymbol, Data: "+"}, ":+"},
+		{"symbol escaped newline", &EmeraldValue{Type: ValueSymbol, Data: "foo\nbar"}, ":\"foo\\nbar\""},
 		{"empty array", &EmeraldValue{Type: ValueArray, Data: []*EmeraldValue{}}, "[]"},
 		{"array", &EmeraldValue{Type: ValueArray, Data: []*EmeraldValue{
 			{Type: ValueInteger, Data: int64(1)},
@@ -109,6 +114,34 @@ func TestEquals(t *testing.T) {
 		{"hello == hello", &EmeraldValue{Type: ValueString, Data: "hello"}, &EmeraldValue{Type: ValueString, Data: "hello"}, true},
 		{"hello != world", &EmeraldValue{Type: ValueString, Data: "hello"}, &EmeraldValue{Type: ValueString, Data: "world"}, false},
 		{"int != string", &EmeraldValue{Type: ValueInteger, Data: int64(1)}, &EmeraldValue{Type: ValueString, Data: "1"}, false},
+		{
+			"hashes compare equal by symbol keys and nested values",
+			&EmeraldValue{Type: ValueHash, Data: map[*EmeraldValue]*EmeraldValue{
+				{Type: ValueSymbol, Data: "b"}: {Type: ValueBool, Data: true},
+			}},
+			&EmeraldValue{Type: ValueHash, Data: map[*EmeraldValue]*EmeraldValue{
+				{Type: ValueSymbol, Data: "b"}: {Type: ValueBool, Data: true},
+			}},
+			true,
+		},
+		{
+			"class values with same non-empty name compare equal",
+			&EmeraldValue{Type: ValueClass, Data: &Class{Name: "String"}},
+			&EmeraldValue{Type: ValueClass, Data: &Class{Name: "String"}},
+			true,
+		},
+		{
+			"anonymous class values compare by identity",
+			&EmeraldValue{Type: ValueClass, Data: &Class{}},
+			&EmeraldValue{Type: ValueClass, Data: &Class{}},
+			false,
+		},
+		{
+			"module values with same non-empty name compare equal",
+			&EmeraldValue{Type: ValueModule, Data: &Module{Name: "Enumerable"}},
+			&EmeraldValue{Type: ValueModule, Data: &Module{Name: "Enumerable"}},
+			true,
+		},
 	}
 
 	for _, tt := range tests {

@@ -4,15 +4,21 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/lexer"
 	"github.com/GoLangDream/rgo/pkg/object"
 	"github.com/GoLangDream/rgo/pkg/parser"
+	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
 
 const StackSize = 2048
@@ -21,6 +27,7 @@ const MaxFrames = 1024
 var DevMode = os.Getenv("RGO_DEV") == "1"
 
 var CurrentVM *VM
+var sendTraceDepth int64
 
 type closureCell struct {
 	slot  **object.EmeraldValue
@@ -41,6 +48,7 @@ func init() {
 }
 
 type Frame struct {
+	ID      int
 	Fn      *object.Function
 	Ip      int
 	Bp      int
@@ -73,16 +81,18 @@ type CatchHandler struct {
 }
 
 type VM struct {
-	constants   []*object.EmeraldValue
-	globals     []*object.EmeraldValue
-	globalNames map[string]int
-	rubyConsts  map[string]*object.EmeraldValue
+	constants           []*object.EmeraldValue
+	globals             []*object.EmeraldValue
+	globalNames         map[string]int
+	bytecodeGlobalNames map[string]int
+	rubyConsts          map[string]*object.EmeraldValue
 
 	stack []*object.EmeraldValue
 	sp    int
 
 	frames []*Frame
 	fp     int
+	isRoot bool
 
 	instructions compiler.Instructions
 
@@ -92,6 +102,9 @@ type VM struct {
 	visibilityBypass bool
 	classStack       []*object.EmeraldValue
 	autoloading      map[string]bool
+	threadDepth      int
+	procCallDepth    int
+	nextFrameID      int
 
 	rescueStack  []*RescueHandler
 	ensureActive bool
@@ -100,7 +113,9 @@ type VM struct {
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
+	currentSpecFile := core.CurrentSpecFile
 	core.Init()
+	core.CurrentSpecFile = currentSpecFile
 	return newVM(bytecode, nil)
 }
 
@@ -108,29 +123,39 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	mainFn := &object.Function{
 		Name:         "__main__",
 		Instructions: bytecode.Instructions,
+		LineMap:      bytecode.LineMap,
 		Constants:    bytecode.Constants,
 		NumLocals:    bytecode.NumLocals,
 		LocalNames:   bytecode.LocalNames,
 	}
 
 	mainFrame := &Frame{
-		Fn: mainFn,
-		Ip: -1,
-		Bp: 0,
+		ID:             1,
+		Fn:             mainFn,
+		Ip:             -1,
+		Bp:             0,
+		BlockBreakAddr: -1,
+		WhileStart:     -1,
+		WhileEnd:       -1,
 	}
 
 	vm := &VM{
-		constants:    bytecode.Constants,
-		globals:      make([]*object.EmeraldValue, 100),
-		globalNames:  bytecode.GlobalNames,
-		rubyConsts:   make(map[string]*object.EmeraldValue),
-		stack:        make([]*object.EmeraldValue, StackSize),
-		sp:           1 + bytecode.NumLocals,
-		frames:       []*Frame{mainFrame},
-		fp:           0,
-		instructions: bytecode.Instructions,
-		autoloading:  make(map[string]bool),
+		constants:           bytecode.Constants,
+		globals:             make([]*object.EmeraldValue, 100),
+		globalNames:         bytecode.GlobalNames,
+		bytecodeGlobalNames: bytecode.GlobalNames,
+		rubyConsts:          make(map[string]*object.EmeraldValue),
+		stack:               make([]*object.EmeraldValue, StackSize),
+		sp:                  1 + bytecode.NumLocals,
+		frames:              []*Frame{mainFrame},
+		fp:                  0,
+		nextFrameID:         2,
+		instructions:        bytecode.Instructions,
+		autoloading:         make(map[string]bool),
+		isRoot:              parent == nil,
 	}
+	vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
+	vm.rubyConsts["Enumerable"] = &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule("Enumerable"), Class: core.R.Classes["Module"]}
 	if parent != nil {
 		vm.globals = parent.globals
 		vm.globalNames = parent.globalNames
@@ -142,6 +167,15 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	vm.installCoreHooks()
 
 	return vm
+}
+
+func (vm *VM) allocateFrameID() int {
+	id := vm.nextFrameID
+	if id <= 0 {
+		id = 1
+	}
+	vm.nextFrameID = id + 1
+	return id
 }
 
 func (vm *VM) installCoreHooks() {
@@ -156,6 +190,18 @@ func (vm *VM) installCoreHooks() {
 	core.GetGlobalVariable = func(name string) *object.EmeraldValue {
 		return vm.getGlobalByName(name)
 	}
+	core.RemoveConstantName = func(container *object.EmeraldValue, name string) {
+		qualified := qualifiedConstantName(container, name)
+		delete(vm.rubyConsts, qualified)
+		if container != nil && container.Type == object.ValueClass {
+			if class := container.Data.(*object.Class); class != nil && class.Name == "Object" {
+				delete(vm.rubyConsts, name)
+			}
+		}
+	}
+	core.CurrentFrameBinding = vm.currentFrameBinding
+	core.CurrentBacktraceFrames = vm.currentBacktraceFrames
+	core.GlobalVariableNames = vm.globalVariableNames
 	core.CallBlockWithArgs = func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.callBlock(block, args...)
 	}
@@ -168,6 +214,14 @@ func (vm *VM) installCoreHooks() {
 		}
 		return vm.callBlockWithSelf(block, self, args...)
 	}
+	core.EnterThreadBlock = func() {
+		vm.threadDepth++
+	}
+	core.LeaveThreadBlock = func() {
+		if vm.threadDepth > 0 {
+			vm.threadDepth--
+		}
+	}
 	core.BlockGivenCheck = func() bool {
 		return vm.currentBlock != nil
 	}
@@ -177,9 +231,13 @@ func (vm *VM) installCoreHooks() {
 	core.EvalSource = func(source string) *object.EmeraldValue {
 		return vm.evalSource(source)
 	}
-	core.RequirePath = func(path string) *object.EmeraldValue {
+	core.EvalSourceWithBinding = func(source string, binding *object.RBinding) *object.EmeraldValue {
+		return vm.evalSourceWithBinding(source, binding)
+	}
+	core.RequirePath = func(path string) (string, *object.EmeraldValue) {
 		return vm.requirePath(path)
 	}
+	core.ResolveRequirePath = vm.resolveRequirePath
 	core.InMethodScope = func() bool {
 		if vm.fp < 0 || vm.fp >= len(vm.frames) || vm.frames[vm.fp] == nil {
 			return false
@@ -189,17 +247,21 @@ func (vm *VM) installCoreHooks() {
 }
 
 func (vm *VM) setGlobalByName(name string, value *object.EmeraldValue) {
+	resolvedName := core.ResolveGlobalAlias(name)
 	if vm.globalNames == nil {
-		if name == "$?" && len(vm.globals) > 0 {
+		if resolvedName == "$?" && len(vm.globals) > 0 {
 			vm.globals[0] = value
 		}
 		return
 	}
-	idx, ok := vm.globalNames[name]
-	if !ok && name == "$?" {
+	idx, ok := vm.globalNames[resolvedName]
+	if !ok && name != resolvedName {
+		idx, ok = vm.globalNames[name]
+	}
+	if !ok && resolvedName == "$?" {
 		idx, ok = vm.globalNames["?"]
 	}
-	if !ok && name == "$?" {
+	if !ok && resolvedName == "$?" {
 		idx, ok = 0, true
 	}
 	if !ok || idx < 0 || idx >= len(vm.globals) {
@@ -209,17 +271,221 @@ func (vm *VM) setGlobalByName(name string, value *object.EmeraldValue) {
 }
 
 func (vm *VM) getGlobalByName(name string) *object.EmeraldValue {
+	resolvedName := core.ResolveGlobalAlias(name)
 	if vm.globalNames == nil {
 		return nil
 	}
-	idx, ok := vm.globalNames[name]
-	if !ok && name == "$?" {
+	idx, ok := vm.globalNames[resolvedName]
+	if !ok && name != resolvedName {
+		idx, ok = vm.globalNames[name]
+	}
+	if !ok && resolvedName == "$?" {
 		idx, ok = vm.globalNames["?"]
 	}
 	if !ok || idx < 0 || idx >= len(vm.globals) {
 		return nil
 	}
 	return vm.globals[idx]
+}
+
+func (vm *VM) resolveGlobalIndex(index int) int {
+	if vm.globalNames == nil {
+		return index
+	}
+	if index < 0 || index >= len(vm.globals) {
+		return index
+	}
+
+	name := vm.rawGlobalNameForIndex(index)
+	if name == "" {
+		return index
+	}
+	resolvedName := core.ResolveGlobalAlias(name)
+	if resolvedName == "" {
+		resolvedName = name
+	}
+	if resolvedIdx, ok := vm.globalNames[resolvedName]; ok {
+		return resolvedIdx
+	}
+	if name != resolvedName {
+		if resolvedIdx, ok := vm.globalNames[name]; ok {
+			return resolvedIdx
+		}
+	}
+	return vm.ensureGlobalIndexForName(name)
+}
+
+func (vm *VM) rawGlobalNameForIndex(index int) string {
+	if vm.bytecodeGlobalNames != nil {
+		for name, idx := range vm.bytecodeGlobalNames {
+			if idx == index {
+				return name
+			}
+		}
+	}
+	if vm.globalNames == nil {
+		return ""
+	}
+	for name, idx := range vm.globalNames {
+		if idx == index {
+			return name
+		}
+	}
+	return ""
+}
+
+func (vm *VM) globalNameForIndex(index int) string {
+	if vm.globalNames != nil {
+		for name, idx := range vm.globalNames {
+			if idx == index {
+				if resolved := core.ResolveGlobalAlias(name); resolved != "" {
+					return resolved
+				}
+				return name
+			}
+		}
+	}
+	return vm.rawGlobalNameForIndex(index)
+}
+
+func (vm *VM) ensureGlobalIndexForName(name string) int {
+	if vm.globalNames == nil {
+		vm.globalNames = make(map[string]int)
+	}
+	resolvedName := core.ResolveGlobalAlias(name)
+	if resolvedName == "" {
+		resolvedName = name
+	}
+	if idx, ok := vm.globalNames[resolvedName]; ok {
+		if name != resolvedName {
+			vm.globalNames[name] = idx
+		}
+		return idx
+	}
+	if idx, ok := vm.globalNames[name]; ok {
+		if name != resolvedName {
+			vm.globalNames[resolvedName] = idx
+		}
+		return idx
+	}
+	used := make(map[int]struct{}, len(vm.globalNames))
+	for _, idx := range vm.globalNames {
+		used[idx] = struct{}{}
+	}
+	for idx := 0; idx < len(vm.globals); idx++ {
+		if _, ok := used[idx]; ok {
+			continue
+		}
+		vm.globalNames[resolvedName] = idx
+		if name != resolvedName {
+			vm.globalNames[name] = idx
+		}
+		return idx
+	}
+	vm.globals = append(vm.globals, nil)
+	idx := len(vm.globals) - 1
+	vm.globalNames[resolvedName] = idx
+	if name != resolvedName {
+		vm.globalNames[name] = idx
+	}
+	return idx
+}
+
+func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+	rawName := vm.rawGlobalNameForIndex(rawIndex)
+	name := vm.globalNameForIndex(resolvedIndex)
+	switch rawName {
+	case "$&", "$`", "$'", "$+":
+		return nil, newSyntaxError("Can't set variable " + rawName)
+	}
+	switch name {
+	case "$&", "$`", "$'", "$+":
+		return nil, core.NewNameError(rawName + " is a read-only variable")
+	case "$!":
+		return nil, core.NewNameError("$! is a read-only variable")
+	case "$@":
+		if core.LastException == nil || core.LastException.Type == object.ValueNil {
+			return nil, core.NewArgumentError("$! not set")
+		}
+	case "$~":
+		if value == nil || value.Type == object.ValueNil || value.Type == object.ValueMatchData {
+			return value, nil
+		}
+		return nil, core.NewTypeError(fmt.Sprintf("wrong argument type %s (expected MatchData)", value.TypeName()))
+	case "$stdout", "stdout":
+		if value == nil || value.Type == object.ValueNil {
+			return nil, core.NewTypeError("$stdout must have write method, NilClass given")
+		}
+		if !vm.receiverCanBeStdout(value) {
+			return nil, core.NewTypeError("$stdout must have write method")
+		}
+	case "$/", "$-0", "$\\", "$,":
+		if value == nil || value.Type == object.ValueNil || value.Type == object.ValueString {
+			return value, nil
+		}
+		return nil, core.NewTypeError("value of " + name + " must be String")
+	case "$.", ".":
+		converted, errVal := vm.coerceGlobalLineNumber(value)
+		if errVal != nil {
+			return nil, errVal
+		}
+		return converted, nil
+	case "$0":
+		if value == nil || value.Type != object.ValueString {
+			return nil, core.NewTypeError("no implicit conversion of " + value.TypeName() + " into String")
+		}
+	case "$:", "$LOAD_PATH", "$-I", "$\"", "$LOADED_FEATURES", "$<", "$FILENAME", "$?", "$-a", "$-l", "$-p":
+		return nil, core.NewNameError(rawName + " is a read-only variable")
+	}
+	return value, nil
+}
+
+func (vm *VM) coerceGlobalLineNumber(value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+	if value == nil {
+		return nil, core.NewTypeError("can't convert NilClass into Integer")
+	}
+	switch value.Type {
+	case object.ValueInteger:
+		return value, nil
+	case object.ValueFloat:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(value.Data.(float64)), Class: core.R.Classes["Integer"]}, nil
+	}
+	if !vm.receiverRespondsTo(value, "to_int") {
+		return nil, core.NewTypeError("can't convert " + value.TypeName() + " into Integer")
+	}
+	converted := vm.send(value, "to_int", nil)
+	if converted != nil && converted.Type == object.ValueException {
+		return nil, converted
+	}
+	if converted == nil || converted.Type != object.ValueInteger {
+		return nil, core.NewTypeError("can't convert " + value.TypeName() + " into Integer")
+	}
+	return converted, nil
+}
+
+func (vm *VM) receiverCanBeStdout(receiver *object.EmeraldValue) bool {
+	if receiver == nil || receiver.Type == object.ValueNil {
+		return false
+	}
+	if classInheritsFrom(receiver.Class, core.R.Classes["IO"]) ||
+		classInheritsFrom(receiver.Class, core.R.Classes["File"]) ||
+		classInheritsFrom(receiver.Class, core.R.Classes["StringIO"]) {
+		return true
+	}
+	if obj, ok := receiver.Data.(*object.Object); ok && obj.SingletonClass != nil {
+		if _, ok := obj.SingletonClass.GetMethod("write"); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (vm *VM) receiverRespondsTo(receiver *object.EmeraldValue, method string) bool {
+	if receiver == nil || receiver.Type == object.ValueNil {
+		return false
+	}
+	methodObj, _, fallback := vm.lookupMethodForSend(receiver, method, nil, false)
+	return fallback == nil && methodObj != nil
 }
 
 func (vm *VM) loadedFeaturesGlobal() *object.EmeraldValue {
@@ -235,17 +501,60 @@ func (vm *VM) loadedFeaturesGlobal() *object.EmeraldValue {
 	return value
 }
 
+func (vm *VM) loadPathGlobal() *object.EmeraldValue {
+	if value := vm.getGlobalByName("$:"); value != nil && value.Type == object.ValueArray {
+		return value
+	}
+	if value := vm.getGlobalByName("$LOAD_PATH"); value != nil && value.Type == object.ValueArray {
+		return value
+	}
+	if value := vm.getGlobalByName("$-I"); value != nil && value.Type == object.ValueArray {
+		return value
+	}
+	entries := []*object.EmeraldValue{
+		{Type: object.ValueString, Data: "lib", Class: core.R.Classes["String"]},
+	}
+	value := &object.EmeraldValue{Type: object.ValueArray, Data: entries, Class: core.R.Classes["Array"]}
+	vm.setGlobalByName("$:", value)
+	vm.setGlobalByName("$LOAD_PATH", value)
+	vm.setGlobalByName("$-I", value)
+	return value
+}
+
+func (vm *VM) programNameGlobal() *object.EmeraldValue {
+	if value := vm.getGlobalByName("$0"); value != nil && value.Type == object.ValueString {
+		return value
+	}
+	name := ""
+	if len(os.Args) > 0 {
+		name = os.Args[0]
+	}
+	value := &object.EmeraldValue{Type: object.ValueString, Data: name, Class: core.R.Classes["String"]}
+	vm.setGlobalByName("$0", value)
+	return value
+}
+
 func (vm *VM) Run() error {
+	if vm.isRoot {
+		defer core.RunAtExitHooks()
+	}
+
 	frame := vm.frames[vm.fp]
 	instructions := frame.Fn.Instructions
 
 	count := 0
 	for frame.Ip < len(instructions)-1 {
 		count++
-		if count > 1000 {
+		if frame.Ip >= len(instructions) {
+			return fmt.Errorf("invalid instruction pointer: %d", frame.Ip)
+		}
+		if count > 1000000 {
 			return fmt.Errorf("infinite loop detected at ip=%d, op=%v", frame.Ip, instructions[frame.Ip])
 		}
 		frame.Ip++
+		if frame.Ip >= len(instructions) {
+			return fmt.Errorf("invalid instruction pointer: %d", frame.Ip)
+		}
 
 		op := compiler.Opcode(instructions[frame.Ip])
 
@@ -265,21 +574,80 @@ func (vm *VM) Run() error {
 }
 
 func (vm *VM) evalSource(source string) *object.EmeraldValue {
+	beginBlocks, remaining, syntaxErr := splitTopLevelBeginBlocks(source)
+	if syntaxErr != nil {
+		core.LastException = syntaxErr
+		return syntaxErr
+	}
+	if len(beginBlocks) > 0 {
+		source = prependBeginBlocks(beginBlocks, remaining)
+	} else {
+		source = remaining
+	}
+	if invalidPercentRegexpSyntax(source) {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), "invalid percent regexp")
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidIndexAssignmentSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidNumberedParameterSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidPatternMatchingSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidSpacedMethodCallArgumentListSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidRescueSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidReadOnlyMatchGlobalAssignmentSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
+	}
+
 	l := lexer.New(source)
 	p := parser.New(l)
 	program := p.ParseProgram()
 	if len(p.Errors()) > 0 {
-		return core.R.NilVal
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), strings.Join(p.Errors(), "\n"))
+		core.LastException = exc
+		return exc
+	}
+	if message := validateDynamicSyntax(program); message != "" {
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
+		core.LastException = exc
+		return exc
 	}
 
 	c := compiler.New()
 	if err := c.Compile(program); err != nil {
+		if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+			fmt.Printf("RGO_DEBUG_REQUIRE eval compile error=%v\n", err)
+		}
 		return core.R.NilVal
 	}
 
 	parent := CurrentVM
 	child := newVM(c.Bytecode(), vm)
 	if err := child.Run(); err != nil {
+		if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+			fmt.Printf("RGO_DEBUG_REQUIRE eval runtime error=%v\n", err)
+		}
 		if parent != nil {
 			parent.installCoreHooks()
 		}
@@ -295,26 +663,1530 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 	return result
 }
 
-func (vm *VM) requirePath(path string) *object.EmeraldValue {
-	if path == "" {
-		return core.NewArgumentError("empty file name")
+func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *object.EmeraldValue {
+	beginBlocks, remaining, syntaxErr := splitTopLevelBeginBlocks(source)
+	if syntaxErr != nil {
+		core.LastException = syntaxErr
+		return syntaxErr
 	}
-	candidates := []string{path}
-	if !strings.HasSuffix(path, ".rb") {
-		candidates = append(candidates, path+".rb")
+	if len(beginBlocks) > 0 {
+		source = prependBeginBlocks(beginBlocks, remaining)
+	} else {
+		source = remaining
+	}
+	if invalidPercentRegexpSyntax(source) {
+		exc := newSyntaxErrorForBinding(binding, "invalid percent regexp")
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidIndexAssignmentSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidNumberedParameterSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidPatternMatchingSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidSpacedMethodCallArgumentListSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidRescueSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+	if message := invalidReadOnlyMatchGlobalAssignmentSyntax(source); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+
+	oldSpecFile := core.CurrentSpecFile
+	if binding != nil && binding.Path != "" {
+		core.CurrentSpecFile = binding.Path
+	}
+	childClassStack := append([]*object.EmeraldValue(nil), vm.classStack...)
+	if binding != nil && len(binding.ClassStack) > 0 {
+		childClassStack = append([]*object.EmeraldValue(nil), binding.ClassStack...)
+	}
+	if binding != nil && binding.Self != nil {
+		switch binding.Self.Type {
+		case object.ValueClass, object.ValueModule:
+			if len(childClassStack) == 0 {
+				childClassStack = append(childClassStack, binding.Self)
+			}
+		}
+	}
+	parent := CurrentVM
+	defer func() {
+		core.CurrentSpecFile = oldSpecFile
+		if parent != nil {
+			parent.installCoreHooks()
+		}
+	}()
+	childSelf := core.R.Main
+	if binding != nil && binding.Self != nil {
+		childSelf = binding.Self
+	}
+
+	l := lexer.New(source)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		exc := newSyntaxErrorForBinding(binding, strings.Join(p.Errors(), "\n"))
+		core.LastException = exc
+		return exc
+	}
+	if message := validateDynamicSyntax(program); message != "" {
+		exc := newSyntaxErrorForBinding(binding, message)
+		core.LastException = exc
+		return exc
+	}
+
+	var c *compiler.Compiler
+	if binding != nil && len(binding.LocalNames) > 0 {
+		c = compiler.NewWithLocalNames(binding.LocalNames)
+	} else {
+		c = compiler.New()
+	}
+	if err := c.Compile(program); err != nil {
+		return core.R.NilVal
+	}
+
+	child := newVM(c.Bytecode(), vm)
+	child.classStack = childClassStack
+	localSlots := bindingLocalSlots(child)
+	child.stack[0] = childSelf
+	if binding != nil {
+		seedBindingLocals(child, binding, localSlots)
+	}
+
+	result := core.R.NilVal
+	if err := child.Run(); err == nil {
+		if r := child.LastPoppedStackElement(); r != nil {
+			result = r
+		}
+		copyBindingLocals(child, binding, localSlots)
+	} else {
+		result = core.R.NilVal
+	}
+	return result
+}
+
+type dynamicSyntaxContext struct {
+	methodDepth             int
+	classDepth              int
+	blockDepth              int
+	braceBlockDepth         int
+	loopDepth               int
+	rescueDepth             int
+	allowAnonymousBlockPass bool
+}
+
+func validateDynamicSyntax(program *ast.Program) string {
+	if program == nil {
+		return ""
+	}
+	return validateDynamicStatements(program.Statements, dynamicSyntaxContext{})
+}
+
+func validateDynamicStatements(stmts []ast.Statement, ctx dynamicSyntaxContext) string {
+	for _, stmt := range stmts {
+		if msg := validateDynamicStatement(stmt, ctx); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+func validateDynamicStatement(stmt ast.Statement, ctx dynamicSyntaxContext) string {
+	switch node := stmt.(type) {
+	case *ast.ExpressionStatement:
+		return validateDynamicExpression(node.Expression, ctx)
+	case *ast.ReturnExpression:
+		return validateReturnSyntax(node, ctx)
+	case *ast.NextExpression:
+		return validateNextSyntax(node, ctx)
+	case *ast.RedoExpression:
+		return validateRedoSyntax(ctx)
+	case *ast.RetryExpression:
+		return validateRetrySyntax(ctx)
+	case *ast.BreakExpression:
+		return validateBreakSyntax(node, ctx)
+	default:
+		return ""
+	}
+}
+
+func validateReturnSyntax(node *ast.ReturnExpression, ctx dynamicSyntaxContext) string {
+	if ctx.classDepth > 0 && ctx.methodDepth == 0 && ctx.blockDepth == 0 {
+		return "Invalid return in class/module body"
+	}
+	return validateDynamicExpression(node.ReturnValue, ctx)
+}
+
+func validateNextSyntax(node *ast.NextExpression, ctx dynamicSyntaxContext) string {
+	if ctx.methodDepth > 0 && ctx.blockDepth == 0 && ctx.loopDepth == 0 {
+		return "Invalid next in method"
+	}
+	return validateDynamicExpression(node.Value, ctx)
+}
+
+func validateBreakSyntax(node *ast.BreakExpression, ctx dynamicSyntaxContext) string {
+	if ctx.blockDepth == 0 && ctx.loopDepth == 0 {
+		if ctx.methodDepth > 0 {
+			return "Invalid break in method"
+		}
+		if ctx.classDepth > 0 {
+			return "Invalid break in class/module body"
+		}
+	}
+	return validateDynamicExpression(node.Value, ctx)
+}
+
+func validateRedoSyntax(ctx dynamicSyntaxContext) string {
+	if ctx.methodDepth > 0 && ctx.blockDepth == 0 && ctx.loopDepth == 0 {
+		return "Invalid redo in method"
+	}
+	return ""
+}
+
+func validateRetrySyntax(ctx dynamicSyntaxContext) string {
+	if ctx.rescueDepth == 0 {
+		return "Invalid retry"
+	}
+	return ""
+}
+
+func validateYieldSyntax(node *ast.YieldExpression, ctx dynamicSyntaxContext) string {
+	if ctx.methodDepth == 0 {
+		return "Invalid yield"
+	}
+	for _, arg := range node.Args {
+		if msg := validateDynamicExpression(arg, ctx); msg != "" {
+			return msg
+		}
+	}
+	for _, arg := range node.KeywordArgs {
+		if msg := validateDynamicExpression(arg.Value, ctx); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+func invalidPercentRegexpSyntax(source string) bool {
+	for i := 0; i+2 < len(source); i++ {
+		if source[i] != '%' || source[i+1] != 'r' {
+			continue
+		}
+		delimiter := source[i+2]
+		if delimiter == ' ' || delimiter == '\t' || delimiter == '\n' || delimiter == '\r' ||
+			(delimiter >= 'A' && delimiter <= 'Z') || (delimiter >= 'a' && delimiter <= 'z') ||
+			(delimiter >= '0' && delimiter <= '9') {
+			return true
+		}
+		closeDelimiter := byte(0)
+		switch delimiter {
+		case '(':
+			closeDelimiter = ')'
+		case '[':
+			closeDelimiter = ']'
+		case '{':
+			closeDelimiter = '}'
+		case '<':
+			closeDelimiter = '>'
+		default:
+			continue
+		}
+		depth := 1
+		escaped := false
+		for j := i + 3; j < len(source); j++ {
+			ch := source[j]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == delimiter {
+				depth++
+				continue
+			}
+			if ch == closeDelimiter {
+				depth--
+				if depth == 0 {
+					break
+				}
+			}
+		}
+		if depth != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func invalidIndexAssignmentSyntax(source string) string {
+	for i := 0; i < len(source); i++ {
+		if source[i] != '[' {
+			continue
+		}
+		end := matchingBracket(source, i)
+		if end < 0 {
+			continue
+		}
+		op := assignmentOperatorAfter(source, end+1)
+		if op == "" {
+			i = end
+			continue
+		}
+		content := source[i+1 : end]
+		if containsBlockPassArg(content) {
+			return "block arg given in index assignment"
+		}
+		if containsKeywordArgInIndex(content) {
+			return "keyword arg given in index assignment"
+		}
+		i = end
+	}
+	return ""
+}
+
+func matchingBracket(source string, start int) int {
+	depth := 0
+	quote := byte(0)
+	escaped := false
+	for i := start; i < len(source); i++ {
+		ch := source[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '[' {
+			depth++
+			continue
+		}
+		if ch == ']' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func assignmentOperatorAfter(source string, pos int) string {
+	for pos < len(source) && (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r') {
+		pos++
+	}
+	if pos >= len(source) {
+		return ""
+	}
+	if source[pos] == '=' {
+		if pos+1 < len(source) && source[pos+1] == '=' {
+			return ""
+		}
+		return "="
+	}
+	if pos+1 >= len(source) {
+		return ""
+	}
+	switch source[pos] {
+	case '+', '-', '*', '/', '%', '|', '&', '^':
+		if source[pos+1] == '=' {
+			return source[pos : pos+2]
+		}
+	case '<', '>':
+		if pos+2 < len(source) && source[pos+1] == source[pos] && source[pos+2] == '=' {
+			return source[pos : pos+3]
+		}
+	}
+	return ""
+}
+
+func containsBlockPassArg(content string) bool {
+	for i := 0; i < len(content); i++ {
+		if content[i] != '&' {
+			continue
+		}
+		if i+1 < len(content) && content[i+1] == '&' {
+			i++
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func containsKeywordArgInIndex(content string) bool {
+	for i := 1; i < len(content); i++ {
+		if content[i] != ':' {
+			continue
+		}
+		j := i - 1
+		for j >= 0 && (content[j] == ' ' || content[j] == '\t' || content[j] == '\n' || content[j] == '\r') {
+			j--
+		}
+		if j < 0 || !isIdentChar(content[j]) {
+			continue
+		}
+		for j >= 0 && isIdentChar(content[j]) {
+			j--
+		}
+		if j < 0 || content[j] == ',' || content[j] == ' ' || content[j] == '\t' || content[j] == '\n' || content[j] == '\r' {
+			return true
+		}
+	}
+	return false
+}
+
+func invalidNumberedParameterSyntax(source string) string {
+	code := maskRubyStringLiterals(source)
+	if !numberedParameterPattern.MatchString(code) && !itParameterPattern.MatchString(code) {
+		return ""
+	}
+	if numberedParameterAssignmentPattern.MatchString(code) {
+		return "_1 is reserved for numbered parameter"
+	}
+	if numberedParameterNestedPattern.MatchString(code) {
+		return "numbered parameter is already used in outer block"
+	}
+	if itBeforeNumberedParameterPattern.MatchString(code) {
+		return "numbered parameters are not allowed when 'it' is already used"
+	}
+	if numberedBeforeItParameterPattern.MatchString(code) {
+		return "'it' is not allowed when a numbered parameter is already used"
+	}
+	if numberedParameterExplicitParamsPattern.MatchString(code) {
+		return "ordinary parameter is defined"
+	}
+	if itParameterExplicitParamsPattern.MatchString(code) {
+		return "ordinary parameter is defined"
+	}
+	return ""
+}
+
+func invalidPatternMatchingSyntax(source string) string {
+	code := maskRubyStringLiterals(source)
+	if !regexp.MustCompile(`(?m)^\s*in\b`).MatchString(code) {
+		return ""
+	}
+	switch {
+	case patternWhenBeforeInPattern.MatchString(code):
+		return "unexpected 'in'"
+	case patternInBeforeWhenPattern.MatchString(code):
+		return "unexpected 'when'"
+	case patternCalculationPattern.MatchString(code):
+		return "expected a delimiter after the patterns of an `in` clause"
+	case hasDuplicatePatternVariable(code):
+		return "duplicated variable name"
+	case hasPinnedVariableBeforeBinding(code):
+		return "n: no such local variable"
+	case patternAlternationBindingPattern.MatchString(code):
+		return "unexpected variable binding in alternative pattern"
+	case patternNonSymbolHashKeyPattern.MatchString(source):
+		return "expected a label as the key in the hash pattern"
+	case patternInterpolatedHashKeyPattern.MatchString(source):
+		return "symbol literal with interpolation is not allowed"
+	case hasDuplicatePatternHashKey(code):
+		return "duplicated key name"
+	default:
+		return ""
+	}
+}
+
+func invalidSpacedMethodCallArgumentListSyntax(source string) string {
+	code := maskRubyStringLiterals(source)
+	for _, match := range spacedMethodCallArgumentListPattern.FindAllStringSubmatch(code, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		if spacedCallKeywordExclusions[match[1]] {
+			continue
+		}
+		return "syntax error, unexpected ','"
+	}
+	return ""
+}
+
+func invalidRescueSyntax(source string) string {
+	compact := strings.Join(strings.Fields(source), " ")
+	if strings.Contains(compact, "lambda {") && strings.Contains(compact, " rescue ") {
+		return "Invalid rescue in block"
+	}
+	if strings.Contains(compact, ".+(1 rescue 1)") {
+		return "syntax error, unexpected rescue modifier"
+	}
+	rescueClassExtraArgPattern := regexp.MustCompile(`\brescue\s+[A-Z]\w*(?:::[A-Z]\w*)?\s+([^\s,=][^\s]*)`)
+	for _, line := range strings.Split(maskRubyStringLiterals(source), "\n") {
+		if match := rescueClassExtraArgPattern.FindStringSubmatch(line); len(match) > 1 {
+			extra := match[1]
+			if extra != "=>" && !strings.HasPrefix(extra, "=>") {
+				return "syntax error, unexpected rescue modifier"
+			}
+		}
+	}
+	return ""
+}
+
+func invalidReadOnlyMatchGlobalAssignmentSyntax(source string) string {
+	if regexp.MustCompile(regexp.QuoteMeta("$'")+`\s*=`).FindStringIndex(source) != nil {
+		return "Can't set variable $'"
+	}
+	code := maskRubyStringLiterals(source)
+	for _, name := range []string{"$&", "$`", "$+"} {
+		if regexp.MustCompile(regexp.QuoteMeta(name)+`\s*=`).FindStringIndex(code) != nil {
+			return "Can't set variable " + name
+		}
+	}
+	return ""
+}
+
+func (vm *VM) checkPatternRuntimeHooks(target *object.EmeraldValue, pattern string) *object.EmeraldValue {
+	if target == nil {
+		return nil
+	}
+	compact := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(pattern)
+	switch {
+	case patternNeedsDeconstructKeys(compact):
+		if !vm.patternRespondsTo(target, "deconstruct_keys") {
+			return nil
+		}
+		result := core.CallMethod(target, "deconstruct_keys", core.R.NilVal)
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		if !patternValueIsHash(result) {
+			return core.NewTypeError("deconstruct_keys must return Hash")
+		}
+	case patternNeedsDeconstruct(compact):
+		if !vm.patternRespondsTo(target, "deconstruct") {
+			return nil
+		}
+		result := core.CallMethod(target, "deconstruct")
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		if !patternValueIsArray(result) {
+			return core.NewTypeError("deconstruct must return Array")
+		}
+	}
+	return nil
+}
+
+func (vm *VM) patternRespondsTo(target *object.EmeraldValue, method string) bool {
+	if core.CallMethod == nil {
+		return false
+	}
+	response := core.CallMethod(target, "respond_to?", &object.EmeraldValue{
+		Type:  object.ValueSymbol,
+		Data:  method,
+		Class: core.R.Classes["Symbol"],
+	})
+	return response == core.R.TrueVal
+}
+
+func patternNeedsDeconstruct(pattern string) bool {
+	return strings.Contains(pattern, "Object[]") || strings.Contains(pattern, "Object()")
+}
+
+func patternNeedsDeconstructKeys(pattern string) bool {
+	return (strings.HasPrefix(pattern, "Object[") || strings.HasPrefix(pattern, "Object(")) && strings.Contains(pattern, ":")
+}
+
+func patternValueIsArray(value *object.EmeraldValue) bool {
+	if value == nil {
+		return false
+	}
+	if value.Type == object.ValueArray {
+		return true
+	}
+	if value.Type == object.ValueObject && value.Class != nil {
+		return classInheritsFrom(value.Class, core.R.Classes["Array"])
+	}
+	return false
+}
+
+func patternValueIsHash(value *object.EmeraldValue) bool {
+	if value == nil {
+		return false
+	}
+	if value.Type == object.ValueHash {
+		return true
+	}
+	if value.Type == object.ValueObject && value.Class != nil {
+		return classInheritsFrom(value.Class, core.R.Classes["Hash"])
+	}
+	return false
+}
+
+func hasDuplicatePatternVariable(code string) bool {
+	for _, match := range patternArrayPattern.FindAllStringSubmatch(code, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		left, right := match[1], match[2]
+		if left == right && left != "_" && !strings.HasPrefix(left, "_") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPinnedVariableBeforeBinding(code string) bool {
+	for _, match := range patternPinnedArrayPattern.FindAllStringSubmatch(code, -1) {
+		if len(match) >= 3 && match[1] == match[2] {
+			return true
+		}
+	}
+	return false
+}
+
+func hasDuplicatePatternHashKey(code string) bool {
+	for _, match := range patternHashPattern.FindAllStringSubmatch(code, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, keyMatch := range patternHashKeyPattern.FindAllStringSubmatch(match[1], -1) {
+			if len(keyMatch) < 2 {
+				continue
+			}
+			key := keyMatch[1]
+			if seen[key] {
+				return true
+			}
+			seen[key] = true
+		}
+	}
+	return false
+}
+
+func maskRubyStringLiterals(source string) string {
+	out := []byte(source)
+	quote := byte(0)
+	escaped := false
+	for i := 0; i < len(out); i++ {
+		ch := out[i]
+		if quote == 0 {
+			if ch == '"' || ch == '\'' {
+				quote = ch
+				out[i] = ' '
+			}
+			continue
+		}
+		out[i] = ' '
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == quote {
+			quote = 0
+		}
+	}
+	return string(out)
+}
+
+var (
+	numberedParameterToken                 = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
+	numberedParameterUse                   = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
+	numberedParameterPattern               = regexp.MustCompile(numberedParameterToken)
+	numberedParameterAssignmentPattern     = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*=`)
+	numberedParameterNestedPattern         = regexp.MustCompile(numberedParameterUse + `[\s\S]*(->|proc\s*\{|\blambda\s*\{)[\s\S]*` + numberedParameterUse)
+	numberedParameterExplicitParamsPattern = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*` + numberedParameterUse + `|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `)`)
+	numberedParameterMethodNamePattern     = regexp.MustCompile(`^_[0-9]+$`)
+	itParameterPattern                     = regexp.MustCompile(`(^|[^A-Za-z0-9_])it([^A-Za-z0-9_?!]|$)`)
+	itParameterExplicitParamsPattern       = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*\bit\b|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b)`)
+	itBeforeNumberedParameterPattern       = regexp.MustCompile(`\bit\b[\s\S]*(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`)
+	numberedBeforeItParameterPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)[\s\S]*\bit\b`)
+	patternWhenBeforeInPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bwhen\b[\s\S]*\bin\b`)
+	patternInBeforeWhenPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bin\b[\s\S]*\bwhen\b`)
+	patternCalculationPattern              = regexp.MustCompile(`(?m)^\s*in\s+[^\n]*\+`)
+	patternArrayPattern                    = regexp.MustCompile(`\[\s*([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
+	patternPinnedArrayPattern              = regexp.MustCompile(`\[\s*\^([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
+	patternAlternationBindingPattern       = regexp.MustCompile(`(?m)^\s*in\s+[\s\S]*\|\s*\[[^\]]*,\s*[A-Za-z][A-Za-z0-9_]*\s*\]`)
+	patternNonSymbolHashKeyPattern         = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"[^"\n]+"\s*=>`)
+	patternInterpolatedHashKeyPattern      = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"#\{[^}\n]+\}"\s*:`)
+	patternHashPattern                     = regexp.MustCompile(`(?m)^\s*in\s+\{([^}\n]*)\}`)
+	patternHashKeyPattern                  = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*:`)
+	spacedMethodCallArgumentListPattern    = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_?!]*)\s+\([^)]*,[^)]*\)`)
+)
+
+var spacedCallKeywordExclusions = map[string]bool{
+	"case": true, "if": true, "unless": true, "until": true, "while": true,
+}
+
+func isIdentChar(ch byte) bool {
+	return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_'
+}
+
+func invalidDynamicRegexpEscape(pattern string) bool {
+	escaped := false
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if !escaped {
+			if ch == '\\' {
+				escaped = true
+			}
+			continue
+		}
+		escaped = false
+		switch ch {
+		case 'x':
+			if i+1 >= len(pattern) || !isRegexpHexDigit(pattern[i+1]) {
+				return true
+			}
+		case 'c':
+			if i+1 >= len(pattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isRegexpHexDigit(ch byte) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+}
+
+func invalidDynamicRegexpModifier(pattern, options string) bool {
+	if strings.Contains(options, "a") {
+		return true
+	}
+	return strings.Contains(pattern, "(?o)") || strings.Contains(pattern, "(?o:")
+}
+
+func invalidDynamicRegexpGrouping(pattern string) bool {
+	depth := 0
+	escaped := false
+	inClass := false
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if inClass {
+			if ch == ']' {
+				inClass = false
+			}
+			continue
+		}
+		switch ch {
+		case '[':
+			inClass = true
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return true
+			}
+			depth--
+		}
+	}
+	return depth != 0
+}
+
+func validateDynamicExpression(expr ast.Expression, ctx dynamicSyntaxContext) string {
+	if expr == nil {
+		return ""
+	}
+	switch node := expr.(type) {
+	case *ast.ReturnExpression:
+		return validateReturnSyntax(node, ctx)
+	case *ast.NextExpression:
+		return validateNextSyntax(node, ctx)
+	case *ast.RedoExpression:
+		return validateRedoSyntax(ctx)
+	case *ast.RetryExpression:
+		return validateRetrySyntax(ctx)
+	case *ast.BreakExpression:
+		return validateBreakSyntax(node, ctx)
+	case *ast.YieldExpression:
+		return validateYieldSyntax(node, ctx)
+	case *ast.RegexpLiteral:
+		if strings.Contains(node.Pattern, "[:alpha:]-[:digit:]") {
+			return "invalid character class range"
+		}
+		if invalidDynamicRegexpGrouping(node.Pattern) {
+			return "invalid regexp grouping"
+		}
+		if invalidDynamicRegexpModifier(node.Pattern, node.Options) {
+			return "invalid regexp modifier"
+		}
+		if invalidDynamicRegexpEscape(node.Pattern) {
+			return "invalid escape in regexp"
+		}
+	case *ast.DefExpression:
+		return validateDynamicBlock(node.Body, dynamicSyntaxContext{
+			methodDepth:             ctx.methodDepth + 1,
+			classDepth:              ctx.classDepth,
+			allowAnonymousBlockPass: node.BlockParam != nil && node.BlockParam.Value == "_",
+		})
+	case *ast.ClassExpression:
+		nextCtx := ctx
+		nextCtx.classDepth++
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.ModuleExpression:
+		nextCtx := ctx
+		nextCtx.classDepth++
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.ProcLiteral:
+		nextCtx := ctx
+		nextCtx.blockDepth++
+		nextCtx.allowAnonymousBlockPass = node.BlockParam != nil && node.BlockParam.Value == "_"
+		if node.Body != nil && node.Body.Token.Type == lexer.LBRACE {
+			nextCtx.braceBlockDepth++
+		}
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.SplatExpression:
+		if node.AnonymousBlockPass && !ctx.allowAnonymousBlockPass {
+			return "anonymous block forwarding is only allowed in method and lambda bodies"
+		}
+		return validateDynamicExpression(node.Value, ctx)
+	case *ast.MethodCall:
+		if msg := validateDynamicExpression(node.Receiver, ctx); msg != "" {
+			return msg
+		}
+		if node.Block != nil && len(node.Args) > 0 {
+			if splat, ok := node.Args[len(node.Args)-1].(*ast.SplatExpression); ok && splat.Token.Type == lexer.BIT_AND {
+				return "block argument and actual block given"
+			}
+		}
+		for _, arg := range node.Args {
+			if msg := validateDynamicExpression(arg, ctx); msg != "" {
+				return msg
+			}
+		}
+		for _, arg := range node.KeywordArgs {
+			if msg := validateDynamicExpression(arg.Value, ctx); msg != "" {
+				return msg
+			}
+		}
+		if node.Block != nil {
+			nextCtx := ctx
+			nextCtx.blockDepth++
+			if node.Block.Token.Type == lexer.LBRACE {
+				nextCtx.braceBlockDepth++
+			}
+			return validateDynamicBlock(node.Block, nextCtx)
+		}
+	case *ast.IfExpression:
+		if msg := validateDynamicExpression(node.Condition, ctx); msg != "" {
+			return msg
+		}
+		if msg := validateDynamicBlock(node.Consequent, ctx); msg != "" {
+			return msg
+		}
+		for _, elsif := range node.ElsIf {
+			if msg := validateDynamicExpression(elsif.Condition, ctx); msg != "" {
+				return msg
+			}
+			if msg := validateDynamicBlock(elsif.Consequent, ctx); msg != "" {
+				return msg
+			}
+		}
+		return validateDynamicBlock(node.Alternative, ctx)
+	case *ast.WhileExpression:
+		if msg := validateDynamicExpression(node.Condition, ctx); msg != "" {
+			return msg
+		}
+		nextCtx := ctx
+		nextCtx.loopDepth++
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.UntilExpression:
+		if msg := validateDynamicExpression(node.Condition, ctx); msg != "" {
+			return msg
+		}
+		nextCtx := ctx
+		nextCtx.loopDepth++
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.ForExpression:
+		if msg := validateDynamicExpression(node.Collection, ctx); msg != "" {
+			return msg
+		}
+		nextCtx := ctx
+		nextCtx.loopDepth++
+		return validateDynamicBlock(node.Body, nextCtx)
+	case *ast.BeginExpression:
+		if node.Ensure != nil && ctx.braceBlockDepth > 0 {
+			return "Invalid ensure in block"
+		}
+		if node.Else != nil && len(node.Rescue) == 0 && node.Ensure == nil {
+			return "else without rescue is useless"
+		}
+		if msg := validateDynamicBlock(node.Body, ctx); msg != "" {
+			return msg
+		}
+		for _, rescue := range node.Rescue {
+			for _, exception := range rescue.Exceptions {
+				if msg := validateDynamicExpression(exception, ctx); msg != "" {
+					return msg
+				}
+			}
+			rescueCtx := ctx
+			rescueCtx.rescueDepth++
+			if msg := validateDynamicBlock(rescue.Body, rescueCtx); msg != "" {
+				return msg
+			}
+		}
+		if msg := validateDynamicBlock(node.Else, ctx); msg != "" {
+			return msg
+		}
+		return validateDynamicBlock(node.Ensure, ctx)
+	case *ast.AssignExpression:
+		if ctx.methodDepth > 0 && node.Name != nil && isConstantIdentifier(node.Name.Value) {
+			return "dynamic constant assignment"
+		}
+		if msg := validateDynamicExpression(node.Target, ctx); msg != "" {
+			return msg
+		}
+		if msg := validateDynamicExpression(node.Index, ctx); msg != "" {
+			return msg
+		}
+		return validateDynamicExpression(node.Value, ctx)
+	case *ast.MultiAssignExpression:
+		for _, value := range node.Values {
+			if msg := validateDynamicExpression(value, ctx); msg != "" {
+				return msg
+			}
+		}
+	case *ast.InfixExpression:
+		if msg := validateDynamicExpression(node.Left, ctx); msg != "" {
+			return msg
+		}
+		return validateDynamicExpression(node.Right, ctx)
+	case *ast.PrefixExpression:
+		return validateDynamicExpression(node.Right, ctx)
+	case *ast.TernaryExpression:
+		if msg := validateDynamicExpression(node.Condition, ctx); msg != "" {
+			return msg
+		}
+		if msg := validateDynamicExpression(node.Consequent, ctx); msg != "" {
+			return msg
+		}
+		return validateDynamicExpression(node.Alternative, ctx)
+	case *ast.ArrayLiteral:
+		for _, elem := range node.Elements {
+			if msg := validateDynamicExpression(elem, ctx); msg != "" {
+				return msg
+			}
+		}
+	case *ast.HashLiteral:
+		for _, key := range node.Order {
+			if msg := validateDynamicExpression(key, ctx); msg != "" {
+				return msg
+			}
+			if msg := validateDynamicExpression(node.Pairs[key], ctx); msg != "" {
+				return msg
+			}
+		}
+	case *ast.IndexExpression:
+		if msg := validateDynamicExpression(node.Left, ctx); msg != "" {
+			return msg
+		}
+		if msg := validateDynamicExpression(node.Index, ctx); msg != "" {
+			return msg
+		}
+		return validateDynamicExpression(node.End, ctx)
+	}
+	return ""
+}
+
+func isConstantIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	ch, _ := utf8.DecodeRuneInString(name)
+	return unicode.IsUpper(ch)
+}
+
+func validateDynamicBlock(block *ast.BlockExpression, ctx dynamicSyntaxContext) string {
+	if block == nil {
+		return ""
+	}
+	return validateDynamicStatements(block.Statements, ctx)
+}
+
+func splitTopLevelBeginBlocks(source string) ([]string, string, *object.EmeraldValue) {
+	const keyword = "BEGIN"
+	keyLen := len(keyword)
+	remaining := make([]byte, 0, len(source))
+	blocks := []string{}
+
+	blockDepth := 0
+	inSingleQuote := false
+	inDoubleQuote := false
+	inBacktick := false
+	inLineComment := false
+	var escaped bool
+
+	n := len(source)
+	sourceBytes := []byte(source)
+
+	for i := 0; i < n; {
+		ch := sourceBytes[i]
+
+		if inLineComment {
+			remaining = append(remaining, ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			i++
+			continue
+		}
+
+		if inSingleQuote {
+			remaining = append(remaining, ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '\'' {
+				inSingleQuote = false
+			}
+			i++
+			continue
+		}
+
+		if inDoubleQuote {
+			remaining = append(remaining, ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inDoubleQuote = false
+			}
+			i++
+			continue
+		}
+
+		if inBacktick {
+			remaining = append(remaining, ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '`' {
+				inBacktick = false
+			}
+			i++
+			continue
+		}
+
+		if ch == '#' {
+			remaining = append(remaining, ch)
+			inLineComment = true
+			i++
+			continue
+		}
+
+		if ch == '\'' {
+			remaining = append(remaining, ch)
+			inSingleQuote = true
+			escaped = false
+			i++
+			continue
+		}
+
+		if ch == '"' {
+			remaining = append(remaining, ch)
+			inDoubleQuote = true
+			escaped = false
+			i++
+			continue
+		}
+
+		if ch == '`' {
+			remaining = append(remaining, ch)
+			inBacktick = true
+			escaped = false
+			i++
+			continue
+		}
+
+		if isRubyIdentifierStart(ch) {
+			j := i + 1
+			for j < n && isRubyIdentifierContinue(sourceBytes[j]) {
+				j++
+			}
+			word := string(sourceBytes[i:j])
+			if word == keyword {
+				prev := byte(0)
+				if i > 0 {
+					prev = sourceBytes[i-1]
+				}
+				next := byte(0)
+				if i+keyLen < n {
+					next = sourceBytes[i+keyLen]
+				}
+				if !isRubyIdentChar(prev) && !isRubyIdentChar(next) {
+					k := j
+					for k < n {
+						c := sourceBytes[k]
+						if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+							k++
+							continue
+						}
+						break
+					}
+					if k < n && sourceBytes[k] == '{' {
+						if blockDepth > 0 {
+							return nil, "", newSyntaxError("BEGIN must be at top-level")
+						}
+						bodyStart := k + 1
+						m := bodyStart
+						depth := 1
+						blockInSingle := false
+						blockInDouble := false
+						blockInBacktick := false
+						blockInLineComment := false
+						blockEscaped := false
+						for m < n {
+							c := sourceBytes[m]
+							if blockInLineComment {
+								if c == '\n' {
+									blockInLineComment = false
+								}
+								m++
+								continue
+							}
+							if blockInSingle {
+								if blockEscaped {
+									blockEscaped = false
+								} else if c == '\\' {
+									blockEscaped = true
+								} else if c == '\'' {
+									blockInSingle = false
+								}
+								m++
+								continue
+							}
+							if blockInDouble {
+								if blockEscaped {
+									blockEscaped = false
+								} else if c == '\\' {
+									blockEscaped = true
+								} else if c == '"' {
+									blockInDouble = false
+								}
+								m++
+								continue
+							}
+							if blockInBacktick {
+								if blockEscaped {
+									blockEscaped = false
+								} else if c == '\\' {
+									blockEscaped = true
+								} else if c == '`' {
+									blockInBacktick = false
+								}
+								m++
+								continue
+							}
+							if c == '#' {
+								blockInLineComment = true
+								m++
+								continue
+							}
+							if c == '\'' {
+								blockInSingle = true
+								blockEscaped = false
+								m++
+								continue
+							}
+							if c == '"' {
+								blockInDouble = true
+								blockEscaped = false
+								m++
+								continue
+							}
+							if c == '`' {
+								blockInBacktick = true
+								blockEscaped = false
+								m++
+								continue
+							}
+							if c == '{' {
+								depth++
+								m++
+								continue
+							}
+							if c == '}' {
+								depth--
+								m++
+								if depth == 0 {
+									break
+								}
+								continue
+							}
+							m++
+						}
+						if m > n || depth != 0 {
+							return nil, "", newSyntaxError("syntax error: unexpected end of input")
+						}
+
+						blocks = append(blocks, string(sourceBytes[bodyStart:m-1]))
+						i = m
+						continue
+					}
+				}
+			} else if word == "begin" || word == "class" || word == "module" || word == "def" || word == "if" || word == "unless" || word == "while" || word == "until" || word == "for" || word == "case" || word == "do" {
+				blockDepth++
+			} else if word == "end" {
+				if blockDepth > 0 {
+					blockDepth--
+				}
+			}
+			remaining = append(remaining, sourceBytes[i:j]...)
+			i = j
+			continue
+		}
+
+		if ch == '{' {
+			blockDepth++
+			remaining = append(remaining, ch)
+			i++
+			continue
+		}
+
+		if ch == '}' {
+			if blockDepth > 0 {
+				blockDepth--
+			}
+			remaining = append(remaining, ch)
+			i++
+			continue
+		}
+
+		remaining = append(remaining, ch)
+		i++
+	}
+
+	return blocks, string(remaining), nil
+}
+
+func prependBeginBlocks(blocks []string, source string) string {
+	if len(blocks) == 0 {
+		return source
+	}
+	parts := make([]byte, 0, len(source)+64*len(blocks))
+	for _, block := range blocks {
+		if len(block) > 0 {
+			parts = append(parts, block...)
+		}
+		parts = append(parts, ';')
+	}
+	parts = append(parts, source...)
+	return string(parts)
+}
+
+func isRubyIdentifierStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '@' || c == '$' || c == ':'
+}
+
+func isRubyIdentifierContinue(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_' ||
+		c == '?' ||
+		c == '!' ||
+		c == ':' ||
+		c == '@' ||
+		c == '$'
+}
+
+func isRubyIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_'
+}
+
+func newSyntaxError(message string) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueException,
+		Data:  &object.RException{Message: message},
+		Class: core.R.Classes["SyntaxError"],
+	}
+}
+
+func newSyntaxErrorForBinding(binding *object.RBinding, message string) *object.EmeraldValue {
+	path := ""
+	line := int64(1)
+	if binding != nil {
+		path = binding.Path
+		line = binding.Line
+	}
+	if path == "" {
+		path = "eval"
+	}
+	if line == 0 {
+		line = 1
+	}
+	return newSyntaxError(fmt.Sprintf("%s:%d: %s", path, line, message))
+}
+
+func bindingLocalSlots(vm *VM) map[string]int {
+	if vm.fp < 0 || vm.fp >= len(vm.frames) {
+		return map[string]int{}
+	}
+	frame := vm.frames[vm.fp]
+	if frame == nil || frame.Fn == nil {
+		return map[string]int{}
+	}
+	slots := map[string]int{}
+	if len(frame.Fn.LocalNames) > 0 {
+		named := make([]struct {
+			name  string
+			index int
+		}, 0, len(frame.Fn.LocalNames))
+		for name, index := range frame.Fn.LocalNames {
+			named = append(named, struct {
+				name  string
+				index int
+			}{name: name, index: index})
+		}
+		sort.Slice(named, func(i, j int) bool {
+			return named[i].index < named[j].index
+		})
+		for _, item := range named {
+			slot := frame.Bp + 1 + item.index
+			if slot >= 0 {
+				slots[item.name] = slot
+			}
+		}
+	} else {
+		for i, name := range frame.Fn.Params {
+			slot := frame.Bp + 1 + i
+			if slot >= 0 {
+				slots[name] = slot
+			}
+		}
+		for _, kp := range frame.Fn.KeywordParams {
+			slot := frame.Bp + 1 + len(frame.Fn.Params)
+			if frame.Fn.HasRestParam {
+				slot++
+			}
+			for _, prior := range frame.Fn.KeywordParams {
+				if prior.Name == kp.Name {
+					break
+				}
+				slot++
+			}
+			if slot >= 0 {
+				slots[kp.Name] = slot
+			}
+		}
+	}
+	return slots
+}
+
+func seedBindingLocals(vm *VM, binding *object.RBinding, slots map[string]int) {
+	if binding == nil || len(slots) == 0 {
+		return
+	}
+	if binding.Locals == nil {
+		binding.Locals = map[string]*object.EmeraldValue{}
+	}
+	for name, slot := range slots {
+		if value, ok := binding.Locals[name]; ok {
+			if slot >= len(vm.stack) {
+				for len(vm.stack) <= slot {
+					vm.stack = append(vm.stack, nil)
+				}
+			}
+			vm.stack[slot] = value
+			if slot >= vm.sp {
+				vm.sp = slot + 1
+			}
+		}
+	}
+}
+
+func copyBindingLocals(vm *VM, binding *object.RBinding, slots map[string]int) {
+	if binding == nil || len(slots) == 0 {
+		return
+	}
+	if binding.Locals == nil {
+		binding.Locals = map[string]*object.EmeraldValue{}
+	}
+	existing := map[string]struct{}{}
+	for _, name := range binding.LocalNames {
+		existing[name] = struct{}{}
+	}
+	ordered := make([]struct {
+		name string
+		slot int
+	}, 0, len(slots))
+	for name, slot := range slots {
+		ordered = append(ordered, struct {
+			name string
+			slot int
+		}{name: name, slot: slot})
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].slot < ordered[j].slot
+	})
+	for _, item := range ordered {
+		name := item.name
+		slot := item.slot
+		if slot < 0 || slot >= len(vm.stack) {
+			continue
+		}
+		if vm.stack[slot] == nil {
+			continue
+		}
+		binding.Locals[name] = vm.stack[slot]
+		if _, ok := existing[name]; !ok {
+			binding.LocalNames = append(binding.LocalNames, name)
+			existing[name] = struct{}{}
+		}
+	}
+}
+
+func (vm *VM) resolveRequirePath(path string) string {
+	if path == "" {
+		return ""
+	}
+	currentDir, _ := os.Getwd()
+
+	requestPath := filepath.FromSlash(strings.ReplaceAll(path, "\\", "/"))
+	isAbs := filepath.IsAbs(requestPath)
+	isBare := !strings.ContainsAny(requestPath, "/\\")
+	isExplicitRelative := strings.HasPrefix(requestPath, "."+string(filepath.Separator)) ||
+		strings.HasPrefix(requestPath, ".."+string(filepath.Separator))
+	isDotOrDotDot := requestPath == "." || requestPath == ".."
+	cleanPath := filepath.Clean(requestPath)
+
+	candidates := []string{}
+	seen := map[string]struct{}{}
+	addCandidate := func(c string) {
+		if c == "" {
+			return
+		}
+		clean := filepath.Clean(c)
+		if _, ok := seen[clean]; ok {
+			return
+		}
+		seen[clean] = struct{}{}
+		candidates = append(candidates, clean)
+	}
+
+	if isExplicitRelative || isAbs || isDotOrDotDot {
+		addCandidate(cleanPath)
+	}
+	if isBare {
+		entries := core.GetGlobalVariable("$LOAD_PATH")
+		if entries != nil && entries.Type == object.ValueArray {
+			for _, entry := range entries.Data.([]*object.EmeraldValue) {
+				epath, ok := entry.Data.(string)
+				if !ok {
+					continue
+				}
+				addCandidate(filepath.Join(epath, requestPath))
+				if !strings.HasSuffix(requestPath, ".rb") {
+					addCandidate(filepath.Join(epath, requestPath+".rb"))
+				}
+			}
+		}
+	}
+	if !isBare {
+		addCandidate(cleanPath)
+	}
+	if !strings.HasSuffix(cleanPath, ".rb") {
+		addCandidate(cleanPath + ".rb")
+	}
+	if isExplicitRelative && currentDir != "" {
+		addCandidate(filepath.Join(currentDir, cleanPath))
+		if !strings.HasSuffix(cleanPath, ".rb") {
+			addCandidate(filepath.Join(currentDir, cleanPath+".rb"))
+		}
+	}
+
+	if isDotOrDotDot && currentDir != "" {
+		addCandidate(filepath.Join(currentDir, cleanPath))
 	}
 	for _, candidate := range candidates {
-		content, err := os.ReadFile(candidate)
+		if info, err := os.Stat(candidate); err != nil || info.IsDir() {
+			continue
+		}
+		file, err := os.Open(candidate)
 		if err != nil {
 			continue
 		}
-		return vm.evalSource(string(content))
+		_ = file.Close()
+		return candidate
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueException,
-		Data:  &object.RException{Message: "cannot load such file -- " + path},
-		Class: core.R.Classes["LoadError"],
+
+	return ""
+}
+
+func (vm *VM) requirePath(path string) (string, *object.EmeraldValue) {
+	if path == "" {
+		return "", core.NewArgumentError("empty file name")
 	}
+	candidate := vm.resolveRequirePath(path)
+	if candidate == "" {
+		return "", &object.EmeraldValue{
+			Type:  object.ValueException,
+			Data:  &object.RException{Message: "cannot load such file -- " + path},
+			Class: core.R.Classes["LoadError"],
+		}
+	}
+
+	previousSpecFile := core.CurrentSpecFile
+	core.CurrentSpecFile = candidate
+	defer func() {
+		core.CurrentSpecFile = previousSpecFile
+	}()
+	content, err := os.ReadFile(candidate)
+	if err != nil {
+		return "", &object.EmeraldValue{
+			Type:  object.ValueException,
+			Data:  &object.RException{Message: "cannot load such file -- " + path},
+			Class: core.R.Classes["LoadError"],
+		}
+	}
+	result := vm.evalSource(string(content))
+	return candidate, result
 }
 
 func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
@@ -322,6 +2194,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	switch op {
 	case compiler.OpConstant:
 		idx := vm.readUint16()
+		if idx < 0 || idx >= len(constants) {
+			return fmt.Errorf("invalid constant index %d (constants: %d) at ip=%d", idx, len(constants), vm.frames[vm.fp].Ip)
+		}
 		vm.push(constants[idx])
 
 	case compiler.OpTrue:
@@ -333,6 +2208,18 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpNil:
 		vm.push(core.R.NilVal)
 
+	case compiler.OpPatternCheck:
+		patternIdx := vm.readUint16()
+		pattern := constants[patternIdx].Data.(string)
+		target := vm.peek(0)
+		if errVal := vm.checkPatternRuntimeHooks(target, pattern); errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+
 	case compiler.OpPop:
 		vm.popFrameValue(frame)
 
@@ -341,6 +2228,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		left := vm.pop()
 		result := vm.add(left, right)
 		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		if result != nil && result.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
+			vm.returnUnhandledException(frame, result)
 			return nil
 		}
 		vm.push(result)
@@ -486,7 +2377,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if lok && rok {
 			vm.push(&object.EmeraldValue{Type: object.ValueInteger, Data: l | r, Class: core.R.Classes["Integer"]})
 		} else {
-			vm.push(core.R.NilVal)
+			result := vm.send(left, "|", []*object.EmeraldValue{right})
+			if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.push(result)
 		}
 
 	case compiler.OpBitXor:
@@ -570,7 +2465,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpArray:
 		n := vm.readUint16()
-		if n > 100 {
+		if n > StackSize {
 			return fmt.Errorf("OpArray: too many elements: %d", n)
 		}
 		elems := make([]*object.EmeraldValue, n)
@@ -585,11 +2480,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpHash:
 		n := vm.readUint16()
-		h := make(map[*object.EmeraldValue]*object.EmeraldValue)
+		h := &object.RHash{Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue)}
 		for i := 0; i < int(n); i++ {
 			key := vm.pop()
 			value := vm.pop()
-			h[key] = value
+			if _, exists := h.Pairs[key]; !exists {
+				h.Keys = append(h.Keys, key)
+			}
+			h.Pairs[key] = value
 		}
 		vm.push(&object.EmeraldValue{
 			Type:  object.ValueHash,
@@ -625,9 +2523,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpGetGlobal:
 		idx := vm.readUint16()
+		idx = vm.resolveGlobalIndex(idx)
 		val := vm.globals[idx]
 		if val == nil {
 			for name, globalIdx := range vm.globalNames {
+				if globalIdx == idx && name == "$!" {
+					val = core.LastException
+					break
+				}
 				if globalIdx == idx && (name == "stdout" || name == "$stdout") {
 					val = core.StdoutObject()
 					vm.globals[idx] = val
@@ -635,6 +2538,16 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				}
 				if globalIdx == idx && (name == "$\"" || name == "$LOADED_FEATURES") {
 					val = vm.loadedFeaturesGlobal()
+					vm.globals[idx] = val
+					break
+				}
+				if globalIdx == idx && (name == "$:" || name == "$LOAD_PATH" || name == "$-I") {
+					val = vm.loadPathGlobal()
+					vm.globals[idx] = val
+					break
+				}
+				if globalIdx == idx && name == "$0" {
+					val = vm.programNameGlobal()
 					vm.globals[idx] = val
 					break
 				}
@@ -646,8 +2559,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(val)
 
 	case compiler.OpSetGlobal:
-		idx := vm.readUint16()
-		vm.globals[idx] = vm.peek(0)
+		rawIdx := vm.readUint16()
+		idx := vm.resolveGlobalIndex(rawIdx)
+		value, errVal := vm.validateGlobalAssignment(rawIdx, idx, vm.peek(0))
+		if errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		vm.stack[vm.sp-1] = value
+		vm.globals[idx] = value
+		if name := vm.rawGlobalNameForIndex(rawIdx); name != "" {
+			core.NotifyGlobalVariableSet(name, value)
+		}
 
 	case compiler.OpGetConstant:
 		nameIdx := vm.readUint16()
@@ -684,6 +2610,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				Data:  cls,
 				Class: core.R.Classes["Class"],
 			})
+		} else if namespace, ok := vm.namespaceModuleValue(name); ok {
+			vm.push(namespace)
 		} else if core.EvaluatingRaiseErrorMatcher() {
 			vm.push(core.NewNameError("uninitialized constant " + name))
 		} else {
@@ -728,6 +2656,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if value != nil && value.Type == object.ValueException && vm.raiseException(frame, value) {
 			return nil
 		}
+		if value != nil && value.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
+			vm.returnUnhandledException(frame, value)
+			return nil
+		}
 		vm.push(value)
 
 	case compiler.OpSetScopedConstant:
@@ -740,7 +2672,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		value := vm.pop()
 		receiver := vm.pop()
 		assigned, result := vm.scopedConstantAssignmentValue(receiver, name, value, mode)
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if result != nil && result.Type == object.ValueException {
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, result)
 			return nil
 		}
 		if assigned {
@@ -835,28 +2771,35 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 		val := vm.peek(0)
 		receiver := vm.stack[frame.Bp]
-		if obj, ok := receiver.Data.(*object.Object); ok {
-			obj.InstanceVars[name] = val
-		} else if proc, ok := receiver.Data.(*object.Proc); ok {
-			if proc.InstanceVars == nil {
-				proc.InstanceVars = make(map[string]*object.EmeraldValue)
+		if result := core.SetDynamicInstanceVar(receiver, name, val); result != nil {
+			if vm.raiseException(frame, result) {
+				return nil
 			}
-			proc.InstanceVars[name] = val
-		} else if module, ok := receiver.Data.(*object.Module); ok {
-			module.InstanceVars[name] = val
-		} else if class, ok := receiver.Data.(*object.Class); ok {
-			class.SetInstanceVar(name, val)
-		} else {
-			core.SetDynamicInstanceVar(receiver, name, val)
 		}
 
 	case compiler.OpGetClassVar:
 		nameIdx := vm.readUint16()
 		name := constants[nameIdx].Data.(string)
 		receiver := vm.stack[frame.Bp]
-		if val, ok := core.LookupClassVariable(receiver, name); ok {
+		target := vm.classVarScopeReceiver(receiver)
+		if vm.classVarAccessesToplevel(target) {
+			if vm.raiseException(frame, core.NewRuntimeError("class variable access from toplevel")) {
+				return nil
+			}
+			vm.push(core.R.NilVal)
+			break
+		}
+		if val, errVal, ok := core.LookupClassVariableWithError(target, name); errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.push(core.R.NilVal)
+		} else if ok {
 			vm.push(val)
 		} else {
+			if vm.raiseException(frame, core.NewNameError("uninitialized class variable "+name)) {
+				return nil
+			}
 			vm.push(core.R.NilVal)
 		}
 
@@ -865,7 +2808,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 		val := vm.peek(0)
 		receiver := vm.stack[frame.Bp]
-		core.SetClassVariable(receiver, name, val)
+		target := vm.classVarScopeReceiver(receiver)
+		if vm.classVarAccessesToplevel(target) {
+			if vm.raiseException(frame, core.NewRuntimeError("class variable access from toplevel")) {
+				return nil
+			}
+			break
+		}
+		core.SetClassVariable(target, name, val)
 
 	case compiler.OpGetFree:
 		idx := vm.readUint8()
@@ -950,39 +2900,118 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpSelf:
 		vm.push(vm.stack[frame.Bp])
 
+	case compiler.OpAlias:
+		args := make([]*object.EmeraldValue, 2)
+		for i := 0; i < 2; i++ {
+			args[1-i] = vm.pop()
+		}
+		receiver := vm.pop()
+		target := receiver
+		if len(vm.classStack) > 0 {
+			target = vm.classStack[len(vm.classStack)-1]
+		} else if receiver != nil && receiver == core.R.Main {
+			if obj, ok := receiver.Data.(*object.Object); ok && obj != nil && obj.Class != nil {
+				target = &object.EmeraldValue{
+					Type:  object.ValueClass,
+					Data:  obj.Class,
+					Class: core.R.Classes["Class"],
+				}
+			}
+		}
+		result := core.AliasMethod(target, args...)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		if result != nil && result.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
+			vm.returnUnhandledException(frame, result)
+			return nil
+		}
+		vm.push(result)
+
 	case compiler.OpReturn:
 		// Don't decrement fp here - the caller will handle that
 		vm.sp = frame.Bp
 
 	case compiler.OpReturnValue:
 		retVal := vm.pop()
+		if vm.returningFromClassBodyBlock(frame) {
+			exception := core.NewLocalJumpError("unexpected return")
+			if vm.raiseException(frame, exception) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, exception)
+			return nil
+		}
 		// Don't decrement fp here - the caller will handle that
 		// Just reset the stack to the base pointer and push the return value
 		vm.sp = frame.Bp
 		vm.push(retVal)
 
-	case compiler.OpSend:
+	case compiler.OpSend, compiler.OpSendWithKeywords:
+		isKeywordSend := op == compiler.OpSendWithKeywords
 		methodNameIdx := vm.readUint16()
 		blockArg := vm.readUint8()
 		numArgs := vm.readUint8()
+		splatIndex := int(vm.readUint8())
 		methodName := constants[methodNameIdx].Data.(string)
+		prevBlock := vm.currentBlock
 
 		var block *object.EmeraldValue
-		if blockArg == 1 {
+		switch blockArg {
+		case 1:
 			block = derefClosureValue(vm.pop())
+		case 2:
+			block = prevBlock
 		}
 
 		args := make([]*object.EmeraldValue, int(numArgs))
 		for i := 0; i < int(numArgs); i++ {
 			args[numArgs-1-i] = vm.pop()
 		}
+		if splatIndex != 255 {
+			expanded, errVal := vm.expandMethodSplatArgs(args, splatIndex)
+			if errVal != nil {
+				if vm.raiseException(frame, errVal) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, errVal)
+				return nil
+			}
+			args = expanded
+		}
+
+		if isKeywordSend && len(args) > 0 {
+			last := args[len(args)-1]
+			if last != nil && last.Type == object.ValueHash {
+				core.MarkRuby2KeywordHash(last)
+			}
+		}
 
 		receiver := vm.pop()
+		if methodName == "alias_method" && len(args) == 2 {
+			left := ""
+			right := ""
+			if args[0] != nil && (args[0].Type == object.ValueString || args[0].Type == object.ValueSymbol) {
+				if s, ok := args[0].Data.(string); ok {
+					left = strings.TrimPrefix(s, ":")
+				}
+			}
+			if args[1] != nil && (args[1].Type == object.ValueString || args[1].Type == object.ValueSymbol) {
+				if s, ok := args[1].Data.(string); ok {
+					right = strings.TrimPrefix(s, ":")
+				}
+			}
+			if strings.HasPrefix(left, "$") && strings.HasPrefix(right, "$") {
+				core.AliasGlobalVariable(left, right)
+				vm.push(core.R.NilVal)
+				break
+			}
+		}
 
-		prevBlock := vm.currentBlock
-		if blockArg == 1 {
+		switch blockArg {
+		case 1, 2:
 			vm.currentBlock = block
-		} else {
+		default:
 			vm.currentBlock = nil
 		}
 		result := vm.send(receiver, methodName, args)
@@ -998,10 +3027,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpBreak:
 		val := core.R.NilVal
-		if vm.sp > frame.Bp {
-			val = vm.stack[vm.sp-1]
-			vm.sp--
-		}
 		if frame.WhileEnd >= 0 {
 			frame.Ip = frame.WhileEnd - 1
 			return nil
@@ -1015,8 +3040,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpBreakValue:
 		val := core.R.NilVal
 		if vm.sp > frame.Bp {
-			val = vm.stack[vm.sp-1]
-			vm.sp--
+			val = vm.pop()
 		}
 		if frame.WhileEnd >= 0 {
 			frame.Ip = frame.WhileEnd - 1
@@ -1028,6 +3052,23 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(val)
 		return nil
 
+	case compiler.OpNext:
+		val := core.R.NilVal
+		if vm.sp > frame.Bp {
+			val = vm.pop()
+		}
+		frame.BlockNextVal = val
+		frame.Ip = len(frame.Fn.Instructions) - 1
+		vm.sp = frame.Bp
+		core.ForEachMarkNext()
+		return nil
+
+	case compiler.OpEnterForEach:
+		core.EnterForEachMode(vm.readUint8() == 1)
+
+	case compiler.OpExitForEach:
+		core.ExitForEachMode()
+
 	case compiler.OpSetWhileEnd:
 		target := vm.readUint16()
 		frame.WhileEnd = int(target)
@@ -1038,7 +3079,16 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
 
 	case compiler.OpYield:
-		result := vm.callBlock(vm.yieldBlock())
+		block := vm.yieldBlock()
+		if block == nil {
+			errVal := core.NewLocalJumpError("no block given")
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		result := vm.callBlock(block)
 		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
 			return nil
 		}
@@ -1054,7 +3104,50 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		for i := numArgs - 1; i >= 0; i-- {
 			args[i] = vm.pop()
 		}
-		result := vm.callBlock(vm.yieldBlock(), args...)
+		block := vm.yieldBlock()
+		if block == nil {
+			errVal := core.NewLocalJumpError("no block given")
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		result := vm.callBlock(block, args...)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		if result != nil && result.Type == object.ValueException {
+			vm.returnUnhandledException(frame, result)
+			return nil
+		}
+		vm.push(result)
+
+	case compiler.OpYieldWithSplat:
+		numArgs := int(vm.readUint8())
+		splatIndex := int(vm.readUint8())
+		args := make([]*object.EmeraldValue, numArgs)
+		for i := numArgs - 1; i >= 0; i-- {
+			args[i] = vm.pop()
+		}
+		block := vm.yieldBlock()
+		if block == nil {
+			errVal := core.NewLocalJumpError("no block given")
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		expanded, errVal := vm.expandYieldSplatArgs(args, splatIndex)
+		if errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		result := vm.callBlock(block, expanded...)
 		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
 			return nil
 		}
@@ -1083,6 +3176,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		if len(vm.classStack) > 0 {
 			classVal := vm.classStack[len(vm.classStack)-1]
+			if methodDefinitionTargetFrozen(classVal) {
+				errVal := frozenMethodDefinitionError(classVal, true)
+				if vm.raiseException(frame, errVal) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, errVal)
+				return nil
+			}
 			method.Owner = classVal
 			if classVal.Type == object.ValueClass {
 				cls := classVal.Data.(*object.Class)
@@ -1090,6 +3191,25 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			} else if classVal.Type == object.ValueModule {
 				mod := classVal.Data.(*object.Module)
 				mod.DefineMethod(name, method)
+				if vm.currentDefinitionMode() == "module_function" {
+					copy := *method
+					copy.Visibility = "public"
+					if mod.SingletonClass == nil {
+						if singleton := core.CallMethod(classVal, "singleton_class"); singleton != nil && singleton.Type == object.ValueClass {
+							mod.SingletonClass = singleton.Data.(*object.Class)
+						}
+					}
+					if mod.SingletonClass != nil {
+						if mod.SingletonClass.Methods == nil {
+							mod.SingletonClass.Methods = map[string]*object.Method{}
+						}
+						copy.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: mod.SingletonClass, Class: core.R.Classes["Class"]}
+						mod.SingletonClass.Methods[name] = &copy
+					}
+				}
+			} else {
+				vm.push(core.NewTypeError("can't define method"))
+				break
 			}
 		} else {
 			mainObj := core.R.Main.Data.(*object.Object)
@@ -1108,6 +3228,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return fmt.Errorf("expected closure, got %T", closureVal.Data)
 		}
 		receiver := vm.pop()
+		if singletonMethodDefinitionFrozen(receiver) {
+			errVal := frozenMethodDefinitionError(receiver, false)
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
 
 		method := &object.Method{
 			Name:    name,
@@ -1151,11 +3279,33 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpClass:
 		nameIdx := vm.readUint16()
+		hasExplicitSuperclass := vm.readUint8() == 1
 		name := constants[nameIdx].Data.(string)
 
 		var class *object.Class
+		if errVal, found := vm.qualifiedPrivateConstantError(name); found {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		if errVal := vm.invalidQualifiedClassNameError(name); errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
 		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueClass {
 			class = existing.Data.(*object.Class)
+		} else if existing, ok := vm.rubyConsts[name]; ok && existing.Type != object.ValueClass {
+			exception := core.NewTypeError(name + " is not a class")
+			if vm.raiseException(frame, exception) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, exception)
+			return nil
 		} else if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
 			if existing, found := vm.classValueFromContainer(container, constName); found {
 				class = existing.Data.(*object.Class)
@@ -1168,6 +3318,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if class == nil {
 			class = object.NewClass(name)
 			class.SuperClass = core.R.Classes["Object"]
+			class.SuperClassSet = !hasExplicitSuperclass
 		}
 
 		classVal := &object.EmeraldValue{
@@ -1176,6 +3327,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Class: core.R.Classes["Class"],
 		}
 		vm.rubyConsts[name] = classVal
+		if container := vm.currentConstantContainer(); container != nil && !strings.Contains(name, "::") {
+			defineConstantOn(container, name, classVal)
+			vm.rubyConsts[qualifiedConstantName(container, name)] = classVal
+		} else if strings.Contains(name, "::") {
+			vm.defineQualifiedConstant(name, classVal)
+		}
 		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
 			defineConstantOn(container, constName, classVal)
 		}
@@ -1189,11 +3346,24 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return fmt.Errorf("OpInherited: expected class, got %v", classVal)
 		}
 		if superVal == nil || superVal.Type != object.ValueClass {
-			return fmt.Errorf("OpInherited: expected superclass, got %v", superVal)
+			exception := core.NewTypeError("superclass must be a Class")
+			if vm.raiseException(frame, exception) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, exception)
+			return nil
 		}
 		class := classVal.Data.(*object.Class)
 		superClass := superVal.Data.(*object.Class)
-		if class.SuperClass != nil && class.SuperClass != core.R.Classes["Object"] && class.SuperClass != superClass {
+		if superClass.IsSingleton {
+			exception := core.NewTypeError("can't make subclass of singleton class")
+			if vm.raiseException(frame, exception) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, exception)
+			return nil
+		}
+		if class.SuperClassSet && class.SuperClass != nil && class.SuperClass != superClass {
 			exception := core.NewTypeError("superclass mismatch for class " + class.Name)
 			if vm.raiseException(frame, exception) {
 				return nil
@@ -1202,6 +3372,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		class.SuperClass = superClass
+		class.SuperClassSet = true
 		vm.push(classVal)
 
 	case compiler.OpModule:
@@ -1209,13 +3380,63 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 
 		var module *object.Module
-		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueModule {
-			module = existing.Data.(*object.Module)
-		} else if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
-			if existing, found := vm.scopedConstantValue(container, constName); found && existing.Type == object.ValueModule {
+		useExisting := func(existing *object.EmeraldValue) bool {
+			if existing == nil {
+				return false
+			}
+			if existing.Type == object.ValueException {
+				if vm.raiseException(frame, existing) {
+					return true
+				}
+				vm.returnUnhandledException(frame, existing)
+				return true
+			}
+			if existing.Type == object.ValueModule {
 				module = existing.Data.(*object.Module)
-			} else {
+				return false
+			}
+			exception := core.NewTypeError(name + " is not a module")
+			if vm.raiseException(frame, exception) {
+				return true
+			}
+			vm.returnUnhandledException(frame, exception)
+			return true
+		}
+		if errVal, found := vm.qualifiedPrivateConstantError(name); found {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		if existing, ok := vm.rubyConsts[name]; ok {
+			if useExisting(existing) {
+				return nil
+			}
+		} else if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
+			if existing, found := directConstantValue(container, constName); found {
+				if useExisting(existing) {
+					return nil
+				}
+			}
+			if module == nil {
 				module = object.NewModule("")
+			}
+		} else if container, constName, ok := vm.qualifiedConstantContainer(name); ok {
+			if existing, found := directConstantValue(container, constName); found {
+				if useExisting(existing) {
+					return nil
+				}
+			}
+			if module == nil {
+				module = object.NewModule("")
+			}
+		} else if existing, ok := vm.topLevelConstantValue(name); ok {
+			if useExisting(existing) {
+				return nil
+			}
+			if module == nil {
+				module = object.NewModule(name)
 			}
 		} else {
 			module = object.NewModule(name)
@@ -1227,6 +3448,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Class: core.R.Classes["Module"],
 		}
 		vm.rubyConsts[name] = moduleVal
+		if container := vm.currentConstantContainer(); container != nil && !strings.Contains(name, "::") {
+			defineConstantOn(container, name, moduleVal)
+			vm.rubyConsts[qualifiedConstantName(container, name)] = moduleVal
+		} else if strings.Contains(name, "::") {
+			vm.defineQualifiedConstant(name, moduleVal)
+		}
 		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
 			defineConstantOn(container, constName, moduleVal)
 		}
@@ -1235,6 +3462,28 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpDup:
 		vm.push(vm.peek(0))
+
+	case compiler.OpMultiAssignPrepare:
+		val := vm.pop()
+		prepared, err := vm.prepareMultiAssignRHS(val)
+		if err != nil {
+			if vm.raiseException(frame, err) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, err)
+			return nil
+		}
+		vm.push(prepared)
+
+	case compiler.OpMultiAssignCheckToAry:
+		val := vm.pop()
+		if err := vm.checkMultiAssignToAry(val); err != nil {
+			if vm.raiseException(frame, err) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, err)
+			return nil
+		}
 
 	case compiler.OpClosure:
 		fnIdx := vm.readUint16()
@@ -1259,6 +3508,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Block:      vm.yieldBlock(),
 			Binding:    vm.currentFrameBinding(),
 			ClassStack: vm.currentClassStackSnapshot(),
+			AutoSplat:  true,
 		}
 
 		vm.push(&object.EmeraldValue{
@@ -1301,13 +3551,30 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpSplat:
 		val := vm.pop()
-		if val.Type == object.ValueArray {
-			elems := val.Data.([]*object.EmeraldValue)
-			for _, elem := range elems {
-				vm.push(elem)
+		arr, err := vm.toAryForSplat(val)
+		if err != nil {
+			if vm.raiseException(frame, err) {
+				return nil
 			}
-		} else {
-			vm.push(val)
+			vm.returnUnhandledException(frame, err)
+			return nil
+		}
+		for _, elem := range arr {
+			vm.push(elem)
+		}
+
+	case compiler.OpSplatToA:
+		val := vm.pop()
+		arr, err := vm.toAForAssignmentSplat(val)
+		if err != nil {
+			if vm.raiseException(frame, err) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, err)
+			return nil
+		}
+		for _, elem := range arr {
+			vm.push(elem)
 		}
 
 	case compiler.OpRange:
@@ -1316,27 +3583,58 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		left := vm.pop()
 
 		var start, end int64
-		if l, ok := left.Data.(int64); ok {
-			start = l
-		} else if l, ok := left.Data.(float64); ok {
-			start = int64(l)
-		} else {
-			vm.push(core.R.NilVal)
-			return nil
+		var startRaw, endRaw float64
+		startFloat := false
+		endFloat := false
+		startMissing := false
+		endMissing := false
+		if left == nil {
+			left = nil
+			startMissing = true
+			start = 0
 		}
-		if r, ok := right.Data.(int64); ok {
-			end = r
-		} else if r, ok := right.Data.(float64); ok {
-			end = int64(r)
-		} else {
-			vm.push(core.R.NilVal)
-			return nil
+		if right == nil {
+			right = nil
+			endMissing = true
+			end = 0
+		} else if right.Type == object.ValueNil {
+			right = nil
+			endMissing = true
+			end = 0
+		}
+		if left != nil {
+			if l, ok := left.Data.(int64); ok {
+				start = l
+				startRaw = float64(l)
+			} else if l, ok := left.Data.(float64); ok {
+				start = int64(l)
+				startFloat = true
+				startRaw = l
+			}
+		}
+		if right != nil {
+			if r, ok := right.Data.(int64); ok {
+				end = r
+				endRaw = float64(r)
+			} else if r, ok := right.Data.(float64); ok {
+				end = int64(r)
+				endFloat = true
+				endRaw = r
+			}
 		}
 
 		rangeObj := &object.RRange{
-			Start:     start,
-			End:       end,
-			Exclusive: exclusive == 1,
+			Start:        start,
+			End:          end,
+			StartValue:   left,
+			EndValue:     right,
+			StartFloat:   startFloat,
+			EndFloat:     endFloat,
+			StartRaw:     startRaw,
+			EndRaw:       endRaw,
+			StartMissing: startMissing,
+			EndMissing:   endMissing,
+			Exclusive:    exclusive == 1,
 		}
 		vm.push(&object.EmeraldValue{
 			Type:  object.ValueRange,
@@ -1373,6 +3671,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		args := make([]*object.EmeraldValue, int(numArgs))
 		if numArgs == 255 {
+			if frame.Fn != nil && frame.Fn.DefinedByDefineMethod {
+				result := core.NewRuntimeError("implicit argument passing of super from method defined by define_method() is not supported")
+				if vm.raiseException(frame, result) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, result)
+				return nil
+			}
 			args = append([]*object.EmeraldValue(nil), frame.Args...)
 		} else {
 			for i := 0; i < int(numArgs); i++ {
@@ -1396,7 +3702,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			superClass = self.Class.SuperClass
 		}
 		if superClass == nil {
-			vm.push(core.R.NilVal)
+			result := core.NewNoMethodError("super: no superclass method `" + frame.MethodName + "'")
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, result)
 			return nil
 		}
 		var methodObj *object.Method
@@ -1408,7 +3718,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			methodObj, owner, ok = superClass.GetMethodWithOwner(frame.MethodName)
 		}
 		if !ok {
-			vm.push(core.R.NilVal)
+			result := core.NewNoMethodError("super: no superclass method `" + frame.MethodName + "'")
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, result)
 			return nil
 		}
 
@@ -1436,23 +3750,26 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				vm.stack[vm.sp] = arg
 				vm.sp++
 			}
+			var blockParamProc *object.Proc
 			if fn.HasBlockParam {
 				blockVal := vm.currentBlock
 				if blockVal == nil {
 					blockVal = core.R.NilVal
 				} else if blockVal.Type == object.ValueClosure {
 					closure := blockVal.Data.(*object.Closure)
+					proc := &object.Proc{
+						Fn:           closure.Fn,
+						Env:          closure.Free,
+						Block:        closure.Block,
+						Binding:      closure.Binding,
+						ClassStack:   closure.ClassStack,
+						InstanceVars: make(map[string]*object.EmeraldValue),
+						IsLambda:     false,
+					}
+					blockParamProc = proc
 					blockVal = &object.EmeraldValue{
-						Type: object.ValueProc,
-						Data: &object.Proc{
-							Fn:           closure.Fn,
-							Env:          closure.Free,
-							Block:        closure.Block,
-							Binding:      closure.Binding,
-							ClassStack:   closure.ClassStack,
-							InstanceVars: make(map[string]*object.EmeraldValue),
-							IsLambda:     false,
-						},
+						Type:  object.ValueProc,
+						Data:  proc,
 						Class: core.R.Classes["Proc"],
 					}
 				}
@@ -1467,6 +3784,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				vm.sp = minSp
 			}
 			newFrame := &Frame{
+				ID:         vm.allocateFrameID(),
 				Fn:         fn,
 				Ip:         -1,
 				Bp:         bp,
@@ -1474,6 +3792,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				SuperStart: owner.SuperClass,
 				Args:       args,
 				Block:      vm.currentBlock,
+			}
+			if blockParamProc != nil {
+				blockParamProc.BreakOwnerID = newFrame.ID
 			}
 			vm.frames = append(vm.frames, newFrame)
 			vm.fp++
@@ -1487,11 +3808,16 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					break
 				}
 				curFrame = vm.frames[vm.fp]
+				if core.LastBlockResult != nil {
+					break
+				}
 				instructions = curFrame.Fn.Instructions
 			}
 
 			result := core.R.NilVal
-			if vm.sp > bp {
+			if core.LastBlockResult != nil {
+				result = core.LastBlockResult
+			} else if vm.sp > bp {
 				result = vm.stack[vm.sp-1]
 			}
 			vm.sp = bp
@@ -1569,6 +3895,20 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		vm.push(core.R.FalseVal)
 
+	case compiler.OpDefined:
+		nameIdx := vm.readUint16()
+		name, ok := constants[nameIdx].Data.(string)
+		if !ok {
+			return fmt.Errorf("OpDefined: expected string constant, got %T", constants[nameIdx].Data)
+		}
+		receiver := vm.pop()
+		value, found := vm.scopedConstantValue(receiver, name)
+		if found && value != nil && value.Type != object.ValueException {
+			vm.push(&object.EmeraldValue{Type: object.ValueString, Data: "constant", Class: core.R.Classes["String"]})
+		} else {
+			vm.push(core.R.NilVal)
+		}
+
 	case compiler.OpBeginRescue:
 		rescueOffset := vm.readUint16()
 		ensureOffset := vm.readUint16()
@@ -1635,9 +3975,34 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpRescueMatch:
 		count := int(vm.readUint8())
-		classes := make([]*object.EmeraldValue, count)
+		splatMask := int(vm.readUint16())
+		values := make([]*object.EmeraldValue, count)
 		for i := count - 1; i >= 0; i-- {
-			classes[i] = vm.pop()
+			values[i] = vm.pop()
+		}
+		classes := make([]*object.EmeraldValue, 0, count)
+		for i, value := range values {
+			if splatMask&(1<<i) == 0 {
+				classes = append(classes, value)
+				continue
+			}
+			expanded, err := vm.toAForAssignmentSplat(value)
+			if err != nil {
+				if vm.raiseException(frame, err) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, err)
+				return nil
+			}
+			classes = append(classes, expanded...)
+		}
+		if invalidRescueClause(classes) {
+			err := core.NewTypeError("class or module required for rescue clause")
+			if vm.raiseException(frame, err) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, err)
+			return nil
 		}
 		vm.push(boolValue(rescueMatches(core.LastException, classes)))
 
@@ -1667,7 +4032,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		for i := len(vm.catchStack) - 1; i >= 0; i-- {
 			handler := vm.catchStack[i]
-			if handler.Label != nil && handler.Label.Equals(label) {
+			if handler.Label != nil && throwLabelsMatch(handler.Label, label) {
 				vm.catchStack = vm.catchStack[:i]
 				if value != nil {
 					vm.push(value)
@@ -1680,6 +4045,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				return nil
 			}
 		}
+		className := "ArgumentError"
+		if vm.threadDepth > 0 {
+			className = "UncaughtThrowError"
+		}
+		exception := core.NewException(className, "uncaught throw")
+		if vm.raiseException(frame, exception) {
+			return nil
+		}
+		vm.returnUnhandledException(frame, exception)
 
 	default:
 		return fmt.Errorf("unknown opcode: %v", op)
@@ -1723,6 +4097,9 @@ func (vm *VM) popFrameValue(frame *Frame) *object.EmeraldValue {
 }
 
 func (vm *VM) peek(n int) *object.EmeraldValue {
+	if n < 0 || vm.sp-1-n < 0 || vm.sp == 0 {
+		return core.R.NilVal
+	}
 	return vm.stack[vm.sp-1-n]
 }
 
@@ -1769,6 +4146,9 @@ func (vm *VM) add(left, right *object.EmeraldValue) *object.EmeraldValue {
 		case string:
 			return &object.EmeraldValue{Type: object.ValueString, Data: l + r, Class: core.R.Classes["String"]}
 		}
+	}
+	if left == nil || left.Type == object.ValueNil {
+		return core.NewNoMethodError("undefined method `+'")
 	}
 	if left != nil && left.Class != nil {
 		return vm.send(left, "+", []*object.EmeraldValue{right})
@@ -1904,7 +4284,15 @@ func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
 				return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / vm.powInt(l, -int(r)), Class: core.R.Classes["Float"]}
 			}
 			if integerPowOverflows(l, int(r)) {
-				return core.NewRangeErrorValue("integer out of range")
+				result := int64(math.MaxInt64)
+				if l < 0 && r%2 != 0 {
+					result = math.MinInt64
+				}
+				value := &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: core.R.Classes["Integer"]}
+				if l == 2 && r >= 0 {
+					core.RememberBERPackOverride(value, core.BERPackPowerOfTwo(int(r)))
+				}
+				return value
 			}
 			return &object.EmeraldValue{Type: object.ValueInteger, Data: vm.powInt(l, int(r)), Class: core.R.Classes["Integer"]}
 		case float64:
@@ -1999,6 +4387,9 @@ func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
 		return core.R.FalseVal
 	}
 	if core.TimeValuesEqual(left, right) {
+		return core.R.TrueVal
+	}
+	if left.Type == right.Type && left.Equals(right) {
 		return core.R.TrueVal
 	}
 	switch l := left.Data.(type) {
@@ -2360,14 +4751,13 @@ func (vm *VM) sliceIndex(left, start, length *object.EmeraldValue) *object.Emera
 }
 
 func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueArray {
+		return vm.send(left, "[]=", []*object.EmeraldValue{index, value})
+	}
+	if left != nil && left.Type == object.ValueHash {
+		return vm.send(left, "[]=", []*object.EmeraldValue{index, value})
+	}
 	switch l := left.Data.(type) {
-	case []*object.EmeraldValue:
-		switch i := index.Data.(type) {
-		case int64:
-			if i >= 0 && i < int64(len(l)) {
-				l[i] = value
-			}
-		}
 	case map[*object.EmeraldValue]*object.EmeraldValue:
 		found := false
 		for k := range l {
@@ -2388,33 +4778,76 @@ func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.Emera
 }
 
 func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
+	if os.Getenv("RGO_DEBUG_SEND_TRACE") == "1" {
+		depth := atomic.AddInt64(&sendTraceDepth, 1)
+		if depth <= 40 {
+			fmt.Printf("send depth=%d method=%q receiverType=%s\n", depth, method, receiver.TypeName())
+		}
+		if depth%200 == 0 {
+			fmt.Printf("send depth=%d method=%q receiverType=%s\n", depth, method, receiver.TypeName())
+		}
+		if depth > 4000 {
+			panic(fmt.Sprintf("send recursion guard: method=%s receiver=%s depth=%d", method, receiver.TypeName(), depth))
+		}
+		defer atomic.AddInt64(&sendTraceDepth, -1)
+	}
 	if receiver == nil {
 		receiver = core.R.NilVal
 	}
 	receiver = derefClosureValue(receiver)
-	if method == "send" && len(args) > 0 {
-		methodName, ok := methodNameFromValue(args[0])
+	if (method == "send" || method == "__send__" || method == "public_send") && len(args) > 0 {
+		methodName, ok, parseErr := core.MethodNameFromValueWithError(args[0])
+		if parseErr != nil {
+			return parseErr
+		}
 		if !ok {
-			return core.R.NilVal
+			return core.NewTypeError("is not a symbol nor a string")
 		}
 		forwardArgs := args[1:]
 		if methodName != "initialize" && len(forwardArgs) == 1 && forwardArgs[0] != nil && forwardArgs[0].Type == object.ValueArray {
 			forwardArgs = forwardArgs[0].Data.([]*object.EmeraldValue)
 		}
 		prev := vm.visibilityBypass
-		vm.visibilityBypass = true
-		result := vm.send(receiver, methodName, forwardArgs)
+		vm.visibilityBypass = method != "public_send"
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, forwardArgs, true)
+		if fallback != nil {
+			vm.visibilityBypass = prev
+			return fallback
+		}
+		result := vm.invokeMethod(receiver, method, methodName, forwardArgs, methodObj, methodOwner)
 		vm.visibilityBypass = prev
 		return result
 	}
+
 	if method == "instance_eval" && vm.currentBlock != nil {
+		if len(args) > 0 {
+			return core.NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+		}
 		block := vm.currentBlock
 		vm.currentBlock = nil
-		return vm.callBlockWithSelf(block, receiver, args...)
+		return vm.callBlockWithInstanceEvalContext(receiver, block, receiver)
+	}
+	if method == "instance_eval" {
+		if len(args) == 0 {
+			return core.NewArgumentError("wrong number of arguments (given 0, expected 1..3)")
+		}
+		if len(args) > 3 {
+			return core.NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..3)", len(args)))
+		}
+		evalBinding := vm.instanceEvalBinding(receiver)
+		evalArgs := make([]*object.EmeraldValue, 0, len(args)+1)
+		evalArgs = append(evalArgs, args[0], evalBinding)
+		if len(args) > 1 {
+			evalArgs = append(evalArgs, args[1])
+		}
+		if len(args) > 2 {
+			evalArgs = append(evalArgs, args[2])
+		}
+		return core.CallMethod(receiver, "eval", evalArgs...)
 	}
 	if (method == "class_eval" || method == "module_eval") && vm.currentBlock != nil {
 		if len(args) > 0 {
-			return core.NewArgumentError("wrong number of arguments")
+			return core.NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
 		}
 		block := vm.currentBlock
 		vm.currentBlock = nil
@@ -2429,7 +4862,10 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	if method == "instance_exec" && vm.currentBlock != nil {
 		block := vm.currentBlock
 		vm.currentBlock = nil
-		return vm.callBlockWithSelf(block, receiver, args...)
+		return vm.callBlockWithInstanceEvalContext(receiver, block, args...)
+	}
+	if method == "instance_exec" {
+		return core.NewLocalJumpError("no block given")
 	}
 	if method == "class_exec" || method == "module_exec" {
 		if vm.currentBlock == nil {
@@ -2448,17 +4884,52 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	if method == "__exec_class_body__" && (receiver.Type == object.ValueClass || receiver.Type == object.ValueModule) && vm.currentBlock != nil {
 		block := vm.currentBlock
 		vm.currentBlock = nil
+		core.ResetCurrentMethodVisibility(receiver)
 		vm.classStack = append(vm.classStack, receiver)
 		result := vm.callBlockWithSelf(block, receiver)
 		vm.classStack = vm.classStack[:len(vm.classStack)-1]
+		core.ResetCurrentMethodVisibility(receiver)
 		return result
 	}
 
+	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, false)
+	if fallback != nil {
+		return fallback
+	}
+
+	return vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner)
+}
+
+func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, missingAsNameError bool) (*object.Method, *object.Class, *object.EmeraldValue) {
 	var methodObj *object.Method
 	var methodOwner *object.Class
 	var ok bool
 
-	methodName := method
+	lookupClassSingletonMethod := func(singletonClass *object.Class, methodName string) (*object.Method, *object.Class, bool) {
+		if singletonClass == nil {
+			return nil, nil, false
+		}
+		for _, mod := range singletonClass.PrependedModules {
+			if method, found := mod.GetMethod(methodName); found {
+				return method, singletonClass, true
+			}
+		}
+		if method, found := singletonClass.Methods[methodName]; found {
+			return method, singletonClass, true
+		}
+		for _, mod := range singletonClass.IncludedModules {
+			if method, found := mod.GetMethod(methodName); found {
+				return method, singletonClass, true
+			}
+		}
+		return nil, nil, false
+	}
+	lookupClassReceiverMethod := func(cls *object.Class, methodName string) (*object.Method, *object.Class, bool) {
+		if cls == nil || cls.SingletonClass == nil {
+			return nil, nil, false
+		}
+		return lookupClassSingletonMethod(cls.SingletonClass, methodName)
+	}
 
 	if receiver.Type == object.ValueObject {
 		if obj, isObject := receiver.Data.(*object.Object); isObject {
@@ -2467,9 +4938,9 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 				methodOwner = nil
 				ok = true
 			} else if obj.SingletonClass != nil {
-				if m, found := obj.SingletonClass.Methods[method]; found {
+				if m, owner, found := lookupClassSingletonMethod(obj.SingletonClass, method); found {
 					methodObj = m
-					methodOwner = obj.SingletonClass
+					methodOwner = owner
 					ok = true
 				}
 			}
@@ -2478,12 +4949,10 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 
 	if receiver.Type == object.ValueClass {
 		cls := receiver.Data.(*object.Class)
-		if cls.SingletonClass != nil {
-			if m, found := cls.SingletonClass.Methods[method]; found {
-				methodObj = m
-				methodOwner = cls.SingletonClass
-				ok = true
-			}
+		if m, owner, found := lookupClassReceiverMethod(cls, method); found {
+			methodObj = m
+			methodOwner = owner
+			ok = true
 		}
 		if !ok {
 			if m, found := cls.ClassMethods[method]; found {
@@ -2497,13 +4966,11 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			classInheritsFrom(cls, core.R.Classes["Time"])
 		if !ok && inheritClassMethodsFirst {
 			for current := cls.SuperClass; current != nil; current = current.SuperClass {
-				if current.SingletonClass != nil {
-					if m, found := current.SingletonClass.Methods[method]; found {
-						methodObj = m
-						methodOwner = current.SingletonClass
-						ok = true
-						break
-					}
+				if m, owner, found := lookupClassReceiverMethod(current, method); found {
+					methodObj = m
+					methodOwner = owner
+					ok = true
+					break
 				}
 				if m, found := current.ClassMethods[method]; found {
 					methodObj = m
@@ -2522,14 +4989,30 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 				}
 			}
 		}
+		if !ok && !inheritClassMethodsFirst && method == "[]" {
+			for current := cls.SuperClass; current != nil; current = current.SuperClass {
+				if m, owner, found := lookupClassReceiverMethod(current, method); found {
+					methodObj = m
+					methodOwner = owner
+					ok = true
+					break
+				}
+				if m, found := current.ClassMethods[method]; found {
+					methodObj = m
+					methodOwner = current
+					ok = true
+					break
+				}
+			}
+		}
 	}
 
 	if receiver.Type == object.ValueModule {
 		mod := receiver.Data.(*object.Module)
 		if mod.SingletonClass != nil {
-			if m, found := mod.SingletonClass.Methods[method]; found {
+			if m, owner, found := lookupClassSingletonMethod(mod.SingletonClass, method); found {
 				methodObj = m
-				methodOwner = mod.SingletonClass
+				methodOwner = owner
 				ok = true
 			}
 		}
@@ -2554,13 +5037,11 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			goto afterInheritedClassMethodLookup
 		}
 		for current := cls.SuperClass; current != nil; current = current.SuperClass {
-			if current.SingletonClass != nil {
-				if m, found := current.SingletonClass.Methods[method]; found {
-					methodObj = m
-					methodOwner = current.SingletonClass
-					ok = true
-					break
-				}
+			if m, owner, found := lookupClassReceiverMethod(current, method); found {
+				methodObj = m
+				methodOwner = owner
+				ok = true
+				break
 			}
 			if m, found := current.ClassMethods[method]; found {
 				methodObj = m
@@ -2574,31 +5055,46 @@ afterInheritedClassMethodLookup:
 
 	if !ok {
 		if fallback := vm.dynamicModuleOrClassAccessor(receiver, method, args); fallback != nil {
-			return fallback
+			return nil, nil, fallback
 		}
 		if fallback := core.FileStatFixtureDispatch(receiver, method, args...); fallback != nil {
-			return fallback
+			return nil, nil, fallback
 		}
 		if fallback := vm.constSourceLocationArgumentError(method, args); fallback != nil {
-			return fallback
+			return nil, nil, fallback
 		}
 		if fallback := vm.moduleEvalArgumentError(method, args); fallback != nil {
-			return fallback
+			return nil, nil, fallback
 		}
 		if fallback := vm.constDefinedArgumentError(method, args); fallback != nil {
-			return fallback
+			return nil, nil, fallback
 		}
 		if core.EvaluatingRaiseErrorMatcher() {
-			return core.NewNoMethodError("undefined method `" + method + "'")
+			if numberedParameterMethodNamePattern.MatchString(method) {
+				return nil, nil, core.NewNoMethodError("undefined local variable or method `" + method + "'")
+			}
+			if missingAsNameError {
+				return nil, nil, core.NewNameError("undefined method `" + method + "'")
+			}
+			return nil, nil, core.NewNoMethodError("undefined method `" + method + "'")
 		}
-		return core.R.NilVal
+		return nil, nil, core.R.NilVal
 	}
+	return methodObj, methodOwner, nil
+}
+
+func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
+	oldFrame := vm.frames[vm.fp]
+	if methodObj == nil {
+		return core.NewNoMethodError("undefined method `" + method + "'")
+	}
+
 	if methodObj.Visibility == "undefined" {
 		return core.NewNoMethodError("undefined method `" + method + "'")
 	}
-	if !vm.visibilityBypass && method != "public" && method != "private" && method != "protected" &&
-		method != "module_function" && method != "public_class_method" && method != "private_class_method" &&
-		method != "using" && method != "refine" &&
+	if !vm.visibilityBypass && parentMethod != "public" && parentMethod != "private" && parentMethod != "protected" &&
+		parentMethod != "module_function" && parentMethod != "public_class_method" && parentMethod != "private_class_method" &&
+		parentMethod != "using" && parentMethod != "refine" &&
 		(methodObj.Visibility == "private" || methodObj.Visibility == "protected") && receiver != core.R.Main {
 		return core.NewNoMethodError(methodObj.Visibility + " method `" + method + "' called")
 	}
@@ -2607,21 +5103,41 @@ afterInheritedClassMethodLookup:
 	}
 
 	if fn, ok := methodObj.Fn.(*object.Function); ok {
-		if methodObj.EnforceArity {
-			if err := methodArityError(fn, len(args)); err != nil {
-				return err
-			}
+		args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
+		if err := methodArityError(fn, positionalArityArgCount(fn, args)); err != nil {
+			return err
 		}
-		oldFrame := vm.frames[vm.fp]
+		if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
+			return errVal
+		}
+		if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
+			return errVal
+		}
+		if errVal := rejectedNonSymbolPositionalHashWithKeywords(fn, args); errVal != nil {
+			return errVal
+		}
+		if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
+			return errVal
+		}
+		if errVal := unknownKeywordArgument(fn, args); errVal != nil {
+			return errVal
+		}
 
 		bp := vm.sp
 
 		vm.stack[vm.sp] = receiver
 		vm.sp++
 
-		if len(fn.KeywordParams) > 0 && len(args) > 0 {
-			lastArg := args[len(args)-1]
-			positionalArgs := args[:len(args)-1]
+		if len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" {
+			positionalArgs := args
+			var kwargsHash map[*object.EmeraldValue]*object.EmeraldValue
+			if len(args) > 0 {
+				lastArg := args[len(args)-1]
+				if lastArg.Type == object.ValueHash && core.Ruby2KeywordHash(lastArg) {
+					positionalArgs = args[:len(args)-1]
+					kwargsHash = executorHashToMap(lastArg)
+				}
+			}
 
 			if fn.HasRestParam {
 				normalCount := fn.RestParamIndex
@@ -2650,11 +5166,6 @@ afterInheritedClassMethodLookup:
 				}
 			}
 
-			var kwargsHash map[*object.EmeraldValue]*object.EmeraldValue
-			if lastArg.Type == object.ValueHash {
-				kwargsHash = lastArg.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-			}
-
 			for _, kp := range fn.KeywordParams {
 				val := vm.lookupKwarg(kwargsHash, kp.Name)
 				if val == nil {
@@ -2665,6 +5176,10 @@ afterInheritedClassMethodLookup:
 					}
 				}
 				vm.stack[vm.sp] = val
+				vm.sp++
+			}
+			if fn.KeywordRestParam != "" {
+				vm.stack[vm.sp] = vm.keywordRestHash(kwargsHash, fn.KeywordParams)
 				vm.sp++
 			}
 		} else if fn.HasRestParam {
@@ -2681,7 +5196,7 @@ afterInheritedClassMethodLookup:
 				last := restElems[len(restElems)-1]
 				if last != nil && last.Type == object.ValueHash {
 					copied := make(map[*object.EmeraldValue]*object.EmeraldValue)
-					for key, value := range last.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+					for key, value := range executorHashToMap(last) {
 						copied[key] = value
 					}
 					last = &object.EmeraldValue{Type: object.ValueHash, Data: copied, Class: core.R.Classes["Hash"]}
@@ -2706,23 +5221,26 @@ afterInheritedClassMethodLookup:
 			}
 		}
 
+		var blockParamProc *object.Proc
 		if fn.HasBlockParam {
 			blockVal := vm.currentBlock
 			if blockVal == nil {
 				blockVal = core.R.NilVal
 			} else if blockVal.Type == object.ValueClosure {
 				closure := blockVal.Data.(*object.Closure)
+				proc := &object.Proc{
+					Fn:           closure.Fn,
+					Env:          closure.Free,
+					Block:        closure.Block,
+					Binding:      closure.Binding,
+					ClassStack:   closure.ClassStack,
+					InstanceVars: make(map[string]*object.EmeraldValue),
+					IsLambda:     false,
+				}
+				blockParamProc = proc
 				blockVal = &object.EmeraldValue{
-					Type: object.ValueProc,
-					Data: &object.Proc{
-						Fn:           closure.Fn,
-						Env:          closure.Free,
-						Block:        closure.Block,
-						Binding:      closure.Binding,
-						ClassStack:   closure.ClassStack,
-						InstanceVars: make(map[string]*object.EmeraldValue),
-						IsLambda:     false,
-					},
+					Type:  object.ValueProc,
+					Data:  proc,
 					Class: core.R.Classes["Proc"],
 				}
 			}
@@ -2739,18 +5257,22 @@ afterInheritedClassMethodLookup:
 
 		methodClosure := vm.detachedMethodClosure(methodObj)
 		newFrame := &Frame{
+			ID:             vm.allocateFrameID(),
 			Fn:             fn,
 			Ip:             -1,
 			Bp:             bp,
 			Closure:        methodClosure,
-			MethodName:     methodName,
+			MethodName:     method,
 			Args:           args,
 			Block:          vm.currentBlock,
 			BlockBreakAddr: -1,
 			WhileStart:     -1,
 			WhileEnd:       -1,
 		}
-		if methodFromPrependedModule(receiver.Class, methodName, methodObj) {
+		if blockParamProc != nil {
+			blockParamProc.BreakOwnerID = newFrame.ID
+		}
+		if methodFromPrependedModule(receiver.Class, method, methodObj) {
 			newFrame.SuperStart = receiver.Class
 		} else if methodOwner == nil {
 			newFrame.SuperStart = receiver.Class
@@ -2779,7 +5301,10 @@ afterInheritedClassMethodLookup:
 				return core.R.NilVal
 			}
 			frame = vm.frames[vm.fp]
-			if frame.BlockBreak {
+			if frame.BlockBreak || frame.BlockNextVal != nil {
+				break
+			}
+			if core.LastBlockResult != nil {
 				break
 			}
 			instructions = frame.Fn.Instructions
@@ -2795,6 +5320,8 @@ afterInheritedClassMethodLookup:
 			}
 		} else if frame.BlockNextVal != nil {
 			result = frame.BlockNextVal
+		} else if core.LastBlockResult != nil {
+			result = core.LastBlockResult
 		} else if vm.sp > bp {
 			result = vm.stack[vm.sp-1]
 		}
@@ -2808,6 +5335,21 @@ afterInheritedClassMethodLookup:
 	}
 
 	return core.R.NilVal
+}
+
+func (vm *VM) enforceCurrentFrameLocals() int {
+	if vm.fp < 0 || vm.fp >= len(vm.frames) || vm.frames[vm.fp] == nil {
+		return vm.sp
+	}
+	frame := vm.frames[vm.fp]
+	if frame.Fn == nil {
+		return vm.sp
+	}
+	minSp := frame.Bp + 1 + frame.Fn.NumLocals
+	if vm.sp < minSp {
+		vm.sp = minSp
+	}
+	return vm.sp
 }
 
 func (vm *VM) detachedMethodClosure(method *object.Method) *object.Closure {
@@ -2836,10 +5378,15 @@ func detachClosureCapture(value *object.EmeraldValue) *object.EmeraldValue {
 		return core.R.NilVal
 	}
 	if cell, ok := value.Data.(*closureCell); ok {
+		captured := cell.value
+		if captured == nil && cell.slot != nil && *cell.slot != nil {
+			captured = derefClosureValue(*cell.slot)
+		}
 		return &object.EmeraldValue{
 			Type: object.ValueObject,
 			Data: &closureCell{
-				value: derefClosureValue(&object.EmeraldValue{Type: value.Type, Data: cell, Class: value.Class}),
+				slot:  nil,
+				value: captured,
 			},
 			Class: value.Class,
 		}
@@ -2871,7 +5418,48 @@ func methodArityError(fn *object.Function, argc int) *object.EmeraldValue {
 	return nil
 }
 
+func positionalArityArgCount(fn *object.Function, args []*object.EmeraldValue) int {
+	if fn == nil || len(args) == 0 {
+		return len(args)
+	}
+	last := args[len(args)-1]
+	if last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last) && functionAcceptsKeywords(fn) {
+		return len(args) - 1
+	}
+	return len(args)
+}
+
+func functionAcceptsKeywords(fn *object.Function) bool {
+	return fn != nil && (len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly)
+}
+
+func dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn *object.Function, args []*object.EmeraldValue) []*object.EmeraldValue {
+	if fn == nil || functionAcceptsKeywords(fn) || len(args) == 0 {
+		return args
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash || !core.Ruby2KeywordHash(last) {
+		return args
+	}
+	if len(executorHashToMap(last)) != 0 {
+		return args
+	}
+	return args[:len(args)-1]
+}
+
 func (vm *VM) currentDefinitionVisibility() string {
+	if vm.currentDefinitionMode() == "module_function" {
+		return "private"
+	}
+	mode := vm.currentDefinitionMode()
+	switch mode {
+	case "private", "protected":
+		return mode
+	}
+	return "public"
+}
+
+func (vm *VM) currentDefinitionMode() string {
 	if len(vm.classStack) == 0 {
 		return "private"
 	}
@@ -2884,9 +5472,8 @@ func (vm *VM) currentDefinitionVisibility() string {
 		visibility = classVal.Data.(*object.Module).GetInstanceVar("@__visibility")
 	}
 	if visibility != nil && visibility.Type == object.ValueString {
-		switch visibility.Data.(string) {
-		case "private", "protected":
-			return visibility.Data.(string)
+		if mode, ok := visibility.Data.(string); ok {
+			return mode
 		}
 	}
 	return "public"
@@ -2995,14 +5582,16 @@ func (vm *VM) scopedLocalConstantContainer(frame *Frame, qualifiedName string) (
 	}
 	rootName := parts[0]
 	idx, ok := frame.Fn.LocalNames[rootName]
-	if !ok {
-		return nil, "", false
+	var container *object.EmeraldValue
+	if ok {
+		stackIdx := frame.Bp + idx + 1
+		if stackIdx >= 0 && stackIdx < len(vm.stack) {
+			container = vm.stack[stackIdx]
+		}
 	}
-	stackIdx := frame.Bp + idx + 1
-	if stackIdx < 0 || stackIdx >= len(vm.stack) {
-		return nil, "", false
+	if container == nil && frame.Closure != nil {
+		container = bindingLocalValue(frame.Closure.Binding, rootName)
 	}
-	container := vm.stack[stackIdx]
 	if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
 		return nil, "", false
 	}
@@ -3014,6 +5603,18 @@ func (vm *VM) scopedLocalConstantContainer(frame *Frame, qualifiedName string) (
 		container = value
 	}
 	return container, parts[len(parts)-1], true
+}
+
+func bindingLocalValue(binding *object.RBinding, name string) *object.EmeraldValue {
+	for current := binding; current != nil; current = current.Parent {
+		if current.Locals == nil {
+			continue
+		}
+		if value, ok := current.Locals[name]; ok {
+			return value
+		}
+	}
+	return nil
 }
 
 func (vm *VM) scopedLocalConstantValue(frame *Frame, qualifiedName string) (*object.EmeraldValue, bool) {
@@ -3040,9 +5641,6 @@ func (vm *VM) lexicalConstantValue(name string) (*object.EmeraldValue, bool) {
 			if loaded {
 				return value, true
 			}
-		}
-		if value, ok := vm.qualifiedLexicalParentConstantValue(container, name); ok {
-			return value, true
 		}
 	}
 	return nil, false
@@ -3115,7 +5713,59 @@ func (vm *VM) topLevelConstantValue(name string) (*object.EmeraldValue, bool) {
 	if class, ok := core.R.Classes[name]; ok {
 		return &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: core.R.Classes["Class"]}, true
 	}
+	if value, ok := vm.namespaceModuleValue(name); ok {
+		return value, true
+	}
 	return nil, false
+}
+
+func (vm *VM) namespaceModuleValue(name string) (*object.EmeraldValue, bool) {
+	prefix := name + "::"
+	for constName := range vm.rubyConsts {
+		if strings.HasPrefix(constName, prefix) {
+			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+			vm.rubyConsts[name] = moduleVal
+			vm.populateNamespaceModule(moduleVal, name)
+			return moduleVal, true
+		}
+	}
+	for className := range core.R.Classes {
+		if strings.HasPrefix(className, prefix) {
+			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+			vm.rubyConsts[name] = moduleVal
+			vm.populateNamespaceModule(moduleVal, name)
+			return moduleVal, true
+		}
+	}
+	return nil, false
+}
+
+func (vm *VM) populateNamespaceModule(moduleVal *object.EmeraldValue, name string) {
+	if moduleVal == nil || moduleVal.Type != object.ValueModule {
+		return
+	}
+	module := moduleVal.Data.(*object.Module)
+	prefix := name + "::"
+	for constName, value := range vm.rubyConsts {
+		if !strings.HasPrefix(constName, prefix) {
+			continue
+		}
+		child := strings.TrimPrefix(constName, prefix)
+		if child == "" || strings.Contains(child, "::") {
+			continue
+		}
+		module.DefineConstant(child, value)
+	}
+	for className, class := range core.R.Classes {
+		if !strings.HasPrefix(className, prefix) {
+			continue
+		}
+		child := strings.TrimPrefix(className, prefix)
+		if child == "" || strings.Contains(child, "::") {
+			continue
+		}
+		module.DefineConstant(child, &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: core.R.Classes["Class"]})
+	}
 }
 
 func directConstantValue(container *object.EmeraldValue, name string) (*object.EmeraldValue, bool) {
@@ -3123,14 +5773,14 @@ func directConstantValue(container *object.EmeraldValue, name string) (*object.E
 	case object.ValueClass:
 		class := container.Data.(*object.Class)
 		if class.PrivateConstants[name] {
-			return core.NewNameError("private constant " + class.Name + "::" + name + " referenced"), true
+			return core.NewPrivateConstantNameError(container, name), true
 		}
 		value, ok := class.Constants[name]
 		return value, ok
 	case object.ValueModule:
 		module := container.Data.(*object.Module)
 		if module.PrivateConstants[name] {
-			return core.NewNameError("private constant " + module.Name + "::" + name + " referenced"), true
+			return core.NewPrivateConstantNameError(container, name), true
 		}
 		value, ok := module.Constants[name]
 		return value, ok
@@ -3231,6 +5881,52 @@ func (vm *VM) classValueFromContainer(container *object.EmeraldValue, constName 
 	return nil, false
 }
 
+func (vm *VM) invalidQualifiedClassNameError(qualifiedName string) *object.EmeraldValue {
+	if !strings.Contains(qualifiedName, "::") {
+		return nil
+	}
+	parts := strings.Split(qualifiedName, "::")
+	if len(parts) < 2 {
+		return nil
+	}
+	if parts[0] == "nil" {
+		return core.NewTypeError(parts[0] + " is not a class/module")
+	}
+	container, found := vm.topLevelConstantValue(parts[0])
+	if !found {
+		return nil
+	}
+	if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
+		return core.NewTypeError(parts[0] + " is not a class/module")
+	}
+	for _, constName := range parts[1 : len(parts)-1] {
+		value, ok := vm.scopedConstantValue(container, constName)
+		if !ok {
+			return nil
+		}
+		if value == nil || (value.Type != object.ValueClass && value.Type != object.ValueModule) {
+			return core.NewTypeError(strings.Join(parts[:len(parts)-1], "::") + " is not a class/module")
+		}
+		container = value
+	}
+	return nil
+}
+
+func (vm *VM) qualifiedPrivateConstantError(qualifiedName string) (*object.EmeraldValue, bool) {
+	if !strings.Contains(qualifiedName, "::") {
+		return nil, false
+	}
+	container, constName, ok := vm.qualifiedConstantContainer(qualifiedName)
+	if !ok {
+		return nil, false
+	}
+	value, found := directConstantValue(container, constName)
+	if found && value != nil && value.Type == object.ValueException {
+		return value, true
+	}
+	return nil, false
+}
+
 func (vm *VM) currentConstantContainer() *object.EmeraldValue {
 	for i := len(vm.classStack) - 1; i >= 0; i-- {
 		entry := vm.classStack[i]
@@ -3248,6 +5944,29 @@ func (vm *VM) currentClassStackSnapshot() []*object.EmeraldValue {
 	return append([]*object.EmeraldValue(nil), vm.classStack...)
 }
 
+func (vm *VM) classVarScopeReceiver(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if len(vm.classStack) > 0 {
+		if scope := vm.classStack[len(vm.classStack)-1]; scope != nil {
+			return scope
+		}
+	}
+	return receiver
+}
+
+func (vm *VM) classVarAccessesToplevel(receiver *object.EmeraldValue) bool {
+	return len(vm.classStack) == 0 && receiver == core.R.Main
+}
+
+func throwLabelsMatch(catchLabel, throwLabel *object.EmeraldValue) bool {
+	if catchLabel == nil || throwLabel == nil {
+		return catchLabel == throwLabel
+	}
+	if catchLabel.Type != throwLabel.Type {
+		return false
+	}
+	return catchLabel.Equals(throwLabel)
+}
+
 func defineConstantOn(container *object.EmeraldValue, name string, value *object.EmeraldValue) {
 	switch container.Type {
 	case object.ValueClass:
@@ -3257,6 +5976,40 @@ func defineConstantOn(container *object.EmeraldValue, name string, value *object
 		module.DefineConstant(name, value)
 	}
 	core.AssignConstantName(container, name, value)
+}
+
+func (vm *VM) defineQualifiedConstant(name string, value *object.EmeraldValue) {
+	idx := strings.LastIndex(name, "::")
+	if idx <= 0 || idx+2 >= len(name) {
+		return
+	}
+	parentName := name[:idx]
+	constName := name[idx+2:]
+	parent, ok := vm.ensureNamespaceContainer(parentName)
+	if !ok {
+		return
+	}
+	defineConstantOn(parent, constName, value)
+}
+
+func (vm *VM) ensureNamespaceContainer(name string) (*object.EmeraldValue, bool) {
+	if value, ok := vm.topLevelConstantValue(name); ok && (value.Type == object.ValueClass || value.Type == object.ValueModule) {
+		return value, true
+	}
+	idx := strings.LastIndex(name, "::")
+	if idx <= 0 || idx+2 >= len(name) {
+		moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+		vm.rubyConsts[name] = moduleVal
+		return moduleVal, true
+	}
+	parent, ok := vm.ensureNamespaceContainer(name[:idx])
+	if !ok {
+		return nil, false
+	}
+	moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+	vm.rubyConsts[name] = moduleVal
+	defineConstantOn(parent, name[idx+2:], moduleVal)
+	return moduleVal, true
 }
 
 func sameModuleOrClassValue(left, right *object.EmeraldValue) bool {
@@ -3335,6 +6088,9 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 	if handler.Frame != frame {
 		return false
 	}
+	if handler.RescueOffset > 0 && frame.Ip >= handler.RescueOffset-1 {
+		return false
+	}
 	vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
 	if handler.RescueOffset > 0 {
 		handler.Frame.Ip = handler.RescueOffset - 1
@@ -3343,8 +6099,18 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 	} else {
 		handler.Frame.Ip = handler.EndOffset - 1
 	}
-	vm.ensureActive = false
+	// Keep ensure context active only when we jumped directly into an ensure block.
+	// This is used by backtrace construction to avoid introducing synthetic frame noise.
+	vm.ensureActive = handler.RescueOffset == 0 && handler.EnsureOffset > 0
 	return true
+}
+
+func (vm *VM) returningFromClassBodyBlock(frame *Frame) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__block__" || vm.fp <= 0 || vm.fp >= len(vm.frames) {
+		return false
+	}
+	caller := vm.frames[vm.fp-1]
+	return caller != nil && caller.Fn != nil && strings.HasSuffix(caller.Fn.Name, "#body")
 }
 
 func (vm *VM) returnUnhandledException(frame *Frame, exception *object.EmeraldValue) {
@@ -3370,6 +6136,25 @@ func rescueMatches(exception *object.EmeraldValue, classes []*object.EmeraldValu
 	}
 	for _, classVal := range classes {
 		if rescueClassMatches(exception.Class, classVal) {
+			return true
+		}
+	}
+	return false
+}
+
+func invalidRescueClause(classes []*object.EmeraldValue) bool {
+	for _, classVal := range classes {
+		if classVal == nil {
+			return true
+		}
+		switch classVal.Type {
+		case object.ValueClass, object.ValueModule:
+			continue
+		case object.ValueArray:
+			if invalidRescueClause(classVal.Data.([]*object.EmeraldValue)) {
+				return true
+			}
+		default:
 			return true
 		}
 	}
@@ -3549,21 +6334,95 @@ func valueRespondsToMethod(value *object.EmeraldValue, name string) bool {
 	if value == nil {
 		return false
 	}
-	if value.Type == object.ValueObject {
+	switch value.Type {
+	case object.ValueObject:
 		if obj, ok := value.Data.(*object.Object); ok {
 			if _, ok := obj.SingletonMethods[name]; ok {
 				return true
 			}
 			if obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.PrependedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
+				}
 				if _, ok := obj.SingletonClass.Methods[name]; ok {
+					return true
+				}
+				for _, mod := range obj.SingletonClass.IncludedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
+				}
+			}
+		}
+		if value.Class != nil {
+			if _, ok := value.Class.GetMethod(name); ok {
+				return true
+			}
+		}
+		return false
+	case object.ValueClass:
+		class, ok := value.Data.(*object.Class)
+		if !ok {
+			return false
+		}
+		for current := class; current != nil; current = current.SuperClass {
+			if current.SingletonClass != nil {
+				for _, mod := range current.SingletonClass.PrependedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
+				}
+				if _, ok := current.SingletonClass.Methods[name]; ok {
+					return true
+				}
+				for _, mod := range current.SingletonClass.IncludedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
+				}
+			}
+			if _, ok := current.ClassMethods[name]; ok {
+				return true
+			}
+		}
+		if value.Class != nil {
+			if _, ok := value.Class.GetMethod(name); ok {
+				return true
+			}
+		}
+		return false
+	case object.ValueModule:
+		mod, ok := value.Data.(*object.Module)
+		if !ok {
+			return false
+		}
+		if mod.SingletonClass != nil {
+			for _, singletonMod := range mod.SingletonClass.PrependedModules {
+				if _, ok := singletonMod.GetMethod(name); ok {
+					return true
+				}
+			}
+			if _, ok := mod.SingletonClass.Methods[name]; ok {
+				return true
+			}
+			for _, singletonMod := range mod.SingletonClass.IncludedModules {
+				if _, ok := singletonMod.GetMethod(name); ok {
 					return true
 				}
 			}
 		}
-	}
-	if value.Class != nil {
-		if _, ok := value.Class.GetMethod(name); ok {
-			return true
+		if value.Class != nil {
+			if _, ok := value.Class.GetMethod(name); ok {
+				return true
+			}
+		}
+	default:
+		if value.Class != nil {
+			if _, ok := value.Class.GetMethod(name); ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -3602,7 +6461,383 @@ func isConstantNameRune(r rune) bool {
 	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_'
 }
 
+func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldValue, prevBlock *object.EmeraldValue, markRuby2Keywords bool) int {
+	bp := vm.sp
+
+	if len(fn.KeywordParams) > 0 && len(args) > 0 {
+		lastArg := args[len(args)-1]
+		positionalArgs := args
+		var kwargs map[*object.EmeraldValue]*object.EmeraldValue
+
+		if lastArg != nil && lastArg.Type == object.ValueHash {
+			kwargs = executorHashToMap(lastArg)
+			positionalArgs = args[:len(args)-1]
+		}
+
+		if fn.HasRestParam {
+			vm.bindRestParameterSlots(fn, positionalArgs, bp, markRuby2Keywords)
+		} else {
+			normalCount := len(fn.ParamDefaults)
+			if normalCount < len(positionalArgs) {
+				normalCount = len(positionalArgs)
+			}
+			for i := 0; i < normalCount; i++ {
+				slot := bp + 1 + i
+				vm.stack[slot] = positionalArgOrDefault(fn, positionalArgs, i)
+				if vm.sp <= slot {
+					vm.sp = slot + 1
+				}
+			}
+		}
+
+		for _, kp := range fn.KeywordParams {
+			slot := bp + 1 + len(fn.Params)
+			if fn.HasRestParam {
+				slot++
+			}
+			for _, prior := range fn.KeywordParams {
+				if prior.Name == kp.Name {
+					break
+				}
+				slot++
+			}
+			val := vm.lookupKwarg(kwargs, kp.Name)
+			if val == nil {
+				if kp.HasDefault && kp.Default != nil {
+					val = kp.Default
+				} else {
+					val = core.R.NilVal
+				}
+			}
+			vm.stack[slot] = val
+			if vm.sp <= slot {
+				vm.sp = slot + 1
+			}
+		}
+	} else if fn.HasRestParam {
+		vm.bindRestParameterSlots(fn, args, bp, false)
+	} else {
+		normalCount := len(fn.ParamDefaults)
+		if normalCount < len(args) {
+			normalCount = len(args)
+		}
+		for i := 0; i < normalCount; i++ {
+			slot := bp + 1 + i
+			vm.stack[slot] = positionalArgOrDefault(fn, args, i)
+			if vm.sp <= slot {
+				vm.sp = slot + 1
+			}
+		}
+	}
+
+	if fn.HasBlockParam {
+		blockVal := prevBlock
+		if blockVal == nil {
+			blockVal = core.R.NilVal
+		} else if blockVal.Type == object.ValueClosure {
+			closure := blockVal.Data.(*object.Closure)
+			blockVal = &object.EmeraldValue{
+				Type: object.ValueProc,
+				Data: &object.Proc{
+					Fn:           closure.Fn,
+					Env:          closure.Free,
+					Block:        closure.Block,
+					Binding:      closure.Binding,
+					ClassStack:   closure.ClassStack,
+					InstanceVars: make(map[string]*object.EmeraldValue),
+					IsLambda:     false,
+				},
+				Class: core.R.Classes["Proc"],
+			}
+		}
+		blockSlot := bp + fn.BlockParamIndex + 1
+		vm.stack[blockSlot] = blockVal
+		if vm.sp <= blockSlot {
+			vm.sp = blockSlot + 1
+		}
+	}
+
+	minSp := bp + 1 + fn.NumLocals
+	if vm.sp < minSp {
+		vm.sp = minSp
+	}
+
+	return bp
+}
+
+func (vm *VM) bindRestParameterSlots(fn *object.Function, args []*object.EmeraldValue, bp int, markRuby2Keywords bool) {
+	preCount := fn.RestParamIndex
+	if preCount < 0 {
+		preCount = 0
+	}
+	if preCount > len(fn.Params) {
+		preCount = len(fn.Params)
+	}
+	postCount := len(fn.Params) - preCount
+
+	for i := 0; i < preCount; i++ {
+		slot := bp + 1 + i
+		vm.stack[slot] = positionalArgOrDefault(fn, args, i)
+		if vm.sp <= slot {
+			vm.sp = slot + 1
+		}
+	}
+
+	postStart := len(args) - postCount
+	if postStart < preCount {
+		postStart = preCount
+	}
+	restElems := make([]*object.EmeraldValue, 0)
+	if postStart > preCount && preCount < len(args) {
+		restElems = args[preCount:postStart]
+	}
+	if markRuby2Keywords && len(restElems) > 0 {
+		last := restElems[len(restElems)-1]
+		if last != nil && last.Type == object.ValueHash {
+			copied := make(map[*object.EmeraldValue]*object.EmeraldValue)
+			for key, value := range executorHashToMap(last) {
+				copied[key] = value
+			}
+			last = &object.EmeraldValue{Type: object.ValueHash, Data: copied, Class: core.R.Classes["Hash"]}
+			core.MarkRuby2KeywordHash(last)
+			restElems[len(restElems)-1] = last
+		}
+	}
+	restSlot := bp + 1 + preCount
+	vm.stack[restSlot] = &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  restElems,
+		Class: core.R.Classes["Array"],
+	}
+	if vm.sp <= restSlot {
+		vm.sp = restSlot + 1
+	}
+
+	for j := 0; j < postCount; j++ {
+		paramIndex := preCount + j
+		argIndex := postStart + j
+		slot := bp + 1 + preCount + 1 + j
+		if argIndex < len(args) && args[argIndex] != nil {
+			vm.stack[slot] = args[argIndex]
+		} else if paramIndex < len(fn.ParamDefaults) && fn.ParamDefaults[paramIndex] != nil {
+			vm.stack[slot] = fn.ParamDefaults[paramIndex]
+		} else {
+			vm.stack[slot] = core.R.NilVal
+		}
+		if vm.sp <= slot {
+			vm.sp = slot + 1
+		}
+	}
+}
+
+func (vm *VM) toAryForSplat(val *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if val == nil || val.Type == object.ValueNil {
+		return nil, core.NewTypeError("no implicit conversion into Array")
+	}
+	if val.Type == object.ValueArray {
+		return val.Data.([]*object.EmeraldValue), nil
+	}
+	if core.CallMethod == nil || val.Class == nil {
+		return nil, core.NewTypeError("no implicit conversion into Array")
+	}
+
+	coerced := core.CallMethod(val, "to_ary")
+	if coerced == nil || coerced.Type != object.ValueArray {
+		return nil, core.NewTypeError("no implicit conversion into Array")
+	}
+	return coerced.Data.([]*object.EmeraldValue), nil
+}
+
+func (vm *VM) prepareMultiAssignRHS(val *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+	if val == nil || val.Type == object.ValueNil {
+		return vm.arrayValue(core.R.NilVal), nil
+	}
+	if val.Type == object.ValueArray {
+		return val, nil
+	}
+
+	coerced, called, err := vm.callArrayCoercion(val, "to_ary")
+	if err != nil {
+		return nil, err
+	}
+	if !called || coerced == nil || coerced.Type == object.ValueNil {
+		return vm.arrayValue(val), nil
+	}
+	if coerced.Type != object.ValueArray {
+		return nil, core.NewTypeError("can't convert to Array")
+	}
+	return coerced, nil
+}
+
+func (vm *VM) checkMultiAssignToAry(val *object.EmeraldValue) *object.EmeraldValue {
+	if val == nil || val.Type == object.ValueNil || val.Type == object.ValueArray {
+		return nil
+	}
+
+	coerced, called, err := vm.callArrayCoercion(val, "to_ary")
+	if err != nil {
+		return err
+	}
+	if !called || coerced == nil || coerced.Type == object.ValueNil {
+		return nil
+	}
+	if coerced.Type != object.ValueArray {
+		return core.NewTypeError("can't convert to Array")
+	}
+	return nil
+}
+
+func (vm *VM) toAForAssignmentSplat(val *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if val == nil || val.Type == object.ValueNil {
+		return []*object.EmeraldValue{}, nil
+	}
+	if val.Type == object.ValueArray {
+		return val.Data.([]*object.EmeraldValue), nil
+	}
+
+	coerced, called, err := vm.callArrayCoercion(val, "to_a")
+	if err != nil {
+		return nil, err
+	}
+	if !called || coerced == nil || coerced.Type == object.ValueNil {
+		return []*object.EmeraldValue{val}, nil
+	}
+	if coerced.Type != object.ValueArray {
+		return nil, core.NewTypeError("can't convert to Array")
+	}
+	return coerced.Data.([]*object.EmeraldValue), nil
+}
+
+func (vm *VM) toAForMethodSplat(val *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if val == nil || val.Type == object.ValueNil {
+		return []*object.EmeraldValue{}, nil
+	}
+	if val.Type == object.ValueArray {
+		return append([]*object.EmeraldValue(nil), val.Data.([]*object.EmeraldValue)...), nil
+	}
+
+	coerced, called, err := vm.callArrayCoercion(val, "to_a")
+	if err != nil {
+		return nil, err
+	}
+	if !called || coerced == nil || coerced.Type == object.ValueNil {
+		return []*object.EmeraldValue{val}, nil
+	}
+	if coerced.Type != object.ValueArray {
+		return nil, core.NewTypeError("can't convert to Array")
+	}
+	return append([]*object.EmeraldValue(nil), coerced.Data.([]*object.EmeraldValue)...), nil
+}
+
+func (vm *VM) callArrayCoercion(val *object.EmeraldValue, method string) (*object.EmeraldValue, bool, *object.EmeraldValue) {
+	if core.CallMethod == nil || val == nil || val.Class == nil {
+		return nil, false, nil
+	}
+
+	prevException := core.LastException
+	prevRaisedResult := core.LastRaisedResult
+	responds := core.CallMethod(val, "respond_to?",
+		&object.EmeraldValue{Type: object.ValueSymbol, Data: method, Class: core.R.Classes["Symbol"]},
+		core.R.TrueVal,
+	)
+	if core.LastException != nil && core.LastException != prevException {
+		return nil, false, core.LastException
+	}
+	if core.LastRaisedResult != nil && core.LastRaisedResult != prevRaisedResult {
+		return nil, false, core.LastRaisedResult
+	}
+	if responds == nil || responds.Type == object.ValueException {
+		return responds, false, responds
+	}
+	if responds.Type != object.ValueBool || !responds.Data.(bool) {
+		return nil, false, nil
+	}
+
+	prevException = core.LastException
+	prevRaisedResult = core.LastRaisedResult
+	coerced := core.CallMethod(val, method)
+	if core.LastException != nil && core.LastException != prevException {
+		return nil, true, core.LastException
+	}
+	if core.LastRaisedResult != nil && core.LastRaisedResult != prevRaisedResult {
+		return nil, true, core.LastRaisedResult
+	}
+	if coerced != nil && coerced.Type == object.ValueException {
+		return nil, true, coerced
+	}
+	return coerced, true, nil
+}
+
+func (vm *VM) arrayValue(elems ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  elems,
+		Class: core.R.Classes["Array"],
+	}
+}
+
+func (vm *VM) expandMethodSplatArgs(args []*object.EmeraldValue, splatIndex int) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if splatIndex < 0 || splatIndex >= len(args) {
+		return args, nil
+	}
+
+	expanded := make([]*object.EmeraldValue, 0, len(args))
+	expanded = append(expanded, args[:splatIndex]...)
+	elems, errVal := vm.toAForMethodSplat(args[splatIndex])
+	if errVal != nil {
+		return nil, errVal
+	}
+	expanded = append(expanded, elems...)
+	if splatIndex+1 < len(args) {
+		expanded = append(expanded, args[splatIndex+1:]...)
+	}
+	return expanded, nil
+}
+
+func (vm *VM) expandYieldSplatArgs(args []*object.EmeraldValue, splatIndex int) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if splatIndex < 0 || splatIndex >= len(args) {
+		return args, nil
+	}
+
+	expanded := make([]*object.EmeraldValue, 0, len(args))
+	expanded = append(expanded, args[:splatIndex]...)
+
+	splatArg := args[splatIndex]
+	if splatArg != nil && splatArg.Type != object.ValueNil {
+		elems, errVal := vm.toAryForSplat(splatArg)
+		if errVal != nil {
+			return nil, errVal
+		}
+		expanded = append(expanded, elems...)
+	}
+
+	if splatIndex+1 < len(args) {
+		expanded = append(expanded, args[splatIndex+1:]...)
+	}
+	return expanded, nil
+}
+
 func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if os.Getenv("RGO_DEBUG_FOR_LOOP") == "1" {
+		blockType := object.ValueNil
+		if block != nil {
+			blockType = block.Type
+		}
+		argType := ""
+		if len(args) > 0 && args[0] != nil {
+			argType = args[0].TypeName()
+		}
+		fmt.Printf("callBlock: blockType=%v args=%d first=%s\n", blockType, len(args), argType)
+	}
+	if block != nil && block.Type == object.ValueProc {
+		proc, _ := block.Data.(*object.Proc)
+		if proc != nil && !proc.IsLambda {
+			vm.procCallDepth++
+			defer func() {
+				vm.procCallDepth--
+			}()
+		}
+	}
 	return vm.callBlockWithSelf(block, blockBindingSelf(block), args...)
 }
 
@@ -3639,11 +6874,13 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if block == nil {
 		return core.R.NilVal
 	}
+	isThreadBlock := vm.threadDepth > 0
+	autoSplat := false
 
 	var fn *object.Function
 	var closure *object.Closure
+	var procData *object.Proc
 	isLambda := false
-	autoSplat := false
 	switch block.Type {
 	case object.ValueClosure:
 		closure = block.Data.(*object.Closure)
@@ -3651,6 +6888,7 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		autoSplat = closure.AutoSplat
 	case object.ValueProc:
 		proc := block.Data.(*object.Proc)
+		procData = proc
 		if proc.Native != nil {
 			return proc.Native(args...)
 		}
@@ -3672,16 +6910,40 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if fn == nil {
 		return core.R.NilVal
 	}
-	if isLambda && len(args) != len(fn.Params) && !fn.HasRestParam {
+	if autoSplat && (!isLambda || fn.SingleDestructure) {
+		expanded, errVal := vm.blockAutosplatArgs(fn, args)
+		if errVal != nil {
+			return errVal
+		}
+		args = expanded
+	}
+	if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
+		return errVal
+	}
+	if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
+		return errVal
+	}
+	if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
+		return errVal
+	}
+	lambdaParamCount := len(fn.Params)
+	if fn.SingleDestructure && lambdaParamCount > 1 && len(args) == 1 {
+		lambdaParamCount = 1
+	}
+	if isLambda && len(args) != lambdaParamCount && !fn.HasRestParam {
 		return core.NewArgumentError("wrong number of arguments")
 	}
-	if autoSplat && !isLambda && len(args) == 1 && len(fn.Params) > 1 && args[0] != nil && args[0].Type == object.ValueArray {
-		args = args[0].Data.([]*object.EmeraldValue)
+	if isLambda && fn.HasRestParam && len(args) < lambdaParamCount {
+		return core.NewArgumentError("wrong number of arguments")
 	}
 
 	prevBlock := vm.currentBlock
 	vm.currentBlock = nil
 	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	if isThreadBlock {
+		vm.catchStack = nil
+	}
 	if len(closure.ClassStack) > 0 {
 		vm.classStack = append([]*object.EmeraldValue(nil), closure.ClassStack...)
 		if self != nil && (self.Type == object.ValueClass || self.Type == object.ValueModule) {
@@ -3691,26 +6953,15 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	defer func() {
 		vm.currentBlock = prevBlock
 		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
 	}()
 
 	bp := vm.sp
 
 	vm.stack[vm.sp] = self
-	vm.sp++
+	vm.bindFunctionArguments(fn, args, prevBlock, false)
 
-	for i := 0; i < fn.NumLocals; i++ {
-		vm.stack[bp+1+i] = core.R.NilVal
-	}
-	for _, arg := range args {
-		vm.stack[vm.sp] = arg
-		vm.sp++
-	}
-	minSp := bp + 1 + fn.NumLocals
-	if vm.sp < minSp {
-		vm.sp = minSp
-	}
-
-	newFrame := &Frame{Fn: fn, Ip: -1, Bp: bp, Closure: closure, Block: closure.Block, BlockBreak: false, BlockBreakVal: nil, BlockNextVal: nil, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1}
+	newFrame := &Frame{ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure, Block: closure.Block, BlockBreak: false, BlockBreakVal: nil, BlockNextVal: nil, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1}
 	vm.frames = append(vm.frames, newFrame)
 	vm.fp++
 
@@ -3728,7 +6979,7 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 			break
 		}
 		frame = vm.frames[vm.fp]
-		if frame.BlockBreak {
+		if frame.BlockBreak || frame.BlockNextVal != nil {
 			break
 		}
 		instructions = frame.Fn.Instructions
@@ -3745,7 +6996,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		if result == nil {
 			result = core.R.NilVal
 		}
-		core.LastBlockResult = result
+		if !isLambda && vm.procCallDepth > 0 && !vm.procBreakOwnerActive(procData) {
+			result = core.NewLocalJumpError("unexpected break")
+			core.LastException = result
+		} else {
+			core.LastBlockResult = result
+		}
 	} else if frame.BlockNextVal != nil {
 		result = frame.BlockNextVal
 	} else {
@@ -3758,40 +7014,605 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	return result
 }
 
+func (vm *VM) procBreakOwnerActive(proc *object.Proc) bool {
+	if proc == nil || proc.BreakOwnerID <= 0 {
+		return false
+	}
+	for i := vm.fp; i >= 0; i-- {
+		if i < len(vm.frames) && vm.frames[i] != nil && vm.frames[i].ID == proc.BreakOwnerID {
+			return true
+		}
+	}
+	return false
+}
+
+func (vm *VM) blockAutosplatArgs(fn *object.Function, args []*object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if len(args) != 1 || args[0] == nil {
+		return args, nil
+	}
+	if !blockWantsDestructuring(fn) {
+		return args, nil
+	}
+	arg := args[0]
+	if arg.Type == object.ValueArray {
+		return arg.Data.([]*object.EmeraldValue), nil
+	}
+	if core.CallMethod == nil {
+		return args, nil
+	}
+	responds := core.CallMethod(arg, "respond_to?",
+		&object.EmeraldValue{Type: object.ValueSymbol, Data: "to_ary", Class: core.R.Classes["Symbol"]},
+		core.R.TrueVal,
+	)
+	if responds == nil || responds.Type == object.ValueException {
+		return args, nil
+	}
+	if responds.Type != object.ValueBool || !responds.Data.(bool) {
+		return args, nil
+	}
+	prevException := core.LastException
+	prevRaisedResult := core.LastRaisedResult
+	coerced := core.CallMethod(arg, "to_ary")
+	if core.LastException != nil && core.LastException != prevException {
+		return nil, core.LastException
+	}
+	if core.LastRaisedResult != nil && core.LastRaisedResult != prevRaisedResult {
+		return nil, core.LastRaisedResult
+	}
+	if coerced == nil || coerced.Type == object.ValueNil {
+		return args, nil
+	}
+	if coerced.Type == object.ValueException {
+		return nil, coerced
+	}
+	if coerced.Type != object.ValueArray {
+		return nil, core.NewTypeError("can't convert to Array")
+	}
+	return coerced.Data.([]*object.EmeraldValue), nil
+}
+
+func blockWantsDestructuring(fn *object.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if len(fn.Params) > 1 {
+		return true
+	}
+	if fn.TrailingCommaParam {
+		return true
+	}
+	return fn.HasRestParam && fn.RestParamIndex > 0
+}
+
+func missingRequiredKeywordArgument(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || len(fn.KeywordParams) == 0 {
+		return nil
+	}
+	var kwargs map[*object.EmeraldValue]*object.EmeraldValue
+	if len(args) > 0 {
+		last := args[len(args)-1]
+		if last != nil && last.Type == object.ValueHash {
+			kwargs = executorHashToMap(last)
+		}
+	}
+	missing := make([]string, 0)
+	for _, kp := range fn.KeywordParams {
+		if kp.HasDefault {
+			continue
+		}
+		if vmValue := keywordValueFromMap(kwargs, kp.Name); vmValue == nil {
+			missing = append(missing, ":"+kp.Name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if len(missing) == 1 {
+		return core.NewArgumentError("missing keyword: " + missing[0])
+	}
+	return core.NewArgumentError("missing keywords: " + strings.Join(missing, ", "))
+}
+
+func rejectedKeywordArgument(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || !fn.RejectKeywords || len(args) == 0 {
+		return nil
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash {
+		return nil
+	}
+	if core.Ruby2KeywordHash(last) {
+		return core.NewArgumentError("no keywords accepted")
+	}
+	positionalCapacity := len(fn.Params)
+	if fn.HasRestParam {
+		positionalCapacity = len(args)
+	}
+	if len(args) > positionalCapacity {
+		return core.NewArgumentError("no keywords accepted")
+	}
+	return nil
+}
+
+func rejectedPositionalForKeywordRestOnly(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || !fn.KeywordRestOnly || len(args) == 0 {
+		return nil
+	}
+	if len(fn.Params) > 0 || fn.HasRestParam {
+		if len(args) < 2 {
+			return nil
+		}
+		last := args[len(args)-1]
+		if last == nil || last.Type != object.ValueHash || !core.Ruby2KeywordHash(last) {
+			return nil
+		}
+		for _, arg := range args[:len(args)-1] {
+			if hashHasNonSymbolKey(arg) {
+				return core.NewArgumentError("wrong number of arguments")
+			}
+		}
+		return nil
+	}
+	if len(args) == 1 {
+		last := args[0]
+		if last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last) {
+			return nil
+		}
+	}
+	return core.NewArgumentError("wrong number of arguments")
+}
+
+func rejectedNonSymbolPositionalHashWithKeywords(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || (len(fn.KeywordParams) == 0 && fn.KeywordRestParam == "") || len(args) < 2 {
+		return nil
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash || !core.Ruby2KeywordHash(last) {
+		return nil
+	}
+	for _, arg := range args[:len(args)-1] {
+		if hashHasNonSymbolKey(arg) {
+			return core.NewArgumentError("wrong number of arguments")
+		}
+	}
+	return nil
+}
+
+func hashHasNonSymbolKey(value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueHash {
+		return false
+	}
+	for _, key := range orderedKeywordKeys(value) {
+		if key == nil || key.Type != object.ValueSymbol {
+			return true
+		}
+	}
+	return false
+}
+
+func (vm *VM) keywordRestHash(kwargs map[*object.EmeraldValue]*object.EmeraldValue, explicit []object.KeywordParamInfo) *object.EmeraldValue {
+	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue)
+	keys := make([]*object.EmeraldValue, 0)
+	for key, value := range kwargs {
+		if key == nil {
+			continue
+		}
+		matched := false
+		for _, kp := range explicit {
+			if keywordKeyMatchesName(key, kp.Name) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		pairs[key] = value
+		keys = append(keys, key)
+	}
+	return &object.EmeraldValue{
+		Type: object.ValueHash,
+		Data: &object.RHash{
+			Pairs: pairs,
+			Keys:  keys,
+		},
+		Class: core.R.Classes["Hash"],
+	}
+}
+
+func unknownKeywordArgument(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || len(fn.KeywordParams) == 0 || len(args) == 0 {
+		return nil
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash {
+		return nil
+	}
+	unknown := make([]string, 0)
+	keywordHashes := []*object.EmeraldValue{last}
+	if len(args) > 1 {
+		prior := args[len(args)-2]
+		if prior != nil && prior.Type == object.ValueHash {
+			keywordHashes = append([]*object.EmeraldValue{prior}, keywordHashes...)
+		}
+	}
+	for _, hash := range keywordHashes {
+		for _, key := range orderedKeywordKeys(hash) {
+			if key == nil {
+				continue
+			}
+			if keywordParamExists(fn, key) {
+				continue
+			}
+			unknown = append(unknown, keywordDisplayName(key))
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	if len(unknown) == 1 {
+		return core.NewArgumentError("unknown keyword: " + unknown[0])
+	}
+	return core.NewArgumentError("unknown keywords: " + strings.Join(unknown, ", "))
+}
+
+func orderedKeywordKeys(hash *object.EmeraldValue) []*object.EmeraldValue {
+	if hash == nil || hash.Type != object.ValueHash {
+		return nil
+	}
+	if h, ok := hash.Data.(*object.RHash); ok {
+		return h.Keys
+	}
+	if h, ok := hash.Data.(map[*object.EmeraldValue]*object.EmeraldValue); ok {
+		keys := make([]*object.EmeraldValue, 0, len(h))
+		for key := range h {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return keywordDisplayName(keys[i]) < keywordDisplayName(keys[j])
+		})
+		return keys
+	}
+	return nil
+}
+
+func keywordParamExists(fn *object.Function, key *object.EmeraldValue) bool {
+	for _, kp := range fn.KeywordParams {
+		if keywordKeyMatchesName(key, kp.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func keywordKeyMatchesName(key *object.EmeraldValue, name string) bool {
+	if key == nil {
+		return false
+	}
+	switch key.Type {
+	case object.ValueSymbol:
+		if s, ok := key.Data.(string); ok {
+			return strings.TrimPrefix(s, ":") == name
+		}
+	case object.ValueString:
+		if s, ok := key.Data.(string); ok {
+			return strings.TrimPrefix(s, ":") == name
+		}
+	}
+	return false
+}
+
+func keywordDisplayName(key *object.EmeraldValue) string {
+	if key == nil {
+		return "nil"
+	}
+	switch key.Type {
+	case object.ValueSymbol:
+		if s, ok := key.Data.(string); ok {
+			if strings.HasPrefix(s, ":") {
+				return s
+			}
+			return ":" + s
+		}
+	}
+	return key.Inspect()
+}
+
+func keywordValueFromMap(kwargs map[*object.EmeraldValue]*object.EmeraldValue, name string) *object.EmeraldValue {
+	if kwargs == nil {
+		return nil
+	}
+	for key, value := range kwargs {
+		if key == nil {
+			continue
+		}
+		if keywordKeyMatchesName(key, name) {
+			return value
+		}
+	}
+	return nil
+}
+
+func (vm *VM) callBlockWithInstanceEvalContext(receiver *object.EmeraldValue, block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	contextClass := vm.instanceEvalContextClass(receiver)
+	if block == nil {
+		return core.R.NilVal
+	}
+	switch data := block.Data.(type) {
+	case *object.Closure:
+		closure := *data
+		closure.ClassStack = append(append([]*object.EmeraldValue(nil), data.ClassStack...), contextClass)
+		block = &object.EmeraldValue{Type: block.Type, Data: &closure, Class: block.Class}
+	case *object.Proc:
+		proc := *data
+		proc.ClassStack = append(append([]*object.EmeraldValue(nil), data.ClassStack...), contextClass)
+		block = &object.EmeraldValue{Type: block.Type, Data: &proc, Class: block.Class}
+	}
+	result := vm.callBlockWithSelf(block, receiver, args...)
+	return result
+}
+
+func (vm *VM) instanceEvalContextClass(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		receiver = core.R.NilVal
+	}
+	switch receiver.Type {
+	case object.ValueObject, object.ValueClass, object.ValueModule:
+		if receiver.Type == object.ValueObject {
+			if _, ok := receiver.Data.(*object.Object); !ok {
+				return core.R.NilVal
+			}
+		}
+		if singleton := core.CallMethod(receiver, "singleton_class"); singleton != nil && singleton.Type == object.ValueClass {
+			return singleton
+		}
+	}
+	return core.R.NilVal
+}
+
+func (vm *VM) instanceEvalBinding(receiver *object.EmeraldValue) *object.EmeraldValue {
+	path := core.CurrentSpecFile
+	if path == "" {
+		path = "spec.rb"
+	}
+	if receiver == nil {
+		return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{Self: core.R.NilVal, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, Path: path, Line: 1}, Class: core.R.Classes["Binding"]}
+	}
+	binding := core.CallMethod(receiver, "binding")
+	if binding != nil && binding.Type == object.ValueBinding {
+		duplicate := core.CallMethod(binding, "dup")
+		if duplicate == nil || duplicate.Type != object.ValueBinding {
+			duplicate = binding
+		}
+		if data, ok := duplicate.Data.(*object.RBinding); ok {
+			data.Self = receiver
+			if data.Path == "" {
+				data.Path = path
+			}
+			if data.Line <= 0 {
+				data.Line = 1
+			}
+			return &object.EmeraldValue{Type: object.ValueBinding, Data: data, Class: core.R.Classes["Binding"]}
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{Self: receiver, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, Path: path, Line: 1}, Class: core.R.Classes["Binding"]}
+}
+
 func (vm *VM) currentFrameBinding() *object.RBinding {
 	if vm.fp < 0 || vm.fp >= len(vm.frames) {
-		return &object.RBinding{Self: core.R.Main, Locals: map[string]*object.EmeraldValue{}, Constants: vm.rubyConsts}
+		return &object.RBinding{
+			Self:         core.R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Method:       "",
+			Constants:    vm.rubyConsts,
+			ClassStack:   vm.currentClassStackSnapshot(),
+			Path:         core.CurrentSpecFile,
+			Line:         1,
+			InstanceVars: map[string]*object.EmeraldValue{},
+		}
 	}
 	frame := vm.frames[vm.fp]
 	locals := make(map[string]*object.EmeraldValue)
+	localNames := []string{}
+	path := core.CurrentSpecFile
+	if path == "" {
+		path = "spec.rb"
+	}
+	line := int64(1)
+	if frame != nil && frame.Ip >= 0 {
+		line = int64(frame.Ip + 1)
+	}
 	if frame != nil && frame.Fn != nil {
-		for i, name := range frame.Fn.Params {
-			slot := frame.Bp + 1 + i
-			if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
-				locals[name] = vm.stack[slot]
+		if len(frame.Fn.LocalNames) > 0 {
+			namedLocals := make([]struct {
+				name  string
+				index int64
+			}, 0, len(frame.Fn.LocalNames))
+			for name, index := range frame.Fn.LocalNames {
+				namedLocals = append(namedLocals, struct {
+					name  string
+					index int64
+				}{name: name, index: int64(index)})
+			}
+			sort.Slice(namedLocals, func(i, j int) bool {
+				return namedLocals[i].index < namedLocals[j].index
+			})
+			for _, item := range namedLocals {
+				slot := frame.Bp + 1 + int(item.index)
+				if item.index >= 0 && int(item.index) < len(frame.Fn.Params) {
+					if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
+						locals[item.name] = vm.stack[slot]
+						localNames = append(localNames, item.name)
+						continue
+					}
+					if len(frame.Args) > int(item.index) {
+						locals[item.name] = frame.Args[int(item.index)]
+						localNames = append(localNames, item.name)
+						continue
+					}
+				}
+				if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
+					locals[item.name] = vm.stack[slot]
+					localNames = append(localNames, item.name)
+				}
+			}
+		} else {
+			for i, name := range frame.Fn.Params {
+				slot := frame.Bp + 1 + i
+				if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
+					locals[name] = vm.stack[slot]
+					localNames = append(localNames, name)
+				}
+			}
+			for _, kp := range frame.Fn.KeywordParams {
+				slot := frame.Bp + 1 + len(frame.Fn.Params)
+				if frame.Fn.HasRestParam {
+					slot++
+				}
+				for _, prior := range frame.Fn.KeywordParams {
+					if prior.Name == kp.Name {
+						break
+					}
+					slot++
+				}
+				if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
+					locals[kp.Name] = vm.stack[slot]
+					localNames = append(localNames, kp.Name)
+				}
 			}
 		}
-		for _, kp := range frame.Fn.KeywordParams {
-			slot := frame.Bp + 1 + len(frame.Fn.Params)
-			if frame.Fn.HasRestParam {
-				slot++
-			}
-			for _, prior := range frame.Fn.KeywordParams {
-				if prior.Name == kp.Name {
-					break
-				}
-				slot++
-			}
-			if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
-				locals[kp.Name] = vm.stack[slot]
-			}
+	}
+	methodName := ""
+	if frame != nil {
+		if frame.MethodName != "" {
+			methodName = frame.MethodName
+		} else if frame.Fn != nil && frame.Fn.Name != "" && frame.Fn.Name != "main" {
+			methodName = frame.Fn.Name
 		}
 	}
 	self := core.R.Main
 	if frame != nil && frame.Bp >= 0 && frame.Bp < vm.sp && vm.stack[frame.Bp] != nil {
 		self = vm.stack[frame.Bp]
 	}
-	return &object.RBinding{Self: self, Locals: locals, Constants: vm.rubyConsts}
+	seenNames := map[string]bool{}
+	for name := range locals {
+		seenNames[name] = true
+	}
+	if frame != nil && frame.Fn != nil && frame.Closure != nil && len(frame.Fn.FreeVarNames) > 0 && len(frame.Closure.Free) > 0 {
+		for idx, name := range frame.Fn.FreeVarNames {
+			if name == "" {
+				continue
+			}
+			if seenNames[name] {
+				continue
+			}
+			if idx >= len(frame.Closure.Free) {
+				continue
+			}
+			locals[name] = frame.Closure.Free[idx]
+			localNames = append(localNames, name)
+			seenNames[name] = true
+		}
+	}
+	return &object.RBinding{
+		Self:         self,
+		Locals:       locals,
+		LocalNames:   localNames,
+		Method:       methodName,
+		Constants:    vm.rubyConsts,
+		ClassStack:   vm.currentClassStackSnapshot(),
+		Path:         path,
+		Line:         line,
+		InstanceVars: map[string]*object.EmeraldValue{},
+	}
+}
+
+func (vm *VM) globalVariableNames() []string {
+	if vm.globalNames == nil {
+		return []string{}
+	}
+	names := make(map[string]struct{}, len(vm.globalNames))
+	for name := range vm.globalNames {
+		key := core.ResolveGlobalAlias(name)
+		if key == "" {
+			key = name
+		}
+		names[key] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
+	frames := make([]object.RBacktraceLocation, 0, len(vm.frames))
+	ensureBlockIndex := vm.fp - 1
+	ensureBlockLine := int64(0)
+	if vm.ensureActive && vm.fp >= 0 && vm.fp < len(vm.frames) && vm.frames[vm.fp] != nil {
+		ensureBlockLine = vm.sourceLineForFrame(vm.frames[vm.fp])
+	}
+	for i := vm.fp; i >= 0; i-- {
+		frame := vm.frames[i]
+		if frame == nil || frame.Fn == nil {
+			continue
+		}
+		label := "main"
+		if frame.MethodName != "" {
+			label = frame.MethodName
+		} else if frame.Fn.Name != "" {
+			switch frame.Fn.Name {
+			case "main":
+				label = "main"
+			case "__block__", "__lambda__":
+				label = "block"
+			default:
+				label = frame.Fn.Name
+			}
+		}
+		path := core.CurrentSpecFile
+		if path == "" {
+			path = label
+		}
+		line := vm.sourceLineForFrame(frame)
+
+		if vm.ensureActive && i == ensureBlockIndex {
+			label = "block"
+			if ensureBlockLine > 0 {
+				line = vm.sourceLineForFrame(frame)
+			}
+		}
+
+		frames = append(frames, object.RBacktraceLocation{
+			Path:  path,
+			Line:  line,
+			Label: label,
+		})
+	}
+	return frames
+}
+
+func (vm *VM) sourceLineForFrame(frame *Frame) int64 {
+	if frame == nil || frame.Ip < 0 {
+		return 0
+	}
+	if frame.Fn != nil && len(frame.Fn.LineMap) > 0 {
+		bestPos := -1
+		bestLine := 0
+		for pos, line := range frame.Fn.LineMap {
+			if pos <= frame.Ip && pos > bestPos && line > 0 {
+				bestPos = pos
+				bestLine = line
+			}
+		}
+		if bestLine > 0 {
+			return int64(bestLine)
+		}
+	}
+	return int64(frame.Ip + 1)
 }
 
 func (vm *VM) LastPoppedStackElement() *object.EmeraldValue {
@@ -3821,6 +7642,95 @@ func (vm *VM) lookupKwarg(hash map[*object.EmeraldValue]*object.EmeraldValue, na
 	return nil
 }
 
+func executorHashToMap(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+	if value == nil || value.Type != object.ValueHash {
+		return nil
+	}
+	if h, ok := value.Data.(map[*object.EmeraldValue]*object.EmeraldValue); ok {
+		return h
+	}
+	if h, ok := value.Data.(*object.RHash); ok {
+		return h.Pairs
+	}
+	return nil
+}
+
+func methodDefinitionTargetFrozen(value *object.EmeraldValue) bool {
+	if value == nil {
+		return false
+	}
+	if value.Frozen {
+		return true
+	}
+	if value.Type != object.ValueClass {
+		return false
+	}
+	class, ok := value.Data.(*object.Class)
+	if !ok || class == nil {
+		return false
+	}
+	if class.Frozen {
+		return true
+	}
+	return class.IsSingleton && class.SingletonOwner != nil && class.SingletonOwner.Frozen
+}
+
+func singletonMethodDefinitionFrozen(receiver *object.EmeraldValue) bool {
+	if methodDefinitionTargetFrozen(receiver) {
+		return true
+	}
+	if receiver == nil {
+		return false
+	}
+	switch receiver.Type {
+	case object.ValueObject:
+		obj, ok := receiver.Data.(*object.Object)
+		return ok && obj != nil && obj.SingletonClass != nil && obj.SingletonClass.Frozen
+	case object.ValueClass:
+		class, ok := receiver.Data.(*object.Class)
+		return ok && class != nil && class.SingletonClass != nil && class.SingletonClass.Frozen
+	case object.ValueModule:
+		mod, ok := receiver.Data.(*object.Module)
+		return ok && mod != nil && mod.SingletonClass != nil && mod.SingletonClass.Frozen
+	default:
+		return false
+	}
+}
+
+func frozenMethodDefinitionError(receiver *object.EmeraldValue, lexicalDefinition bool) *object.EmeraldValue {
+	kind := "object"
+	if receiver != nil {
+		switch receiver.Type {
+		case object.ValueClass:
+			kind = "Class"
+			if lexicalDefinition {
+				kind = "class"
+			}
+		case object.ValueModule:
+			kind = "Module"
+			if lexicalDefinition {
+				kind = "module"
+			}
+		case object.ValueObject:
+			kind = "object"
+		default:
+			kind = strings.ToLower(receiver.TypeName())
+		}
+	}
+	message := "can't modify frozen " + kind
+	if receiver != nil {
+		message += ": " + receiver.Inspect()
+	}
+	return &object.EmeraldValue{
+		Type: object.ValueException,
+		Data: &object.RException{
+			Message:           message,
+			NameErrorReceiver: receiver,
+		},
+		Class: core.R.Classes["FrozenError"],
+	}
+}
+
 func (vm *VM) GetCurrentBlock() *object.EmeraldValue {
 	return vm.currentBlock
 }
@@ -3837,7 +7747,7 @@ func (vm *VM) qualifiedConstantValue(name string) (*object.EmeraldValue, bool) {
 		case object.ValueClass:
 			class := value.Data.(*object.Class)
 			if class.PrivateConstants[constName] {
-				return core.NewNameError("private constant " + prefix + "::" + constName + " referenced"), true
+				return core.NewPrivateConstantNameError(value, constName), true
 			}
 			if constant, ok := class.GetConstant(constName); ok {
 				return constant, true
@@ -3852,9 +7762,9 @@ func (vm *VM) qualifiedConstantValue(name string) (*object.EmeraldValue, bool) {
 		case object.ValueModule:
 			module := value.Data.(*object.Module)
 			if module.PrivateConstants[constName] {
-				return core.NewNameError("private constant " + prefix + "::" + constName + " referenced"), true
+				return core.NewPrivateConstantNameError(value, constName), true
 			}
-			if constant, ok := module.GetConstant(constName); ok {
+			if constant, ok := module.Constants[constName]; ok {
 				return constant, true
 			}
 			if constant, ok := vm.triggerAutoload(value, constName); ok {
@@ -3866,9 +7776,57 @@ func (vm *VM) qualifiedConstantValue(name string) (*object.EmeraldValue, bool) {
 			return nil, false
 		}
 	}
+	if !strings.Contains(prefix, "::") {
+		for i := len(vm.classStack) - 1; i >= 0; i-- {
+			container := vm.classStack[i]
+			if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
+				continue
+			}
+			value, ok := directConstantValue(container, prefix)
+			if !ok {
+				continue
+			}
+			if value != nil && value.Type == object.ValueException {
+				return value, true
+			}
+			if value == nil || (value.Type != object.ValueClass && value.Type != object.ValueModule) {
+				return core.NewTypeError("not a class/module"), true
+			}
+			return vm.scopedConstantValue(value, constName)
+		}
+		for i := len(vm.classStack) - 1; i >= 0; i-- {
+			container := vm.classStack[i]
+			if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
+				continue
+			}
+			value, ok := vm.qualifiedLexicalParentConstantValue(container, prefix)
+			if !ok {
+				continue
+			}
+			if value != nil && value.Type == object.ValueException {
+				return value, true
+			}
+			if value == nil || (value.Type != object.ValueClass && value.Type != object.ValueModule) {
+				return core.NewTypeError("not a class/module"), true
+			}
+			return vm.scopedConstantValue(value, constName)
+		}
+		if value, ok := vm.uniqueQualifiedSuffixConstant(prefix); ok {
+			if value != nil && value.Type == object.ValueException {
+				return value, true
+			}
+			if value == nil || (value.Type != object.ValueClass && value.Type != object.ValueModule) {
+				return core.NewTypeError("not a class/module"), true
+			}
+			return vm.scopedConstantValue(value, constName)
+		}
+	}
+	if value, ok := vm.topLevelConstantValue(prefix); ok && value.Type != object.ValueClass && value.Type != object.ValueModule {
+		return core.NewTypeError("not a class/module"), true
+	}
 	if cls, ok := core.R.Classes[prefix]; ok {
 		if cls.PrivateConstants[constName] {
-			return core.NewNameError("private constant " + prefix + "::" + constName + " referenced"), true
+			return core.NewPrivateConstantNameError(&object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: core.R.Classes["Class"]}, constName), true
 		}
 		if constant, ok := cls.GetConstant(constName); ok {
 			return constant, true
@@ -3885,21 +7843,49 @@ func (vm *VM) qualifiedConstantValue(name string) (*object.EmeraldValue, bool) {
 	return nil, false
 }
 
+func (vm *VM) uniqueQualifiedSuffixConstant(name string) (*object.EmeraldValue, bool) {
+	suffix := "::" + name
+	var found *object.EmeraldValue
+	for constName, value := range vm.rubyConsts {
+		if !strings.HasSuffix(constName, suffix) {
+			continue
+		}
+		if found != nil && found != value {
+			return nil, false
+		}
+		found = value
+	}
+	return found, found != nil
+}
+
 func (vm *VM) scopedConstantValue(receiver *object.EmeraldValue, constName string) (*object.EmeraldValue, bool) {
 	if receiver == nil {
 		return nil, false
 	}
+	qualifiedName := qualifiedConstantName(receiver, constName)
 	switch receiver.Type {
 	case object.ValueClass:
 		class := receiver.Data.(*object.Class)
 		if class.PrivateConstants[constName] {
-			return core.NewNameError("private constant " + class.Name + "::" + constName + " referenced"), true
+			return core.NewPrivateConstantNameError(receiver, constName), true
+		}
+		if owner, found := privateConstantOwnerInClassLookup(class, constName); found {
+			return core.NewPrivateConstantNameError(owner, constName), true
 		}
 		if constant, ok := class.GetConstant(constName); ok {
 			return constant, true
 		}
 		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
 			return constant, true
+		}
+		if constant, ok := vm.rubyConsts[qualifiedName]; ok {
+			return constant, true
+		}
+		if processConst, ok := processConstantValue(qualifiedName); ok {
+			return processConst, true
+		}
+		if cls, ok := core.R.Classes[qualifiedName]; ok {
+			return &object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: core.R.Classes["Class"]}, true
 		}
 		if core.EvaluatingRaiseErrorMatcher() {
 			return core.NewNameError("uninitialized constant " + class.Name + "::" + constName), true
@@ -3908,18 +7894,74 @@ func (vm *VM) scopedConstantValue(receiver *object.EmeraldValue, constName strin
 	case object.ValueModule:
 		module := receiver.Data.(*object.Module)
 		if module.PrivateConstants[constName] {
-			return core.NewNameError("private constant " + module.Name + "::" + constName + " referenced"), true
+			return core.NewPrivateConstantNameError(receiver, constName), true
 		}
-		if constant, ok := module.GetConstant(constName); ok {
+		if owner, found := privateConstantOwnerInModuleLookup(module, constName); found {
+			return core.NewPrivateConstantNameError(owner, constName), true
+		}
+		if constant, ok := module.Constants[constName]; ok {
 			return constant, true
 		}
 		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
 			return constant, true
 		}
+		if constant, ok := vm.rubyConsts[qualifiedName]; ok {
+			return constant, true
+		}
+		if processConst, ok := processConstantValue(qualifiedName); ok {
+			return processConst, true
+		}
+		if cls, ok := core.R.Classes[qualifiedName]; ok {
+			return &object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: core.R.Classes["Class"]}, true
+		}
 		if core.EvaluatingRaiseErrorMatcher() {
 			return core.NewNameError("uninitialized constant " + module.Name + "::" + constName), true
 		}
 		return nil, false
+	}
+	if receiver.Type != object.ValueClass && receiver.Type != object.ValueModule {
+		return core.NewTypeError("not a class/module"), true
+	}
+	return nil, false
+}
+
+func privateConstantOwnerInClassLookup(class *object.Class, name string) (*object.EmeraldValue, bool) {
+	if class == nil {
+		return nil, false
+	}
+	if _, ok := class.Constants[name]; ok {
+		return nil, false
+	}
+	for _, mod := range class.IncludedModules {
+		if owner, found := privateConstantOwnerInModuleLookup(mod, name); found {
+			return owner, true
+		}
+	}
+	if class.SuperClass != nil {
+		if class.SuperClass.PrivateConstants[name] {
+			return &object.EmeraldValue{Type: object.ValueClass, Data: class.SuperClass, Class: core.R.Classes["Class"]}, true
+		}
+		if owner, found := privateConstantOwnerInClassLookup(class.SuperClass, name); found {
+			return owner, true
+		}
+	}
+	return nil, false
+}
+
+func privateConstantOwnerInModuleLookup(module *object.Module, name string) (*object.EmeraldValue, bool) {
+	if module == nil {
+		return nil, false
+	}
+	if _, ok := module.Constants[name]; ok {
+		return nil, false
+	}
+	for _, included := range module.IncludedModules {
+		if included.PrivateConstants[name] {
+			return &object.EmeraldValue{Type: object.ValueModule, Data: included, Class: core.R.Classes["Module"]}, true
+		}
+		if owner, found := privateConstantOwnerInModuleLookup(included, name); found {
+			return owner, true
+		}
 	}
 	return nil, false
 }

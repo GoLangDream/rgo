@@ -3,8 +3,11 @@ package compiler
 import (
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/lexer"
@@ -137,28 +140,36 @@ type EmittedInstruction struct {
 
 type CompilationScope struct {
 	instructions        Instructions
+	lineMap             map[int]int
 	lastInstruction     EmittedInstruction
 	previousInstruction EmittedInstruction
 	breakTarget         int
 	nextPatchPos        []int
+	nextPatchDepth      int
+	nextPatchTarget     int
 	redoTarget          int
 	breakValuePatchPos  []int
 	retryTarget         int
 }
 
 type Compiler struct {
-	constants   []*object.EmeraldValue
-	scopes      []CompilationScope
-	scopeIndex  int
-	symbolTable *SymbolTable
+	constants    []*object.EmeraldValue
+	scopes       []CompilationScope
+	scopeIndex   int
+	symbolTable  *SymbolTable
+	methodDepth  int
+	currentLine  int
+	forEachDepth int
 }
 
 func New() *Compiler {
 	mainScope := CompilationScope{
-		instructions: Instructions{},
-		breakTarget:  -1,
-		redoTarget:   -1,
-		retryTarget:  -1,
+		instructions:    Instructions{},
+		lineMap:         map[int]int{},
+		breakTarget:     -1,
+		nextPatchTarget: -1,
+		redoTarget:      -1,
+		retryTarget:     -1,
 	}
 
 	symbolTable := NewSymbolTable()
@@ -174,6 +185,97 @@ func New() *Compiler {
 	}
 }
 
+func NewWithLocalNames(localNames []string) *Compiler {
+	c := New()
+	seen := map[string]struct{}{}
+	for _, name := range localNames {
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		c.symbolTable.Define(name)
+	}
+	return c
+}
+
+func compileNodeLine(node interface{}) int {
+	switch n := node.(type) {
+	case *ast.ExpressionStatement:
+		return compileNodeLine(n.Expression)
+	case *ast.IntegerLiteral:
+		return n.Token.Line
+	case *ast.FloatLiteral:
+		return n.Token.Line
+	case *ast.StringLiteral:
+		return n.Token.Line
+	case *ast.SymbolLiteral:
+		return n.Token.Line
+	case *ast.Identifier:
+		return n.Token.Line
+	case *ast.Constant:
+		return n.Token.Line
+	case *ast.ConstantResolution:
+		return n.Token.Line
+	case *ast.InstanceVariable:
+		return n.Token.Line
+	case *ast.ClassVariable:
+		return n.Token.Line
+	case *ast.GlobalVariable:
+		return n.Token.Line
+	case *ast.AssignExpression:
+		return n.Token.Line
+	case *ast.MultiAssignExpression:
+		return n.Token.Line
+	case *ast.InfixExpression:
+		return n.Token.Line
+	case *ast.PrefixExpression:
+		return n.Token.Line
+	case *ast.Boolean:
+		return n.Token.Line
+	case *ast.NilExpression:
+		return n.Token.Line
+	case *ast.IfExpression:
+		return n.Token.Line
+	case *ast.WhileExpression:
+		return n.Token.Line
+	case *ast.UntilExpression:
+		return n.Token.Line
+	case *ast.ForExpression:
+		return n.Token.Line
+	case *ast.MethodCall:
+		return n.Token.Line
+	case *ast.DefExpression:
+		return n.Token.Line
+	case *ast.ClassExpression:
+		return n.Token.Line
+	case *ast.ModuleExpression:
+		return n.Token.Line
+	case *ast.BlockExpression:
+		return n.Token.Line
+	case *ast.ProcLiteral:
+		return n.Token.Line
+	case *ast.ArrayLiteral:
+		return n.Token.Line
+	case *ast.HashLiteral:
+		return n.Token.Line
+	case *ast.IndexExpression:
+		return n.Token.Line
+	case *ast.ReturnExpression:
+		return n.Token.Line
+	case *ast.BreakExpression:
+		return n.Token.Line
+	case *ast.NextExpression:
+		return n.Token.Line
+	case *ast.BeginExpression:
+		return n.Token.Line
+	case *ast.DefinedExpression:
+		return n.Token.Line
+	case *ast.SelfExpression:
+		return n.Token.Line
+	}
+	return 0
+}
+
 func (c *Compiler) globalSymbolIndex(name string) int {
 	root := c.symbolTable
 	for root.Outer != nil {
@@ -187,6 +289,14 @@ func (c *Compiler) globalSymbolIndex(name string) int {
 }
 
 func (c *Compiler) Compile(node interface{}) error {
+	prevLine := c.currentLine
+	if line := compileNodeLine(node); line > 0 {
+		c.currentLine = line
+	}
+	defer func() {
+		c.currentLine = prevLine
+	}()
+
 	switch node := node.(type) {
 	case *ast.Program:
 		for _, s := range node.Statements {
@@ -200,11 +310,12 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		c.Emit(OpPop)
 	case *ast.IntegerLiteral:
-		c.EmitConstant(&object.EmeraldValue{
+		value := &object.EmeraldValue{
 			Type:  object.ValueInteger,
 			Data:  node.Value,
 			Class: core.R.Classes["Integer"],
-		})
+		}
+		c.EmitConstant(core.RememberULEBPackIntegerLiteral(value, node.Token.Literal))
 	case *ast.RangeExpression:
 		if err := c.compileRangeExpression(node); err != nil {
 			return err
@@ -265,33 +376,48 @@ func (c *Compiler) Compile(node interface{}) error {
 		})
 		c.emit(OpRationalNew)
 	case *ast.StringLiteral:
-		val := node.Value
-		if !strings.Contains(val, "#{") {
-			c.EmitConstant(&object.EmeraldValue{
+		if node.Command {
+			c.Emit(OpSelf)
+		}
+		if err := c.compileStringLiteralValue(node); err != nil {
+			return err
+		}
+		if node.Command {
+			methodNameIdx := c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
-				Data:  val,
+				Data:  "`",
 				Class: core.R.Classes["String"],
 			})
-		} else {
-			if err := c.compileStringInterpolation(val); err != nil {
-				return err
-			}
+			c.emit(OpSend, methodNameIdx, 0, 1, 255)
 		}
 	case *ast.SymbolLiteral:
-		val := node.Value
-		if len(val) > 0 && val[0] == ':' {
-			val = val[1:]
-		}
+		val := normalizedStaticSymbolName(node.Value)
 		c.EmitConstant(&object.EmeraldValue{
 			Type:  object.ValueSymbol,
 			Data:  val,
 			Class: core.R.Classes["Symbol"],
 		})
 	case *ast.RegexpLiteral:
+		if node.Interpolates && strings.Contains(node.Pattern, "#{") {
+			c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "Regexp",
+				Class: core.R.Classes["String"],
+			}))
+			if err := c.compileStringInterpolation(node.Pattern); err != nil {
+				return err
+			}
+			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "new",
+				Class: core.R.Classes["String"],
+			}), 0, 1, 255)
+			return nil
+		}
 		c.EmitConstant(&object.EmeraldValue{
 			Type: object.ValueRegexp,
 			Data: &object.RRegexp{
-				Pattern: node.Pattern,
+				Pattern: strings.ReplaceAll(node.Pattern, lexer.EscapedHashInterpolation, "#"),
 				Options: node.Options,
 			},
 			Class: core.R.Classes["Regexp"],
@@ -311,6 +437,14 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpSelf)
 			return nil
 		}
+		if node.Value == "__LINE__" {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  int64(node.Token.Line),
+				Class: core.R.Classes["Integer"],
+			})
+			return nil
+		}
 		if node.Value == "block_given?" {
 			c.Emit(OpBlockGiven)
 			return nil
@@ -322,7 +456,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				Type:  object.ValueString,
 				Data:  node.Value,
 				Class: core.R.Classes["String"],
-			}), 0, 0)
+			}), 0, 0, 255)
 			return nil
 		}
 		switch sym.Scope {
@@ -354,7 +488,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			})
 			return nil
 		}
-		if _, ok := node.Left.(*ast.Constant); !ok && node.Left != nil {
+		if node.Left != nil {
 			if err := c.Compile(node.Left); err != nil {
 				return err
 			}
@@ -390,28 +524,30 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Left); err != nil {
 				return err
 			}
-			c.Emit(OpDup)
 			jumpPos := c.emit(OpJumpNotTruthy, 9999)
-			c.Emit(OpPop) // pop the duplicated left value
 			if err := c.Compile(node.Right); err != nil {
 				return err
 			}
-			afterRight := len(c.currentInstructions())
-			c.changeOperand(jumpPos, afterRight)
+			jumpToEndPos := c.emit(OpJump, 9999)
+			c.changeOperand(jumpPos, len(c.currentInstructions()))
+			c.emit(OpFalse)
+			afterFalse := len(c.currentInstructions())
+			c.changeOperand(jumpToEndPos, afterFalse)
 			return nil
 		}
 		if node.Operator == "||" || node.Operator == "or" {
 			if err := c.Compile(node.Left); err != nil {
 				return err
 			}
-			c.Emit(OpDup)
 			jumpPos := c.emit(OpJumpTruthy, 9999)
-			c.Emit(OpPop) // pop the duplicated left value
 			if err := c.Compile(node.Right); err != nil {
 				return err
 			}
-			afterRight := len(c.currentInstructions())
-			c.changeOperand(jumpPos, afterRight)
+			jumpToEndPos := c.emit(OpJump, 9999)
+			c.changeOperand(jumpPos, len(c.currentInstructions()))
+			c.emit(OpTrue)
+			afterTrue := len(c.currentInstructions())
+			c.changeOperand(jumpToEndPos, afterTrue)
 			return nil
 		}
 
@@ -445,7 +581,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				Data:  "===",
 				Class: core.R.Classes["String"],
 			})
-			c.emit(OpSend, methodNameIdx, 0, 1)
+			c.emit(OpSend, methodNameIdx, 0, 1, 255)
 		case ">":
 			c.Emit(OpGreaterThan)
 		case ">=":
@@ -460,14 +596,21 @@ func (c *Compiler) Compile(node interface{}) error {
 				Data:  "<=>",
 				Class: core.R.Classes["String"],
 			})
-			c.emit(OpSend, methodNameIdx, 0, 1)
+			c.emit(OpSend, methodNameIdx, 0, 1, 255)
 		case "=~":
 			methodNameIdx := c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  "=~",
 				Class: core.R.Classes["String"],
 			})
-			c.emit(OpSend, methodNameIdx, 0, 1)
+			c.emit(OpSend, methodNameIdx, 0, 1, 255)
+		case "!~":
+			methodNameIdx := c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "!~",
+				Class: core.R.Classes["String"],
+			})
+			c.emit(OpSend, methodNameIdx, 0, 1, 255)
 		case "&":
 			c.Emit(OpBitAnd)
 		case "|":
@@ -591,7 +734,7 @@ func (c *Compiler) Compile(node interface{}) error {
 						Data:  "===",
 						Class: core.R.Classes["String"],
 					})
-					c.emit(OpSend, methodNameIdx, 0, 1)
+					c.emit(OpSend, methodNameIdx, 0, 1, 255)
 					condJumpPos := c.emit(OpJumpNotTruthy, 9999)
 					c.Emit(OpPop)
 					if err := c.compileBlockAsValue(clause.Body); err != nil {
@@ -636,7 +779,20 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Left); err != nil {
 				return err
 			}
+			if node.Pattern != "" {
+				c.emit(OpPatternCheck, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  node.Pattern,
+					Class: core.R.Classes["String"],
+				}))
+			}
 			c.Emit(OpPop)
+		} else if node.Pattern != "" {
+			c.emit(OpPatternCheck, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  node.Pattern,
+				Class: core.R.Classes["String"],
+			}))
 		}
 		c.Emit(OpTrue)
 	case *ast.ArrayLiteral:
@@ -678,6 +834,27 @@ func (c *Compiler) Compile(node interface{}) error {
 			if node.Target != nil {
 				target = node.Target
 			}
+			if node.End != nil {
+				if err := c.Compile(target); err != nil {
+					return err
+				}
+				if err := c.Compile(node.Index); err != nil {
+					return err
+				}
+				if err := c.Compile(node.End); err != nil {
+					return err
+				}
+				if err := c.Compile(node.Value); err != nil {
+					return err
+				}
+				methodNameIdx := c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  "[]=",
+					Class: core.R.Classes["String"],
+				})
+				c.emit(OpSend, methodNameIdx, 0, 3, 255)
+				return nil
+			}
 			if err := c.Compile(target); err != nil {
 				return err
 			}
@@ -691,7 +868,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			return nil
 		}
 
-		if node.Target != nil && len(node.Name.Value) > 0 && node.Name.Value[0] >= 'A' && node.Name.Value[0] <= 'Z' {
+		if node.Target != nil && isConstantName(node.Name.Value) {
 			if err := c.Compile(node.Target); err != nil {
 				return err
 			}
@@ -710,15 +887,10 @@ func (c *Compiler) Compile(node interface{}) error {
 				mode = ScopedConstAssignAdd
 			}
 			if mode == ScopedConstAssignPlain {
-				c.EmitConstant(name)
 				if err := c.Compile(node.Value); err != nil {
 					return err
 				}
-				c.emit(OpSend, c.addConstant(&object.EmeraldValue{
-					Type:  object.ValueString,
-					Data:  "const_set",
-					Class: core.R.Classes["String"],
-				}), 0, 2)
+				c.emit(OpSetScopedConstant, c.addConstant(name), mode)
 				return nil
 			}
 			if mode == ScopedConstAssignOr || mode == ScopedConstAssignAnd {
@@ -742,6 +914,9 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(op)
 		} else if err := c.Compile(node.Value); err != nil {
 			return err
+		}
+		if isSplatMultiAssignTarget(node.Target) {
+			c.Emit(OpMultiAssignPrepare)
 		}
 
 		// Check if the name is a global variable (starts with $)
@@ -770,7 +945,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			return nil
 		}
 
-		if len(node.Name.Value) > 0 && node.Name.Value[0] >= 'A' && node.Name.Value[0] <= 'Z' {
+		if isConstantName(node.Name.Value) {
 			c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  node.Name.Value,
@@ -802,6 +977,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Values[0]); err != nil {
 				return err
 			}
+			c.Emit(OpMultiAssignPrepare)
 			for i := 0; i < len(node.Names); i++ {
 				c.Emit(OpDup)
 				c.EmitConstant(&object.EmeraldValue{
@@ -843,9 +1019,26 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 			c.Emit(OpPop)
 		} else {
-			for _, val := range node.Values {
-				if err := c.Compile(val); err != nil {
-					return err
+			hasNestedTarget := multiAssignHasNestedTarget(node)
+			for i, val := range node.Values {
+				if splat, ok := val.(*ast.SplatExpression); ok {
+					if err := c.Compile(splat.Value); err != nil {
+						return err
+					}
+					if hasNestedTarget {
+						c.Emit(OpDup)
+						c.Emit(OpMultiAssignCheckToAry)
+					}
+					c.Emit(OpSplatToA)
+				} else {
+					if err := c.Compile(val); err != nil {
+						return err
+					}
+					if i < len(node.Targets) && isNestedMultiAssignTarget(node.Targets[i]) {
+						c.Emit(OpMultiAssignPrepare)
+					} else if len(node.Values) == 1 && i < len(node.Targets) && isSplatMultiAssignTarget(node.Targets[i]) {
+						c.Emit(OpMultiAssignPrepare)
+					}
 				}
 			}
 			for i := len(node.Names) - 1; i >= 0; i-- {
@@ -882,6 +1075,24 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 	case *ast.MethodCall:
+		if c.methodDepth > 0 && node.Receiver == nil && node.Method != nil && node.Method.Value == "END" && node.Block != nil {
+			fmt.Fprintln(os.Stderr, "warning: END in method; use at_exit")
+		}
+		if node.Receiver == nil && node.Method != nil && len(node.Args) == 1 && len(node.KeywordArgs) == 0 && node.Block == nil {
+			if sym, ok := c.symbolTable.Resolve(node.Method.Value); ok && sym.Scope == ScopeLocal {
+				if prefix, ok := node.Args[0].(*ast.PrefixExpression); ok && prefix.Operator == "-" {
+					if err := c.Compile(node.Method); err != nil {
+						return err
+					}
+					if err := c.Compile(prefix.Right); err != nil {
+						return err
+					}
+					c.Emit(OpSub)
+					return nil
+				}
+			}
+		}
+
 		if node.Receiver != nil {
 			if err := c.Compile(node.Receiver); err != nil {
 				return err
@@ -910,17 +1121,23 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		args := node.Args
 		var blockPass ast.Expression
+		var blockPassAnonymous bool
 		if len(args) > 0 {
 			if splat, ok := args[len(args)-1].(*ast.SplatExpression); ok && splat.Token.Type == lexer.BIT_AND {
 				blockPass = splat.Value
+				blockPassAnonymous = splat.AnonymousBlockPass
 				args = args[:len(args)-1]
 			}
 		}
 
-		for _, arg := range args {
+		splatIndex := 255
+		for i, arg := range args {
 			compileArg := arg
 			if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type != lexer.BIT_AND {
 				compileArg = splat.Value
+				if splat.Token.Type == lexer.MULTIPLY && splatIndex == 255 {
+					splatIndex = i
+				}
 			}
 			if err := c.Compile(compileArg); err != nil {
 				return err
@@ -929,7 +1146,17 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		argCount := len(args)
 
+		sendOp := OpSend
+		if len(args) > 0 {
+			if hash, ok := args[len(args)-1].(*ast.HashLiteral); ok && hash.Token.Type == lexer.ARROW {
+				sendOp = OpSendWithKeywords
+			}
+			if splat, ok := args[len(args)-1].(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+				sendOp = OpSendWithKeywords
+			}
+		}
 		if len(node.KeywordArgs) > 0 {
+			sendOp = OpSendWithKeywords
 			for i := len(node.KeywordArgs) - 1; i >= 0; i-- {
 				kwa := node.KeywordArgs[i]
 				if err := c.Compile(kwa.Value); err != nil {
@@ -947,17 +1174,21 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		blockArg := 0
 		if blockPass != nil {
-			if err := c.Compile(blockPass); err != nil {
-				return err
+			if blockPassAnonymous {
+				blockArg = 2
+			} else {
+				if err := c.Compile(blockPass); err != nil {
+					return err
+				}
+				blockArg = 1
 			}
-			blockArg = 1
 		} else if node.Block != nil {
 			if err := c.compileBlockAsClosure(node.Block); err != nil {
 				return err
 			}
 			blockArg = 1
 		}
-		c.emit(OpSend, methodNameIdx, blockArg, argCount)
+		c.emit(sendOp, methodNameIdx, blockArg, argCount, splatIndex)
 		if node.Safe {
 			c.changeOperand(jumpEnd, len(c.currentInstructions()))
 		}
@@ -971,7 +1202,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  "include",
 			Class: core.R.Classes["String"],
 		})
-		c.emit(OpSend, methodNameIdx, 0, 1)
+		c.emit(OpSend, methodNameIdx, 0, 1, 255)
 	case *ast.ExtendExpression:
 		c.Emit(OpSelf)
 		if err := c.Compile(node.Module); err != nil {
@@ -982,7 +1213,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  "extend",
 			Class: core.R.Classes["String"],
 		})
-		c.emit(OpSend, methodNameIdx, 0, 1)
+		c.emit(OpSend, methodNameIdx, 0, 1, 255)
 	case *ast.PrependExpression:
 		c.Emit(OpSelf)
 		if err := c.Compile(node.Module); err != nil {
@@ -993,9 +1224,22 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  "prepend",
 			Class: core.R.Classes["String"],
 		})
-		c.emit(OpSend, methodNameIdx, 0, 1)
+		c.emit(OpSend, methodNameIdx, 0, 1, 255)
 	case *ast.UndefExpression:
-		c.Emit(OpNil)
+		c.Emit(OpSelf)
+		for _, method := range node.Methods {
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueSymbol,
+				Data:  normalizedStaticSymbolName(method.String()),
+				Class: core.R.Classes["Symbol"],
+			})
+		}
+		methodNameIdx := c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  "undef_method",
+			Class: core.R.Classes["String"],
+		})
+		c.emit(OpSend, methodNameIdx, 0, len(node.Methods), 255)
 	case *ast.AliasExpression:
 		c.Emit(OpSelf)
 		c.EmitConstant(&object.EmeraldValue{
@@ -1008,11 +1252,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data:  node.Old.String(),
 			Class: core.R.Classes["Symbol"],
 		})
-		c.emit(OpSend, c.addConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  "alias_method",
-			Class: core.R.Classes["String"],
-		}), 0, 2)
+		c.emit(OpAlias)
 	case *ast.ReturnExpression:
 		if node.ReturnValue != nil {
 			if err := c.Compile(node.ReturnValue); err != nil {
@@ -1036,14 +1276,20 @@ func (c *Compiler) Compile(node interface{}) error {
 		for _, kp := range node.KeywordParams {
 			c.symbolTable.Define(kp.Name)
 		}
+		if node.KeywordRestParam != nil {
+			c.symbolTable.Define(node.KeywordRestParam.Value)
+		}
 
 		if node.BlockParam != nil {
 			c.symbolTable.Define(node.BlockParam.Value)
 		}
 
+		c.methodDepth++
 		if err := c.compileBlockAsValue(node.Body); err != nil {
+			c.methodDepth--
 			return err
 		}
+		c.methodDepth--
 
 		c.replaceLastPopWithReturn()
 
@@ -1051,6 +1297,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		numLocals := c.symbolTable.MaxSymbols
 		localNames := c.localNames()
 
+		lineMap := c.currentLineMapCopy()
 		instructions := c.LeaveScope()
 
 		kwParams := make([]object.KeywordParamInfo, len(node.KeywordParams))
@@ -1079,13 +1326,20 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		fnObj := &object.Function{
-			Name:          node.Name.Value,
-			Params:        params,
-			Instructions:  instructions,
-			NumLocals:     numLocals,
-			LocalNames:    localNames,
-			ParamDefaults: paramDefaults,
-			KeywordParams: kwParams,
+			Name:            node.Name.Value,
+			Params:          params,
+			Instructions:    instructions,
+			LineMap:         lineMap,
+			NumLocals:       numLocals,
+			LocalNames:      localNames,
+			ParamDefaults:   paramDefaults,
+			KeywordParams:   kwParams,
+			RejectKeywords:  node.RejectKeywords,
+			KeywordRestOnly: node.KeywordRestOnly,
+			FreeVarNames:    freeVarNames(free),
+		}
+		if node.KeywordRestParam != nil {
+			fnObj.KeywordRestParam = node.KeywordRestParam.Value
 		}
 		if node.RestParam != nil {
 			fnObj.HasRestParam = true
@@ -1132,12 +1386,12 @@ func (c *Compiler) Compile(node interface{}) error {
 				Type:  object.ValueString,
 				Data:  "singleton_class",
 				Class: core.R.Classes["String"],
-			}), 0, 0)
+			}), 0, 0, 255)
 		} else if node.SuperClass != nil {
-			if node.SuperClass.Token.Type == lexer.CONSTANT || strings.Contains(node.SuperClass.Value, "::") {
+			if ident, ok := node.SuperClass.(*ast.Identifier); ok && (ident.Token.Type == lexer.CONSTANT || strings.Contains(ident.Value, "::")) {
 				c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
 					Type:  object.ValueString,
-					Data:  node.SuperClass.Value,
+					Data:  ident.Value,
 					Class: core.R.Classes["String"],
 				}))
 			} else {
@@ -1148,11 +1402,15 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		if node.SingletonReceiver == nil {
+			hasSuperclass := 0
+			if node.SuperClass != nil {
+				hasSuperclass = 1
+			}
 			c.emit(OpClass, c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  node.Name.Value,
 				Class: core.R.Classes["String"],
-			}))
+			}), hasSuperclass)
 
 			if node.SuperClass != nil {
 				c.Emit(OpInherited)
@@ -1165,10 +1423,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			return err
 		}
 
-		c.Emit(OpReturnValue)
+		if len(c.currentInstructions()) == 0 {
+			c.Emit(OpNil)
+			c.Emit(OpReturnValue)
+		} else {
+			c.replaceLastPopWithReturn()
+		}
 
 		numLocals := c.symbolTable.MaxSymbols
 		localNames := c.localNames()
+		lineMap := c.currentLineMapCopy()
 		instructions := c.LeaveScope()
 
 		bodyFn := &object.EmeraldValue{
@@ -1176,8 +1440,10 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data: &object.Function{
 				Name:         node.Name.Value + "#body",
 				Instructions: instructions,
+				LineMap:      lineMap,
 				NumLocals:    numLocals,
 				LocalNames:   localNames,
+				FreeVarNames: freeVarNames(c.symbolTable.FreeSymbols),
 			},
 			Class: core.R.Classes["Class"],
 		}
@@ -1187,7 +1453,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Type:  object.ValueString,
 			Data:  "__exec_class_body__",
 			Class: core.R.Classes["String"],
-		}), 1, 0)
+		}), 1, 0, 255)
 		if node.SingletonReceiver == nil {
 			c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
@@ -1195,7 +1461,6 @@ func (c *Compiler) Compile(node interface{}) error {
 				Class: core.R.Classes["String"],
 			}))
 		}
-		c.Emit(OpPop)
 	case *ast.ModuleExpression:
 		c.emit(OpModule, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
@@ -1213,6 +1478,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.Emit(OpReturnValue)
 		numLocals := c.symbolTable.MaxSymbols
 		localNames := c.localNames()
+		lineMap := c.currentLineMapCopy()
 		instructions := c.LeaveScope()
 
 		bodyFn := &object.EmeraldValue{
@@ -1220,8 +1486,10 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data: &object.Function{
 				Name:         node.Name.Value + "#body",
 				Instructions: instructions,
+				LineMap:      lineMap,
 				NumLocals:    numLocals,
 				LocalNames:   localNames,
+				FreeVarNames: freeVarNames(c.symbolTable.FreeSymbols),
 			},
 			Class: core.R.Classes["Class"],
 		}
@@ -1231,7 +1499,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Type:  object.ValueString,
 			Data:  "__exec_class_body__",
 			Class: core.R.Classes["String"],
-		}), 1, 0)
+		}), 1, 0, 255)
 		c.emit(OpSetConstant, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  node.Name.Value,
@@ -1257,13 +1525,16 @@ func (c *Compiler) Compile(node interface{}) error {
 			free := c.symbolTable.FreeSymbols
 			numLocals := c.symbolTable.MaxSymbols
 			localNames := c.localNames()
+			lineMap := c.currentLineMapCopy()
 			instructions := c.LeaveScope()
 
 			fnObj := &object.Function{
 				Name:         "__block__",
 				Instructions: instructions,
+				LineMap:      lineMap,
 				NumLocals:    numLocals,
 				LocalNames:   localNames,
+				FreeVarNames: freeVarNames(free),
 			}
 
 			fn := &object.EmeraldValue{
@@ -1305,7 +1576,9 @@ func (c *Compiler) Compile(node interface{}) error {
 		setWhileEndPos := c.emit(OpSetWhileEnd, 0)
 		bodyStart := len(c.currentInstructions())
 		previousRedoTarget := c.scopes[c.scopeIndex].redoTarget
+		previousNextPatchTarget := c.scopes[c.scopeIndex].nextPatchTarget
 		c.scopes[c.scopeIndex].redoTarget = bodyStart
+		c.scopes[c.scopeIndex].nextPatchTarget = loopStart
 
 		if err := c.Compile(node.Body); err != nil {
 			return err
@@ -1332,6 +1605,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.scopes[c.scopeIndex].breakTarget = -1
 		c.scopes[c.scopeIndex].nextPatchPos = []int{}
 		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
+		c.scopes[c.scopeIndex].nextPatchTarget = previousNextPatchTarget
 		c.scopes[c.scopeIndex].redoTarget = previousRedoTarget
 	case *ast.UntilExpression:
 		// until is like while with negated condition
@@ -1345,7 +1619,9 @@ func (c *Compiler) Compile(node interface{}) error {
 		jumpTruthyPos := c.emit(OpJumpTruthy, 9999)
 		bodyStart := len(c.currentInstructions())
 		previousRedoTarget := c.scopes[c.scopeIndex].redoTarget
+		previousNextPatchTarget := c.scopes[c.scopeIndex].nextPatchTarget
 		c.scopes[c.scopeIndex].redoTarget = bodyStart
+		c.scopes[c.scopeIndex].nextPatchTarget = loopStart
 
 		if err := c.Compile(node.Body); err != nil {
 			return err
@@ -1358,6 +1634,7 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		// until returns nil in Ruby
 		c.Emit(OpNil)
+		c.scopes[c.scopeIndex].nextPatchTarget = previousNextPatchTarget
 		c.scopes[c.scopeIndex].redoTarget = previousRedoTarget
 	case *ast.ForExpression:
 		if err := c.compileForExpression(node); err != nil {
@@ -1381,8 +1658,16 @@ func (c *Compiler) Compile(node interface{}) error {
 		} else {
 			c.Emit(OpNil)
 		}
+		if c.forEachDepth > 0 {
+			c.emit(OpNext, 0)
+			return nil
+		}
 		pos := c.emit(OpJump, 0)
-		c.scopes[c.scopeIndex].nextPatchPos = append(c.scopes[c.scopeIndex].nextPatchPos, pos)
+		if c.scopes[c.scopeIndex].nextPatchTarget >= 0 {
+			c.changeOperand(pos, c.scopes[c.scopeIndex].nextPatchTarget)
+		} else {
+			c.scopes[c.scopeIndex].nextPatchPos = append(c.scopes[c.scopeIndex].nextPatchPos, pos)
+		}
 	case *ast.RedoExpression:
 		if c.scopes[c.scopeIndex].redoTarget >= 0 {
 			c.emit(OpJump, c.scopes[c.scopeIndex].redoTarget)
@@ -1397,8 +1682,16 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.YieldExpression:
 		if len(node.Args) > 0 || len(node.KeywordArgs) > 0 {
-			for _, arg := range node.Args {
-				if err := c.Compile(arg); err != nil {
+			splatIndex := -1
+			for i, arg := range node.Args {
+				compileArg := arg
+				if splat, ok := arg.(*ast.SplatExpression); ok {
+					compileArg = splat.Value
+					if splatIndex < 0 {
+						splatIndex = i
+					}
+				}
+				if err := c.Compile(compileArg); err != nil {
 					return err
 				}
 			}
@@ -1410,21 +1703,40 @@ func (c *Compiler) Compile(node interface{}) error {
 						return err
 					}
 					c.EmitConstant(&object.EmeraldValue{
-						Type:  object.ValueString,
-						Data:  ":" + kwa.Name,
-						Class: core.R.Classes["String"],
+						Type:  object.ValueSymbol,
+						Data:  normalizedStaticSymbolName(kwa.Name),
+						Class: core.R.Classes["Symbol"],
 					})
 				}
 				c.emit(OpHash, len(node.KeywordArgs))
 				argCount++
 			}
-			c.emit(OpYieldWithValue, argCount)
+			if splatIndex >= 0 {
+				c.emit(OpYieldWithSplat, argCount, splatIndex)
+			} else {
+				c.emit(OpYieldWithValue, argCount)
+			}
 		} else {
 			c.Emit(OpYield)
 		}
 	case *ast.SelfExpression:
 		c.Emit(OpSelf)
 	case *ast.RaiseExpression:
+		if node.Message != nil {
+			c.Emit(OpSelf)
+			if err := c.Compile(node.Error); err != nil {
+				return err
+			}
+			if err := c.Compile(node.Message); err != nil {
+				return err
+			}
+			c.emit(OpSend, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "raise",
+				Class: core.R.Classes["String"],
+			}), 0, 2, 255)
+			return nil
+		}
 		if node.Error != nil {
 			if err := c.Compile(node.Error); err != nil {
 				return err
@@ -1512,6 +1824,26 @@ func (c *Compiler) Compile(node interface{}) error {
 func (c *Compiler) compileDefinedExpression(node *ast.DefinedExpression) {
 	if node == nil || node.Expression == nil {
 		c.Emit(OpNil)
+		return
+	}
+	if resolution, ok := node.Expression.(*ast.ConstantResolution); ok {
+		if resolution.Left != nil {
+			if err := c.Compile(resolution.Left); err != nil {
+				c.Emit(OpNil)
+				return
+			}
+		} else {
+			c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  "Object",
+				Class: core.R.Classes["String"],
+			}))
+		}
+		c.emit(OpDefined, c.addConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  resolution.Name.Value,
+			Class: core.R.Classes["String"],
+		}))
 		return
 	}
 	result, ok := c.definedDescription(node.Expression)
@@ -1611,6 +1943,7 @@ func (c *Compiler) Bytecode() *Bytecode {
 	}
 	return &Bytecode{
 		Instructions: c.currentInstructions(),
+		LineMap:      c.currentLineMapCopy(),
 		Constants:    c.constants,
 		NumLocals:    c.symbolTable.MaxSymbols,
 		GlobalNames:  globalNames,
@@ -1628,6 +1961,14 @@ func (c *Compiler) localNames() map[string]int {
 	return localNames
 }
 
+func freeVarNames(free []Symbol) []string {
+	names := make([]string, len(free))
+	for i, s := range free {
+		names[i] = s.Name
+	}
+	return names
+}
+
 func (c *Compiler) currentInstructions() Instructions {
 	return c.scopes[c.scopeIndex].instructions
 }
@@ -1637,10 +1978,44 @@ func (c *Compiler) currentInstructions() Instructions {
 // so the block body's instructions are in the block scope.
 // For blocks without params, the statements are compiled inline in the parent scope.
 func (c *Compiler) compileBlockAsClosure(block *ast.BlockExpression) error {
+	return c.compileBlockAsClosureWithLocalNames(block, nil)
+}
+
+func (c *Compiler) compileBlockAsClosureWithLocalNames(block *ast.BlockExpression, localNameOverrides map[string]int) error {
+	return c.compileBlockAsClosureWithLocalNamesInternal(block, localNameOverrides, false)
+}
+
+func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockExpression, localNameOverrides map[string]int, forLoopCollectAsPair bool) error {
+	implicitIt := c.blockUsesImplicitItParameter(block)
 	c.EnterScope()
 
-	for _, param := range block.Params {
+	params := block.Params
+	paramDefaults := block.ParamDefaults
+	if implicitIt {
+		params = []*ast.Identifier{{Value: "it"}}
+		paramDefaults = []ast.Expression{nil}
+	}
+	restIndex := block.RestParamIndex
+	if restIndex < 0 || restIndex > len(params) {
+		restIndex = len(params)
+	}
+	for _, param := range params[:restIndex] {
 		c.symbolTable.Define(param.Value)
+	}
+	if block.RestParam != nil {
+		c.symbolTable.Define(block.RestParam.Value)
+	}
+	for _, param := range params[restIndex:] {
+		c.symbolTable.Define(param.Value)
+	}
+	if block.BlockParam != nil {
+		c.symbolTable.Define(block.BlockParam.Value)
+	}
+	for _, kp := range block.KeywordParams {
+		c.symbolTable.Define(kp.Name)
+	}
+	for _, localName := range block.BlockLocals {
+		c.symbolTable.Define(localName)
 	}
 
 	if err := c.compileBlockAsValue(block); err != nil {
@@ -1652,25 +2027,73 @@ func (c *Compiler) compileBlockAsClosure(block *ast.BlockExpression) error {
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
 	localNames := c.localNames()
+	maxIndex := -1
+	for _, idx := range localNames {
+		if idx > maxIndex {
+			maxIndex = idx
+		}
+	}
+	for name, idx := range localNameOverrides {
+		if idx < 0 {
+			maxIndex++
+			idx = maxIndex
+		} else if idx > maxIndex {
+			maxIndex = idx
+		}
+		localNames[name] = idx
+	}
+	if maxIndex+1 > numLocals {
+		numLocals = maxIndex + 1
+	}
+
+	lineMap := c.currentLineMapCopy()
 	instructions := c.LeaveScope()
 
-	paramDefaults := make([]*object.EmeraldValue, len(block.Params))
-	for i, defaultExpr := range block.ParamDefaults {
-		if i >= len(paramDefaults) {
+	compiledParamDefaults := make([]*object.EmeraldValue, len(params))
+	for i, defaultExpr := range paramDefaults {
+		if i >= len(compiledParamDefaults) {
 			break
 		}
 		if defaultExpr != nil {
-			paramDefaults[i] = c.compileDefaultValue(defaultExpr)
+			compiledParamDefaults[i] = c.compileDefaultValue(defaultExpr)
 		}
+	}
+	kwParams := make([]object.KeywordParamInfo, len(block.KeywordParams))
+	for i, kp := range block.KeywordParams {
+		info := object.KeywordParamInfo{
+			Name:       kp.Name,
+			HasDefault: kp.Default != nil,
+		}
+		if kp.Default != nil {
+			info.Default = c.compileDefaultValue(kp.Default)
+		}
+		kwParams[i] = info
 	}
 
 	fnObj := &object.Function{
-		Name:          "__block__",
-		Params:        identifierNames(block.Params),
-		ParamDefaults: paramDefaults,
-		Instructions:  instructions,
-		NumLocals:     numLocals,
-		LocalNames:    localNames,
+		Name:                 "__block__",
+		Params:               identifierNames(params),
+		ParamDefaults:        compiledParamDefaults,
+		BlockLocals:          append([]string(nil), block.BlockLocals...),
+		Instructions:         instructions,
+		LineMap:              lineMap,
+		NumLocals:            numLocals,
+		LocalNames:           localNames,
+		KeywordParams:        kwParams,
+		RejectKeywords:       block.RejectKeywords,
+		SingleDestructure:    block.SingleDestructure,
+		KeywordRestOnly:      block.KeywordRestOnly,
+		FreeVarNames:         freeVarNames(free),
+		TrailingCommaParam:   block.TrailingComma,
+		ForLoopCollectAsPair: forLoopCollectAsPair,
+	}
+	if block.RestParam != nil {
+		fnObj.HasRestParam = true
+		fnObj.RestParamIndex = restIndex
+	}
+	if block.BlockParam != nil {
+		fnObj.HasBlockParam = true
+		fnObj.BlockParamIndex = numLocals - 1
 	}
 
 	fn := &object.EmeraldValue{
@@ -1693,6 +2116,11 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 		c.Emit(OpNil)
 		return nil
 	}
+	scopeIndex := c.scopeIndex
+	c.scopes[scopeIndex].nextPatchDepth++
+	defer func() {
+		c.scopes[scopeIndex].nextPatchDepth--
+	}()
 	for i, s := range block.Statements {
 		if i == len(block.Statements)-1 {
 			if exprStmt, ok := s.(*ast.ExpressionStatement); ok {
@@ -1708,11 +2136,128 @@ func (c *Compiler) compileBlockAsValue(block *ast.BlockExpression) error {
 	}
 	c.removeLastPop()
 	endPos := len(c.currentInstructions())
-	for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
-		c.changeOperand(patchPos, endPos)
+	scope := &c.scopes[c.scopeIndex]
+	targetPos := endPos
+	if scope.nextPatchTarget >= 0 {
+		targetPos = scope.nextPatchTarget
 	}
-	c.scopes[c.scopeIndex].nextPatchPos = []int{}
+	if scope.nextPatchDepth == 1 {
+		for _, patchPos := range scope.nextPatchPos {
+			c.changeOperand(patchPos, targetPos)
+		}
+		scope.nextPatchPos = []int{}
+	}
 	return nil
+}
+
+func (c *Compiler) blockUsesImplicitItParameter(block *ast.BlockExpression) bool {
+	if block == nil || len(block.Params) > 0 || block.RestParam != nil || block.BlockParam != nil || len(block.KeywordParams) > 0 {
+		return false
+	}
+	if c.symbolTableHasLexicalBinding("it") {
+		return false
+	}
+	return statementsUseBareIt(block.Statements)
+}
+
+func (c *Compiler) procLiteralUsesImplicitItParameter(node *ast.ProcLiteral) bool {
+	if node == nil || len(node.Params) > 0 || node.RestParam != nil || node.BlockParam != nil {
+		return false
+	}
+	if c.symbolTableHasLexicalBinding("it") {
+		return false
+	}
+	if node.Body == nil {
+		return false
+	}
+	return statementsUseBareIt(node.Body.Statements)
+}
+
+func (c *Compiler) symbolTableHasLexicalBinding(name string) bool {
+	for table := c.symbolTable; table != nil; table = table.Outer {
+		if _, ok := table.store[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func statementsUseBareIt(stmts []ast.Statement) bool {
+	for _, stmt := range stmts {
+		switch node := stmt.(type) {
+		case *ast.ExpressionStatement:
+			if expressionUsesBareIt(node.Expression) {
+				return true
+			}
+		case ast.Expression:
+			if expressionUsesBareIt(node) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func expressionUsesBareIt(expr ast.Expression) bool {
+	switch node := expr.(type) {
+	case nil:
+		return false
+	case *ast.Identifier:
+		return node.Value == "it"
+	case *ast.MethodCall:
+		if node.Receiver == nil && node.Method != nil && node.Method.Value == "it" && len(node.Args) == 0 && len(node.KeywordArgs) == 0 && node.Block == nil {
+			return true
+		}
+		if expressionUsesBareIt(node.Receiver) {
+			return true
+		}
+		for _, arg := range node.Args {
+			if expressionUsesBareIt(arg) {
+				return true
+			}
+		}
+		for _, arg := range node.KeywordArgs {
+			if expressionUsesBareIt(arg.Value) {
+				return true
+			}
+		}
+		return false
+	case *ast.AssignExpression:
+		if node.Name != nil && node.Name.Value == "it" {
+			return true
+		}
+		return expressionUsesBareIt(node.Target) || expressionUsesBareIt(node.Index) || expressionUsesBareIt(node.Value)
+	case *ast.InfixExpression:
+		return expressionUsesBareIt(node.Left) || expressionUsesBareIt(node.Right)
+	case *ast.PrefixExpression:
+		return expressionUsesBareIt(node.Right)
+	case *ast.ArrayLiteral:
+		for _, elem := range node.Elements {
+			if expressionUsesBareIt(elem) {
+				return true
+			}
+		}
+	case *ast.HashLiteral:
+		for _, key := range node.Order {
+			if expressionUsesBareIt(key) || expressionUsesBareIt(node.Pairs[key]) {
+				return true
+			}
+		}
+	case *ast.IfExpression:
+		return expressionUsesBareIt(node.Condition) || statementsUseBareIt(blockStatements(node.Consequent)) || statementsUseBareIt(blockStatements(node.Alternative))
+	case *ast.BeginExpression:
+		return statementsUseBareIt(blockStatements(node.Body)) || statementsUseBareIt(blockStatements(node.Else)) || statementsUseBareIt(blockStatements(node.Ensure))
+	case *ast.TernaryExpression:
+		return expressionUsesBareIt(node.Condition) || expressionUsesBareIt(node.Consequent) || expressionUsesBareIt(node.Alternative)
+	}
+	return false
+}
+
+func blockStatements(block *ast.BlockExpression) []ast.Statement {
+	if block == nil {
+		return nil
+	}
+	return block.Statements
 }
 
 func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
@@ -1745,12 +2290,20 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 			rescueStart = rescueOffsets[i]
 		}
 
-		for _, exc := range rescue.Exceptions {
+		splatMask := 0
+		for excIndex, exc := range rescue.Exceptions {
+			if splat, ok := exc.(*ast.SplatExpression); ok {
+				splatMask |= 1 << excIndex
+				if err := c.Compile(splat.Value); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := c.Compile(exc); err != nil {
 				return err
 			}
 		}
-		c.emit(OpRescueMatch, len(rescue.Exceptions))
+		c.emit(OpRescueMatch, len(rescue.Exceptions), splatMask)
 		pendingNoMatchJump = c.emit(OpJumpNotTruthy, 0)
 		c.Emit(OpRescue)
 		if rescue.Variable != nil {
@@ -1760,6 +2313,12 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 			sym, _ := c.symbolTable.Resolve(rescue.Variable.Value)
 			if sym.Scope == ScopeLocal {
 				c.emit(OpSetLocal, sym.Index)
+			}
+			if rescue.Target != nil {
+				if err := c.Compile(rescue.Target); err != nil {
+					return err
+				}
+				c.Emit(OpPop)
 			}
 		} else {
 			c.Emit(OpPop)
@@ -1772,15 +2331,25 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		rescueEndJumps = append(rescueEndJumps, c.emit(OpJump, 0))
 	}
 
-	unmatchedEnsureStart := 0
-	if hasEnsure && pendingNoMatchJump > 0 {
-		unmatchedEnsureStart = len(c.currentInstructions())
-		c.Emit(OpEnsure)
-		if err := c.compileBlockAsValue(node.Ensure); err != nil {
+	unmatchedReraiseStart := 0
+	if pendingNoMatchJump > 0 {
+		unmatchedReraiseStart = len(c.currentInstructions())
+		if hasEnsure {
+			c.Emit(OpEnsure)
+			if err := c.compileBlockAsValue(node.Ensure); err != nil {
+				return err
+			}
+			c.Emit(OpPop)
+		}
+		c.Emit(OpReraise)
+	}
+
+	elseStart := 0
+	if hasElse {
+		elseStart = len(c.currentInstructions())
+		if err := c.compileBlockAsValue(node.Else); err != nil {
 			return err
 		}
-		c.Emit(OpPop)
-		c.Emit(OpReraise)
 	}
 
 	ensureStart := len(c.currentInstructions())
@@ -1792,25 +2361,17 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		c.Emit(OpPop)
 	}
 
-	if hasElse {
-		if err := c.compileBlockAsValue(node.Else); err != nil {
-			return err
-		}
-	}
-
 	endStart := len(c.currentInstructions())
 
-	if hasEnsure {
+	if hasElse {
+		c.changeOperand(jumpToEnd, elseStart)
+	} else if hasEnsure {
 		c.changeOperand(jumpToEnd, ensureStart)
 	} else {
 		c.changeOperand(jumpToEnd, endStart)
 	}
 	if pendingNoMatchJump > 0 {
-		if hasEnsure {
-			c.changeOperand(pendingNoMatchJump, unmatchedEnsureStart)
-		} else {
-			c.changeOperand(pendingNoMatchJump, endStart)
-		}
+		c.changeOperand(pendingNoMatchJump, unmatchedReraiseStart)
 	}
 	for _, jump := range rescueEndJumps {
 		if hasEnsure {
@@ -1871,6 +2432,12 @@ func (c *Compiler) addInstruction(ins Instructions) int {
 	pos := len(c.currentInstructions())
 	updated := append(c.currentInstructions(), ins...)
 	c.scopes[c.scopeIndex].instructions = updated
+	if c.currentLine > 0 {
+		if c.scopes[c.scopeIndex].lineMap == nil {
+			c.scopes[c.scopeIndex].lineMap = map[int]int{}
+		}
+		c.scopes[c.scopeIndex].lineMap[pos] = c.currentLine
+	}
 	return pos
 }
 
@@ -1898,6 +2465,7 @@ func (c *Compiler) removeLastPop() {
 		return
 	}
 	c.scopes[c.scopeIndex].instructions = c.scopes[c.scopeIndex].instructions[:last.Position]
+	delete(c.scopes[c.scopeIndex].lineMap, last.Position)
 	c.scopes[c.scopeIndex].lastInstruction = c.scopes[c.scopeIndex].previousInstruction
 	c.scopes[c.scopeIndex].previousInstruction = EmittedInstruction{}
 }
@@ -1934,11 +2502,42 @@ func (c *Compiler) changeOperandAt(opPos int, operandIndex int, operand int) {
 	}
 }
 
+func normalizedStaticSymbolName(value string) string {
+	if len(value) > 0 && value[0] == ':' {
+		value = value[1:]
+	}
+	value = strings.ReplaceAll(value, lexer.EscapedHashInterpolation, "#")
+	if len(value) < 3 || !strings.HasPrefix(value, "#{") || !strings.HasSuffix(value, "}") {
+		return value
+	}
+	if resolved, ok := staticQuotedInterpolationValue(value[2 : len(value)-1]); ok {
+		return resolved
+	}
+	return value
+}
+
+func staticQuotedInterpolationValue(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if strings.HasSuffix(expr, ".to_sym") {
+		expr = strings.TrimSpace(strings.TrimSuffix(expr, ".to_sym"))
+	}
+	if len(expr) < 2 {
+		return "", false
+	}
+	quote := expr[0]
+	if (quote != '\'' && quote != '"') || expr[len(expr)-1] != quote {
+		return "", false
+	}
+	return expr[1 : len(expr)-1], true
+}
+
 func (c *Compiler) EnterScope() {
 	scope := CompilationScope{
 		instructions:       Instructions{},
+		lineMap:            map[int]int{},
 		breakTarget:        -1,
 		nextPatchPos:       []int{},
+		nextPatchTarget:    -1,
 		redoTarget:         -1,
 		breakValuePatchPos: []int{},
 		retryTarget:        -1,
@@ -1957,8 +2556,21 @@ func (c *Compiler) LeaveScope() Instructions {
 	return instructions
 }
 
+func (c *Compiler) currentLineMapCopy() map[int]int {
+	source := c.scopes[c.scopeIndex].lineMap
+	if len(source) == 0 {
+		return nil
+	}
+	copied := make(map[int]int, len(source))
+	for pos, line := range source {
+		copied[pos] = line
+	}
+	return copied
+}
+
 type Bytecode struct {
 	Instructions Instructions
+	LineMap      map[int]int
 	Constants    []*object.EmeraldValue
 	NumLocals    int
 	GlobalNames  map[string]int
@@ -1968,11 +2580,12 @@ type Bytecode struct {
 func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue {
 	switch node := expr.(type) {
 	case *ast.IntegerLiteral:
-		return &object.EmeraldValue{
+		value := &object.EmeraldValue{
 			Type:  object.ValueInteger,
 			Data:  node.Value,
 			Class: core.R.Classes["Integer"],
 		}
+		return core.RememberULEBPackIntegerLiteral(value, node.Token.Literal)
 	case *ast.FloatLiteral:
 		return &object.EmeraldValue{
 			Type:  object.ValueFloat,
@@ -2007,6 +2620,20 @@ func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue
 	}
 }
 
+func (c *Compiler) compileStringLiteralValue(node *ast.StringLiteral) error {
+	val := node.Value
+	if !node.Interpolates || !strings.Contains(val, "#{") {
+		val = strings.ReplaceAll(val, lexer.EscapedHashInterpolation, "#")
+		c.EmitConstant(&object.EmeraldValue{
+			Type:  object.ValueString,
+			Data:  val,
+			Class: core.R.Classes["String"],
+		})
+		return nil
+	}
+	return c.compileStringInterpolation(val)
+}
+
 func (c *Compiler) compileStringInterpolation(s string) error {
 	parts := splitStringInterpolation(s)
 	if len(parts) == 0 {
@@ -2027,7 +2654,7 @@ func (c *Compiler) compileStringInterpolation(s string) error {
 			if len(p.Errors()) > 0 {
 				c.EmitConstant(&object.EmeraldValue{
 					Type:  object.ValueString,
-					Data:  "#{" + part.text + "}",
+					Data:  strings.ReplaceAll("#{"+part.text+"}", lexer.EscapedHashInterpolation, "#"),
 					Class: core.R.Classes["String"],
 				})
 			} else if len(prog.Statements) > 0 {
@@ -2046,7 +2673,7 @@ func (c *Compiler) compileStringInterpolation(s string) error {
 					Data:  "to_s",
 					Class: core.R.Classes["String"],
 				})
-				c.emit(OpSend, methodIdx, 0, 0)
+				c.emit(OpSend, methodIdx, 0, 0, 255)
 			} else {
 				c.EmitConstant(&object.EmeraldValue{
 					Type:  object.ValueString,
@@ -2057,7 +2684,7 @@ func (c *Compiler) compileStringInterpolation(s string) error {
 		} else {
 			c.EmitConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
-				Data:  part.text,
+				Data:  strings.ReplaceAll(part.text, lexer.EscapedHashInterpolation, "#"),
 				Class: core.R.Classes["String"],
 			})
 		}
@@ -2079,7 +2706,7 @@ func splitStringInterpolation(s string) []interpPart {
 	i := 0
 	start := 0
 	for i < len(s) {
-		if i+1 < len(s) && s[i] == '#' && s[i+1] == '{' {
+		if i+1 < len(s) && s[i] == '#' && s[i+1] == '{' && (i == 0 || s[i-1] != lexer.EscapedHashInterpolation[0]) {
 			if i > start {
 				parts = append(parts, interpPart{text: s[start:i], isExpr: false})
 			}
@@ -2160,7 +2787,7 @@ func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
 		}))
 		return nil
 	}
-	if len(name.Value) > 0 && name.Value[0] >= 'A' && name.Value[0] <= 'Z' {
+	if isConstantName(name.Value) {
 		c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  name.Value,
@@ -2200,6 +2827,10 @@ func (c *Compiler) emitCaptureSymbol(sym Symbol) {
 	case ScopeOuterFree:
 		c.emit(OpGetOuterFreeCell, sym.ScopeIndex)
 	case ScopeFree:
+		if localSym, ok := c.symbolTable.store[sym.Name]; ok && localSym.Scope == ScopeLocal {
+			c.emit(OpGetLocalCell, localSym.Index)
+			return
+		}
 		c.emit(OpGetFreeCell, sym.Index)
 	case ScopeGlobal:
 		c.emit(OpGetGlobal, sym.Index)
@@ -2217,6 +2848,7 @@ func (c *Compiler) compileExpressionThunk(expr ast.Expression) error {
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
 	localNames := c.localNames()
+	lineMap := c.currentLineMapCopy()
 	instructions := c.LeaveScope()
 
 	fn := &object.EmeraldValue{
@@ -2224,8 +2856,10 @@ func (c *Compiler) compileExpressionThunk(expr ast.Expression) error {
 		Data: &object.Function{
 			Name:         "__scoped_const_rhs__",
 			Instructions: instructions,
+			LineMap:      lineMap,
 			NumLocals:    numLocals,
 			LocalNames:   localNames,
+			FreeVarNames: freeVarNames(free),
 		},
 		Class: core.R.Classes["Class"],
 	}
@@ -2253,106 +2887,747 @@ func (c *Compiler) compileRangeExpression(node *ast.RangeExpression) error {
 }
 
 func (c *Compiler) compileForExpression(node *ast.ForExpression) error {
-	c.EnterScope()
-	c.symbolTable.Define(node.Variable.Value)
+	collectForResults := len(node.Body.Statements) > 0
+	forBody := *node.Body
 
-	if err := c.compileBlockAsValue(node.Body); err != nil {
-		return err
+	// for loop loop variables should be assigned back into the outer scope.
+	// Capture all variables first in the outer frame (if not already present),
+	// then pass temporary iterator values into the block body and rebind.
+	targetLocalAliases := map[string]int{}
+	assignedVarCount := 1
+	tupleUnpackTarget := c.forTargetNeedsTupleUnpack(node.Variable)
+	hasSplatTarget := false
+	nonNilTargetCount := 0
+	for _, name := range node.Variable {
+		if name != nil {
+			nonNilTargetCount++
+		}
+		if _, ok := name.(*ast.SplatExpression); ok {
+			hasSplatTarget = true
+			break
+		}
+	}
+	if hasSplatTarget || node.TupleTarget {
+		assignedVarCount = 1
+	} else if tupleUnpackTarget {
+		assignedVarCount = 1
+	}
+	for _, name := range node.Variable {
+		targetName := c.forTargetCaptureName(name)
+		if targetName == "" {
+			continue
+		}
+		if !isValidLocalNameLikeRuby(targetName) {
+			continue
+		}
+		sym, ok := c.symbolTable.Resolve(targetName)
+		if ok && sym.Scope != ScopeBuiltin {
+			targetLocalAliases[targetName] = sym.Index
+			continue
+		}
+		c.symbolTable.Define(targetName)
+		if sym, ok := c.symbolTable.Resolve(targetName); ok && sym.Scope != ScopeBuiltin {
+			targetLocalAliases[targetName] = sym.Index
+		}
+	}
+	bodyAssignedLocals := c.forBodyAssignedLocalNames(&forBody)
+	for bodyName := range bodyAssignedLocals {
+		if _, exists := targetLocalAliases[bodyName]; exists {
+			continue
+		}
+		if _, ok := c.symbolTable.Resolve(bodyName); ok {
+			sym, _ := c.symbolTable.Resolve(bodyName)
+			if sym.Scope != ScopeBuiltin {
+				continue
+			}
+		}
+		c.symbolTable.Define(bodyName)
+		if sym, ok := c.symbolTable.Resolve(bodyName); ok && sym.Scope != ScopeBuiltin {
+			targetLocalAliases[bodyName] = sym.Index
+		}
 	}
 
-	c.replaceLastPopWithReturn()
-
-	free := c.symbolTable.FreeSymbols
-	numLocals := c.symbolTable.MaxSymbols
-	localNames := c.localNames()
-	instructions := c.LeaveScope()
-
-	fnObj := &object.Function{
-		Name:         "__for_block__",
-		Instructions: instructions,
-		NumLocals:    numLocals,
-		LocalNames:   localNames,
+	// Temporary parameters receive each yielded value(s). Assign into outer targets explicitly.
+	forBody.Params = make([]*ast.Identifier, assignedVarCount)
+	for i := 0; i < assignedVarCount; i++ {
+		forBody.Params[i] = &ast.Identifier{
+			Token: node.Token,
+			Value: fmt.Sprintf("__rgo_for_value_%d", i),
+		}
 	}
 
-	fn := &object.EmeraldValue{
-		Type:  object.ValueFunction,
-		Data:  fnObj,
-		Class: core.R.Classes["Class"],
-	}
-	fnIdx := c.addConstant(fn)
-	for _, s := range free {
-		c.emitCaptureSymbol(s)
-	}
-	c.emit(OpClosure, fnIdx, len(free))
+	if assignedVarCount > 0 {
+		prefix := make([]ast.Statement, 0, assignedVarCount)
+		targetValue := forBody.Params[0]
+		for i, name := range node.Variable {
+			var valueExpr ast.Expression
+			var err error
+			switch {
+			case hasSplatTarget:
+				valueExpr, err = c.forTargetSplatValue(node.Token, i, node.Variable, targetValue)
+				if err != nil {
+					return err
+				}
+			case node.TupleTarget:
+				valueExpr = c.forTargetArrayValue(node.Token, i, targetValue)
+			case tupleUnpackTarget:
+				valueExpr = c.forTargetFirstArrayOrSelfValue(node.Token, targetValue)
+			case !hasSplatTarget && !tupleUnpackTarget:
+				if len(node.Variable) == 1 {
+					flattenForHash := &ast.MethodCall{
+						Token:    node.Token,
+						Receiver: forBody.Params[0],
+						Method: &ast.Identifier{
+							Token: node.Token,
+							Value: "to_a",
+						},
+						Args: []ast.Expression{},
+					}
+					flattenForHash = &ast.MethodCall{
+						Token:    node.Token,
+						Receiver: flattenForHash,
+						Method: &ast.Identifier{
+							Token: node.Token,
+							Value: "flatten",
+						},
+						Args: []ast.Expression{},
+					}
+					isHashValue := &ast.MethodCall{
+						Token:    node.Token,
+						Receiver: targetValue,
+						Method: &ast.Identifier{
+							Token: node.Token,
+							Value: "is_a?",
+						},
+						Args: []ast.Expression{&ast.Constant{
+							Token: node.Token,
+							Name:  "Hash",
+						}},
+					}
+					valueExpr = &ast.TernaryExpression{
+						Token: node.Token,
+						Condition: &ast.InfixExpression{
+							Token:    node.Token,
+							Left:     isHashValue,
+							Operator: "==",
+							Right:    &ast.Boolean{Token: node.Token, Value: true},
+						},
+						Consequent:  flattenForHash,
+						Alternative: forBody.Params[0],
+					}
+					break
+				}
+				valueExpr = c.forTargetArrayValue(node.Token, i, targetValue)
+				break
+			}
 
-	if err := c.Compile(node.Collection); err != nil {
-		return err
-	}
+			assignExpr, err := c.forTargetAssignmentExpression(name, valueExpr)
+			if err != nil {
+				return err
+			}
+			if assignExpr != nil {
+				prefix = append(prefix, &ast.ExpressionStatement{
+					Token:      node.Token,
+					Expression: assignExpr,
+				})
+			}
+		}
 
+		if !hasSplatTarget && !tupleUnpackTarget && node.TupleTarget && nonNilTargetCount > 1 {
+			isArrayValue := &ast.MethodCall{
+				Token:    node.Token,
+				Receiver: targetValue,
+				Method: &ast.Identifier{
+					Token: node.Token,
+					Value: "is_a?",
+				},
+				Args: []ast.Expression{&ast.Constant{Token: node.Token, Name: "Array"}},
+			}
+			arrayLength := c.forTargetLengthExpression(targetValue, node.Token)
+			shortArray := &ast.InfixExpression{
+				Token:    node.Token,
+				Left:     arrayLength,
+				Operator: "<",
+				Right:    c.integerLiteral(node.Token, int64(len(node.Variable))),
+			}
+			skipShortSource := &ast.InfixExpression{
+				Token:    node.Token,
+				Left:     isArrayValue,
+				Operator: "&&",
+				Right:    shortArray,
+			}
+			guardBlock := &ast.BlockExpression{Token: node.Token}
+			guardBlock.Statements = append(guardBlock.Statements, prefix...)
+			guardBlock.Statements = append(guardBlock.Statements, forBody.Statements...)
+			forBody.Statements = []ast.Statement{
+				&ast.ExpressionStatement{
+					Token: node.Token,
+					Expression: &ast.IfExpression{
+						Token:      node.Token,
+						Condition:  skipShortSource,
+						Consequent: guardBlock,
+						IsUnless:   true,
+					},
+				},
+			}
+		} else {
+			forBody.Statements = append(prefix, forBody.Statements...)
+		}
+	}
 	eachIdx := c.addConstant(&object.EmeraldValue{
 		Type:  object.ValueString,
 		Data:  "each",
 		Class: core.R.Classes["String"],
 	})
-	c.emit(OpSend, eachIdx, 1, 0)
+
+	if err := c.Compile(node.Collection); err != nil {
+		return err
+	}
+	c.forEachDepth++
+	forLoopCollectAsPair := !hasSplatTarget && !node.TupleTarget && !tupleUnpackTarget
+	if err := c.compileBlockAsClosureWithLocalNamesInternal(&forBody, targetLocalAliases, forLoopCollectAsPair); err != nil {
+		c.forEachDepth--
+		return err
+	}
+	c.forEachDepth--
+
+	if collectForResults {
+		c.emit(OpEnterForEach, 1)
+	} else {
+		c.emit(OpEnterForEach, 0)
+	}
+	c.emit(OpSend, eachIdx, 1, 0, 255)
+	c.emit(OpExitForEach)
 
 	return nil
 }
 
+func (c *Compiler) forBodyAssignedLocalNames(block *ast.BlockExpression) map[string]struct{} {
+	names := map[string]struct{}{}
+	if block == nil {
+		return names
+	}
+	for _, stmt := range block.Statements {
+		c.forBodyCollectAssignedLocalNamesFromStatement(stmt, names)
+	}
+	return names
+}
+
+func (c *Compiler) forBodyCollectAssignedLocalNamesFromStatement(stmt ast.Statement, names map[string]struct{}) {
+	if stmt == nil {
+		return
+	}
+	switch node := stmt.(type) {
+	case *ast.ExpressionStatement:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Expression, names)
+	case *ast.ReturnExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.ReturnValue, names)
+	case *ast.BreakExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Value, names)
+	case *ast.NextExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Value, names)
+	case *ast.ThrowExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Label, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Value, names)
+		for _, arg := range node.ExtraArgs {
+			c.forBodyCollectAssignedLocalNamesFromExpression(arg, names)
+		}
+	case *ast.RaiseExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Error, names)
+	case *ast.RedoExpression:
+	case *ast.RetryExpression:
+	}
+}
+
+func (c *Compiler) forBodyCollectAssignedLocalNamesFromBlock(block *ast.BlockExpression, names map[string]struct{}) {
+	if block == nil {
+		return
+	}
+	for _, stmt := range block.Statements {
+		c.forBodyCollectAssignedLocalNamesFromStatement(stmt, names)
+	}
+}
+
+func (c *Compiler) forBodyCollectAssignedLocalNamesFromExpression(expr ast.Expression, names map[string]struct{}) {
+	if expr == nil {
+		return
+	}
+	switch node := expr.(type) {
+	case *ast.AssignExpression:
+		c.forBodyAddAssignedLocalName(node.Name, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Target, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Index, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.End, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Value, names)
+	case *ast.MultiAssignExpression:
+		for _, name := range node.Names {
+			c.forBodyAddAssignedLocalName(name, names)
+		}
+		for _, value := range node.Values {
+			c.forBodyCollectAssignedLocalNamesFromExpression(value, names)
+		}
+	case *ast.InfixExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Left, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Right, names)
+	case *ast.PrefixExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Right, names)
+	case *ast.TernaryExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Condition, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Consequent, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Alternative, names)
+	case *ast.RangeExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Left, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Right, names)
+	case *ast.IndexExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Left, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Index, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.End, names)
+	case *ast.ArrayLiteral:
+		for _, elem := range node.Elements {
+			c.forBodyCollectAssignedLocalNamesFromExpression(elem, names)
+		}
+	case *ast.HashLiteral:
+		for _, key := range node.Order {
+			c.forBodyCollectAssignedLocalNamesFromExpression(key, names)
+			if value, ok := node.Pairs[key]; ok {
+				c.forBodyCollectAssignedLocalNamesFromExpression(value, names)
+			}
+		}
+	case *ast.MethodCall:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Receiver, names)
+		for _, arg := range node.Args {
+			c.forBodyCollectAssignedLocalNamesFromExpression(arg, names)
+		}
+		for _, kw := range node.KeywordArgs {
+			c.forBodyCollectAssignedLocalNamesFromExpression(kw.Value, names)
+		}
+	case *ast.ConstantResolution:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Left, names)
+	case *ast.IfExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Condition, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Consequent, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Alternative, names)
+		for _, elsif := range node.ElsIf {
+			c.forBodyCollectAssignedLocalNamesFromExpression(elsif.Condition, names)
+			c.forBodyCollectAssignedLocalNamesFromBlock(elsif.Consequent, names)
+		}
+	case *ast.WhileExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Condition, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Body, names)
+	case *ast.UntilExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Condition, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Body, names)
+	case *ast.ForExpression:
+		for _, target := range node.Variable {
+			targetName := c.forTargetCaptureName(target)
+			if !isValidLocalNameLikeRuby(targetName) {
+				continue
+			}
+			c.forBodyAddAssignedLocalName(&ast.Identifier{Value: targetName}, names)
+		}
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Body, names)
+	case *ast.BeginExpression:
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Body, names)
+		for _, rescueClause := range node.Rescue {
+			c.forBodyCollectAssignedLocalNamesFromBlock(rescueClause.Body, names)
+		}
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Else, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Ensure, names)
+	case *ast.CaseExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Expression, names)
+		for _, clause := range node.Clauses {
+			for _, cond := range clause.Conditions {
+				c.forBodyCollectAssignedLocalNamesFromExpression(cond, names)
+			}
+			c.forBodyCollectAssignedLocalNamesFromBlock(clause.Body, names)
+		}
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Else, names)
+	case *ast.CatchExpression:
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Label, names)
+		c.forBodyCollectAssignedLocalNamesFromBlock(node.Body, names)
+	case *ast.BlockExpression:
+		c.forBodyCollectAssignedLocalNamesFromBlock(node, names)
+	case *ast.ProcLiteral, *ast.DefExpression, *ast.ClassExpression, *ast.ModuleExpression:
+		return
+	}
+}
+
+func (c *Compiler) forBodyAddAssignedLocalName(name *ast.Identifier, names map[string]struct{}) {
+	if name == nil {
+		return
+	}
+	if !isValidLocalNameLikeRuby(name.Value) {
+		return
+	}
+	names[name.Value] = struct{}{}
+}
+
+func (c *Compiler) forTargetArrayValue(token lexer.Token, targetIndex int, source ast.Expression) ast.Expression {
+	indexExpr := &ast.IndexExpression{
+		Token: token,
+		Left:  source,
+		Index: &ast.IntegerLiteral{
+			Token: token,
+			Value: int64(targetIndex),
+		},
+	}
+	return &ast.TernaryExpression{
+		Token: token,
+		Condition: &ast.InfixExpression{
+			Token:    token,
+			Left:     c.forTargetLengthExpression(source, token),
+			Operator: ">",
+			Right:    &ast.IntegerLiteral{Token: token, Value: int64(targetIndex)},
+		},
+		Consequent:  indexExpr,
+		Alternative: &ast.IntegerLiteral{Token: token, Value: 0},
+	}
+}
+
+func (c *Compiler) forTargetNeedsTupleUnpack(targets []ast.Expression) bool {
+	if len(targets) != 1 {
+		return false
+	}
+	if target, ok := targets[0].(*ast.ArrayLiteral); ok {
+		return len(target.Elements) == 1
+	}
+	return false
+}
+
+func (c *Compiler) forTargetFirstArrayOrSelfValue(token lexer.Token, source ast.Expression) ast.Expression {
+	isArrayValue := &ast.MethodCall{
+		Token:    token,
+		Receiver: source,
+		Method: &ast.Identifier{
+			Token: token,
+			Value: "is_a?",
+		},
+		Args: []ast.Expression{&ast.Constant{Token: token, Name: "Array"}},
+	}
+	return &ast.TernaryExpression{
+		Token: token,
+		Condition: &ast.InfixExpression{
+			Token:    token,
+			Left:     isArrayValue,
+			Operator: "==",
+			Right:    &ast.Boolean{Token: token, Value: true},
+		},
+		Consequent: &ast.IndexExpression{
+			Token: token,
+			Left:  source,
+			Index: &ast.IntegerLiteral{
+				Token: token,
+				Value: 0,
+			},
+		},
+		Alternative: source,
+	}
+}
+
+func (c *Compiler) forTargetSplatValue(token lexer.Token, targetIndex int, targets []ast.Expression, source ast.Expression) (ast.Expression, error) {
+	if source == nil {
+		return &ast.NilExpression{Token: token}, nil
+	}
+	splatIndex := -1
+	for i, candidate := range targets {
+		if _, ok := candidate.(*ast.SplatExpression); ok {
+			splatIndex = i
+			break
+		}
+	}
+	if splatIndex < 0 {
+		return nil, fmt.Errorf("splat assignment expected splat target")
+	}
+	if targetIndex < splatIndex {
+		return &ast.IndexExpression{
+			Token: token,
+			Left:  source,
+			Index: &ast.IntegerLiteral{
+				Token: token,
+				Value: int64(targetIndex),
+			},
+		}, nil
+	}
+	if targetIndex > splatIndex {
+		afterCount := len(targets) - splatIndex - 1
+		afterOffset := int64(targetIndex - splatIndex)
+		length := c.forTargetLengthExpression(source, token)
+		minSourceLength := int64(splatIndex + afterCount)
+		availableCond := &ast.InfixExpression{
+			Token:    token,
+			Left:     length,
+			Operator: ">=",
+			Right:    c.integerLiteral(token, minSourceLength),
+		}
+		afterIndex := &ast.InfixExpression{
+			Token:    token,
+			Left:     length,
+			Operator: "-",
+			Right:    c.integerLiteral(token, int64(afterCount+1)-afterOffset),
+		}
+		return &ast.TernaryExpression{
+			Token:     token,
+			Condition: availableCond,
+			Consequent: &ast.IndexExpression{
+				Token: token,
+				Left:  source,
+				Index: afterIndex,
+			},
+			Alternative: &ast.NilExpression{Token: token},
+		}, nil
+	}
+
+	afterCount := len(targets) - splatIndex - 1
+	length := c.forTargetLengthExpression(source, token)
+	preCountExpr := c.integerLiteral(token, int64(splatIndex))
+	diffExpr := &ast.InfixExpression{
+		Token:    token,
+		Left:     length,
+		Operator: "-",
+		Right:    preCountExpr,
+	}
+	diffExpr2 := &ast.InfixExpression{
+		Token:    token,
+		Left:     diffExpr,
+		Operator: "-",
+		Right:    c.integerLiteral(token, int64(afterCount)),
+	}
+	restLenExpr := &ast.TernaryExpression{
+		Token:       token,
+		Condition:   &ast.InfixExpression{Token: token, Left: diffExpr2, Operator: ">", Right: c.integerLiteral(token, 0)},
+		Consequent:  diffExpr2,
+		Alternative: &ast.IntegerLiteral{Token: token, Value: 0},
+	}
+	startExpr := &ast.TernaryExpression{
+		Token:       token,
+		Condition:   &ast.InfixExpression{Token: token, Left: preCountExpr, Operator: ">", Right: length},
+		Consequent:  length,
+		Alternative: preCountExpr,
+	}
+	return &ast.IndexExpression{
+		Token: token,
+		Left:  source,
+		Index: startExpr,
+		End:   restLenExpr,
+	}, nil
+}
+
+func (c *Compiler) forTargetLengthExpression(source ast.Expression, token lexer.Token) ast.Expression {
+	return &ast.MethodCall{
+		Token:    token,
+		Receiver: source,
+		Method: &ast.Identifier{
+			Token: token,
+			Value: "length",
+		},
+		Args: []ast.Expression{},
+	}
+}
+
+func (c *Compiler) integerLiteral(token lexer.Token, value int64) *ast.IntegerLiteral {
+	return &ast.IntegerLiteral{
+		Token: token,
+		Value: value,
+	}
+}
+
+func isValidLocalNameLikeRuby(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	first := name[0]
+	if first != '_' && (first < 'a' || first > 'z') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		ch := name[i]
+		if ch == '_' ||
+			(ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (c *Compiler) forTargetCaptureName(target ast.Expression) string {
+	switch node := target.(type) {
+	case *ast.Identifier:
+		return node.Value
+	case *ast.ArrayLiteral:
+		if len(node.Elements) != 1 {
+			return ""
+		}
+		return c.forTargetCaptureName(node.Elements[0])
+	case *ast.InstanceVariable:
+		return node.Name
+	case *ast.ClassVariable:
+		return node.Name
+	case *ast.GlobalVariable:
+		return node.Name
+	case *ast.SplatExpression:
+		return c.forTargetCaptureName(node.Value)
+	default:
+		return ""
+	}
+}
+
+func (c *Compiler) forTargetAssignmentExpression(target ast.Expression, value ast.Expression) (ast.Expression, error) {
+	if target == nil {
+		return nil, nil
+	}
+	switch node := target.(type) {
+	case *ast.ArrayLiteral:
+		if len(node.Elements) == 1 {
+			return c.forTargetAssignmentExpression(node.Elements[0], value)
+		}
+		return nil, nil
+	case *ast.Identifier:
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name:  node,
+			Value: value,
+		}, nil
+	case *ast.Constant:
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name: &ast.Identifier{
+				Token: node.Token,
+				Value: node.Name,
+			},
+			Value: value,
+		}, nil
+	case *ast.InstanceVariable:
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name: &ast.Identifier{
+				Token: node.Token,
+				Value: node.Name,
+			},
+			Value: value,
+		}, nil
+	case *ast.ClassVariable:
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name: &ast.Identifier{
+				Token: node.Token,
+				Value: node.Name,
+			},
+			Value: value,
+		}, nil
+	case *ast.GlobalVariable:
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name: &ast.Identifier{
+				Token: node.Token,
+				Value: node.Name,
+			},
+			Value: value,
+		}, nil
+	case *ast.IndexExpression:
+		assignName := node.Left
+		return &ast.AssignExpression{
+			Token: node.Token,
+			Name: &ast.Identifier{
+				Token: node.Token,
+				Value: node.String(),
+			},
+			Target: assignName,
+			Index:  node.Index,
+			End:    node.End,
+			Value:  value,
+		}, nil
+	case *ast.MethodCall:
+		if node.Receiver == nil || node.Method == nil {
+			return nil, fmt.Errorf("invalid for loop target %T", target)
+		}
+		if len(node.Args) > 0 || len(node.KeywordArgs) > 0 {
+			return nil, fmt.Errorf("invalid for loop target %T", target)
+		}
+		return &ast.MethodCall{
+			Token:    node.Token,
+			Receiver: node.Receiver,
+			Method: &ast.Identifier{
+				Token: node.Method.Token,
+				Value: node.Method.Value + "=",
+			},
+			Safe: node.Safe,
+			Args: []ast.Expression{value},
+		}, nil
+	case *ast.SplatExpression:
+		return c.forTargetAssignmentExpression(node.Value, value)
+	default:
+		return nil, fmt.Errorf("invalid for-loop target %T", target)
+	}
+}
+
 func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
+	implicitIt := c.procLiteralUsesImplicitItParameter(node)
 	c.EnterScope()
-	for _, param := range node.Params {
+
+	params := node.Params
+	paramDefaults := node.ParamDefaults
+	if implicitIt {
+		params = []*ast.Identifier{{Value: "it"}}
+		paramDefaults = []ast.Expression{nil}
+	}
+	restIndex := node.RestParamIndex
+	if restIndex < 0 || restIndex > len(params) {
+		restIndex = len(params)
+	}
+	for _, param := range params[:restIndex] {
 		c.symbolTable.Define(param.Value)
 	}
 	if node.RestParam != nil {
 		c.symbolTable.Define(node.RestParam.Value)
+	}
+	for _, param := range params[restIndex:] {
+		c.symbolTable.Define(param.Value)
 	}
 	if node.BlockParam != nil {
 		c.symbolTable.Define(node.BlockParam.Value)
 	}
 
 	if node.Body != nil {
-		for _, s := range node.Body.Statements {
-			if err := c.Compile(s); err != nil {
-				return err
-			}
+		if err := c.compileBlockAsValue(node.Body); err != nil {
+			return err
 		}
 	}
-
-	endPos := len(c.currentInstructions())
-	for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
-		c.changeOperand(patchPos, endPos)
-	}
-	c.scopes[c.scopeIndex].nextPatchPos = []int{}
 
 	c.replaceLastPopWithReturn()
 
 	free := c.symbolTable.FreeSymbols
 	numLocals := c.symbolTable.MaxSymbols
 	localNames := c.localNames()
+	lineMap := c.currentLineMapCopy()
 	instructions := c.LeaveScope()
 
-	paramDefaults := make([]*object.EmeraldValue, len(node.Params))
-	for i, defaultExpr := range node.ParamDefaults {
-		if i >= len(paramDefaults) {
+	compiledParamDefaults := make([]*object.EmeraldValue, len(params))
+	for i, defaultExpr := range paramDefaults {
+		if i >= len(compiledParamDefaults) {
 			break
 		}
 		if defaultExpr != nil {
-			paramDefaults[i] = c.compileDefaultValue(defaultExpr)
+			compiledParamDefaults[i] = c.compileDefaultValue(defaultExpr)
 		}
 	}
 
 	fnObj := &object.Function{
-		Name:          "__lambda__",
-		Params:        identifierNames(node.Params),
-		ParamDefaults: paramDefaults,
-		Instructions:  instructions,
-		NumLocals:     numLocals,
-		LocalNames:    localNames,
+		Name:           "__lambda__",
+		Params:         identifierNames(params),
+		ParamDefaults:  compiledParamDefaults,
+		Instructions:   instructions,
+		LineMap:        lineMap,
+		NumLocals:      numLocals,
+		LocalNames:     localNames,
+		RejectKeywords: node.RejectKeywords,
+		FreeVarNames:   freeVarNames(free),
 	}
 	if node.RestParam != nil {
 		fnObj.HasRestParam = true
-		fnObj.RestParamIndex = len(node.Params)
+		fnObj.RestParamIndex = restIndex
 	}
 	if node.BlockParam != nil {
 		fnObj.HasBlockParam = true
@@ -2379,4 +3654,38 @@ func identifierNames(params []*ast.Identifier) []string {
 		names[i] = param.Value
 	}
 	return names
+}
+
+func isNestedMultiAssignTarget(target ast.Expression) bool {
+	switch target.(type) {
+	case *ast.ArrayLiteral:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSplatMultiAssignTarget(target ast.Expression) bool {
+	_, ok := target.(*ast.SplatExpression)
+	return ok
+}
+
+func multiAssignHasNestedTarget(node *ast.MultiAssignExpression) bool {
+	if node == nil {
+		return false
+	}
+	for _, target := range node.Targets {
+		if isNestedMultiAssignTarget(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func isConstantName(name string) bool {
+	if name == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(name)
+	return unicode.IsUpper(r)
 }

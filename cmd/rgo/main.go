@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"strings"
+	"time"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
@@ -72,6 +75,19 @@ Usage:
 }
 
 func runRubyFile(filename string) {
+	_ = os.Setenv("MSPEC_RUNNER", "1")
+	abs, err := filepath.Abs(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+
+	oldSpecFile := core.CurrentSpecFile
+	core.CurrentSpecFile = abs
+	defer func() {
+		core.CurrentSpecFile = oldSpecFile
+	}()
+
 	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
@@ -111,9 +127,28 @@ func runRubyFile(filename string) {
 }
 
 func runSpecFile(filename string) {
+	applyTestMemoryLimit()
+	timeoutSeconds := getEnvInt("RGO_SPEC_TIMEOUT")
+
+	_ = os.Setenv("MSPEC_RUNNER", "1")
 	testRunner = &SpecRunner{verbose: false}
 	currentFile = filename
-	err := executeSpecFile(filename)
+	var err error
+	if timeoutSeconds > 0 {
+		done := make(chan error, 1)
+		go func() {
+			done <- executeSpecFile(filename)
+		}()
+
+		select {
+		case err = <-done:
+		case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+			fmt.Fprintf(os.Stderr, "Test timed out after %d seconds\n", timeoutSeconds)
+			os.Exit(124)
+		}
+	} else {
+		err = executeSpecFile(filename)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		testRunner.failCount++
@@ -127,9 +162,44 @@ func runSpecFile(filename string) {
 	}
 }
 
+func applyTestMemoryLimit() {
+	memoryKB := getEnvInt("RGO_TEST_MEMORY_KB")
+	if memoryKB <= 0 {
+		return
+	}
+
+	limit := &syscall.Rlimit{
+		Cur: uint64(memoryKB) * 1024,
+		Max: uint64(memoryKB) * 1024,
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_AS, limit); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: unable to set RGO_TEST_MEMORY_KB=%d (%v)\n", memoryKB, err)
+	}
+}
+
+func getEnvInt(name string) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
 func executeSpecFile(filename string) error {
 	core.Init()
-	core.CurrentSpecFile = filename
+	abs, err := filepath.Abs(filename)
+	if err != nil {
+		return fmt.Errorf("Error reading file: %v", err)
+	}
+	oldSpecFile := core.CurrentSpecFile
+	core.CurrentSpecFile = abs
+	defer func() {
+		core.CurrentSpecFile = oldSpecFile
+	}()
 
 	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
 	if err != nil {
@@ -178,23 +248,18 @@ func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (stri
 	baseDir := filepath.Dir(abs)
 	for _, line := range strings.Split(string(bytes), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "require_relative ") && (strings.Contains(trimmed, "shared/") || strings.Contains(trimmed, "fixtures/")) {
+		if strings.HasPrefix(trimmed, "require_relative ") && strings.Contains(trimmed, "shared/") {
 			rel := strings.TrimSpace(strings.TrimPrefix(trimmed, "require_relative "))
 			rel = strings.Trim(rel, "'\"")
 			if !strings.HasSuffix(rel, ".rb") {
 				rel += ".rb"
 			}
-			requiredPath := filepath.Join(baseDir, rel)
-			var required string
-			if strings.HasSuffix(filepath.ToSlash(filepath.Clean(rel)), "fixtures/classes.rb") && strings.Contains(filepath.ToSlash(baseDir), "core/thread") {
-				required = threadFixtureSubset()
-			} else {
-				required, err = readSpecFileWithSharedRequires(requiredPath, seen)
-				if err != nil {
-					return "", err
-				}
+			requiredPath := filepath.Clean(filepath.Join(baseDir, rel))
+			if filepath.IsAbs(rel) {
+				requiredPath = filepath.Clean(rel)
 			}
-			out.WriteString(required)
+			out.WriteString("require_relative ")
+			out.WriteString(fmt.Sprintf("%q", requiredPath))
 			out.WriteString("\n")
 			continue
 		}

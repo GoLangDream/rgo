@@ -5,6 +5,7 @@ type Class struct {
 	NameValue           *EmeraldValue
 	TemporaryName       bool
 	SuperClass          *Class
+	SuperClassSet       bool
 	Methods             map[string]*Method
 	Constants           map[string]*EmeraldValue
 	PrivateConstants    map[string]bool
@@ -14,6 +15,7 @@ type Class struct {
 	ClassMethods        map[string]*Method
 	InstanceVars        map[string]*EmeraldValue
 	IsSingleton         bool
+	Frozen              bool
 	SingletonOwner      *EmeraldValue
 	SingletonClass      *Class
 	IncludedModules     []*Module // Modules included via include
@@ -39,7 +41,16 @@ func (c *Class) DefineMethod(name string, method *Method) {
 }
 
 func (c *Class) DefineClassMethod(name string, method *Method) {
+	if c.ClassMethods == nil {
+		c.ClassMethods = map[string]*Method{}
+	}
 	c.ClassMethods[name] = method
+	if c.SingletonClass != nil {
+		if c.SingletonClass.Methods == nil {
+			c.SingletonClass.Methods = map[string]*Method{}
+		}
+		c.SingletonClass.Methods[name] = method
+	}
 }
 
 func (c *Class) GetMethod(name string) (*Method, bool) {
@@ -102,7 +113,7 @@ func (c *Class) Include(module *Module) {
 
 func (c *Class) Extend(module *Module) {
 	for name, method := range module.Methods {
-		c.ClassMethods[name] = method
+		c.DefineClassMethod(name, method)
 	}
 }
 

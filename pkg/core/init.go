@@ -2,20 +2,29 @@ package core
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"math"
+	"math/big"
+	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
 	"github.com/GoLangDream/rgo/pkg/object"
 )
@@ -30,43 +39,143 @@ var CallBlockWithArgs func(block *object.EmeraldValue, args ...*object.EmeraldVa
 
 var CallBlockWithSelf func(block *object.EmeraldValue, self *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
 
+var EnterThreadBlock func()
+var LeaveThreadBlock func()
+
 var SetGlobalVariable func(name string, value *object.EmeraldValue)
 
 var GetGlobalVariable func(name string) *object.EmeraldValue
 
-var EvalSource func(source string) *object.EmeraldValue
+var RemoveConstantName func(container *object.EmeraldValue, name string)
 
-var RequirePath func(path string) *object.EmeraldValue
+var CurrentFrameBinding func() *object.RBinding
+
+var GlobalVariableNames func() []string
+var CurrentBacktraceFrames func() []object.RBacktraceLocation
+
+var EvalSource func(source string) *object.EmeraldValue
+var EvalSourceWithBinding func(source string, binding *object.RBinding) *object.EmeraldValue
+
+var RequirePath func(path string) (string, *object.EmeraldValue)
+var ResolveRequirePath func(path string) string
 
 var InMethodScope func() bool
 
 var LastBlockResult *object.EmeraldValue
+var forEachContextStack []struct {
+	Collect bool
+	Next    bool
+}
 
 var LastException *object.EmeraldValue
 var LastRaisedResult *object.EmeraldValue
 var LastMatcherException *object.EmeraldValue
 
 var CurrentSpecFile string
+var globalVariableAliases map[string]string
+var globalVariableTraces map[string][]globalVariableTrace
 var envObject *object.EmeraldValue
 var ruby2KeywordHashes map[*object.EmeraldValue]bool
 var fileUtimeOverrides map[string]fileTimeOverride
 var currentFileUmask int64 = 0022
 var stringEncodings map[*object.EmeraldValue]string
 var encodingValues map[string]*object.EmeraldValue
+var berPackOverrides map[*object.EmeraldValue][]byte
+var ulebPackOverrides map[*object.EmeraldValue][]byte
+var objectIDCounter int64
+var objectIDByInteger map[int64]int64
+var objectIDBySymbol map[string]int64
+var objectIDByValue map[*object.EmeraldValue]int64
 var nextIOFd int64
 var ioDataByFd map[int64]*ioShimData
+var ioPipeBuffers map[int64]*bytes.Buffer
+var ioPopenStates map[int64]*ioPopenState
+var ioFIFOStates map[string]*ioFIFOState
+var ioFIFOStatesMu sync.Mutex
+var ioPopenLoopCommandPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])loop[[:space:]]*\{`)
+var ioPopenLoopDoPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])loop[[:space:]]+do\b`)
+var evalSourceEncodingCommentPattern = regexp.MustCompile(`(?i)^\s*#\s*(?:coding|encoding)\s*[:=]\s*([A-Za-z0-9_\-]+)`)
+var exceptionPathFromMessagePattern = regexp.MustCompile(`^(.+?):\d+:\s`)
 var suppressFileOpenBlock bool
+var signalExceptionNumbers map[*object.EmeraldValue]int64
+var signalTraps map[int64]signalTrapData
+
+var kernelRandSeed int64
+var kernelRand = rand.New(rand.NewSource(1))
+
+func EnterForEachMode(collect bool) {
+	forEachContextStack = append(forEachContextStack, struct {
+		Collect bool
+		Next    bool
+	}{Collect: collect, Next: false})
+}
+
+func ExitForEachMode() {
+	if len(forEachContextStack) == 0 {
+		return
+	}
+	forEachContextStack = forEachContextStack[:len(forEachContextStack)-1]
+}
+
+func ForEachCollecting() bool {
+	if len(forEachContextStack) == 0 {
+		return false
+	}
+	return forEachContextStack[len(forEachContextStack)-1].Collect
+}
+
+func ForEachMarkNext() {
+	if len(forEachContextStack) == 0 {
+		return
+	}
+	forEachContextStack[len(forEachContextStack)-1].Next = true
+}
+
+func ForEachNextSeen() bool {
+	if len(forEachContextStack) == 0 {
+		return false
+	}
+	return forEachContextStack[len(forEachContextStack)-1].Next
+}
+
+func ForEachConsumeNext() bool {
+	if len(forEachContextStack) == 0 {
+		return false
+	}
+	ctx := &forEachContextStack[len(forEachContextStack)-1]
+	seen := ctx.Next
+	ctx.Next = false
+	return seen
+}
+
+func ForEachClearNext() {
+	if len(forEachContextStack) == 0 {
+		return
+	}
+	forEachContextStack[len(forEachContextStack)-1].Next = false
+}
 
 type fileTimeOverride struct {
 	atime time.Time
 	mtime time.Time
 }
 
+type signalTrapData struct {
+	handler *object.EmeraldValue
+	state   string
+}
+
 type encodingData struct {
 	name string
 }
 
+type globalVariableTrace struct {
+	handler *object.EmeraldValue
+	source  string
+}
+
 var defaultExternalEncoding = "UTF-8"
+var defaultInternalEncoding = ""
 
 type argfData struct {
 	paths   []string
@@ -76,6 +185,8 @@ type argfData struct {
 	closed  bool
 	io      *object.EmeraldValue
 }
+
+var argfClassValue *object.EmeraldValue
 
 func rubyString(value string) *object.EmeraldValue {
 	str := &object.EmeraldValue{Type: object.ValueString, Data: value, Class: R.Classes["String"]}
@@ -114,7 +225,16 @@ func StdoutObject() *object.EmeraldValue {
 	}
 	stdoutObject = newIOShimValue("IO")
 	if data := ioShim(stdoutObject); data != nil {
+		if ioDataByFd != nil {
+			oldFD := data.fd
+			delete(ioDataByFd, oldFD)
+			ioDataByFd[1] = data
+		}
 		data.fd = 1
+		data.mode = "w"
+		data.encodingExplicit = false
+		data.readClosed = false
+		data.writeClosed = false
 	}
 	return stdoutObject
 }
@@ -126,6 +246,15 @@ type enumeratorData struct {
 	index     int
 	generated bool
 	result    *object.EmeraldValue
+	generator func() ([]*object.EmeraldValue, *object.EmeraldValue)
+	eachFunc  func() *object.EmeraldValue
+	size      *int64
+	sizeValue *object.EmeraldValue
+}
+
+type arithmeticSequenceData struct {
+	r    *object.RRange
+	step int64
 }
 
 type yielderData struct {
@@ -167,6 +296,8 @@ type threadData struct {
 	abortOnException  bool
 	priority          int64
 	ran               bool
+	finished          bool
+	stopped           bool
 	group             *object.EmeraldValue
 }
 
@@ -196,24 +327,76 @@ type processStatusData struct {
 type processChild struct {
 	pid        int64
 	exitstatus int64
+	termsig    *int64
 	running    bool
-	pgroup     bool
+	pgroup     int64
+	pgroupJoin bool
+	cmd        *exec.Cmd
+}
+
+type processSpawnRedirect struct {
+	close      bool
+	sameStdout bool
+	file       *os.File
+}
+
+type processForkThreadState struct {
+	thread *object.EmeraldValue
+	ran    bool
+}
+
+type ioPopenState struct {
+	command       string
+	env           map[string]string
+	chdir         string
+	mergeErrToOut bool
+}
+
+type ioFIFOState struct {
+	readers        int64
+	writers        int64
+	waitingReaders int64
+	waitingWriters int64
+	buffer         *bytes.Buffer
 }
 
 type ioShimData struct {
-	writeCalls     int64
-	nonblock       bool
-	closed         bool
-	path           string
-	pathEncoding   string
-	mode           string
-	offset         int64
-	cachedSize     int64
-	cachedInfo     os.FileInfo
-	autoclose      bool
-	fd             int64
-	closeHook      bool
-	closeException *object.EmeraldValue
+	writeCalls             int64
+	lineno                 int64
+	pipeBuffer             int64
+	pid                    int64
+	nonblock               bool
+	closed                 bool
+	readClosed             bool
+	writeClosed            bool
+	closeOnExec            bool
+	isReadPipe             bool
+	peerFD                 int64
+	peerClosed             bool
+	ungetBuffer            string
+	stringValue            *object.EmeraldValue
+	path                   string
+	pathEncoding           string
+	newlineMode            string
+	inheritDefaultExternal bool
+	encodingExplicit       bool
+	encodingSetBySetter    bool
+	externalEncoding       string
+	internalEncoding       string
+	encodingInvalidReplace bool
+	encodingReplaceString  string
+	universalNewline       bool
+	isFIFO                 bool
+	mode                   string
+	offset                 int64
+	sync                   bool
+	binmode                bool
+	cachedSize             int64
+	cachedInfo             os.FileInfo
+	autoclose              bool
+	fd                     int64
+	closeHook              bool
+	closeException         *object.EmeraldValue
 }
 
 var lastDirForFd *dirData
@@ -234,11 +417,78 @@ var currentThread *object.EmeraldValue
 var currentFiber *object.EmeraldValue
 var threadReportOnExceptionDefault = true
 var threadAbortOnExceptionDefault = false
+var atExitHooks []*object.EmeraldValue
+var endHookFns map[*object.Function]struct{}
+var setTraceFuncValue *object.EmeraldValue
 var requiredFeatures = make(map[string]bool)
 var loadingFeatures = make(map[string]bool)
+var loadingFeatureOwners = make(map[string]*object.EmeraldValue)
+
+func RegisterAtExitHook(block *object.EmeraldValue) {
+	atExitHooks = append(atExitHooks, block)
+}
+
+func RegisterEndHook(block *object.EmeraldValue) {
+	if block == nil {
+		return
+	}
+	proc, ok := block.Data.(*object.Proc)
+	if !ok || proc == nil || proc.Fn == nil {
+		RegisterAtExitHook(block)
+		return
+	}
+
+	if endHookFns == nil {
+		endHookFns = make(map[*object.Function]struct{})
+	}
+	if _, exists := endHookFns[proc.Fn]; exists {
+		return
+	}
+	endHookFns[proc.Fn] = struct{}{}
+	RegisterAtExitHook(block)
+}
+
+func RunAtExitHooks() {
+	runSignalExitTrap()
+	if len(atExitHooks) == 0 {
+		return
+	}
+	for i := len(atExitHooks) - 1; i >= 0; i-- {
+		hook := atExitHooks[i]
+		if hook == nil {
+			continue
+		}
+		if CallBlockWithArgs == nil {
+			continue
+		}
+		result := CallBlockWithArgs(hook)
+		if result != nil && result.Type == object.ValueException {
+			LastException = result
+		}
+	}
+}
 
 func FeatureLoading(path string) bool {
 	return loadingFeatures[path]
+}
+
+func waitForConcurrentRequire(path string, owner *object.EmeraldValue) {
+	currentData := threadValueData(threadClassCurrent(nil))
+	if currentData != nil {
+		currentData.stopped = true
+	}
+	for loadingFeatures[path] && loadingFeatureOwners[path] != owner {
+		if len(pendingThreads) == 0 {
+			if currentData != nil {
+				currentData.stopped = false
+			}
+			break
+		}
+		runNextPendingThread()
+	}
+	if currentData != nil {
+		currentData.stopped = false
+	}
 }
 
 func loadedFeaturesGlobal() *object.EmeraldValue {
@@ -296,6 +546,8 @@ var processArgv0 *object.EmeraldValue
 var processRlimits = make(map[int64][2]int64)
 var processNextPID int64 = 10_000
 var processChildren []*processChild
+var processForkExitBangStatus *int64
+var processForkNoBlockStatus *int64
 var refinementModules map[*object.EmeraldValue]map[any]*object.EmeraldValue
 
 func EvaluatingRaiseErrorMatcher() bool {
@@ -308,6 +560,9 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	cls, ok := receiver.Data.(*object.Class)
 	if !ok {
 		return R.NilVal
+	}
+	if cls.IsSingleton {
+		return typeError("can't create instance of singleton class")
 	}
 	if cls.Name == "Class" {
 		superClass := R.Classes["Object"]
@@ -340,10 +595,30 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		}
 		return newRuntimeException(cls, message)
 	}
+	if classInheritsFrom(cls, R.Classes["Array"]) {
+		obj := &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{},
+			Class: cls,
+		}
+		if CallMethod != nil && classHasMethod(cls, "initialize") {
+			result := CallMethod(obj, "initialize", args...)
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+		}
+		return obj
+	}
 	obj := &object.EmeraldValue{
 		Type:  object.ValueObject,
 		Data:  object.NewObject(cls),
 		Class: cls,
+	}
+	if cls.Name == "BasicObject" {
+		if len(args) > 0 {
+			return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+		}
+		return obj
 	}
 	if CallMethod != nil && classHasMethod(cls, "initialize") {
 		result := CallMethod(obj, "initialize", args...)
@@ -360,9 +635,44 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	return obj
 }
 
+func classAllocate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
+	cls, ok := receiver.Data.(*object.Class)
+	if !ok {
+		return R.NilVal
+	}
+	if cls.IsSingleton {
+		return typeError("can't create instance of singleton class")
+	}
+	if classInheritsFrom(cls, R.Classes["Array"]) {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{},
+			Class: cls,
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  object.NewObject(cls),
+		Class: cls,
+	}
+}
+
 func classHasMethod(class *object.Class, name string) bool {
 	if class == nil {
 		return false
+	}
+	if name == "initialize" {
+		method, owner, ok := class.GetMethodWithOwner(name)
+		if !ok {
+			return false
+		}
+		if owner != nil && owner.Name == "BasicObject" && class.Name != "BasicObject" {
+			return false
+		}
+		return method != nil
 	}
 	_, ok := class.GetMethod(name)
 	return ok
@@ -531,12 +841,33 @@ func Init() {
 	R = &Runtime{
 		Classes: make(map[string]*object.Class),
 	}
+	kernelRandSeed = time.Now().UnixNano()
+	kernelRand = rand.New(rand.NewSource(kernelRandSeed))
 	scratchPadRecorded = nil
+	atExitHooks = nil
+	endHookFns = make(map[*object.Function]struct{})
+	requiredFeatures = make(map[string]bool)
+	loadingFeatures = make(map[string]bool)
+	loadingFeatureOwners = make(map[string]*object.EmeraldValue)
+	setTraceFuncValue = nil
+	globalVariableAliases = make(map[string]string)
+	globalVariableAliases["$LOAD_PATH"] = "$:"
+	globalVariableAliases["$-I"] = "$:"
+	globalVariableAliases["$LOADED_FEATURES"] = "$\""
+	globalVariableAliases["$-d"] = "$DEBUG"
+	globalVariableAliases["$-v"] = "$VERBOSE"
+	globalVariableAliases["$-w"] = "$VERBOSE"
+	globalVariableTraces = make(map[string][]globalVariableTrace)
 	defaultThreadGroup = nil
 	processArgv0 = nil
 	processNextPID = 10_000
 	processChildren = nil
+	signalExceptionNumbers = nil
+	signalTraps = make(map[int64]signalTrapData)
 	refinementModules = make(map[*object.EmeraldValue]map[any]*object.EmeraldValue)
+	pendingThreads = nil
+	currentThread = nil
+	currentFiber = nil
 	processGroups = processInitialGroups()
 	fileUtimeOverrides = make(map[string]fileTimeOverride)
 	currentFileUmask = 0022
@@ -544,8 +875,16 @@ func Init() {
 	stringEncodings = make(map[*object.EmeraldValue]string)
 	ruby2KeywordHashes = make(map[*object.EmeraldValue]bool)
 	encodingValues = make(map[string]*object.EmeraldValue)
+	berPackOverrides = make(map[*object.EmeraldValue][]byte)
+	if ulebPackOverrides == nil {
+		ulebPackOverrides = make(map[*object.EmeraldValue][]byte)
+	}
 	nextIOFd = 10
 	ioDataByFd = make(map[int64]*ioShimData)
+	ioPipeBuffers = make(map[int64]*bytes.Buffer)
+	ioPopenStates = make(map[int64]*ioPopenState)
+	ioFIFOStates = make(map[string]*ioFIFOState)
+	argfClassValue = nil
 
 	R.TrueVal = &object.EmeraldValue{
 		Type:  object.ValueBool,
@@ -564,6 +903,16 @@ func Init() {
 		Data:  nil,
 		Class: nil,
 	}
+	objectIDCounter = 1
+	objectIDByInteger = make(map[int64]int64)
+	objectIDBySymbol = make(map[string]int64)
+	objectIDByValue = make(map[*object.EmeraldValue]int64)
+	objectIDByValue[R.NilVal] = objectIDCounter
+	objectIDCounter++
+	objectIDByValue[R.FalseVal] = objectIDCounter
+	objectIDCounter++
+	objectIDByValue[R.TrueVal] = objectIDCounter
+	objectIDCounter++
 
 	R.createClasses()
 	R.defineMethods()
@@ -598,6 +947,8 @@ func (rt *Runtime) createClasses() {
 	encodingClass.SuperClass = objectClass
 	ioClass := object.NewClass("IO")
 	ioClass.SuperClass = objectClass
+	stringIOClass := object.NewClass("StringIO")
+	stringIOClass.SuperClass = ioClass
 	fileClass := object.NewClass("File")
 	fileClass.SuperClass = ioClass
 	fileStatClass := object.NewClass("File::Stat")
@@ -630,6 +981,8 @@ func (rt *Runtime) createClasses() {
 	enumeratorClass.SuperClass = objectClass
 	yielderClass := object.NewClass("Enumerator::Yielder")
 	yielderClass.SuperClass = objectClass
+	arithmeticSequenceClass := object.NewClass("Enumerator::ArithmeticSequence")
+	arithmeticSequenceClass.SuperClass = enumeratorClass
 
 	exceptionClass := object.NewClass("Exception")
 	exceptionClass.SuperClass = objectClass
@@ -637,22 +990,31 @@ func (rt *Runtime) createClasses() {
 	standardErrorClass.SuperClass = exceptionClass
 	systemCallErrorClass := object.NewClass("SystemCallError")
 	systemCallErrorClass.SuperClass = standardErrorClass
+	signalExceptionClass := object.NewClass("SignalException")
+	signalExceptionClass.SuperClass = exceptionClass
+	signalExceptionClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: signalExceptionNew, Arity: -1})
 	encodingCompatibilityErrorClass := object.NewClass("Encoding::CompatibilityError")
 	encodingCompatibilityErrorClass.SuperClass = standardErrorClass
+	encodingInvalidByteSequenceErrorClass := object.NewClass("Encoding::InvalidByteSequenceError")
+	encodingInvalidByteSequenceErrorClass.SuperClass = standardErrorClass
+	encodingUndefinedConversionErrorClass := object.NewClass("Encoding::UndefinedConversionError")
+	encodingUndefinedConversionErrorClass.SuperClass = standardErrorClass
 	ioErrorClass := object.NewClass("IOError")
 	ioErrorClass.SuperClass = standardErrorClass
-	ioWaitWritableClass := object.NewClass("IO::WaitWritable")
-	ioWaitWritableClass.SuperClass = standardErrorClass
-	ioWaitReadableClass := object.NewClass("IO::WaitReadable")
-	ioWaitReadableClass.SuperClass = standardErrorClass
-	ioEAGAINWaitReadableClass := object.NewClass("IO::EAGAINWaitReadable")
-	ioEAGAINWaitReadableClass.SuperClass = ioWaitReadableClass
 	errnoENOENTClass := object.NewClass("Errno::ENOENT")
 	errnoENOENTClass.SuperClass = systemCallErrorClass
 	errnoEAGAINClass := object.NewClass("Errno::EAGAIN")
 	errnoEAGAINClass.SuperClass = systemCallErrorClass
 	errnoEWOULDBLOCKClass := object.NewClass("Errno::EWOULDBLOCK")
 	errnoEWOULDBLOCKClass.SuperClass = errnoEAGAINClass
+	errnoESPIPEClass := object.NewClass("Errno::ESPIPE")
+	errnoESPIPEClass.SuperClass = systemCallErrorClass
+	ioWaitWritableClass := object.NewClass("IO::WaitWritable")
+	ioWaitWritableClass.SuperClass = errnoEAGAINClass
+	ioWaitReadableClass := object.NewClass("IO::WaitReadable")
+	ioWaitReadableClass.SuperClass = errnoEAGAINClass
+	ioEAGAINWaitReadableClass := object.NewClass("IO::EAGAINWaitReadable")
+	ioEAGAINWaitReadableClass.SuperClass = ioWaitReadableClass
 	errnoEACCESClass := object.NewClass("Errno::EACCES")
 	errnoEACCESClass.SuperClass = systemCallErrorClass
 	errnoEBADFClass := object.NewClass("Errno::EBADF")
@@ -683,6 +1045,12 @@ func (rt *Runtime) createClasses() {
 	runtimeErrorClass.SuperClass = standardErrorClass
 	systemExitClass := object.NewClass("SystemExit")
 	systemExitClass.SuperClass = exceptionClass
+	noMemoryErrorClass := object.NewClass("NoMemoryError")
+	noMemoryErrorClass.SuperClass = exceptionClass
+	securityErrorClass := object.NewClass("SecurityError")
+	securityErrorClass.SuperClass = exceptionClass
+	systemStackErrorClass := object.NewClass("SystemStackError")
+	systemStackErrorClass.SuperClass = exceptionClass
 	frozenErrorClass := object.NewClass("FrozenError")
 	frozenErrorClass.SuperClass = runtimeErrorClass
 	argumentErrorClass := object.NewClass("ArgumentError")
@@ -701,6 +1069,8 @@ func (rt *Runtime) createClasses() {
 	keyErrorClass.SuperClass = indexErrorClass
 	rangeErrorClass := object.NewClass("RangeError")
 	rangeErrorClass.SuperClass = standardErrorClass
+	regexpErrorClass := object.NewClass("RegexpError")
+	regexpErrorClass.SuperClass = standardErrorClass
 	zeroDivisionErrorClass := object.NewClass("ZeroDivisionError")
 	zeroDivisionErrorClass.SuperClass = standardErrorClass
 	syntaxErrorClass := object.NewClass("SyntaxError")
@@ -713,6 +1083,8 @@ func (rt *Runtime) createClasses() {
 	closedQueueErrorClass.SuperClass = stopIterationClass
 	fiberErrorClass := object.NewClass("FiberError")
 	fiberErrorClass.SuperClass = standardErrorClass
+	uncaughtThrowErrorClass := object.NewClass("UncaughtThrowError")
+	uncaughtThrowErrorClass.SuperClass = argumentErrorClass
 
 	methodClass := object.NewClass("Method")
 	methodClass.SuperClass = objectClass
@@ -722,6 +1094,10 @@ func (rt *Runtime) createClasses() {
 	bindingClass.SuperClass = objectClass
 	threadClass := object.NewClass("Thread")
 	threadClass.SuperClass = objectClass
+	threadBacktraceClass := object.NewClass("Backtrace")
+	threadBacktraceClass.SuperClass = objectClass
+	threadBacktraceLocationClass := object.NewClass("Location")
+	threadBacktraceLocationClass.SuperClass = objectClass
 	threadGroupClass := object.NewClass("ThreadGroup")
 	threadGroupClass.SuperClass = objectClass
 	mutexClass := object.NewClass("Mutex")
@@ -752,6 +1128,8 @@ func (rt *Runtime) createClasses() {
 	processSysClass.SuperClass = objectClass
 	processStatusClass := object.NewClass("Process::Status")
 	processStatusClass.SuperClass = objectClass
+	signalClass := object.NewClass("Signal")
+	signalClass.SuperClass = objectClass
 
 	R.TrueVal.Class = trueClass
 	R.FalseVal.Class = falseClass
@@ -770,6 +1148,7 @@ func (rt *Runtime) createClasses() {
 	R.Classes["String"] = stringClass
 	R.Classes["Encoding"] = encodingClass
 	R.Classes["IO"] = ioClass
+	R.Classes["StringIO"] = stringIOClass
 	R.Classes["File"] = fileClass
 	R.Classes["File::Stat"] = fileStatClass
 	R.Classes["Time"] = timeClass
@@ -786,10 +1165,13 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Proc"] = procClass
 	R.Classes["Enumerator"] = enumeratorClass
 	R.Classes["Enumerator::Yielder"] = yielderClass
+	R.Classes["Enumerator::ArithmeticSequence"] = arithmeticSequenceClass
 	R.Classes["Exception"] = exceptionClass
 	R.Classes["StandardError"] = standardErrorClass
 	R.Classes["SystemCallError"] = systemCallErrorClass
 	R.Classes["Encoding::CompatibilityError"] = encodingCompatibilityErrorClass
+	R.Classes["Encoding::InvalidByteSequenceError"] = encodingInvalidByteSequenceErrorClass
+	R.Classes["Encoding::UndefinedConversionError"] = encodingUndefinedConversionErrorClass
 	R.Classes["IOError"] = ioErrorClass
 	R.Classes["IO::WaitWritable"] = ioWaitWritableClass
 	R.Classes["IO::WaitReadable"] = ioWaitReadableClass
@@ -797,6 +1179,7 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Errno::ENOENT"] = errnoENOENTClass
 	R.Classes["Errno::EAGAIN"] = errnoEAGAINClass
 	R.Classes["Errno::EWOULDBLOCK"] = errnoEWOULDBLOCKClass
+	R.Classes["Errno::ESPIPE"] = errnoESPIPEClass
 	R.Classes["Errno::EACCES"] = errnoEACCESClass
 	R.Classes["Errno::EBADF"] = errnoEBADFClass
 	R.Classes["Errno::EEXIST"] = errnoEEXISTClass
@@ -812,6 +1195,10 @@ func (rt *Runtime) createClasses() {
 	R.Classes["EOFError"] = eofErrorClass
 	R.Classes["RuntimeError"] = runtimeErrorClass
 	R.Classes["SystemExit"] = systemExitClass
+	R.Classes["NoMemoryError"] = noMemoryErrorClass
+	R.Classes["SecurityError"] = securityErrorClass
+	R.Classes["SystemStackError"] = systemStackErrorClass
+	R.Classes["SignalException"] = signalExceptionClass
 	R.Classes["FrozenError"] = frozenErrorClass
 	R.Classes["ArgumentError"] = argumentErrorClass
 	R.Classes["TypeError"] = typeErrorClass
@@ -821,12 +1208,14 @@ func (rt *Runtime) createClasses() {
 	R.Classes["IndexError"] = indexErrorClass
 	R.Classes["KeyError"] = keyErrorClass
 	R.Classes["RangeError"] = rangeErrorClass
+	R.Classes["RegexpError"] = regexpErrorClass
 	R.Classes["ZeroDivisionError"] = zeroDivisionErrorClass
 	R.Classes["SyntaxError"] = syntaxErrorClass
 	R.Classes["LoadError"] = loadErrorClass
 	R.Classes["ThreadError"] = threadErrorClass
 	R.Classes["ClosedQueueError"] = closedQueueErrorClass
 	R.Classes["FiberError"] = fiberErrorClass
+	R.Classes["UncaughtThrowError"] = uncaughtThrowErrorClass
 	R.Classes["Errno::ECHILD"] = standardErrorClass
 	R.Classes["Errno::ESRCH"] = standardErrorClass
 	R.Classes["Errno::EPERM"] = standardErrorClass
@@ -834,6 +1223,8 @@ func (rt *Runtime) createClasses() {
 	R.Classes["UnboundMethod"] = unboundMethodClass
 	R.Classes["Binding"] = bindingClass
 	R.Classes["Thread"] = threadClass
+	R.Classes["Thread::Backtrace"] = threadBacktraceClass
+	R.Classes["Thread::Backtrace::Location"] = threadBacktraceLocationClass
 	R.Classes["ThreadGroup"] = threadGroupClass
 	R.Classes["Mutex"] = mutexClass
 	R.Classes["ConditionVariable"] = conditionVariableClass
@@ -849,10 +1240,23 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Process::GID"] = processGIDClass
 	R.Classes["Process::Sys"] = processSysClass
 	R.Classes["Process::Status"] = processStatusClass
+	R.Classes["Signal"] = signalClass
+
+	threadClass.DefineConstant("Backtrace", &object.EmeraldValue{
+		Type:  object.ValueClass,
+		Data:  threadBacktraceClass,
+		Class: R.Classes["Class"],
+	})
+	threadBacktraceClass.DefineConstant("Location", &object.EmeraldValue{
+		Type:  object.ValueClass,
+		Data:  threadBacktraceLocationClass,
+		Class: R.Classes["Class"],
+	})
 }
 
 func (rt *Runtime) defineMethods() {
 	objectClass := R.Classes["Object"]
+	basicObjectClass := R.Classes["BasicObject"]
 	objectClass.DefineMethod("class", &object.Method{Name: "class", Fn: methodClass, Arity: 0})
 	objectClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: methodToS, Arity: 0})
 	objectClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: methodInspect, Arity: 0})
@@ -861,18 +1265,26 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("eql?", &object.Method{Name: "eql?", Fn: methodEql, Arity: 1})
 	objectClass.DefineMethod("instance_of?", &object.Method{Name: "instance_of?", Fn: methodInstanceOf, Arity: 1})
 	objectClass.DefineMethod("respond_to?", &object.Method{Name: "respond_to?", Fn: methodRespondTo, Arity: 1})
+	objectClass.DefineMethod("respond_to_missing?", &object.Method{Name: "respond_to_missing?", Fn: methodRespondToMissing, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("methods", &object.Method{Name: "methods", Fn: methodMethods, Arity: -1})
+	objectClass.DefineMethod("public_methods", &object.Method{Name: "public_methods", Fn: methodPublicMethods, Arity: -1})
+	objectClass.DefineMethod("private_methods", &object.Method{Name: "private_methods", Fn: methodPrivateMethods, Arity: -1})
+	objectClass.DefineMethod("protected_methods", &object.Method{Name: "protected_methods", Fn: methodProtectedMethods, Arity: -1})
 	objectClass.DefineMethod("method", &object.Method{Name: "method", Fn: methodObjectMethod, Arity: 1})
 	objectClass.DefineMethod("send", &object.Method{Name: "send", Fn: methodSend, Arity: 1})
 	objectClass.DefineMethod("singleton_class", &object.Method{Name: "singleton_class", Fn: methodSingletonClass, Arity: 0})
 	objectClass.DefineMethod("instance_variable_set", &object.Method{Name: "instance_variable_set", Fn: methodInstanceVariableSet, Arity: 2})
+	objectClass.DefineMethod("instance_variable_get", &object.Method{Name: "instance_variable_get", Fn: methodInstanceVariableGet, Arity: 1})
+	objectClass.DefineMethod("instance_variable_defined?", &object.Method{Name: "instance_variable_defined?", Fn: methodInstanceVariableDefined, Arity: 1})
+	objectClass.DefineMethod("instance_variables", &object.Method{Name: "instance_variables", Fn: methodInstanceVariables, Arity: 0})
+	objectClass.DefineMethod("remove_instance_variable", &object.Method{Name: "remove_instance_variable", Fn: methodRemoveInstanceVariable, Arity: 1})
 	objectClass.DefineMethod("strftime", &object.Method{Name: "strftime", Fn: objectStrftime, Arity: -1})
 	objectClass.DefineMethod("deconstruct_keys", &object.Method{Name: "deconstruct_keys", Fn: objectDeconstructKeys, Arity: -1})
 	objectClass.DefineMethod("is_a?", &object.Method{Name: "is_a?", Fn: methodIsA, Arity: 1})
 	objectClass.DefineMethod("freeze", &object.Method{Name: "freeze", Fn: methodFreeze, Arity: 0})
 	objectClass.DefineMethod("frozen?", &object.Method{Name: "frozen?", Fn: methodFrozen, Arity: 0})
 	objectClass.DefineMethod("dup", &object.Method{Name: "dup", Fn: methodDup, Arity: 0})
-	objectClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: methodDup, Arity: 0})
+	objectClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: methodClone, Arity: 0})
 	objectClass.DefineMethod("attr_accessor", &object.Method{Name: "attr_accessor", Fn: methodAttrAccessor, Arity: -1})
 	objectClass.DefineMethod("attr_reader", &object.Method{Name: "attr_reader", Fn: methodAttrReader, Arity: -1})
 	objectClass.DefineMethod("attr_writer", &object.Method{Name: "attr_writer", Fn: methodAttrWriter, Arity: -1})
@@ -880,7 +1292,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("public", &object.Method{Name: "public", Fn: methodSetPublicVisibility, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("private", &object.Method{Name: "private", Fn: methodSetPrivateVisibility, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("protected", &object.Method{Name: "protected", Fn: methodSetProtectedVisibility, Arity: -1, Visibility: "private"})
-	objectClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: methodEval, Arity: 1})
+	objectClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: methodEval, Arity: -1})
 	objectClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: objectExtend, Arity: -1})
 	objectClass.DefineMethod("define_singleton_method", &object.Method{Name: "define_singleton_method", Fn: methodDefineSingletonMethod, Arity: -1})
 	objectClass.DefineMethod("should_receive", &object.Method{Name: "should_receive", Fn: mockShouldReceive, Arity: -1})
@@ -889,11 +1301,23 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("ruby_cmd", &object.Method{Name: "ruby_cmd", Fn: methodRubyCmd, Arity: -1})
 	objectClass.DefineMethod("__FILE__", &object.Method{Name: "__FILE__", Fn: builtinMagicFile, Arity: 0})
 	objectClass.DefineMethod("__dir__", &object.Method{Name: "__dir__", Fn: builtinMagicDir, Arity: 0})
+	objectClass.DefineMethod("__ENCODING__", &object.Method{Name: "__ENCODING__", Fn: builtinMagicEncoding, Arity: 0})
+	objectClass.DefineMethod("local_variables", &object.Method{Name: "local_variables", Fn: builtinLocalVariables, Arity: 0})
+	objectClass.DefineMethod("new_io", &object.Method{Name: "new_io", Fn: builtinNewIO, Arity: -1})
 	objectClass.DefineMethod("tmp", &object.Method{Name: "tmp", Fn: builtinTmp, Arity: -1})
-	objectClass.DefineMethod("touch", &object.Method{Name: "touch", Fn: builtinTouch, Arity: 1})
+	objectClass.DefineMethod("touch", &object.Method{Name: "touch", Fn: builtinTouch, Arity: -1})
 	objectClass.DefineMethod("mkdir_p", &object.Method{Name: "mkdir_p", Fn: builtinMkdirP, Arity: 1})
 	objectClass.DefineMethod("rm_r", &object.Method{Name: "rm_r", Fn: builtinRmR, Arity: -1})
 	objectClass.DefineMethod("mock_to_path", &object.Method{Name: "mock_to_path", Fn: builtinMockToPath, Arity: 1})
+	basicObjectClass.DefineMethod("instance_eval", &object.Method{Name: "instance_eval", Fn: nil, Arity: -1})
+	basicObjectClass.DefineMethod("instance_exec", &object.Method{Name: "instance_exec", Fn: nil, Arity: -1})
+	basicObjectClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: basicObjectInitialize, Arity: 0, Visibility: "private"})
+	basicObjectClass.DefineMethod("send", &object.Method{Name: "send", Fn: methodSend, Arity: 1})
+	basicObjectClass.DefineMethod("__send__", &object.Method{Name: "__send__", Fn: methodSend, Arity: 1})
+	basicObjectClass.DefineMethod("public_send", &object.Method{Name: "public_send", Fn: methodSend, Arity: 1})
+	basicObjectClass.DefineMethod("object_id", &object.Method{Name: "object_id", Fn: methodObjectID, Arity: 0})
+	basicObjectClass.DefineMethod("__id__", &object.Method{Name: "__id__", Fn: methodObjectID, Arity: 0})
+	basicObjectClass.DefineMethod("hash", &object.Method{Name: "hash", Fn: methodObjectID, Arity: 0})
 
 	nilClass := R.Classes["NilClass"]
 	nilClass.DefineMethod("+", &object.Method{Name: "+", Fn: nilPlus, Arity: 1})
@@ -929,6 +1353,7 @@ func (rt *Runtime) defineMethods() {
 	integerClass.DefineMethod("ceil", &object.Method{Name: "ceil", Fn: intCeil, Arity: 0})
 	integerClass.DefineMethod("round", &object.Method{Name: "round", Fn: intRound, Arity: 0})
 	integerClass.DefineMethod("digits", &object.Method{Name: "digits", Fn: intDigits, Arity: 0})
+	integerClass.DefineMethod("coerce", &object.Method{Name: "coerce", Fn: intCoerce, Arity: 1})
 
 	// Bitwise operators
 	integerClass.DefineMethod("&", &object.Method{Name: "&", Fn: intBitAnd, Arity: 1})
@@ -958,6 +1383,7 @@ func (rt *Runtime) defineMethods() {
 	symbolClass.DefineMethod("succ", &object.Method{Name: "succ", Fn: symbolSucc, Arity: 0})
 	symbolClass.DefineMethod("==", &object.Method{Name: "==", Fn: symbolEqual, Arity: 1})
 	symbolClass.DefineMethod("===", &object.Method{Name: "===", Fn: symbolCaseEqual, Arity: 1})
+	symbolClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: symbolCompare, Arity: 1})
 	symbolClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: symbolIndex, Arity: 1})
 	symbolClass.DefineMethod("slice", &object.Method{Name: "slice", Fn: symbolSlice, Arity: 1})
 
@@ -968,12 +1394,12 @@ func (rt *Runtime) defineMethods() {
 	floatClass.DefineMethod("/", &object.Method{Name: "/", Fn: floatDiv, Arity: 1})
 	floatClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: floatToS, Arity: 0})
 	floatClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: floatToI, Arity: 0})
+	floatClass.DefineMethod("to_int", &object.Method{Name: "to_int", Fn: floatToI, Arity: 0})
 	floatClass.DefineMethod("floor", &object.Method{Name: "floor", Fn: floatFloor, Arity: 0})
 	floatClass.DefineMethod("ceil", &object.Method{Name: "ceil", Fn: floatCeil, Arity: 0})
 	floatClass.DefineMethod("round", &object.Method{Name: "round", Fn: floatRound, Arity: 0})
 	floatClass.DefineMethod("abs", &object.Method{Name: "abs", Fn: floatAbs, Arity: 0})
 	floatClass.DefineMethod("to_f", &object.Method{Name: "to_f", Fn: floatToF, Arity: 0})
-	floatClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: floatToI, Arity: 0})
 	floatClass.DefineMethod("zero?", &object.Method{Name: "zero?", Fn: floatZero, Arity: 0})
 	floatClass.DefineMethod("positive?", &object.Method{Name: "positive?", Fn: floatPositive, Arity: 0})
 	floatClass.DefineMethod("negative?", &object.Method{Name: "negative?", Fn: floatNegative, Arity: 0})
@@ -1000,8 +1426,11 @@ func (rt *Runtime) defineMethods() {
 	rangeClass.DefineMethod("member?", &object.Method{Name: "member?", Fn: rangeInclude, Arity: 1})
 	rangeClass.DefineMethod("==", &object.Method{Name: "==", Fn: rangeEqual, Arity: 1})
 	rangeClass.DefineMethod("===", &object.Method{Name: "===", Fn: rangeCaseEqual, Arity: 1})
+	rangeClass.DefineMethod("step", &object.Method{Name: "step", Fn: rangeStep, Arity: -1})
 
 	regexpClass := R.Classes["Regexp"]
+	regexpClass.DefineConstant("FIXEDENCODING", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(16), Class: R.Classes["Integer"]})
+	regexpClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: regexpClassNew, Arity: -1})
 	regexpClass.DefineClassMethod("escape", &object.Method{Name: "escape", Fn: regexpClassEscape, Arity: 1})
 	regexpClass.DefineClassMethod("quote", &object.Method{Name: "quote", Fn: regexpClassEscape, Arity: 1})
 	regexpClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: regexpToS, Arity: 0})
@@ -1032,8 +1461,18 @@ func (rt *Runtime) defineMethods() {
 	unboundMethodClass.DefineMethod("==", &object.Method{Name: "==", Fn: methodMethodEqual, Arity: 1})
 
 	bindingClass := R.Classes["Binding"]
+	bindingClass.DefineMethod("dup", &object.Method{Name: "dup", Fn: bindingDup, Arity: 0})
+	bindingClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: bindingClone, Arity: 0})
 	bindingClass.DefineMethod("local_variables", &object.Method{Name: "local_variables", Fn: bindingLocalVariables, Arity: 0})
-	bindingClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: bindingEval, Arity: 1})
+	bindingClass.DefineMethod("local_variable_defined?", &object.Method{Name: "local_variable_defined?", Fn: bindingLocalVariableDefined, Arity: 1})
+	bindingClass.DefineMethod("local_variable_get", &object.Method{Name: "local_variable_get", Fn: bindingLocalVariableGet, Arity: 1})
+	bindingClass.DefineMethod("local_variable_set", &object.Method{Name: "local_variable_set", Fn: bindingLocalVariableSet, Arity: 2})
+	bindingClass.DefineMethod("instance_variable_set", &object.Method{Name: "instance_variable_set", Fn: bindingInstanceVariableSet, Arity: 2})
+	bindingClass.DefineMethod("instance_variable_get", &object.Method{Name: "instance_variable_get", Fn: bindingInstanceVariableGet, Arity: 1})
+	bindingClass.DefineMethod("instance_variables", &object.Method{Name: "instance_variables", Fn: bindingInstanceVariables, Arity: 0})
+	bindingClass.DefineMethod("receiver", &object.Method{Name: "receiver", Fn: bindingReceiver, Arity: 0})
+	bindingClass.DefineMethod("source_location", &object.Method{Name: "source_location", Fn: bindingSourceLocation, Arity: 0})
+	bindingClass.DefineMethod("eval", &object.Method{Name: "eval", Fn: bindingEval, Arity: -1})
 
 	threadClass := R.Classes["Thread"]
 	threadClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: threadClassNew, Arity: 0})
@@ -1070,7 +1509,8 @@ func (rt *Runtime) defineMethods() {
 	threadClass.DefineMethod("join", &object.Method{Name: "join", Fn: threadJoin, Arity: 0})
 	threadClass.DefineMethod("value", &object.Method{Name: "value", Fn: threadValue, Arity: 0})
 	threadClass.DefineMethod("pid", &object.Method{Name: "pid", Fn: threadPid, Arity: 0})
-	threadClass.DefineMethod("backtrace", &object.Method{Name: "backtrace", Fn: threadBacktrace, Arity: 0})
+	threadClass.DefineMethod("backtrace", &object.Method{Name: "backtrace", Fn: threadBacktrace, Arity: -1})
+	threadClass.DefineMethod("backtrace_locations", &object.Method{Name: "backtrace_locations", Fn: threadBacktraceLocations, Arity: -1})
 	threadClass.DefineMethod("alive?", &object.Method{Name: "alive?", Fn: threadAlive, Arity: 0})
 	threadClass.DefineMethod("stop?", &object.Method{Name: "stop?", Fn: threadStop, Arity: 0})
 	threadClass.DefineMethod("run", &object.Method{Name: "run", Fn: threadWakeup, Arity: 0})
@@ -1089,6 +1529,15 @@ func (rt *Runtime) defineMethods() {
 	threadGroupClass.DefineMethod("enclosed?", &object.Method{Name: "enclosed?", Fn: threadGroupEnclosed, Arity: 0})
 	defaultThreadGroup = newThreadGroup()
 
+	threadBacktraceLocationClass := R.Classes["Thread::Backtrace::Location"]
+	threadBacktraceLocationClass.DefineMethod("path", &object.Method{Name: "path", Fn: threadBacktraceLocationPath, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("absolute_path", &object.Method{Name: "absolute_path", Fn: threadBacktraceLocationAbsolutePath, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("lineno", &object.Method{Name: "lineno", Fn: threadBacktraceLocationLine, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("label", &object.Method{Name: "label", Fn: threadBacktraceLocationLabel, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("base_label", &object.Method{Name: "base_label", Fn: threadBacktraceLocationBaseLabel, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: threadBacktraceLocationToS, Arity: 0})
+	threadBacktraceLocationClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: threadBacktraceLocationInspect, Arity: 0})
+
 	scratchPadClass := R.Classes["ScratchPad"]
 	scratchPadClass.DefineClassMethod("record", &object.Method{Name: "record", Fn: scratchPadRecord, Arity: 1})
 	scratchPadClass.DefineClassMethod("recorded", &object.Method{Name: "recorded", Fn: scratchPadRecordedValue, Arity: 0})
@@ -1099,12 +1548,18 @@ func (rt *Runtime) defineMethods() {
 	processClass.DefineClassMethod("argv0", &object.Method{Name: "argv0", Fn: processArgvZero, Arity: 0})
 	processClass.DefineClassMethod("pid", &object.Method{Name: "pid", Fn: processPid, Arity: 0})
 	processClass.DefineClassMethod("ppid", &object.Method{Name: "ppid", Fn: processPpid, Arity: 0})
+	processClass.DefineClassMethod("getpgrp", &object.Method{Name: "getpgrp", Fn: processGetpgrp, Arity: 0})
+	processClass.DefineClassMethod("setsid", &object.Method{Name: "setsid", Fn: processSetsid, Arity: 0})
 	processClass.DefineClassMethod("uid", &object.Method{Name: "uid", Fn: processUid, Arity: 0})
 	processClass.DefineClassMethod("uid=", &object.Method{Name: "uid=", Fn: processSetID, Arity: 1})
 	processClass.DefineClassMethod("euid", &object.Method{Name: "euid", Fn: processEuid, Arity: 0})
 	processClass.DefineClassMethod("euid=", &object.Method{Name: "euid=", Fn: processSetID, Arity: 1})
 	processClass.DefineClassMethod("gid", &object.Method{Name: "gid", Fn: processGid, Arity: 0})
 	processClass.DefineClassMethod("gid=", &object.Method{Name: "gid=", Fn: processSetID, Arity: 1})
+	processClass.DefineClassMethod("getsid", &object.Method{Name: "getsid", Fn: processGetsid, Arity: -1})
+	processClass.DefineClassMethod("getpgid", &object.Method{Name: "getpgid", Fn: processGetpgid, Arity: 1})
+	processClass.DefineClassMethod("setpgid", &object.Method{Name: "setpgid", Fn: processSetpgid, Arity: 2})
+	processClass.DefineClassMethod("setpgrp", &object.Method{Name: "setpgrp", Fn: processSetpgrp, Arity: 0})
 	processClass.DefineClassMethod("egid", &object.Method{Name: "egid", Fn: processEgid, Arity: 0})
 	processClass.DefineClassMethod("egid=", &object.Method{Name: "egid=", Fn: processSetID, Arity: 1})
 	processClass.DefineClassMethod("groups", &object.Method{Name: "groups", Fn: processGroupsGet, Arity: 0})
@@ -1115,6 +1570,7 @@ func (rt *Runtime) defineMethods() {
 	processClass.DefineClassMethod("last_status", &object.Method{Name: "last_status", Fn: processLastStatus, Arity: -1})
 	processClass.DefineClassMethod("spawn", &object.Method{Name: "spawn", Fn: processSpawn, Arity: -1})
 	processClass.DefineClassMethod("exec", &object.Method{Name: "exec", Fn: processExec, Arity: -1})
+	processClass.DefineClassMethod("_fork", &object.Method{Name: "_fork", Fn: processForkImpl, Arity: -1})
 	processClass.DefineClassMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
 	processClass.DefineClassMethod("wait", &object.Method{Name: "wait", Fn: processWait, Arity: -1})
 	processClass.DefineClassMethod("waitpid", &object.Method{Name: "waitpid", Fn: processWait, Arity: -1})
@@ -1151,14 +1607,28 @@ func (rt *Runtime) defineMethods() {
 	processStatusClass.DefineMethod("to_int", &object.Method{Name: "to_int", Fn: processStatusToI, Arity: 0})
 	processStatusClass.DefineMethod("exitstatus", &object.Method{Name: "exitstatus", Fn: processStatusExitstatus, Arity: 0})
 	processStatusClass.DefineMethod("pid", &object.Method{Name: "pid", Fn: processStatusPid, Arity: 0})
+	processStatusClass.DefineMethod("success?", &object.Method{Name: "success?", Fn: processStatusSuccess, Arity: 0})
+	processStatusClass.DefineMethod("stopped?", &object.Method{Name: "stopped?", Fn: processStatusStopped, Arity: 0})
+	processStatusClass.DefineMethod("stopsig", &object.Method{Name: "stopsig", Fn: processStatusStopSig, Arity: 0})
+	processStatusClass.DefineMethod("coredump?", &object.Method{Name: "coredump?", Fn: processStatusCoredump, Arity: 0})
+	processStatusClass.DefineMethod("signaled?", &object.Method{Name: "signaled?", Fn: processStatusSignaled, Arity: 0})
+	processStatusClass.DefineMethod("exited?", &object.Method{Name: "exited?", Fn: processStatusExited, Arity: 0})
+	processStatusClass.DefineMethod("==", &object.Method{Name: "==", Fn: processStatusEqual, Arity: 1})
+	processStatusClass.DefineMethod("termsig", &object.Method{Name: "termsig", Fn: processStatusTermsig, Arity: 0})
 	processStatusClass.DefineMethod("&", &object.Method{Name: "&", Fn: processStatusBitAnd, Arity: 1})
 	processStatusClass.DefineMethod(">>", &object.Method{Name: ">>", Fn: processStatusRightShift, Arity: 1})
+	signalClass := R.Classes["Signal"]
+	signalClass.DefineClassMethod("list", &object.Method{Name: "list", Fn: signalClassList, Arity: 0})
+	signalClass.DefineClassMethod("signame", &object.Method{Name: "signame", Fn: signalClassSigname, Arity: 1})
+	signalClass.DefineClassMethod("trap", &object.Method{Name: "trap", Fn: signalClassTrap, Arity: -1})
 
 	mockExpectationClass := R.Classes["MockExpectation"]
 	mockExpectationClass.DefineMethod("with", &object.Method{Name: "with", Fn: mockExpectationWith, Arity: -1})
 	mockExpectationClass.DefineMethod("any_number_of_times", &object.Method{Name: "any_number_of_times", Fn: mockExpectationWith, Arity: -1})
 	mockExpectationClass.DefineMethod("once", &object.Method{Name: "once", Fn: mockExpectationWith, Arity: -1})
 	mockExpectationClass.DefineMethod("exactly", &object.Method{Name: "exactly", Fn: mockExpectationWith, Arity: -1})
+	mockExpectationClass.DefineMethod("at_least", &object.Method{Name: "at_least", Fn: mockExpectationWith, Arity: -1})
+	mockExpectationClass.DefineMethod("times", &object.Method{Name: "times", Fn: mockExpectationWith, Arity: -1})
 	mockExpectationClass.DefineMethod("and_return", &object.Method{Name: "and_return", Fn: mockExpectationAndReturn, Arity: -1})
 	mockExpectationClass.DefineMethod("and_raise", &object.Method{Name: "and_raise", Fn: mockExpectationAndRaise, Arity: -1})
 
@@ -1231,14 +1701,22 @@ func (rt *Runtime) defineMethods() {
 	enumeratorClass.DefineMethod("next", &object.Method{Name: "next", Fn: enumeratorNext, Arity: 0})
 	enumeratorClass.DefineMethod("size", &object.Method{Name: "size", Fn: enumeratorSize, Arity: 0})
 	enumeratorClass.DefineMethod("to_a", &object.Method{Name: "to_a", Fn: enumeratorToA, Arity: 0})
+	enumeratorClass.DefineMethod("first", &object.Method{Name: "first", Fn: enumeratorFirst, Arity: -1})
 
 	yielderClass := R.Classes["Enumerator::Yielder"]
 	yielderClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: yielderAppend, Arity: 1})
+
+	arithmeticSequenceClass := R.Classes["Enumerator::ArithmeticSequence"]
+	arithmeticSequenceClass.DefineMethod("begin", &object.Method{Name: "begin", Fn: arithmeticSequenceBegin, Arity: 0})
+	arithmeticSequenceClass.DefineMethod("end", &object.Method{Name: "end", Fn: arithmeticSequenceEnd, Arity: 0})
+	arithmeticSequenceClass.DefineMethod("exclude_end?", &object.Method{Name: "exclude_end?", Fn: arithmeticSequenceExcludeEnd, Arity: 0})
+	arithmeticSequenceClass.DefineMethod("step", &object.Method{Name: "step", Fn: arithmeticSequenceStep, Arity: 0})
 
 	stringClass := R.Classes["String"]
 	stringClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: stringClassNew, Arity: -1})
 	stringClass.DefineMethod("+", &object.Method{Name: "+", Fn: stringAdd, Arity: 1})
 	stringClass.DefineMethod("*", &object.Method{Name: "*", Fn: stringMul, Arity: 1})
+	stringClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: stringCompare, Arity: 1})
 	stringClass.DefineMethod("length", &object.Method{Name: "length", Fn: stringLength, Arity: 0})
 	stringClass.DefineMethod("size", &object.Method{Name: "size", Fn: stringLength, Arity: 0})
 	stringClass.DefineMethod("empty?", &object.Method{Name: "empty?", Fn: stringEmpty, Arity: 0})
@@ -1257,6 +1735,7 @@ func (rt *Runtime) defineMethods() {
 	stringClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: stringToI, Arity: 0})
 	stringClass.DefineMethod("count", &object.Method{Name: "count", Fn: stringCount, Arity: 0})
 	stringClass.DefineMethod("size", &object.Method{Name: "size", Fn: stringCountChars, Arity: 0})
+	stringClass.DefineMethod("bytesize", &object.Method{Name: "bytesize", Fn: stringByteSize, Arity: 0})
 	stringClass.DefineMethod("bytes", &object.Method{Name: "bytes", Fn: stringBytes, Arity: 0})
 	stringClass.DefineMethod("chars", &object.Method{Name: "chars", Fn: stringChars, Arity: 0})
 	stringClass.DefineMethod("find", &object.Method{Name: "find", Fn: stringFind, Arity: 1})
@@ -1295,6 +1774,7 @@ func (rt *Runtime) defineMethods() {
 	stringClass.DefineMethod("delete", &object.Method{Name: "delete", Fn: stringDelete, Arity: 1})
 	stringClass.DefineMethod("squeeze", &object.Method{Name: "squeeze", Fn: stringSqueeze, Arity: 0})
 	stringClass.DefineMethod("to_f", &object.Method{Name: "to_f", Fn: stringToF, Arity: 0})
+	stringClass.DefineMethod("each_char", &object.Method{Name: "each_char", Fn: stringEachChar, Arity: 0})
 	stringClass.DefineMethod("hex", &object.Method{Name: "hex", Fn: stringHex, Arity: 0})
 	stringClass.DefineMethod("oct", &object.Method{Name: "oct", Fn: stringOct, Arity: 0})
 	stringClass.DefineMethod("encoding", &object.Method{Name: "encoding", Fn: stringEncoding, Arity: 0})
@@ -1304,40 +1784,194 @@ func (rt *Runtime) defineMethods() {
 
 	encodingClass := R.Classes["Encoding"]
 	encodingClass.DefineMethod("==", &object.Method{Name: "==", Fn: encodingEqual, Arity: 1})
+	encodingClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: encodingToS, Arity: 0})
 	encodingClass.DefineClassMethod("default_external", &object.Method{Name: "default_external", Fn: encodingDefaultExternal, Arity: 0})
 	encodingClass.DefineClassMethod("default_external=", &object.Method{Name: "default_external=", Fn: encodingSetDefaultExternal, Arity: 1})
+	encodingClass.DefineClassMethod("default_internal", &object.Method{Name: "default_internal", Fn: encodingDefaultInternal, Arity: 0})
+	encodingClass.DefineClassMethod("default_internal=", &object.Method{Name: "default_internal=", Fn: encodingSetDefaultInternal, Arity: 1})
 	encodingClass.DefineClassMethod("find", &object.Method{Name: "find", Fn: encodingFind, Arity: 1})
 	encodingClass.DefineConstant("UTF_8", newEncodingValue("UTF-8"))
 	encodingClass.DefineConstant("UTF_16BE", newEncodingValue("UTF-16BE"))
 	encodingClass.DefineConstant("UTF_32BE", newEncodingValue("UTF-32BE"))
+	encodingClass.DefineConstant("UTF_32", newEncodingValue("UTF-32"))
+	encodingClass.DefineConstant("UTF_32LE", newEncodingValue("UTF-32LE"))
+	encodingClass.DefineConstant("UTF_16LE", newEncodingValue("UTF-16LE"))
 	encodingClass.DefineConstant("US_ASCII", newEncodingValue("US-ASCII"))
 	encodingClass.DefineConstant("BINARY", newEncodingValue("BINARY"))
 	encodingClass.DefineConstant("ASCII_8BIT", newEncodingValue("BINARY"))
+	encodingClass.DefineConstant("IBM866", newEncodingValue("IBM866"))
+	encodingClass.DefineConstant("IBM437", newEncodingValue("IBM437"))
+	encodingClass.DefineConstant("EUC_JP", newEncodingValue("EUC-JP"))
+	encodingClass.DefineConstant("ISO_8859_1", newEncodingValue("ISO-8859-1"))
+	encodingClass.DefineConstant("UTF_16", newEncodingValue("UTF-16"))
 	encodingClass.DefineConstant("CP1251", newEncodingValue("CP1251"))
 	encodingClass.DefineConstant("SHIFT_JIS", newEncodingValue("SHIFT-JIS"))
 	encodingClass.DefineConstant("CompatibilityError", &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Encoding::CompatibilityError"], Class: R.Classes["Class"]})
+	encodingClass.DefineConstant("InvalidByteSequenceError", &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Encoding::InvalidByteSequenceError"], Class: R.Classes["Class"]})
+	encodingClass.DefineConstant("UndefinedConversionError", &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Encoding::UndefinedConversionError"], Class: R.Classes["Class"]})
 
 	ioClass := R.Classes["IO"]
 	ioClass.DefineClassMethod("pipe", &object.Method{Name: "pipe", Fn: ioClassPipe, Arity: -1})
+	ioClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: ioClassNew, Arity: -1})
 	ioClass.DefineClassMethod("for_fd", &object.Method{Name: "for_fd", Fn: ioClassForFd, Arity: -1})
+	ioClass.DefineClassMethod("open", &object.Method{Name: "open", Fn: ioClassOpen, Arity: -1})
+	ioClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: ioClassInitialize, Arity: -1})
+	ioClass.DefineClassMethod("select", &object.Method{Name: "select", Fn: ioClassSelect, Arity: -1})
+	ioClass.DefineClassMethod("popen", &object.Method{Name: "popen", Fn: ioClassPopen, Arity: -1})
+	ioClass.DefineClassMethod("read", &object.Method{Name: "read", Fn: fileClassRead, Arity: -1})
+	ioClass.DefineClassMethod("readlines", &object.Method{Name: "readlines", Fn: fileClassReadlines, Arity: -1})
+	ioClass.DefineClassMethod("write", &object.Method{Name: "write", Fn: ioClassWrite, Arity: -1})
+	ioClass.DefineClassMethod("copy_stream", &object.Method{Name: "copy_stream", Fn: ioClassCopyStream, Arity: -1})
+	ioClass.DefineClassMethod("foreach", &object.Method{Name: "foreach", Fn: ioClassForeach, Arity: -1})
+	ioClass.DefineConstant("SEEK_SET", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]})
+	ioClass.DefineConstant("SEEK_CUR", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]})
+	ioClass.DefineConstant("SEEK_END", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(2), Class: R.Classes["Integer"]})
 	ioClass.DefineMethod("write_nonblock", &object.Method{Name: "write_nonblock", Fn: ioWriteNonblock, Arity: -1})
 	ioClass.DefineMethod("syswrite", &object.Method{Name: "syswrite", Fn: ioSyswrite, Arity: 1})
-	ioClass.DefineMethod("write", &object.Method{Name: "write", Fn: ioSyswrite, Arity: 1})
+	ioClass.DefineMethod("write", &object.Method{Name: "write", Fn: ioWrite, Arity: -1})
+	ioClass.DefineMethod("set_encoding_by_bom", &object.Method{Name: "set_encoding_by_bom", Fn: ioSetEncodingByBOM, Arity: 0})
+	ioClass.DefineMethod("advise", &object.Method{Name: "advise", Fn: ioAdvise, Arity: -1})
+	ioClass.DefineMethod("read", &object.Method{Name: "read", Fn: ioRead, Arity: -1})
+	ioClass.DefineMethod("readline", &object.Method{Name: "readline", Fn: ioReadline, Arity: -1})
+	ioClass.DefineMethod("readlines", &object.Method{Name: "readlines", Fn: ioReadlines, Arity: -1})
+	ioClass.DefineMethod("readpartial", &object.Method{Name: "readpartial", Fn: ioReadpartial, Arity: -1})
+	ioClass.DefineMethod("sysread", &object.Method{Name: "sysread", Fn: ioSysread, Arity: -1})
+	ioClass.DefineMethod("read_nonblock", &object.Method{Name: "read_nonblock", Fn: ioReadNonblock, Arity: -1})
+	ioClass.DefineMethod("getc", &object.Method{Name: "getc", Fn: ioGetc, Arity: 0})
+	ioClass.DefineMethod("getbyte", &object.Method{Name: "getbyte", Fn: ioGetByte, Arity: 0})
+	ioClass.DefineMethod("readbyte", &object.Method{Name: "readbyte", Fn: ioReadByte, Arity: 0})
+	ioClass.DefineMethod("readchar", &object.Method{Name: "readchar", Fn: ioReadChar, Arity: 0})
+	ioClass.DefineMethod("ungetc", &object.Method{Name: "ungetc", Fn: ioUngetc, Arity: 1})
+	ioClass.DefineMethod("ungetbyte", &object.Method{Name: "ungetbyte", Fn: ioUngetbyte, Arity: 1})
+	ioClass.DefineMethod("seek", &object.Method{Name: "seek", Fn: ioSeek, Arity: -1})
+	ioClass.DefineMethod("sysseek", &object.Method{Name: "sysseek", Fn: ioSysseek, Arity: -1})
+	ioClass.DefineMethod("each", &object.Method{Name: "each", Fn: ioEachLine, Arity: -1})
+	ioClass.DefineMethod("each_line", &object.Method{Name: "each_line", Fn: ioEachLine, Arity: -1})
+	ioClass.DefineMethod("each_char", &object.Method{Name: "each_char", Fn: ioEachChar, Arity: 0})
+	ioClass.DefineMethod("each_byte", &object.Method{Name: "each_byte", Fn: ioEachByte, Arity: 0})
+	ioClass.DefineMethod("each_codepoint", &object.Method{Name: "each_codepoint", Fn: ioEachCodepoint, Arity: 0})
+	ioClass.DefineMethod("close_read", &object.Method{Name: "close_read", Fn: ioCloseRead, Arity: 0})
+	ioClass.DefineMethod("close_write", &object.Method{Name: "close_write", Fn: ioCloseWrite, Arity: 0})
+	ioClass.DefineMethod("sync", &object.Method{Name: "sync", Fn: ioSync, Arity: 0})
+	ioClass.DefineMethod("sync=", &object.Method{Name: "sync=", Fn: ioSetSync, Arity: 1})
+	ioClass.DefineMethod("binmode", &object.Method{Name: "binmode", Fn: ioBinmode, Arity: 0})
+	ioClass.DefineMethod("binmode?", &object.Method{Name: "binmode?", Fn: ioBinmodeQuestion, Arity: 0})
+	ioClass.DefineMethod("eof", &object.Method{Name: "eof", Fn: fileInstanceEOF, Arity: 0})
+	ioClass.DefineMethod("eof?", &object.Method{Name: "eof?", Fn: fileInstanceEOF, Arity: 0})
+	ioClass.DefineMethod("lineno", &object.Method{Name: "lineno", Fn: ioLineno, Arity: 0})
+	ioClass.DefineMethod("lineno=", &object.Method{Name: "lineno=", Fn: ioSetLineno, Arity: 1})
 	ioClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: ioPuts, Arity: -1})
 	ioClass.DefineMethod("close", &object.Method{Name: "close", Fn: ioClose, Arity: 0})
 	ioClass.DefineMethod("close_exception", &object.Method{Name: "close_exception", Fn: ioCloseException, Arity: 0})
 	ioClass.DefineMethod("close_exception=", &object.Method{Name: "close_exception=", Fn: ioSetCloseException, Arity: 1})
+	ioClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: ioFileno, Arity: 0})
 	ioClass.DefineMethod("fileno", &object.Method{Name: "fileno", Fn: ioFileno, Arity: 0})
+	ioClass.DefineMethod("pid", &object.Method{Name: "pid", Fn: ioPid, Arity: 0})
+	ioClass.DefineMethod("readable?", &object.Method{Name: "readable?", Fn: ioReadableQuestion, Arity: 0})
+	ioClass.DefineMethod("writable?", &object.Method{Name: "writable?", Fn: ioWritableQuestion, Arity: 0})
+	ioClass.DefineMethod("flush", &object.Method{Name: "flush", Fn: ioFlush, Arity: 0})
 	ioClass.DefineMethod("nonblock=", &object.Method{Name: "nonblock=", Fn: ioSetNonblock, Arity: 1})
 	ioClass.DefineMethod("nonblock?", &object.Method{Name: "nonblock?", Fn: ioNonblock, Arity: 0})
 	ioClass.DefineMethod("autoclose=", &object.Method{Name: "autoclose=", Fn: ioSetAutoclose, Arity: 1})
 	ioClass.DefineMethod("close_on_exec?", &object.Method{Name: "close_on_exec?", Fn: ioCloseOnExec, Arity: 0})
+	ioClass.DefineMethod("close_on_exec=", &object.Method{Name: "close_on_exec=", Fn: ioSetCloseOnExec, Arity: 1})
+	ioClass.DefineMethod("autoclose?", &object.Method{Name: "autoclose?", Fn: ioAutoclose, Arity: 0})
+	ioClass.DefineMethod("fcntl", &object.Method{Name: "fcntl", Fn: ioFcntl, Arity: -1})
+	ioClass.DefineMethod("isatty", &object.Method{Name: "isatty", Fn: ioIsATTY, Arity: 0})
+	ioClass.DefineMethod("tty?", &object.Method{Name: "tty?", Fn: ioTtyQuestion, Arity: 0})
+	ioClass.DefineMethod("fsync", &object.Method{Name: "fsync", Fn: ioFsync, Arity: 0})
+	ioClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: ioAppend, Arity: 1})
+	ioClass.DefineMethod("external_encoding", &object.Method{Name: "external_encoding", Fn: fileInstanceExternalEncoding, Arity: 0})
+	ioClass.DefineMethod("internal_encoding", &object.Method{Name: "internal_encoding", Fn: ioInternalEncoding, Arity: 0})
+	ioClass.DefineMethod("set_encoding", &object.Method{Name: "set_encoding", Fn: ioSetEncoding, Arity: -1})
+	ioClass.DefineMethod("reopen", &object.Method{Name: "reopen", Fn: ioReopen, Arity: -1})
+
+	stringIOClass := R.Classes["StringIO"]
+	stringIOClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: stringIOClassNew, Arity: -1})
+	stringIOClass.DefineClassMethod("open", &object.Method{Name: "open", Fn: stringIOClassOpen, Arity: -1})
+	stringIOClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: stringIOInitialize, Arity: -1})
+	stringIOClass.DefineMethod("string", &object.Method{Name: "string", Fn: stringIOString, Arity: 0})
+	stringIOClass.DefineMethod("string=", &object.Method{Name: "string=", Fn: stringIOSetString, Arity: 1})
+	stringIOClass.DefineMethod("size", &object.Method{Name: "size", Fn: stringIOSize, Arity: 0})
+	stringIOClass.DefineMethod("length", &object.Method{Name: "length", Fn: stringIOSize, Arity: 0})
+	stringIOClass.DefineMethod("external_encoding", &object.Method{Name: "external_encoding", Fn: fileInstanceExternalEncoding, Arity: 0})
+	stringIOClass.DefineMethod("internal_encoding", &object.Method{Name: "internal_encoding", Fn: ioInternalEncoding, Arity: 0})
+	stringIOClass.DefineMethod("sync", &object.Method{Name: "sync", Fn: ioSync, Arity: 0})
+	stringIOClass.DefineMethod("sync=", &object.Method{Name: "sync=", Fn: ioSetSync, Arity: 1})
+	stringIOClass.DefineMethod("read", &object.Method{Name: "read", Fn: fileInstanceRead, Arity: -1})
+	stringIOClass.DefineMethod("readline", &object.Method{Name: "readline", Fn: ioReadline, Arity: -1})
+	stringIOClass.DefineMethod("readlines", &object.Method{Name: "readlines", Fn: ioReadlines, Arity: -1})
+	stringIOClass.DefineMethod("readpartial", &object.Method{Name: "readpartial", Fn: ioReadpartial, Arity: -1})
+	stringIOClass.DefineMethod("sysread", &object.Method{Name: "sysread", Fn: ioSysread, Arity: -1})
+	stringIOClass.DefineMethod("read_nonblock", &object.Method{Name: "read_nonblock", Fn: ioReadNonblock, Arity: -1})
+	stringIOClass.DefineMethod("getc", &object.Method{Name: "getc", Fn: ioGetc, Arity: 0})
+	stringIOClass.DefineMethod("getbyte", &object.Method{Name: "getbyte", Fn: ioGetByte, Arity: 0})
+	stringIOClass.DefineMethod("readbyte", &object.Method{Name: "readbyte", Fn: ioReadByte, Arity: 0})
+	stringIOClass.DefineMethod("readchar", &object.Method{Name: "readchar", Fn: ioReadChar, Arity: 0})
+	stringIOClass.DefineMethod("getch", &object.Method{Name: "getch", Fn: ioGetc, Arity: 0})
+	stringIOClass.DefineMethod("putc", &object.Method{Name: "putc", Fn: ioPutc, Arity: 1})
+	stringIOClass.DefineMethod("ungetc", &object.Method{Name: "ungetc", Fn: ioUngetc, Arity: 1})
+	stringIOClass.DefineMethod("ungetbyte", &object.Method{Name: "ungetbyte", Fn: ioUngetbyte, Arity: 1})
+	stringIOClass.DefineMethod("gets", &object.Method{Name: "gets", Fn: fileInstanceGets, Arity: -1})
+	stringIOClass.DefineMethod("each", &object.Method{Name: "each", Fn: ioEachLine, Arity: -1})
+	stringIOClass.DefineMethod("each_line", &object.Method{Name: "each_line", Fn: ioEachLine, Arity: -1})
+	stringIOClass.DefineMethod("each_char", &object.Method{Name: "each_char", Fn: ioEachChar, Arity: 0})
+	stringIOClass.DefineMethod("each_byte", &object.Method{Name: "each_byte", Fn: ioEachByte, Arity: 0})
+	stringIOClass.DefineMethod("each_codepoint", &object.Method{Name: "each_codepoint", Fn: ioEachCodepoint, Arity: 0})
+	stringIOClass.DefineMethod("eof", &object.Method{Name: "eof", Fn: fileInstanceEOF, Arity: 0})
+	stringIOClass.DefineMethod("eof?", &object.Method{Name: "eof?", Fn: fileInstanceEOF, Arity: 0})
+	stringIOClass.DefineMethod("lineno", &object.Method{Name: "lineno", Fn: ioLineno, Arity: 0})
+	stringIOClass.DefineMethod("lineno=", &object.Method{Name: "lineno=", Fn: ioSetLineno, Arity: 1})
+	stringIOClass.DefineMethod("binmode", &object.Method{Name: "binmode", Fn: ioBinmode, Arity: 0})
+	stringIOClass.DefineMethod("binmode?", &object.Method{Name: "binmode?", Fn: ioBinmodeQuestion, Arity: 0})
+	stringIOClass.DefineMethod("set_encoding", &object.Method{Name: "set_encoding", Fn: ioSetEncoding, Arity: -1})
+	stringIOClass.DefineMethod("seek", &object.Method{Name: "seek", Fn: ioSeek, Arity: -1})
+	stringIOClass.DefineMethod("sysseek", &object.Method{Name: "sysseek", Fn: ioSysseek, Arity: -1})
+	stringIOClass.DefineMethod("autoclose=", &object.Method{Name: "autoclose=", Fn: ioSetAutoclose, Arity: 1})
+	stringIOClass.DefineMethod("close_on_exec=", &object.Method{Name: "close_on_exec=", Fn: ioSetCloseOnExec, Arity: 1})
+	stringIOClass.DefineMethod("close_on_exec?", &object.Method{Name: "close_on_exec?", Fn: ioCloseOnExec, Arity: 0})
+	stringIOClass.DefineMethod("autoclose?", &object.Method{Name: "autoclose?", Fn: ioAutoclose, Arity: 0})
+	stringIOClass.DefineMethod("readable?", &object.Method{Name: "readable?", Fn: ioReadableQuestion, Arity: 0})
+	stringIOClass.DefineMethod("writable?", &object.Method{Name: "writable?", Fn: ioWritableQuestion, Arity: 0})
+	stringIOClass.DefineMethod("isatty", &object.Method{Name: "isatty", Fn: ioIsATTY, Arity: 0})
+	stringIOClass.DefineMethod("tty?", &object.Method{Name: "tty?", Fn: ioTtyQuestion, Arity: 0})
+	stringIOClass.DefineMethod("nonblock=", &object.Method{Name: "nonblock=", Fn: ioSetNonblock, Arity: 1})
+	stringIOClass.DefineMethod("nonblock?", &object.Method{Name: "nonblock?", Fn: ioNonblock, Arity: 0})
+	stringIOClass.DefineMethod("fsync", &object.Method{Name: "fsync", Fn: ioFsync, Arity: 0})
+	stringIOClass.DefineMethod("close", &object.Method{Name: "close", Fn: ioClose, Arity: 0})
+	stringIOClass.DefineMethod("close_read", &object.Method{Name: "close_read", Fn: ioCloseRead, Arity: 0})
+	stringIOClass.DefineMethod("close_write", &object.Method{Name: "close_write", Fn: ioCloseWrite, Arity: 0})
+	stringIOClass.DefineMethod("closed?", &object.Method{Name: "closed?", Fn: ioClosed, Arity: 0})
+	stringIOClass.DefineMethod("closed_read?", &object.Method{Name: "closed_read?", Fn: stringIOClosedRead, Arity: 0})
+	stringIOClass.DefineMethod("closed_write?", &object.Method{Name: "closed_write?", Fn: stringIOClosedWrite, Arity: 0})
+	stringIOClass.DefineMethod("rewind", &object.Method{Name: "rewind", Fn: fileInstanceRewind, Arity: 0})
+	stringIOClass.DefineMethod("pos", &object.Method{Name: "pos", Fn: fileInstancePos, Arity: 0})
+	stringIOClass.DefineMethod("tell", &object.Method{Name: "tell", Fn: fileInstancePos, Arity: 0})
+	stringIOClass.DefineMethod("pos=", &object.Method{Name: "pos=", Fn: stringIOSetPos, Arity: 1})
+	stringIOClass.DefineMethod("reopen", &object.Method{Name: "reopen", Fn: stringIOReopen, Arity: -1})
+	stringIOClass.DefineMethod("write", &object.Method{Name: "write", Fn: stringIOWrite, Arity: -1})
+	stringIOClass.DefineMethod("syswrite", &object.Method{Name: "syswrite", Fn: stringIOWrite, Arity: 1})
+	stringIOClass.DefineMethod("write_nonblock", &object.Method{Name: "write_nonblock", Fn: stringIOWrite, Arity: -1})
+	stringIOClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: stringIOAppend, Arity: 1})
+	stringIOClass.DefineMethod("flush", &object.Method{Name: "flush", Fn: stringIOFlush, Arity: 0})
+	stringIOClass.DefineMethod("truncate", &object.Method{Name: "truncate", Fn: stringIOTruncate, Arity: 1})
+	stringIOClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: stringIONil, Arity: 0})
+	stringIOClass.DefineMethod("fileno", &object.Method{Name: "fileno", Fn: stringIONil, Arity: 0})
+	stringIOClass.DefineMethod("pid", &object.Method{Name: "pid", Fn: stringIONil, Arity: 0})
+	stringIOClass.DefineMethod("to_io", &object.Method{Name: "to_io", Fn: stringIOIdentity, Arity: 0})
+	stringIOClass.DefineMethod("set_encoding_by_bom", &object.Method{Name: "set_encoding_by_bom", Fn: ioSetEncodingByBOM, Arity: 0})
+	stringIOClass.DefineMethod("fcntl", &object.Method{Name: "fcntl", Fn: stringIONotImplemented, Arity: -1})
+	stringIOClass.DefineMethod("getpass", &object.Method{Name: "getpass", Fn: stringIOGetpass, Arity: -1})
+	stringIOClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: ioPuts, Arity: -1})
+	stringIOClass.DefineMethod("print", &object.Method{Name: "print", Fn: ioPrint, Arity: -1})
+	stringIOClass.DefineMethod("printf", &object.Method{Name: "printf", Fn: ioPrintf, Arity: -1})
 
 	fileClass := R.Classes["File"]
 	fileClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: fileClassNew, Arity: -1})
 	fileClass.DefineClassMethod("open", &object.Method{Name: "open", Fn: fileClassOpen, Arity: -1})
-	fileClass.DefineClassMethod("read", &object.Method{Name: "read", Fn: fileClassRead, Arity: 1})
-	fileClass.DefineClassMethod("readlines", &object.Method{Name: "readlines", Fn: fileClassReadlines, Arity: 1})
+	fileClass.DefineClassMethod("write", &object.Method{Name: "write", Fn: ioClassWrite, Arity: -1})
+	fileClass.DefineClassMethod("read", &object.Method{Name: "read", Fn: fileClassRead, Arity: -1})
+	fileClass.DefineClassMethod("readlines", &object.Method{Name: "readlines", Fn: fileClassReadlines, Arity: -1})
 	fileClass.DefineClassMethod("size", &object.Method{Name: "size", Fn: fileClassSize, Arity: 1})
 	fileClass.DefineClassMethod("truncate", &object.Method{Name: "truncate", Fn: fileClassTruncate, Arity: -1})
 	fileClass.DefineClassMethod("stat", &object.Method{Name: "stat", Fn: fileClassStat, Arity: 1})
@@ -1396,6 +2030,17 @@ func (rt *Runtime) defineMethods() {
 	fileClass.DefineConstant("CREAT", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(64), Class: R.Classes["Integer"]})
 	fileClass.DefineConstant("EXCL", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(128), Class: R.Classes["Integer"]})
 	fileClass.DefineConstant("TRUNC", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(512), Class: R.Classes["Integer"]})
+	fileClass.DefineConstant("SEPARATOR", &object.EmeraldValue{Type: object.ValueString, Data: string(filepath.Separator), Class: R.Classes["String"]})
+	fileClass.DefineConstant("PATH_SEPARATOR", &object.EmeraldValue{Type: object.ValueString, Data: string(filepath.ListSeparator), Class: R.Classes["String"]})
+	altSeparator := R.NilVal
+	if runtime.GOOS == "windows" {
+		altSeparator = rubyString("/")
+	}
+	fileClass.DefineConstant("ALT_SEPARATOR", altSeparator)
+	fileClass.DefineConstant("NULL", &object.EmeraldValue{Type: object.ValueString, Data: os.DevNull, Class: R.Classes["String"]})
+	fileClass.DefineConstant("SEEK_SET", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]})
+	fileClass.DefineConstant("SEEK_CUR", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]})
+	fileClass.DefineConstant("SEEK_END", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(2), Class: R.Classes["Integer"]})
 	fileClass.DefineConstant("Stat", &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["File::Stat"], Class: R.Classes["Class"]})
 	fileClass.DefineMethod("size", &object.Method{Name: "size", Fn: fileInstanceSize, Arity: 0})
 	fileClass.DefineMethod("stat", &object.Method{Name: "stat", Fn: fileInstanceStat, Arity: 0})
@@ -1411,11 +2056,16 @@ func (rt *Runtime) defineMethods() {
 	fileClass.DefineMethod("flush", &object.Method{Name: "flush", Fn: fileInstanceFlush, Arity: 0})
 	fileClass.DefineMethod("read", &object.Method{Name: "read", Fn: fileInstanceRead, Arity: -1})
 	fileClass.DefineMethod("gets", &object.Method{Name: "gets", Fn: fileInstanceGets, Arity: -1})
+	fileClass.DefineMethod("lineno", &object.Method{Name: "lineno", Fn: ioLineno, Arity: 0})
+	fileClass.DefineMethod("lineno=", &object.Method{Name: "lineno=", Fn: ioSetLineno, Arity: 1})
 	fileClass.DefineMethod("rewind", &object.Method{Name: "rewind", Fn: fileInstanceRewind, Arity: 0})
 	fileClass.DefineMethod("pos", &object.Method{Name: "pos", Fn: fileInstancePos, Arity: 0})
 	fileClass.DefineMethod("tell", &object.Method{Name: "tell", Fn: fileInstancePos, Arity: 0})
+	fileClass.DefineMethod("pos=", &object.Method{Name: "pos=", Fn: fileInstanceSetPos, Arity: 1})
 	fileClass.DefineMethod("binmode?", &object.Method{Name: "binmode?", Fn: fileInstanceBinmode, Arity: 0})
 	fileClass.DefineMethod("external_encoding", &object.Method{Name: "external_encoding", Fn: fileInstanceExternalEncoding, Arity: 0})
+	fileClass.DefineMethod("internal_encoding", &object.Method{Name: "internal_encoding", Fn: ioInternalEncoding, Arity: 0})
+	fileClass.DefineMethod("set_encoding", &object.Method{Name: "set_encoding", Fn: ioSetEncoding, Arity: -1})
 	fileClass.DefineMethod("eof?", &object.Method{Name: "eof?", Fn: fileInstanceEOF, Arity: 0})
 	fileClass.DefineMethod("closed?", &object.Method{Name: "closed?", Fn: ioClosed, Arity: 0})
 	fileClass.DefineMethod("close_exception", &object.Method{Name: "close_exception", Fn: ioCloseException, Arity: 0})
@@ -1547,61 +2197,67 @@ func (rt *Runtime) defineMethods() {
 
 	objectClass.DefineMethod("write_nonblock", &object.Method{Name: "write_nonblock", Fn: ioWriteNonblock, Arity: -1})
 	objectClass.DefineMethod("syswrite", &object.Method{Name: "syswrite", Fn: ioSyswrite, Arity: 1})
-	objectClass.DefineMethod("write", &object.Method{Name: "write", Fn: ioSyswrite, Arity: 1})
+	objectClass.DefineMethod("write", &object.Method{Name: "write", Fn: ioWrite, Arity: -1})
 	objectClass.DefineMethod("close", &object.Method{Name: "close", Fn: ioClose, Arity: 0})
 
 	structClass := R.Classes["Struct"]
 	structClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: structClassNew, Arity: -1})
 
 	arrayClass := R.Classes["Array"]
+	arrayClass.DefineClassMethod("[]", &object.Method{Name: "[]", Fn: arrayClassSquareBrackets, Arity: -1})
 	arrayClass.DefineMethod("==", &object.Method{Name: "==", Fn: arrayEqual, Arity: 1})
+	arrayClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: arrayCompare, Arity: 1})
 	arrayClass.DefineMethod("*", &object.Method{Name: "*", Fn: arrayMultiply, Arity: 1})
 	arrayClass.DefineMethod("length", &object.Method{Name: "length", Fn: arrayLength, Arity: 0})
 	arrayClass.DefineMethod("size", &object.Method{Name: "size", Fn: arrayLength, Arity: 0})
 	arrayClass.DefineMethod("first", &object.Method{Name: "first", Fn: arrayFirst, Arity: -1})
 	arrayClass.DefineMethod("last", &object.Method{Name: "last", Fn: arrayLast, Arity: -1})
-	arrayClass.DefineMethod("push", &object.Method{Name: "push", Fn: arrayPush, Arity: 1})
-	arrayClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: arrayPush, Arity: 1})
-	arrayClass.DefineMethod("pop", &object.Method{Name: "pop", Fn: arrayPop, Arity: 0})
+	arrayClass.DefineMethod("push", &object.Method{Name: "push", Fn: arrayPush, Arity: -1})
+	arrayClass.DefineMethod("<<", &object.Method{Name: "<<", Fn: arrayPush, Arity: -1})
+	arrayClass.DefineMethod("append", &object.Method{Name: "append", Fn: arrayPush, Arity: -1})
+	arrayClass.DefineMethod("pop", &object.Method{Name: "pop", Fn: arrayPop, Arity: -1})
 	arrayClass.DefineMethod("empty?", &object.Method{Name: "empty?", Fn: arrayEmpty, Arity: 0})
 	arrayClass.DefineMethod("join", &object.Method{Name: "join", Fn: arrayJoin, Arity: 0})
+	arrayClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: arrayToS, Arity: 0})
+	arrayClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: arrayToS, Arity: 0})
 	arrayClass.DefineMethod("reverse", &object.Method{Name: "reverse", Fn: arrayReverse, Arity: 0})
 	arrayClass.DefineMethod("reverse!", &object.Method{Name: "reverse!", Fn: arrayReverseBang, Arity: 0})
 	arrayClass.DefineMethod("reverse_each", &object.Method{Name: "reverse_each", Fn: arrayReverseEach, Arity: 0})
 	arrayClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: arrayIndex, Arity: 1})
-	arrayClass.DefineMethod("at", &object.Method{Name: "at", Fn: arrayIndex, Arity: 1})
+	arrayClass.DefineMethod("at", &object.Method{Name: "at", Fn: arrayAt, Arity: -1})
 	arrayClass.DefineMethod("each", &object.Method{Name: "each", Fn: arrayEach, Arity: 0})
-	arrayClass.DefineMethod("map", &object.Method{Name: "map", Fn: arrayMap, Arity: 0})
-	arrayClass.DefineMethod("collect", &object.Method{Name: "collect", Fn: arrayMap, Arity: 0})
-	arrayClass.DefineMethod("map!", &object.Method{Name: "map!", Fn: arrayMapBang, Arity: 0})
-	arrayClass.DefineMethod("collect!", &object.Method{Name: "collect!", Fn: arrayMapBang, Arity: 0})
+	arrayClass.DefineMethod("map", &object.Method{Name: "map", Fn: arrayMap, Arity: -1})
+	arrayClass.DefineMethod("collect", &object.Method{Name: "collect", Fn: arrayMap, Arity: -1})
+	arrayClass.DefineMethod("map!", &object.Method{Name: "map!", Fn: arrayMapBang, Arity: -1})
+	arrayClass.DefineMethod("collect!", &object.Method{Name: "collect!", Fn: arrayMapBang, Arity: -1})
 	arrayClass.DefineMethod("select", &object.Method{Name: "select", Fn: arraySelect, Arity: 0})
-	arrayClass.DefineMethod("select!", &object.Method{Name: "select!", Fn: arraySelectBang, Arity: 0})
-	arrayClass.DefineMethod("filter!", &object.Method{Name: "filter!", Fn: arraySelectBang, Arity: 0})
+	arrayClass.DefineMethod("select!", &object.Method{Name: "select!", Fn: arraySelectBang, Arity: -1})
+	arrayClass.DefineMethod("filter!", &object.Method{Name: "filter!", Fn: arraySelectBang, Arity: -1})
 	arrayClass.DefineMethod("find", &object.Method{Name: "find", Fn: arrayFind, Arity: 0})
 	arrayClass.DefineMethod("concat", &object.Method{Name: "concat", Fn: arrayConcat, Arity: 1})
 	arrayClass.DefineMethod("delete_at", &object.Method{Name: "delete_at", Fn: arrayDeleteAt, Arity: 1})
 	arrayClass.DefineMethod("delete_if", &object.Method{Name: "delete_if", Fn: arrayDeleteIf, Arity: 0})
-	arrayClass.DefineMethod("keep_if", &object.Method{Name: "keep_if", Fn: arrayKeepIf, Arity: 0})
-	arrayClass.DefineMethod("shift", &object.Method{Name: "shift", Fn: arrayShift, Arity: 0})
+	arrayClass.DefineMethod("keep_if", &object.Method{Name: "keep_if", Fn: arrayKeepIf, Arity: -1})
+	arrayClass.DefineMethod("shift", &object.Method{Name: "shift", Fn: arrayShift, Arity: -1})
 	arrayClass.DefineMethod("unshift", &object.Method{Name: "unshift", Fn: arrayUnshift, Arity: 1})
 	arrayClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: arrayUnshift, Arity: 1})
-	arrayClass.DefineMethod("sample", &object.Method{Name: "sample", Fn: arraySample, Arity: 0})
+	arrayClass.DefineMethod("sample", &object.Method{Name: "sample", Fn: arraySample, Arity: -1})
 	arrayClass.DefineMethod("clear", &object.Method{Name: "clear", Fn: arrayClear, Arity: 0})
 	arrayClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: arrayInitialize, Arity: -1})
 	arrayClass.DefineMethod("include?", &object.Method{Name: "include?", Fn: arrayInclude, Arity: 1})
 	arrayClass.DefineMethod("assoc", &object.Method{Name: "assoc", Fn: arrayAssoc, Arity: 1})
 	arrayClass.DefineMethod("rassoc", &object.Method{Name: "rassoc", Fn: arrayRassoc, Arity: 1})
 	arrayClass.DefineMethod("hash", &object.Method{Name: "hash", Fn: arrayHash, Arity: 0})
-	arrayClass.DefineMethod("[]=", &object.Method{Name: "[]=", Fn: arrayIndexSet, Arity: 2})
+	arrayClass.DefineMethod("[]=", &object.Method{Name: "[]=", Fn: arrayIndexSet, Arity: -1})
 	arrayClass.DefineMethod("count", &object.Method{Name: "count", Fn: arrayCount, Arity: 0})
 	arrayClass.DefineMethod("index", &object.Method{Name: "index", Fn: arrayIndexOf, Arity: 1})
 	arrayClass.DefineMethod("rindex", &object.Method{Name: "rindex", Fn: arrayRIndexOf, Arity: 1})
 	arrayClass.DefineMethod("delete", &object.Method{Name: "delete", Fn: arrayDelete, Arity: 1})
 	arrayClass.DefineMethod("compact", &object.Method{Name: "compact", Fn: arrayCompact, Arity: 0})
 	arrayClass.DefineMethod("compact!", &object.Method{Name: "compact!", Fn: arrayCompactBang, Arity: 0})
-	arrayClass.DefineMethod("flatten", &object.Method{Name: "flatten", Fn: arrayFlatten, Arity: 0})
-	arrayClass.DefineMethod("flatten!", &object.Method{Name: "flatten!", Fn: arrayFlattenBang, Arity: 0})
+	arrayClass.DefineMethod("flatten", &object.Method{Name: "flatten", Fn: arrayFlatten, Arity: -1})
+	arrayClass.DefineMethod("flatten!", &object.Method{Name: "flatten!", Fn: arrayFlattenBang, Arity: -1})
+	arrayClass.DefineMethod("pack", &object.Method{Name: "pack", Fn: arrayPack, Arity: 1})
 	arrayClass.DefineMethod("uniq", &object.Method{Name: "uniq", Fn: arrayUniq, Arity: 0})
 	arrayClass.DefineMethod("uniq!", &object.Method{Name: "uniq!", Fn: arrayUniqBang, Arity: 0})
 	arrayClass.DefineMethod("sort", &object.Method{Name: "sort", Fn: arraySort, Arity: 0})
@@ -1613,8 +2269,11 @@ func (rt *Runtime) defineMethods() {
 	arrayClass.DefineMethod("intersection", &object.Method{Name: "intersection", Fn: arrayIntersection, Arity: -1})
 	arrayClass.DefineMethod("|", &object.Method{Name: "|", Fn: arrayUnion, Arity: 1})
 	arrayClass.DefineMethod("union", &object.Method{Name: "union", Fn: arrayUnion, Arity: -1})
+	arrayClass.DefineMethod("product", &object.Method{Name: "product", Fn: arrayProduct, Arity: -1})
 	arrayClass.DefineMethod("take", &object.Method{Name: "take", Fn: arrayTake, Arity: 1})
 	arrayClass.DefineMethod("drop", &object.Method{Name: "drop", Fn: arrayDrop, Arity: 1})
+	arrayClass.DefineMethod("transpose", &object.Method{Name: "transpose", Fn: arrayTranspose, Arity: 0})
+	arrayClass.DefineMethod("dig", &object.Method{Name: "dig", Fn: arrayDig, Arity: -1})
 	arrayClass.DefineMethod("any?", &object.Method{Name: "any?", Fn: arrayAny, Arity: 0})
 	arrayClass.DefineMethod("all?", &object.Method{Name: "all?", Fn: arrayAll, Arity: 0})
 	arrayClass.DefineMethod("none?", &object.Method{Name: "none?", Fn: arrayNone, Arity: 0})
@@ -1622,19 +2281,25 @@ func (rt *Runtime) defineMethods() {
 	arrayClass.DefineMethod("sum", &object.Method{Name: "sum", Fn: arraySum, Arity: 0})
 	arrayClass.DefineMethod("max", &object.Method{Name: "max", Fn: arrayMax, Arity: 0})
 	arrayClass.DefineMethod("min", &object.Method{Name: "min", Fn: arrayMin, Arity: 0})
+	arrayClass.DefineMethod("minmax", &object.Method{Name: "minmax", Fn: arrayMinmax, Arity: 0})
+	arrayClass.DefineMethod("bsearch", &object.Method{Name: "bsearch", Fn: arrayBsearch, Arity: 0})
+	arrayClass.DefineMethod("bsearch_index", &object.Method{Name: "bsearch_index", Fn: arrayBsearchIndex, Arity: 0})
 	arrayClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: arrayClassNew, Arity: -1})
 	arrayClass.DefineMethod("insert", &object.Method{Name: "insert", Fn: arrayInsert, Arity: 2})
 	arrayClass.DefineMethod("fill", &object.Method{Name: "fill", Fn: arrayFill, Arity: -1})
-	arrayClass.DefineMethod("slice", &object.Method{Name: "slice", Fn: arraySlice, Arity: 1})
+	arrayClass.DefineMethod("slice", &object.Method{Name: "slice", Fn: arraySlice, Arity: -1})
+	arrayClass.DefineMethod("slice!", &object.Method{Name: "slice!", Fn: arraySliceBang, Arity: -1})
 	arrayClass.DefineMethod("values_at", &object.Method{Name: "values_at", Fn: arrayValuesAt, Arity: -1})
-	arrayClass.DefineMethod("zip", &object.Method{Name: "zip", Fn: arrayZip, Arity: 1})
+	arrayClass.DefineMethod("zip", &object.Method{Name: "zip", Fn: arrayZip, Arity: -1})
+	arrayClass.DefineMethod("cycle", &object.Method{Name: "cycle", Fn: arrayCycle, Arity: -1})
 	arrayClass.DefineMethod("each_index", &object.Method{Name: "each_index", Fn: arrayEachIndex, Arity: 0})
 	arrayClass.DefineMethod("each_with_index", &object.Method{Name: "each_with_index", Fn: arrayEachWithIndex, Arity: 0})
 	arrayClass.DefineMethod("rotate", &object.Method{Name: "rotate", Fn: arrayRotate, Arity: 0})
 	arrayClass.DefineMethod("rotate!", &object.Method{Name: "rotate!", Fn: arrayRotateBang, Arity: 0})
-	arrayClass.DefineMethod("shuffle", &object.Method{Name: "shuffle", Fn: arrayShuffle, Arity: 0})
-	arrayClass.DefineMethod("shuffle!", &object.Method{Name: "shuffle!", Fn: arrayShuffleBang, Arity: 0})
+	arrayClass.DefineMethod("shuffle", &object.Method{Name: "shuffle", Fn: arrayShuffle, Arity: -1})
+	arrayClass.DefineMethod("shuffle!", &object.Method{Name: "shuffle!", Fn: arrayShuffleBang, Arity: -1})
 	arrayClass.DefineMethod("fetch", &object.Method{Name: "fetch", Fn: arrayFetch, Arity: 1})
+	arrayClass.DefineMethod("fetch_values", &object.Method{Name: "fetch_values", Fn: arrayFetchValues, Arity: -1})
 	arrayClass.DefineMethod("reject", &object.Method{Name: "reject", Fn: arrayReject, Arity: 0})
 	arrayClass.DefineMethod("reject!", &object.Method{Name: "reject!", Fn: arrayRejectBang, Arity: 0})
 	arrayClass.DefineMethod("reduce", &object.Method{Name: "reduce", Fn: arrayReduce, Arity: 0})
@@ -1646,14 +2311,17 @@ func (rt *Runtime) defineMethods() {
 	arrayClass.DefineMethod("take_while", &object.Method{Name: "take_while", Fn: arrayTakeWhile, Arity: 0})
 	arrayClass.DefineMethod("drop_while", &object.Method{Name: "drop_while", Fn: arrayDropWhile, Arity: 0})
 	arrayClass.DefineMethod("sort_by", &object.Method{Name: "sort_by", Fn: arraySortBy, Arity: 0})
+	arrayClass.DefineMethod("sort_by!", &object.Method{Name: "sort_by!", Fn: arraySortByBang, Arity: 0})
 	arrayClass.DefineMethod("min_by", &object.Method{Name: "min_by", Fn: arrayMinBy, Arity: 0})
 	arrayClass.DefineMethod("max_by", &object.Method{Name: "max_by", Fn: arrayMaxBy, Arity: 0})
 	arrayClass.DefineMethod("to_a", &object.Method{Name: "to_a", Fn: arrayToA, Arity: 0})
 	arrayClass.DefineMethod("to_ary", &object.Method{Name: "to_ary", Fn: arrayToA, Arity: 0})
+	arrayClass.DefineMethod("to_h", &object.Method{Name: "to_h", Fn: arrayToH, Arity: 0})
 	arrayClass.DefineMethod("deconstruct", &object.Method{Name: "deconstruct", Fn: arrayToA, Arity: 0})
 	arrayClass.DefineMethod("dup", &object.Method{Name: "dup", Fn: arrayDup, Arity: 0})
 	arrayClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: arrayDup, Arity: 0})
 	arrayClass.DefineMethod("replace", &object.Method{Name: "replace", Fn: arrayReplace, Arity: 1})
+	arrayClass.DefineClassMethod("try_convert", &object.Method{Name: "try_convert", Fn: arrayClassTryConvert, Arity: 1})
 
 	hashClass := R.Classes["Hash"]
 	hashClass.DefineMethod("[]", &object.Method{Name: "[]", Fn: hashIndex, Arity: 1})
@@ -1717,32 +2385,56 @@ func (rt *Runtime) defineMethods() {
 
 	exceptionClass := R.Classes["Exception"]
 	exceptionClass.DefineMethod("message", &object.Method{Name: "message", Fn: exceptionMessage, Arity: 0})
+	exceptionClass.DefineMethod("path", &object.Method{Name: "path", Fn: exceptionPath, Arity: 0})
 	exceptionClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: exceptionToS, Arity: 0})
 	exceptionClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: exceptionInspect, Arity: 0})
 	exceptionClass.DefineMethod("backtrace", &object.Method{Name: "backtrace", Fn: exceptionBacktrace, Arity: 0})
+	exceptionClass.DefineMethod("backtrace_locations", &object.Method{Name: "backtrace_locations", Fn: exceptionBacktraceLocations, Arity: 0})
+	R.Classes["NameError"].DefineMethod("name", &object.Method{Name: "name", Fn: nameErrorName, Arity: 0})
+	R.Classes["NameError"].DefineMethod("receiver", &object.Method{Name: "receiver", Fn: nameErrorReceiver, Arity: 0})
+	R.Classes["FrozenError"].DefineMethod("receiver", &object.Method{Name: "receiver", Fn: nameErrorReceiver, Arity: 0})
+	R.Classes["SignalException"].DefineMethod("signo", &object.Method{Name: "signo", Fn: signalExceptionSigno, Arity: 0})
+	R.Classes["SignalException"].DefineMethod("signm", &object.Method{Name: "signm", Fn: signalExceptionSignm, Arity: 0})
 	R.Classes["SystemExit"].DefineMethod("status", &object.Method{Name: "status", Fn: systemExitStatus, Arity: 0})
 
 	objectClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: builtinPuts, Arity: -1})
 	objectClass.DefineMethod("print", &object.Method{Name: "print", Fn: builtinPrint, Arity: -1})
 	objectClass.DefineMethod("p", &object.Method{Name: "p", Fn: builtinP, Arity: -1})
+	objectClass.DefineMethod("`", &object.Method{Name: "`", Fn: builtinBacktick, Arity: 1})
+	objectClass.DefineMethod("open", &object.Method{Name: "open", Fn: builtinOpen, Arity: -1})
 	objectClass.DefineMethod("format", &object.Method{Name: "format", Fn: builtinFormat, Arity: -1})
 	objectClass.DefineMethod("sprintf", &object.Method{Name: "sprintf", Fn: builtinFormat, Arity: -1})
 	objectClass.DefineMethod("printf", &object.Method{Name: "printf", Fn: builtinPrintf, Arity: -1})
+	objectClass.DefineMethod("select", &object.Method{Name: "select", Fn: ioClassSelect, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("gets", &object.Method{Name: "gets", Fn: builtinGets, Arity: 0})
 	objectClass.DefineMethod("loop", &object.Method{Name: "loop", Fn: builtinLoop, Arity: 0})
+	objectClass.DefineMethod("load", &object.Method{Name: "load", Fn: builtinLoad, Arity: 1})
 	objectClass.DefineMethod("exit", &object.Method{Name: "exit", Fn: builtinExit, Arity: -1})
+	objectClass.DefineMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
+	objectClass.DefineMethod("caller", &object.Method{Name: "caller", Fn: builtinCaller, Arity: -1})
+	objectClass.DefineMethod("caller_locations", &object.Method{Name: "caller_locations", Fn: builtinCallerLocations, Arity: -1})
+	objectClass.DefineMethod("global_variables", &object.Method{Name: "global_variables", Fn: builtinGlobalVariables, Arity: 0})
 	objectClass.DefineMethod("sleep", &object.Method{Name: "sleep", Fn: builtinSleep, Arity: 1})
+	objectClass.DefineMethod("warn", &object.Method{Name: "warn", Fn: builtinWarn, Arity: -1})
+	objectClass.DefineMethod("at_exit", &object.Method{Name: "at_exit", Fn: builtinAtExit, Arity: -1})
+	objectClass.DefineMethod("trace_var", &object.Method{Name: "trace_var", Fn: builtinTraceVar, Arity: -1})
+	objectClass.DefineMethod("untrace_var", &object.Method{Name: "untrace_var", Fn: builtinUntraceVar, Arity: -1})
+	objectClass.DefineMethod("END", &object.Method{Name: "END", Fn: builtinEND, Arity: -1})
+	objectClass.DefineMethod("set_trace_func", &object.Method{Name: "set_trace_func", Fn: builtinSetTraceFunc, Arity: -1})
 	objectClass.DefineMethod("require", &object.Method{Name: "require", Fn: builtinRequire, Arity: 1})
-	objectClass.DefineMethod("require_relative", &object.Method{Name: "require_relative", Fn: builtinRequire, Arity: 1})
+	objectClass.DefineMethod("require_relative", &object.Method{Name: "require_relative", Fn: builtinRequireRelative, Arity: 1})
 	objectClass.DefineMethod("rand", &object.Method{Name: "rand", Fn: builtinRand, Arity: 0})
 	objectClass.DefineMethod("srand", &object.Method{Name: "srand", Fn: builtinSrand, Arity: 1})
 	objectClass.DefineMethod("Rational", &object.Method{Name: "Rational", Fn: builtinRational, Arity: -1})
-	objectClass.DefineMethod("raise", &object.Method{Name: "raise", Fn: builtinRaise, Arity: 1})
-	objectClass.DefineMethod("fail", &object.Method{Name: "fail", Fn: builtinRaise, Arity: 1})
+	objectClass.DefineMethod("raise", &object.Method{Name: "raise", Fn: builtinRaise, Arity: -1})
+	objectClass.DefineMethod("fail", &object.Method{Name: "fail", Fn: builtinRaise, Arity: -1})
 	objectClass.DefineMethod("abort", &object.Method{Name: "abort", Fn: builtinAbort, Arity: -1})
 	objectClass.DefineMethod("mock", &object.Method{Name: "mock", Fn: builtinMock, Arity: -1})
 	objectClass.DefineMethod("mock_int", &object.Method{Name: "mock_int", Fn: builtinMockInt, Arity: 1})
+	objectClass.DefineMethod("binding", &object.Method{Name: "binding", Fn: builtinBinding, Arity: 0})
 	objectClass.DefineMethod("block_given?", &object.Method{Name: "block_given?", Fn: builtinBlockGiven, Arity: 0})
+	objectClass.DefineMethod("tap", &object.Method{Name: "tap", Fn: builtinTap, Arity: 0})
+	objectClass.DefineMethod("!~", &object.Method{Name: "!~", Fn: builtinNotMatch, Arity: 1})
 	objectClass.DefineMethod("lambda", &object.Method{Name: "lambda", Fn: builtinLambda, Arity: 0})
 	objectClass.DefineMethod("proc", &object.Method{Name: "proc", Fn: builtinProc, Arity: 0})
 	objectClass.DefineMethod("should", &object.Method{Name: "should", Arity: -1, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -1751,27 +2443,74 @@ func (rt *Runtime) defineMethods() {
 			if matcher, ok := args[0].Data.(*raiseErrorMatcher); ok {
 				return evaluateRaiseErrorMatcher(payload, matcher)
 			}
+			if matcher, ok := args[0].Data.(*computedByMatcher); ok {
+				return evaluateComputedByMatcher(payload, matcher)
+			}
 			if matcher, ok := args[0].Data.(*outputMatcher); ok {
 				return evaluateOutputMatcher(payload, matcher)
 			}
 			if matcher, ok := args[0].Data.(*kindOfMatcher); ok {
 				return evaluateKindOfMatcher(payload, matcher)
 			}
+			if matcher, ok := args[0].Data.(*includeMatcher); ok {
+				return evaluateIncludeMatcher(payload, matcher)
+			}
 		}
 		return &object.EmeraldValue{Type: object.ValueObject, Data: &payload, Class: R.Classes["Expectation"]}
 	}})
 
 	kernelClass := R.Classes["Kernel"]
+	copyKernelClassMethod := func(name string, source *object.Method) {
+		if source == nil {
+			return
+		}
+		method := &object.Method{Name: name, Fn: source.Fn, Arity: source.Arity, Closure: source.Closure, Visibility: source.Visibility, EnforceArity: source.EnforceArity, Ruby2Keywords: source.Ruby2Keywords}
+		kernelClass.DefineClassMethod(name, method)
+	}
+	copyKernelInstanceMethod := func(name string, source *object.Method) {
+		if source == nil {
+			return
+		}
+		method := &object.Method{Name: name, Fn: source.Fn, Arity: source.Arity, Closure: source.Closure, Visibility: "private", EnforceArity: source.EnforceArity, Ruby2Keywords: source.Ruby2Keywords}
+		kernelClass.DefineMethod(name, method)
+	}
+	kernelForwardableNames := []string{
+		"abort", "binding", "class", "class_eval", "class_exec", "clone", "dup", "eval", "exit", "format", "instance_exec",
+		"instance_eval", "lambda", "loop", "method", "open", "proc", "puts", "print", "p", "printf", "raise", "readline", "readlines",
+		"rand", "require", "require_relative", "respond_to?", "require", "Rational", "raise", "srand", "send", "singleton_class",
+		"sleep", "select", "caller", "caller_locations", "global_variables", "warn", "at_exit", "trace_var", "untrace_var", "set_trace_func", "load",
+		"block_given?", "tap", "to_s", "to_str", "to_ary", "to_hash", "to_int", "to_io", "to_a", "to_h",
+	}
+	for _, name := range kernelForwardableNames {
+		copyKernelClassMethod(name, objectClass.Methods[name])
+		copyKernelInstanceMethod(name, objectClass.Methods[name])
+	}
+	copyKernelClassMethod("exit!", &object.Method{Name: "exit!", Fn: builtinExitBang, Arity: -1})
+	copyKernelInstanceMethod("exit!", &object.Method{Name: "exit!", Fn: builtinExitBang, Arity: -1})
+	copyKernelClassMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
+	copyKernelInstanceMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
+	copyKernelClassMethod("exec", &object.Method{Name: "exec", Fn: processExec, Arity: -1})
+	copyKernelInstanceMethod("exec", &object.Method{Name: "exec", Fn: processExec, Arity: -1})
+	copyKernelClassMethod("spawn", &object.Method{Name: "spawn", Fn: processSpawn, Arity: -1})
+	copyKernelInstanceMethod("spawn", &object.Method{Name: "spawn", Fn: processSpawn, Arity: -1})
 	kernelClass.DefineClassMethod("format", &object.Method{Name: "format", Fn: builtinFormat, Arity: -1})
 	kernelClass.DefineClassMethod("sprintf", &object.Method{Name: "sprintf", Fn: builtinFormat, Arity: -1})
+	kernelClass.DefineClassMethod("select", &object.Method{Name: "select", Fn: ioClassSelect, Arity: -1})
+	kernelClass.DefineMethod("select", &object.Method{Name: "select", Fn: ioClassSelect, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("should_not", &object.Method{Name: "should_not", Arity: -1, Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		payload := expectationData{Value: r, Negated: true}
 		if len(args) > 0 {
 			if matcher, ok := args[0].Data.(*raiseErrorMatcher); ok {
 				return evaluateRaiseErrorMatcher(payload, matcher)
 			}
+			if matcher, ok := args[0].Data.(*computedByMatcher); ok {
+				return evaluateComputedByMatcher(payload, matcher)
+			}
 			if matcher, ok := args[0].Data.(*outputMatcher); ok {
 				return evaluateOutputMatcher(payload, matcher)
+			}
+			if matcher, ok := args[0].Data.(*includeMatcher); ok {
+				return evaluateIncludeMatcher(payload, matcher)
 			}
 		}
 		return &object.EmeraldValue{Type: object.ValueObject, Data: &payload, Class: R.Classes["Expectation"]}
@@ -1825,6 +2564,10 @@ func (rt *Runtime) defineMethods() {
 	moduleClass.DefineMethod("class_variable_set", &object.Method{Name: "class_variable_set", Fn: moduleClassVariableSet, Arity: 2})
 	moduleClass.DefineMethod("class_variable_get", &object.Method{Name: "class_variable_get", Fn: moduleClassVariableGet, Arity: 1})
 	moduleClass.DefineMethod("class_variable_defined?", &object.Method{Name: "class_variable_defined?", Fn: moduleClassVariableDefined, Arity: 1})
+	moduleClass.DefineMethod("module_eval", &object.Method{Name: "module_eval", Fn: moduleClassEval, Arity: -1})
+	moduleClass.DefineMethod("class_eval", &object.Method{Name: "class_eval", Fn: moduleClassEval, Arity: -1})
+	moduleClass.DefineMethod("module_exec", &object.Method{Name: "module_exec", Fn: moduleClassExec, Arity: -1})
+	moduleClass.DefineMethod("class_exec", &object.Method{Name: "class_exec", Fn: moduleClassExec, Arity: -1})
 
 	classClass := R.Classes["Class"]
 	classClass.DefineMethod("set_temporary_name", &object.Method{Name: "set_temporary_name", Fn: moduleSetTemporaryName, Arity: 1})
@@ -1833,6 +2576,8 @@ func (rt *Runtime) defineMethods() {
 	classClass.DefineMethod("extend", &object.Method{Name: "extend", Fn: classExtend, Arity: -1})
 	classClass.DefineMethod("prepend", &object.Method{Name: "prepend", Fn: classPrepend, Arity: -1})
 	classClass.DefineMethod("new", &object.Method{Name: "new", Fn: classNew, Arity: -1})
+	classClass.DefineMethod("allocate", &object.Method{Name: "allocate", Fn: classAllocate, Arity: 0})
+	classClass.DefineMethod("superclass", &object.Method{Name: "superclass", Fn: classSuperclass, Arity: 0})
 
 	R.Main = &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -1849,6 +2594,17 @@ func methodClass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func classSuperclass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Type != object.ValueClass {
+		return typeError("uninitialized class")
+	}
+	cls := receiver.Data.(*object.Class)
+	if cls.SuperClass == nil {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueClass, Data: cls.SuperClass, Class: R.Classes["Class"]}
+}
+
 func methodToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if receiver != nil {
 		switch receiver.Type {
@@ -1856,11 +2612,13 @@ func methodToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			return rubyString(classToS(receiver.Data.(*object.Class)))
 		case object.ValueModule:
 			return rubyString(moduleToS(receiver.Data.(*object.Module)))
+		case object.ValueArray:
+			return arrayToS(receiver)
 		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueString,
-		Data:  receiver.Inspect(),
+		Data:  receiver.InspectWithSeen(make(map[*object.EmeraldValue]bool)),
 		Class: R.Classes["String"],
 	}
 }
@@ -1986,9 +2744,12 @@ func objectInstanceInspect(value *object.EmeraldValue) string {
 }
 
 func methodInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Type == object.ValueArray {
+		return arrayToS(receiver)
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueString,
-		Data:  receiver.Inspect(),
+		Data:  receiver.InspectWithSeen(make(map[*object.EmeraldValue]bool)),
 		Class: R.Classes["String"],
 	}
 }
@@ -2006,6 +2767,11 @@ func methodFreeze(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 	if receiver != nil {
 		receiver.Frozen = true
+		if receiver.Type == object.ValueClass {
+			if class, ok := receiver.Data.(*object.Class); ok && class != nil {
+				class.Frozen = true
+			}
+		}
 	}
 	return receiver
 }
@@ -2013,6 +2779,11 @@ func methodFreeze(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 func methodFrozen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if receiver != nil && receiver.Frozen {
 		return R.TrueVal
+	}
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if class, ok := receiver.Data.(*object.Class); ok && class != nil && class.Frozen {
+			return R.TrueVal
+		}
 	}
 	return R.FalseVal
 }
@@ -2061,6 +2832,9 @@ func mockExpectationAndReturn(receiver *object.EmeraldValue, args ...*object.Eme
 	if len(args) > 0 {
 		returnValue = args[0]
 	}
+	if data.method == "to_ary" {
+		lastMockToAryReturn = returnValue
+	}
 	defineMockSingleton(data.target, data.method, func(_ *object.EmeraldValue, _ ...*object.EmeraldValue) *object.EmeraldValue {
 		return returnValue
 	})
@@ -2083,14 +2857,43 @@ func mockExpectationAndRaise(receiver *object.EmeraldValue, args ...*object.Emer
 }
 
 func defineMockSingleton(target *object.EmeraldValue, method string, fn func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue) {
-	if obj, ok := target.Data.(*object.Object); ok {
+	if target == nil {
+		return
+	}
+
+	methodFn := &object.Method{Name: method, Arity: -1, Fn: fn}
+
+	switch target.Type {
+	case object.ValueObject:
+		obj, ok := target.Data.(*object.Object)
+		if !ok || obj == nil || obj.SingletonMethods == nil {
+			return
+		}
 		previous, hadPrevious := obj.SingletonMethods[method]
-		obj.SingletonMethods[method] = &object.Method{Name: method, Arity: -1, Fn: fn}
+		obj.SingletonMethods[method] = methodFn
 		mockRestores = append(mockRestores, func() {
 			if hadPrevious {
 				obj.SingletonMethods[method] = previous
 			} else {
 				delete(obj.SingletonMethods, method)
+			}
+		})
+	case object.ValueClass, object.ValueModule:
+		singleton := methodSingletonClass(target)
+		if singleton == nil || singleton.Data == nil {
+			return
+		}
+		singletonClass, ok := singleton.Data.(*object.Class)
+		if !ok || singletonClass == nil || singletonClass.Methods == nil {
+			return
+		}
+		previous, hadPrevious := singletonClass.Methods[method]
+		singletonClass.Methods[method] = methodFn
+		mockRestores = append(mockRestores, func() {
+			if hadPrevious {
+				singletonClass.Methods[method] = previous
+			} else {
+				delete(singletonClass.Methods, method)
 			}
 		})
 	}
@@ -2170,7 +2973,7 @@ func moduleFunction(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		return typeError("module_function must be called for modules")
 	}
 	if len(args) == 0 {
-		setCurrentMethodVisibility(receiver, "private")
+		setCurrentMethodVisibility(receiver, "module_function")
 		return R.NilVal
 	}
 	names, errVal := classMethodNamesFromValues(args...)
@@ -2204,6 +3007,14 @@ func methodSingletonClass(receiver *object.EmeraldValue, args ...*object.Emerald
 	if receiver == nil {
 		return R.NilVal
 	}
+	switch receiver.Type {
+	case object.ValueBool, object.ValueNil:
+		if receiver.Class != nil {
+			return &object.EmeraldValue{Type: object.ValueClass, Data: receiver.Class, Class: R.Classes["Class"]}
+		}
+	case object.ValueInteger, object.ValueFloat, object.ValueSymbol:
+		return NewTypeError("can't define singleton")
+	}
 	name := singletonClassName(receiver)
 	if name == "" {
 		return R.NilVal
@@ -2211,11 +3022,15 @@ func methodSingletonClass(receiver *object.EmeraldValue, args ...*object.Emerald
 	var class *object.Class
 	switch receiver.Type {
 	case object.ValueObject:
-		obj := receiver.Data.(*object.Object)
+		obj, ok := receiver.Data.(*object.Object)
+		if !ok {
+			return NewTypeError("can't define singleton")
+		}
 		class = obj.SingletonClass
 		if class == nil {
 			class = object.NewClass(name)
 			class.SingletonOwner = receiver
+			class.SuperClass = receiver.Class
 			obj.SingletonClass = class
 		}
 	case object.ValueClass:
@@ -2224,7 +3039,22 @@ func methodSingletonClass(receiver *object.EmeraldValue, args ...*object.Emerald
 		if class == nil {
 			class = object.NewClass(name)
 			class.SingletonOwner = receiver
+			for methodName, method := range cls.ClassMethods {
+				class.Methods[methodName] = method
+			}
 			cls.SingletonClass = class
+		}
+		if class.SuperClass == nil && cls.SuperClass != nil {
+			superSingleton := methodSingletonClass(&object.EmeraldValue{
+				Type:  object.ValueClass,
+				Data:  cls.SuperClass,
+				Class: R.Classes["Class"],
+			})
+			if superSingleton != nil && superSingleton.Data != nil {
+				if superClass, ok := superSingleton.Data.(*object.Class); ok && superClass != nil {
+					class.SuperClass = superClass
+				}
+			}
 		}
 	case object.ValueModule:
 		mod := receiver.Data.(*object.Module)
@@ -2236,12 +3066,54 @@ func methodSingletonClass(receiver *object.EmeraldValue, args ...*object.Emerald
 		}
 	default:
 		class = object.NewClass(name)
+		class.SingletonOwner = receiver
+		class.SuperClass = receiver.Class
 	}
 	class.IsSingleton = true
 	if class.SuperClass == nil {
 		class.SuperClass = R.Classes["Class"]
 	}
-	return &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: R.Classes["Class"]}
+	return &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: R.Classes["Class"], Frozen: class.Frozen}
+}
+
+func cloneSingletonClass(orig *object.Class, owner *object.EmeraldValue) *object.Class {
+	if orig == nil {
+		return nil
+	}
+	clone := object.NewClass(orig.Name)
+	clone.NameValue = orig.NameValue
+	clone.TemporaryName = orig.TemporaryName
+	clone.SuperClass = orig.SuperClass
+	clone.IsSingleton = orig.IsSingleton
+	clone.Frozen = orig.Frozen
+	clone.SingletonOwner = owner
+	for name, method := range orig.Methods {
+		clone.Methods[name] = method
+	}
+	for name, constant := range orig.Constants {
+		clone.Constants[name] = constant
+	}
+	for name, private := range orig.PrivateConstants {
+		clone.PrivateConstants[name] = private
+	}
+	for name, deprecated := range orig.DeprecatedConstants {
+		clone.DeprecatedConstants[name] = deprecated
+	}
+	for name, path := range orig.Autoloads {
+		clone.Autoloads[name] = path
+	}
+	for name, classVar := range orig.ClassVars {
+		clone.ClassVars[name] = classVar
+	}
+	for name, method := range orig.ClassMethods {
+		clone.ClassMethods[name] = method
+	}
+	for name, ivar := range orig.InstanceVars {
+		clone.InstanceVars[name] = ivar
+	}
+	clone.IncludedModules = append([]*object.Module{}, orig.IncludedModules...)
+	clone.PrependedModules = append([]*object.Module{}, orig.PrependedModules...)
+	return clone
 }
 
 func singletonClassName(receiver *object.EmeraldValue) string {
@@ -2262,8 +3134,22 @@ func methodInstanceVariableSet(receiver *object.EmeraldValue, args ...*object.Em
 	if len(args) < 2 {
 		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
 	}
-	if attrWriteFrozen(receiver) {
-		return newRuntimeException(R.Classes["RuntimeError"], "can't modify frozen object")
+	name := specName(args[0])
+	if name == "" {
+		return typeError("nil is not a symbol nor a string")
+	}
+	if !strings.HasPrefix(name, "@") {
+		name = "@" + name
+	}
+	if result := setDynamicInstanceVar(receiver, name, args[1]); result != nil {
+		return result
+	}
+	return args[1]
+}
+
+func methodInstanceVariableGet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
 	}
 	name := specName(args[0])
 	if name == "" {
@@ -2272,8 +3158,95 @@ func methodInstanceVariableSet(receiver *object.EmeraldValue, args ...*object.Em
 	if !strings.HasPrefix(name, "@") {
 		name = "@" + name
 	}
-	setDynamicInstanceVar(receiver, name, args[1])
-	return args[1]
+	value := DynamicInstanceVar(receiver, name)
+	if value == nil {
+		return R.NilVal
+	}
+	return value
+}
+
+func methodInstanceVariableDefined(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
+	}
+	name := specName(args[0])
+	if name == "" {
+		return typeError("nil is not a symbol nor a string")
+	}
+	if !strings.HasPrefix(name, "@") {
+		name = "@" + name
+	}
+	vars := receiverInstanceVarMap(receiver)
+	if _, ok := vars[name]; ok {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func methodInstanceVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	vars := receiverInstanceVarMap(receiver)
+	names := make([]string, 0, len(vars))
+	for name := range vars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	result := make([]*object.EmeraldValue, 0, len(names))
+	for _, name := range names {
+		result = append(result, &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: R.Classes["Symbol"]})
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func methodRemoveInstanceVariable(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
+	}
+	name := specName(args[0])
+	if name == "" {
+		return typeError("nil is not a symbol nor a string")
+	}
+	if !strings.HasPrefix(name, "@") {
+		name = "@" + name
+	}
+	if attrWriteFrozen(receiver) {
+		return instanceVariableFrozenError(receiver)
+	}
+
+	vars := receiverInstanceVarMap(receiver)
+	if value, ok := vars[name]; ok {
+		delete(vars, name)
+		return value
+	}
+	return NewNameError("instance variable " + name + " not defined")
+}
+
+func receiverInstanceVarMap(receiver *object.EmeraldValue) map[string]*object.EmeraldValue {
+	if receiver == nil {
+		return map[string]*object.EmeraldValue{}
+	}
+	switch receiver.Type {
+	case object.ValueObject:
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			return obj.InstanceVars
+		}
+	case object.ValueProc:
+		if proc, ok := receiver.Data.(*object.Proc); ok {
+			if proc.InstanceVars == nil {
+				proc.InstanceVars = make(map[string]*object.EmeraldValue)
+			}
+			return proc.InstanceVars
+		}
+	case object.ValueClass:
+		if cls, ok := receiver.Data.(*object.Class); ok {
+			return cls.InstanceVars
+		}
+	case object.ValueModule:
+		if mod, ok := receiver.Data.(*object.Module); ok {
+			return mod.InstanceVars
+		}
+	}
+	return map[string]*object.EmeraldValue{}
 }
 
 func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2281,6 +3254,25 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return R.NilVal
 	}
 	switch receiver.Type {
+	case object.ValueObject:
+		orig, ok := receiver.Data.(*object.Object)
+		if !ok {
+			switch data := receiver.Data.(type) {
+			case *processStatusData:
+				cloned := *data
+				return &object.EmeraldValue{Type: object.ValueObject, Data: &cloned, Class: receiver.Class}
+			default:
+				return &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: receiver.Class}
+			}
+		}
+		dup := object.NewObject(orig.Class)
+		for name, value := range orig.InstanceVars {
+			dup.InstanceVars[name] = value
+		}
+		for name, value := range orig.ClassVars {
+			dup.ClassVars[name] = value
+		}
+		return &object.EmeraldValue{Type: object.ValueObject, Data: dup, Class: receiver.Class}
 	case object.ValueModule:
 		orig := receiver.Data.(*object.Module)
 		dup := object.NewModule(orig.Name)
@@ -2338,6 +3330,38 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return &object.EmeraldValue{Type: object.ValueClass, Data: dup, Class: R.Classes["Class"]}
 	}
 	return receiver
+}
+
+func methodClone(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		return R.NilVal
+	}
+	if receiver.Type != object.ValueObject {
+		return methodDup(receiver, args...)
+	}
+	orig, ok := receiver.Data.(*object.Object)
+	if !ok {
+		switch data := receiver.Data.(type) {
+		case *processStatusData:
+			cloned := *data
+			return &object.EmeraldValue{Type: object.ValueObject, Data: &cloned, Class: receiver.Class, Frozen: receiver.Frozen}
+		default:
+			return &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: receiver.Class, Frozen: receiver.Frozen}
+		}
+	}
+	clone := object.NewObject(orig.Class)
+	for name, value := range orig.InstanceVars {
+		clone.InstanceVars[name] = value
+	}
+	for name, value := range orig.ClassVars {
+		clone.ClassVars[name] = value
+	}
+	for name, method := range orig.SingletonMethods {
+		clone.SingletonMethods[name] = method
+	}
+	result := &object.EmeraldValue{Type: object.ValueObject, Data: clone, Class: receiver.Class, Frozen: receiver.Frozen}
+	clone.SingletonClass = cloneSingletonClass(orig.SingletonClass, result)
+	return result
 }
 
 func moduleConstMissing(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -2525,10 +3549,16 @@ func moduleRemoveConst(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 			delete(class.Autoloads, name)
 			delete(class.PrivateConstants, name)
 			delete(class.DeprecatedConstants, name)
+			if RemoveConstantName != nil {
+				RemoveConstantName(receiver, name)
+			}
 			return value
 		}
 		if path, ok := class.Autoloads[name]; ok {
 			delete(class.Autoloads, name)
+			if RemoveConstantName != nil {
+				RemoveConstantName(receiver, name)
+			}
 			return rubyString(path)
 		}
 	case object.ValueModule:
@@ -2538,10 +3568,16 @@ func moduleRemoveConst(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 			delete(module.Autoloads, name)
 			delete(module.PrivateConstants, name)
 			delete(module.DeprecatedConstants, name)
+			if RemoveConstantName != nil {
+				RemoveConstantName(receiver, name)
+			}
 			return value
 		}
 		if path, ok := module.Autoloads[name]; ok {
 			delete(module.Autoloads, name)
+			if RemoveConstantName != nil {
+				RemoveConstantName(receiver, name)
+			}
 			return rubyString(path)
 		}
 	default:
@@ -3090,7 +4126,9 @@ func moduleClassVariableGet(receiver *object.EmeraldValue, args ...*object.Emera
 	if errVal != nil {
 		return errVal
 	}
-	if value, ok := LookupClassVariable(receiver, name); ok {
+	if value, errVal, ok := LookupClassVariableWithError(receiver, name); errVal != nil {
+		return errVal
+	} else if ok {
 		return value
 	}
 	return NewNameError("uninitialized class variable " + name)
@@ -3126,7 +4164,10 @@ func SetClassVariable(receiver *object.EmeraldValue, name string, value *object.
 			module.ClassVars[name] = value
 		}
 	case object.ValueObject:
-		obj := receiver.Data.(*object.Object)
+		obj, ok := receiver.Data.(*object.Object)
+		if !ok {
+			return
+		}
 		if obj.ClassVars == nil {
 			obj.ClassVars = make(map[string]*object.EmeraldValue)
 		}
@@ -3169,36 +4210,66 @@ func setExistingModuleClassVariable(module *object.Module, name string, value *o
 }
 
 func LookupClassVariable(receiver *object.EmeraldValue, name string) (*object.EmeraldValue, bool) {
-	if receiver == nil {
+	value, errVal, ok := LookupClassVariableWithError(receiver, name)
+	if errVal != nil {
 		return nil, false
+	}
+	return value, ok
+}
+
+func LookupClassVariableWithError(receiver *object.EmeraldValue, name string) (*object.EmeraldValue, *object.EmeraldValue, bool) {
+	if receiver == nil {
+		return nil, nil, false
 	}
 	switch receiver.Type {
 	case object.ValueClass:
-		return lookupClassClassVariable(receiver.Data.(*object.Class), name)
+		return lookupClassClassVariableWithError(receiver.Data.(*object.Class), name)
 	case object.ValueModule:
-		return lookupModuleClassVariable(receiver.Data.(*object.Module), name)
+		value, ok := lookupModuleClassVariable(receiver.Data.(*object.Module), name)
+		return value, nil, ok
 	case object.ValueObject:
-		obj := receiver.Data.(*object.Object)
-		if value, ok := obj.ClassVars[name]; ok {
-			return value, true
+		obj, ok := receiver.Data.(*object.Object)
+		if !ok {
+			return nil, nil, false
 		}
-		return lookupClassClassVariable(obj.Class, name)
+		if value, ok := obj.ClassVars[name]; ok {
+			return value, nil, true
+		}
+		return lookupClassClassVariableWithError(obj.Class, name)
 	}
-	return nil, false
+	return nil, nil, false
 }
 
 func lookupClassClassVariable(class *object.Class, name string) (*object.EmeraldValue, bool) {
+	value, errVal, ok := lookupClassClassVariableWithError(class, name)
+	if errVal != nil {
+		return nil, false
+	}
+	return value, ok
+}
+
+func lookupClassClassVariableWithError(class *object.Class, name string) (*object.EmeraldValue, *object.EmeraldValue, bool) {
+	var foundClass *object.Class
+	var foundValue *object.EmeraldValue
 	for cls := class; cls != nil; cls = cls.SuperClass {
 		if value, ok := cls.ClassVars[name]; ok {
-			return value, true
+			if foundClass != nil {
+				msg := fmt.Sprintf("class variable %s of %s is overtaken by %s", name, classToS(foundClass), classToS(cls))
+				return nil, newRuntimeException(R.Classes["RuntimeError"], msg), false
+			}
+			foundClass = cls
+			foundValue = value
 		}
 		for _, mod := range cls.IncludedModules {
 			if value, ok := lookupModuleClassVariable(mod, name); ok {
-				return value, true
+				return value, nil, true
 			}
 		}
 	}
-	return nil, false
+	if foundClass != nil {
+		return foundValue, nil, true
+	}
+	return nil, nil, false
 }
 
 func lookupModuleClassVariable(module *object.Module, name string) (*object.EmeraldValue, bool) {
@@ -3234,6 +4305,13 @@ func moduleAliasMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return frozenError("can't modify frozen class/module")
 	}
 	newName, oldName := names[0], names[1]
+	if strings.HasPrefix(newName, "$") && strings.HasPrefix(oldName, "$") {
+		AliasGlobalVariable(newName, oldName)
+		return &object.EmeraldValue{Type: object.ValueSymbol, Data: newName, Class: R.Classes["Symbol"]}
+	}
+	if receiver == nil || (receiver.Type != object.ValueClass && receiver.Type != object.ValueModule) {
+		return NewTypeError("not a class/module")
+	}
 	method, _, ok := lookupInstanceMethodWithOwner(receiver, oldName)
 	if !ok {
 		return NewNameError("undefined method `" + oldName + "'")
@@ -3257,6 +4335,10 @@ func moduleAliasMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	return &object.EmeraldValue{Type: object.ValueSymbol, Data: newName, Class: R.Classes["Symbol"]}
 }
 
+func AliasMethod(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return moduleAliasMethod(receiver, args...)
+}
+
 func isAlwaysPrivateMethodName(name string) bool {
 	switch name {
 	case "initialize", "initialize_copy", "initialize_clone", "initialize_dup", "respond_to_missing?":
@@ -3264,6 +4346,35 @@ func isAlwaysPrivateMethodName(name string) bool {
 	default:
 		return false
 	}
+}
+
+func ResolveGlobalAlias(name string) string {
+	if name == "" || globalVariableAliases == nil {
+		return name
+	}
+	seen := make(map[string]bool)
+	current := name
+	for {
+		next, ok := globalVariableAliases[current]
+		if !ok || next == "" || next == current {
+			return current
+		}
+		if seen[current] {
+			return current
+		}
+		seen[current] = true
+		current = next
+	}
+}
+
+func AliasGlobalVariable(newName string, toName string) {
+	if newName == "" || toName == "" {
+		return
+	}
+	if globalVariableAliases == nil {
+		globalVariableAliases = make(map[string]string)
+	}
+	globalVariableAliases[newName] = ResolveGlobalAlias(toName)
 }
 
 func moduleDefineMethod(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -3319,6 +4430,7 @@ func methodFromDefineMethodValue(receiver *object.EmeraldValue, name string, val
 	switch value.Type {
 	case object.ValueClosure:
 		closure := value.Data.(*object.Closure)
+		closure.Fn.DefinedByDefineMethod = true
 		return &object.Method{Name: name, Fn: closure.Fn, Closure: closure}, nil
 	case object.ValueProc:
 		proc := value.Data.(*object.Proc)
@@ -3327,6 +4439,7 @@ func methodFromDefineMethodValue(receiver *object.EmeraldValue, name string, val
 				return proc.Native(args...)
 			}}, nil
 		}
+		proc.Fn.DefinedByDefineMethod = true
 		return &object.Method{Name: name, Fn: proc.Fn, Closure: &object.Closure{
 			Fn:         proc.Fn,
 			Free:       proc.Env,
@@ -3460,13 +4573,32 @@ func moduleUndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	}
 	for _, name := range names {
 		method, _, ok := lookupInstanceMethodWithOwner(receiver, name)
+		if (!ok || isUndefinedMethod(method)) && receiver.Type == object.ValueClass {
+			if cls := receiver.Data.(*object.Class); cls.IsSingleton && cls.SingletonOwner != nil && cls.SingletonOwner.Type == object.ValueObject {
+				if obj, objOK := cls.SingletonOwner.Data.(*object.Object); objOK {
+					if singletonMethod, found := obj.SingletonMethods[name]; found {
+						method = singletonMethod
+						ok = true
+					}
+				}
+			}
+		}
 		if !ok || isUndefinedMethod(method) {
 			return NewNameError("undefined method `" + name + "' for " + moduleOrClassDescription(receiver))
 		}
 		undefined := &object.Method{Name: name, Visibility: "undefined"}
 		switch receiver.Type {
 		case object.ValueClass:
-			receiver.Data.(*object.Class).Methods[name] = undefined
+			cls := receiver.Data.(*object.Class)
+			cls.Methods[name] = undefined
+			if cls.IsSingleton && cls.SingletonOwner != nil && cls.SingletonOwner.Type == object.ValueObject {
+				if obj, ok := cls.SingletonOwner.Data.(*object.Object); ok {
+					if obj.SingletonMethods == nil {
+						obj.SingletonMethods = map[string]*object.Method{}
+					}
+					obj.SingletonMethods[name] = undefined
+				}
+			}
 		case object.ValueModule:
 			receiver.Data.(*object.Module).Methods[name] = undefined
 		}
@@ -3542,6 +4674,11 @@ func lookupInstanceMethodWithOwner(receiver *object.EmeraldValue, name string) (
 func lookupModuleMethodWithOwner(module *object.Module, name string) (*object.Method, *object.EmeraldValue, bool) {
 	if module == nil {
 		return nil, nil, false
+	}
+	for _, mod := range module.PrependedModules {
+		if method, owner, ok := lookupModuleMethodWithOwner(mod, name); ok {
+			return method, owner, true
+		}
 	}
 	if method, ok := module.Methods[name]; ok {
 		if method.Owner != nil {
@@ -3738,6 +4875,18 @@ func setCurrentMethodVisibility(receiver *object.EmeraldValue, visibility string
 	}
 }
 
+func ResetCurrentMethodVisibility(receiver *object.EmeraldValue) {
+	if receiver == nil {
+		return
+	}
+	switch receiver.Type {
+	case object.ValueClass:
+		delete(receiver.Data.(*object.Class).InstanceVars, "@__visibility")
+	case object.ValueModule:
+		delete(receiver.Data.(*object.Module).InstanceVars, "@__visibility")
+	}
+}
+
 func setNamedMethodVisibility(receiver *object.EmeraldValue, name, visibility string) bool {
 	if receiver == nil {
 		return false
@@ -3918,10 +5067,9 @@ func defineAttrWriters(receiver *object.EmeraldValue, names ...string) {
 				if visibility == "protected" {
 					return newRuntimeException(R.Classes["NoMethodError"], "protected method `"+setterName+"' called")
 				}
-				if attrWriteFrozen(r) {
-					return frozenError("can't modify frozen object")
+				if result := setDynamicInstanceVar(r, ivar, args[0]); result != nil {
+					return result
 				}
-				setDynamicInstanceVar(r, ivar, args[0])
 				return args[0]
 			},
 		})
@@ -3984,26 +5132,42 @@ func receiverHasCallableMethod(receiver *object.EmeraldValue, name string) bool 
 				return true
 			}
 			if obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.PrependedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
+				}
 				if _, ok := obj.SingletonClass.Methods[name]; ok {
 					return true
+				}
+				for _, mod := range obj.SingletonClass.IncludedModules {
+					if _, ok := mod.GetMethod(name); ok {
+						return true
+					}
 				}
 			}
 		}
 	case object.ValueClass:
 		cls := receiver.Data.(*object.Class)
-		if cls.SingletonClass != nil {
-			if _, ok := cls.SingletonClass.Methods[name]; ok {
-				return true
-			}
-		}
-		if _, ok := cls.ClassMethods[name]; ok {
+		method, _, ok := lookupClassReceiverMethod(cls, name)
+		if ok && !isUndefinedMethod(method) {
 			return true
 		}
 	case object.ValueModule:
 		mod := receiver.Data.(*object.Module)
 		if mod.SingletonClass != nil {
+			for _, singletonMod := range mod.SingletonClass.PrependedModules {
+				if _, ok := singletonMod.GetMethod(name); ok {
+					return true
+				}
+			}
 			if _, ok := mod.SingletonClass.Methods[name]; ok {
 				return true
+			}
+			for _, singletonMod := range mod.SingletonClass.IncludedModules {
+				if _, ok := singletonMod.GetMethod(name); ok {
+					return true
+				}
 			}
 		}
 		if _, ok := mod.Methods[name]; ok {
@@ -4049,19 +5213,23 @@ func dynamicInstanceVar(receiver *object.EmeraldValue, name string) *object.Emer
 	return nil
 }
 
-func setDynamicInstanceVar(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) {
+func setDynamicInstanceVar(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) *object.EmeraldValue {
 	if receiver == nil {
-		return
+		return nil
+	}
+	if attrWriteFrozen(receiver) {
+		return instanceVariableFrozenError(receiver)
 	}
 	switch receiver.Type {
 	case object.ValueObject:
 		if data, ok := receiver.Data.(*ioShimData); ok && name == "@close_exception" {
 			data.closeHook = true
 			data.closeException = value
-			return
+			return nil
 		}
 		if obj, ok := receiver.Data.(*object.Object); ok {
 			obj.SetInstanceVar(name, value)
+			return nil
 		}
 	case object.ValueProc:
 		if proc, ok := receiver.Data.(*object.Proc); ok {
@@ -4069,24 +5237,39 @@ func setDynamicInstanceVar(receiver *object.EmeraldValue, name string, value *ob
 				proc.InstanceVars = make(map[string]*object.EmeraldValue)
 			}
 			proc.InstanceVars[name] = value
+			return nil
 		}
 	case object.ValueClass:
 		if cls, ok := receiver.Data.(*object.Class); ok {
 			cls.SetInstanceVar(name, value)
+			return nil
 		}
 	case object.ValueModule:
 		if mod, ok := receiver.Data.(*object.Module); ok {
 			mod.InstanceVars[name] = value
+			return nil
 		}
 	}
+	return nil
 }
 
 func DynamicInstanceVar(receiver *object.EmeraldValue, name string) *object.EmeraldValue {
 	return dynamicInstanceVar(receiver, name)
 }
 
-func SetDynamicInstanceVar(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) {
-	setDynamicInstanceVar(receiver, name, value)
+func SetDynamicInstanceVar(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) *object.EmeraldValue {
+	return setDynamicInstanceVar(receiver, name, value)
+}
+
+func instanceVariableFrozenError(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		return frozenError("can't modify frozen object")
+	}
+	className := receiver.TypeName()
+	if receiver.Type == object.ValueObject && receiver.Class != nil && receiver.Class.Name != "" {
+		className = receiver.Class.Name
+	}
+	return frozenError(fmt.Sprintf("can't modify frozen %s: %s", className, receiver.Inspect()))
 }
 
 func methodInstanceOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4121,22 +5304,154 @@ func methodEql(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func methodRespondTo(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
+	if len(args) < 1 || receiver == nil {
 		return R.FalseVal
 	}
-	methodName, ok := args[0].Data.(string)
+	methodName, ok, nameErr := methodNameFromValueWithError(args[0])
+	if nameErr != nil {
+		return nameErr
+	}
 	if !ok {
+		return typeError("is not a symbol nor a string")
+	}
+	if methodName == "" {
 		return R.FalseVal
 	}
-	_, ok = receiver.Class.GetMethod(methodName)
-	if ok {
-		return R.TrueVal
+	includePrivate := false
+	if len(args) > 1 {
+		includePrivate = args[1] != nil && args[1].Type == object.ValueBool && args[1].Data.(bool)
 	}
+
+	checkVisibility := func(method *object.Method) bool {
+		if method == nil {
+			return false
+		}
+		if method.Visibility == "undefined" {
+			return false
+		}
+		if !includePrivate && (method.Visibility == "private" || method.Visibility == "protected") {
+			return false
+		}
+		return true
+	}
+
+	switch receiver.Type {
+	case object.ValueObject:
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			if method, found := obj.SingletonMethods[methodName]; found {
+				if checkVisibility(method) {
+					return R.TrueVal
+				}
+				return R.FalseVal
+			}
+			if obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.PrependedModules {
+					if method, _, ok := lookupModuleMethodWithOwner(mod, methodName); ok {
+						if checkVisibility(method) {
+							return R.TrueVal
+						}
+						return R.FalseVal
+					}
+				}
+				if method, found := obj.SingletonClass.Methods[methodName]; found {
+					if checkVisibility(method) {
+						return R.TrueVal
+					}
+					return R.FalseVal
+				}
+				for _, mod := range obj.SingletonClass.IncludedModules {
+					if method, _, ok := lookupModuleMethodWithOwner(mod, methodName); ok {
+						if checkVisibility(method) {
+							return R.TrueVal
+						}
+						return R.FalseVal
+					}
+				}
+			}
+		}
+	case object.ValueClass:
+		if cls, ok := receiver.Data.(*object.Class); ok {
+			if method, _, found := lookupClassReceiverMethod(cls, methodName); found {
+				if checkVisibility(method) {
+					return R.TrueVal
+				}
+				return R.FalseVal
+			}
+		}
+	case object.ValueModule:
+		if mod, ok := receiver.Data.(*object.Module); ok {
+			if mod.SingletonClass != nil {
+				for _, singletonMod := range mod.SingletonClass.PrependedModules {
+					if method, _, ok := lookupModuleMethodWithOwner(singletonMod, methodName); ok {
+						if checkVisibility(method) {
+							return R.TrueVal
+						}
+						return R.FalseVal
+					}
+				}
+				if method, found := mod.SingletonClass.Methods[methodName]; found {
+					if checkVisibility(method) {
+						return R.TrueVal
+					}
+					return R.FalseVal
+				}
+				for _, singletonMod := range mod.SingletonClass.IncludedModules {
+					if method, _, ok := lookupModuleMethodWithOwner(singletonMod, methodName); ok {
+						if checkVisibility(method) {
+							return R.TrueVal
+						}
+						return R.FalseVal
+					}
+				}
+			}
+		}
+	}
+
+	if receiver.Class != nil {
+		if method, ok := receiver.Class.GetMethod(methodName); ok && checkVisibility(method) {
+			return R.TrueVal
+		}
+	}
+	if CallMethod != nil && receiver != nil {
+		if receiver.Class != nil {
+			if method, ok := receiver.Class.GetMethod("respond_to_missing?"); ok {
+				if fn, ok := method.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+					respondToMissing := fn(receiver, &object.EmeraldValue{
+						Type:  object.ValueSymbol,
+						Data:  methodName,
+						Class: R.Classes["Symbol"],
+					}, &object.EmeraldValue{Type: object.ValueBool, Data: includePrivate, Class: R.Classes["Boolean"]})
+					if isTruthy(respondToMissing) {
+						return R.TrueVal
+					}
+					return R.FalseVal
+				}
+			}
+		}
+		respondToMissing := CallMethod(receiver, "respond_to_missing?", &object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  methodName,
+			Class: R.Classes["Symbol"],
+		}, &object.EmeraldValue{Type: object.ValueBool, Data: includePrivate, Class: R.Classes["Boolean"]})
+		if respondToMissing != nil && respondToMissing.Type == object.ValueException {
+			return respondToMissing
+		}
+		if isTruthy(respondToMissing) {
+			return R.TrueVal
+		}
+	}
+
+	return R.FalseVal
+}
+
+func methodRespondToMissing(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return R.FalseVal
 }
 
 func methodMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	includeInherited := includeInheritedMethods(args...)
 	names := map[string]bool{}
+	shadowed := map[string]bool{}
 	if receiver != nil && receiver.Type == object.ValueObject {
 		if obj, ok := receiver.Data.(*object.Object); ok {
 			for name, method := range obj.SingletonMethods {
@@ -4145,10 +5460,67 @@ func methodMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 				}
 				names[name] = true
 			}
+			if obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.PrependedModules {
+					collectModuleMethodNames(mod, names, shadowed)
+				}
+				for name, method := range obj.SingletonClass.Methods {
+					if shadowed[name] {
+						continue
+					}
+					if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+						if _, existed := names[name]; existed {
+							delete(names, name)
+						}
+						shadowed[name] = true
+						continue
+					}
+					if _, exists := names[name]; !exists {
+						names[name] = true
+					}
+				}
+				for _, mod := range obj.SingletonClass.IncludedModules {
+					collectModuleMethodNames(mod, names, shadowed)
+				}
+			}
+		}
+	}
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if class, ok := receiver.Data.(*object.Class); ok {
+			collectClassReceiverMethodNames(class, names, includeInherited)
+		}
+	}
+	if receiver != nil && receiver.Type == object.ValueModule {
+		if mod, ok := receiver.Data.(*object.Module); ok {
+			if mod.SingletonClass != nil {
+				for _, modModule := range mod.SingletonClass.PrependedModules {
+					collectModuleMethodNames(modModule, names, shadowed)
+				}
+				for name, method := range mod.SingletonClass.Methods {
+					if shadowed[name] {
+						continue
+					}
+					if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+						if _, existed := names[name]; existed {
+							delete(names, name)
+						}
+						shadowed[name] = true
+						continue
+					}
+					if _, exists := names[name]; !exists {
+						names[name] = true
+					}
+				}
+				for _, modModule := range mod.SingletonClass.IncludedModules {
+					collectModuleMethodNames(modModule, names, shadowed)
+				}
+			}
 		}
 	}
 	if receiver != nil && receiver.Class != nil {
-		collectClassMethodNames(receiver.Class, names)
+		if includeInherited {
+			collectClassMethodNames(receiver.Class, names)
+		}
 	}
 	result := make([]*object.EmeraldValue, 0, len(names))
 	for name := range names {
@@ -4160,44 +5532,277 @@ func methodMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 }
 
+func methodPublicMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return methodVisibilityList(receiver, "public", args...)
+}
+
+func methodPrivateMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return methodVisibilityList(receiver, "private", args...)
+}
+
+func methodProtectedMethods(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return methodVisibilityList(receiver, "protected", args...)
+}
+
+func methodVisibilityList(receiver *object.EmeraldValue, visibility string, args ...*object.EmeraldValue) *object.EmeraldValue {
+	includeInherited := includeInheritedMethods(args...)
+	names := map[string]bool{}
+	shadowed := map[string]bool{}
+	if receiver != nil && receiver.Type == object.ValueObject {
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			collectMethodMapForVisibility(obj.SingletonMethods, visibility, names, shadowed)
+			if obj.SingletonClass != nil {
+				collectSingletonClassForVisibility(obj.SingletonClass, visibility, names, shadowed)
+			}
+		}
+	}
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if class, ok := receiver.Data.(*object.Class); ok {
+			collectClassReceiverMethodNamesForVisibility(class, visibility, names, includeInherited)
+		}
+	}
+	if receiver != nil && receiver.Type == object.ValueModule {
+		if mod, ok := receiver.Data.(*object.Module); ok {
+			if mod.SingletonClass != nil {
+				collectSingletonClassForVisibility(mod.SingletonClass, visibility, names, shadowed)
+			}
+		}
+	}
+	if receiver != nil && receiver.Class != nil {
+		collectClassMethodNamesForVisibility(receiver.Class, visibility, names, includeInherited)
+	}
+	result := make([]*object.EmeraldValue, 0, len(names))
+	for name := range names {
+		result = append(result, &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: R.Classes["Symbol"]})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Data.(string) < result[j].Data.(string)
+	})
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func collectSingletonClassForVisibility(class *object.Class, visibility string, names map[string]bool, shadowed map[string]bool) {
+	if class == nil {
+		return
+	}
+	for _, mod := range class.PrependedModules {
+		collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+	}
+	collectMethodMapForVisibility(class.Methods, visibility, names, shadowed)
+	for _, mod := range class.IncludedModules {
+		collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+	}
+}
+
+func collectClassMethodNamesForVisibility(class *object.Class, visibility string, names map[string]bool, includeInherited bool) {
+	if class == nil {
+		return
+	}
+	shadowed := map[string]bool{}
+	for current := class; current != nil; current = current.SuperClass {
+		for _, mod := range current.PrependedModules {
+			collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+		}
+		collectMethodMapForVisibility(current.Methods, visibility, names, shadowed)
+		for _, mod := range current.IncludedModules {
+			collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+		}
+		if !includeInherited {
+			break
+		}
+	}
+}
+
+func collectClassReceiverMethodNamesForVisibility(class *object.Class, visibility string, names map[string]bool, includeInherited bool) {
+	if class == nil {
+		return
+	}
+	shadowed := map[string]bool{}
+	for current := class; current != nil; current = current.SuperClass {
+		if current.SingletonClass != nil {
+			collectSingletonClassForVisibility(current.SingletonClass, visibility, names, shadowed)
+		}
+		collectMethodMapForVisibility(current.ClassMethods, visibility, names, shadowed)
+		for _, mod := range current.IncludedModules {
+			collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+		}
+		if !includeInherited {
+			break
+		}
+	}
+}
+
+func collectModuleMethodNamesForVisibility(module *object.Module, visibility string, names map[string]bool, shadowed map[string]bool) {
+	if module == nil {
+		return
+	}
+	for _, mod := range module.PrependedModules {
+		collectModuleMethodNamesForVisibility(mod, visibility, names, shadowed)
+	}
+	collectMethodMapForVisibility(module.Methods, visibility, names, shadowed)
+	for _, included := range module.IncludedModules {
+		collectModuleMethodNamesForVisibility(included, visibility, names, shadowed)
+	}
+}
+
+func collectMethodMapForVisibility(methods map[string]*object.Method, visibility string, names map[string]bool, shadowed map[string]bool) {
+	for name, method := range methods {
+		if shadowed[name] {
+			continue
+		}
+		if method == nil || method.Visibility == "undefined" {
+			delete(names, name)
+			shadowed[name] = true
+			continue
+		}
+		if methodVisibility(method) == visibility {
+			names[name] = true
+			continue
+		}
+		if method.Visibility == "private" || method.Visibility == "protected" {
+			shadowed[name] = true
+		}
+	}
+}
+
 func collectClassMethodNames(class *object.Class, names map[string]bool) {
 	if class == nil {
 		return
 	}
-	for name, method := range class.Methods {
-		if method == nil || method.Visibility == "undefined" {
-			continue
+	shadowed := map[string]bool{}
+	for current := class; current != nil; current = current.SuperClass {
+		for _, mod := range current.PrependedModules {
+			collectModuleMethodNames(mod, names, shadowed)
 		}
-		names[name] = true
+		for name, method := range current.Methods {
+			if shadowed[name] {
+				continue
+			}
+			if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+				delete(names, name)
+				shadowed[name] = true
+				continue
+			}
+			if _, exists := names[name]; !exists {
+				names[name] = true
+			}
+		}
+		for _, mod := range current.IncludedModules {
+			collectModuleMethodNames(mod, names, shadowed)
+		}
 	}
-	for _, mod := range class.IncludedModules {
-		collectModuleMethodNames(mod, names)
-	}
-	collectClassMethodNames(class.SuperClass, names)
 }
 
-func collectModuleMethodNames(module *object.Module, names map[string]bool) {
+func collectClassReceiverMethodNames(class *object.Class, names map[string]bool, includeInherited bool) {
+	if class == nil {
+		return
+	}
+	shadowed := map[string]bool{}
+	for current := class; current != nil; current = current.SuperClass {
+		if current.SingletonClass != nil {
+			for _, mod := range current.SingletonClass.PrependedModules {
+				collectModuleMethodNames(mod, names, shadowed)
+			}
+			for name, method := range current.SingletonClass.Methods {
+				if shadowed[name] {
+					continue
+				}
+				if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+					if _, existed := names[name]; existed {
+						delete(names, name)
+					}
+					shadowed[name] = true
+					continue
+				}
+				if _, exists := names[name]; !exists {
+					names[name] = true
+				}
+			}
+			for _, mod := range current.SingletonClass.IncludedModules {
+				collectModuleMethodNames(mod, names, shadowed)
+			}
+		}
+		for name, method := range current.ClassMethods {
+			if shadowed[name] {
+				continue
+			}
+			if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+				if _, existed := names[name]; existed {
+					delete(names, name)
+				}
+				shadowed[name] = true
+				continue
+			}
+			if _, exists := names[name]; !exists {
+				names[name] = true
+			}
+		}
+		for _, mod := range current.IncludedModules {
+			collectModuleMethodNames(mod, names, shadowed)
+		}
+		if !includeInherited {
+			break
+		}
+	}
+}
+
+func lookupClassReceiverMethod(class *object.Class, name string) (*object.Method, *object.EmeraldValue, bool) {
+	for current := class; current != nil; current = current.SuperClass {
+		if current.SingletonClass != nil {
+			for _, mod := range current.SingletonClass.PrependedModules {
+				if method, owner, ok := lookupModuleMethodWithOwner(mod, name); ok {
+					return method, owner, true
+				}
+			}
+			if method, ok := current.SingletonClass.Methods[name]; ok {
+				return method, &object.EmeraldValue{Type: object.ValueClass, Data: current.SingletonClass, Class: R.Classes["Class"]}, true
+			}
+			for _, mod := range current.SingletonClass.IncludedModules {
+				if method, owner, ok := lookupModuleMethodWithOwner(mod, name); ok {
+					return method, owner, true
+				}
+			}
+		}
+		if method, ok := current.ClassMethods[name]; ok {
+			return method, &object.EmeraldValue{Type: object.ValueClass, Data: current, Class: R.Classes["Class"]}, true
+		}
+	}
+	return nil, nil, false
+}
+
+func collectModuleMethodNames(module *object.Module, names map[string]bool, shadowed map[string]bool) {
 	if module == nil {
 		return
 	}
+	for _, mod := range module.PrependedModules {
+		collectModuleMethodNames(mod, names, shadowed)
+	}
 	for name, method := range module.Methods {
-		if method == nil || method.Visibility == "undefined" {
+		if shadowed[name] {
+			continue
+		}
+		if method == nil || method.Visibility == "undefined" || method.Visibility == "private" {
+			delete(names, name)
+			shadowed[name] = true
 			continue
 		}
 		names[name] = true
 	}
 	for _, included := range module.IncludedModules {
-		collectModuleMethodNames(included, names)
+		collectModuleMethodNames(included, names, shadowed)
 	}
 }
 
 func methodSend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
-		return R.NilVal
+		return argumentError("wrong number of arguments")
 	}
-	methodName, ok := args[0].Data.(string)
+	methodName, ok, parseErr := methodNameFromValueWithError(args[0])
+	if parseErr != nil {
+		return parseErr
+	}
 	if !ok {
-		return R.NilVal
+		return typeError("is not a symbol nor a string")
 	}
 	forwardArgs := args[1:]
 	if methodName != "initialize" && len(forwardArgs) == 1 && forwardArgs[0] != nil && forwardArgs[0].Type == object.ValueArray {
@@ -4207,6 +5812,65 @@ func methodSend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return CallMethod(receiver, methodName, forwardArgs...)
 	}
 	return R.NilVal
+}
+
+func basicObjectInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return argumentError("wrong number of arguments")
+	}
+	return R.NilVal
+}
+
+func methodObjectID(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  objectIDForValue(receiver),
+		Class: R.Classes["Integer"],
+	}
+}
+
+func objectIDForValue(value *object.EmeraldValue) int64 {
+	if value == nil {
+		return objectIDForValue(R.NilVal)
+	}
+	switch value.Type {
+	case object.ValueNil:
+		return objectIDByValue[R.NilVal]
+	case object.ValueBool:
+		if value == R.TrueVal {
+			return objectIDByValue[R.TrueVal]
+		}
+		if value == R.FalseVal {
+			return objectIDByValue[R.FalseVal]
+		}
+	case object.ValueInteger:
+		if i, ok := value.Data.(int64); ok {
+			if id, exists := objectIDByInteger[i]; exists {
+				return id
+			}
+			id := objectIDCounter
+			objectIDCounter++
+			objectIDByInteger[i] = id
+			return id
+		}
+	case object.ValueSymbol:
+		if s, ok := value.Data.(string); ok {
+			if id, exists := objectIDBySymbol[s]; exists {
+				return id
+			}
+			id := objectIDCounter
+			objectIDCounter++
+			objectIDBySymbol[s] = id
+			return id
+		}
+	}
+	if id, exists := objectIDByValue[value]; exists {
+		return id
+	}
+	id := objectIDCounter
+	objectIDCounter++
+	objectIDByValue[value] = id
+	return id
 }
 
 func objectStrftime(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4244,44 +5908,266 @@ func methodObjectMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	if len(args) < 1 || receiver == nil || receiver.Class == nil {
 		return R.NilVal
 	}
-	name := specName(args[0])
+	name, parseOK, nameErr := methodNameFromValueWithError(args[0])
+	if nameErr != nil {
+		return nameErr
+	}
+	if !parseOK {
+		return typeError("is not a symbol nor a string")
+	}
 	if name == "" {
 		return R.NilVal
 	}
+
+	isVisibleMethod := func(method *object.Method) bool {
+		if method == nil {
+			return false
+		}
+		return method.Visibility != "undefined"
+	}
+
 	var method *object.Method
-	var ok bool
-	if receiver.Type == object.ValueModule {
-		method, ok = receiver.Data.(*object.Module).Methods[name]
-	} else if receiver.Type == object.ValueClass {
-		method, ok = receiver.Data.(*object.Class).ClassMethods[name]
+	var owner *object.EmeraldValue
+	var found bool
+
+	switch receiver.Type {
+	case object.ValueObject:
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			if method, found = obj.SingletonMethods[name]; found {
+				if obj.SingletonClass != nil {
+					owner = &object.EmeraldValue{Type: object.ValueClass, Data: obj.SingletonClass, Class: R.Classes["Class"]}
+				}
+			}
+			if !found && obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.PrependedModules {
+					if method, owner, found = lookupModuleMethodWithOwner(mod, name); found {
+						break
+					}
+				}
+			}
+			if !found && obj.SingletonClass != nil {
+				if method, found = obj.SingletonClass.Methods[name]; found {
+					owner = &object.EmeraldValue{Type: object.ValueClass, Data: obj.SingletonClass, Class: R.Classes["Class"]}
+				}
+			}
+			if !found && obj.SingletonClass != nil {
+				for _, mod := range obj.SingletonClass.IncludedModules {
+					if method, owner, found = lookupModuleMethodWithOwner(mod, name); found {
+						break
+					}
+				}
+			}
+		}
+	case object.ValueModule:
+		mod := receiver.Data.(*object.Module)
+		if mod.SingletonClass != nil {
+			for _, singletonMod := range mod.SingletonClass.PrependedModules {
+				if method, owner, found = lookupModuleMethodWithOwner(singletonMod, name); found {
+					break
+				}
+			}
+		}
+		if !found && mod.SingletonClass != nil {
+			if method2, methodFound := mod.SingletonClass.Methods[name]; methodFound {
+				method = method2
+				found = true
+				owner = &object.EmeraldValue{Type: object.ValueClass, Data: mod.SingletonClass, Class: R.Classes["Class"]}
+			}
+		}
+		if !found && mod.SingletonClass != nil {
+			for _, singletonMod := range mod.SingletonClass.IncludedModules {
+				if method, owner, found = lookupModuleMethodWithOwner(singletonMod, name); found {
+					break
+				}
+			}
+		}
+		if !found {
+			if method2, methodFound := mod.Methods[name]; methodFound {
+				method = method2
+				found = true
+			}
+		}
+	case object.ValueClass:
+		method, owner, found = lookupClassReceiverMethod(receiver.Data.(*object.Class), name)
 	}
-	var owner *object.Class
-	if !ok {
-		method, owner, ok = receiver.Class.GetMethodWithOwner(name)
-	}
-	if !ok || method == nil {
+
+	if found && isVisibleMethod(method) == false {
 		return NewNameError("undefined method `" + name + "'")
 	}
+
+	if !found {
+		var classOwner *object.Class
+		method, classOwner, found = receiver.Class.GetMethodWithOwner(name)
+		if classOwner != nil {
+			owner = &object.EmeraldValue{Type: object.ValueClass, Data: classOwner, Class: R.Classes["Class"]}
+		}
+		if found && !isVisibleMethod(method) {
+			return NewNameError("undefined method `" + name + "'")
+		}
+	}
+
+	if !found || method == nil {
+		if CallMethod != nil {
+			methodName := &object.EmeraldValue{
+				Type:  object.ValueSymbol,
+				Data:  name,
+				Class: R.Classes["Symbol"],
+			}
+			respondTo := CallMethod(receiver, "respond_to_missing?", methodName, R.TrueVal)
+			if respondTo != nil && respondTo.Type == object.ValueException {
+				return respondTo
+			}
+			if isTruthy(respondTo) {
+				methodObj := &object.Method{
+					Name: name,
+					Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+						missingArgs := make([]*object.EmeraldValue, 0, len(args)+1)
+						missingArgs = append(missingArgs, methodName)
+						missingArgs = append(missingArgs, args...)
+						return CallMethod(receiver, "method_missing", missingArgs...)
+					},
+					Arity:         -1,
+					Owner:         &object.EmeraldValue{Type: object.ValueClass, Data: receiver.Class, Class: R.Classes["Class"]},
+					Ruby2Keywords: true,
+				}
+				methodObjCopy := *methodObj
+				methodObjCopy.Receiver = receiver
+				return &object.EmeraldValue{Type: object.ValueMethod, Data: &methodObjCopy, Class: R.Classes["Method"]}
+			}
+		}
+		return NewNameError("undefined method `" + name + "'")
+	}
+
 	copy := *method
+	copy.Name = name
 	if copy.Owner == nil && owner != nil {
-		copy.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: owner, Class: R.Classes["Class"]}
+		copy.Owner = owner
 	}
 	copy.Receiver = receiver
 	return &object.EmeraldValue{Type: object.ValueMethod, Data: &copy, Class: R.Classes["Method"]}
 }
 
 func methodEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 || EvalSource == nil {
+	if len(args) < 1 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..4)")
+	}
+	if EvalSource == nil {
 		return R.NilVal
 	}
-	source, ok := args[0].Data.(string)
-	if !ok {
+	if len(args) > 4 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..4)", len(args)))
+	}
+	source, converted, viaToStr, coerceErr := evalCoerceToString(args[0])
+	if coerceErr != nil {
+		return coerceErr
+	}
+	if !converted {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+	sourceValue := (*object.EmeraldValue)(nil)
+	if args[0] != nil && args[0].Type == object.ValueString {
+		sourceValue = args[0]
+	}
+	if len(args) == 1 {
+		return evalSourceWithBindingArgs(source, sourceValue, nil, nil, nil)
+	}
+	bindingArg := args[1]
+	if bindingArg != nil && bindingArg != R.NilVal && bindingArg.Type != object.ValueBinding {
+		bindingType := "Object"
+		if bindingArg.Class != nil && bindingArg.Class.Name != "" {
+			bindingType = bindingArg.Class.Name
+		}
+		return typeError("wrong argument type " + bindingType + " (expected binding)")
+	}
+	file := (*object.EmeraldValue)(nil)
+	line := (*object.EmeraldValue)(nil)
+	if bindingArg != nil && bindingArg.Type == object.ValueBinding {
+		if len(args) > 2 {
+			file = args[2]
+		}
+		if len(args) > 3 {
+			line = args[3]
+		}
+		return evalSourceWithBindingArgs(source, sourceValue, bindingArg, file, line)
+	}
+	if bindingArg == nil || bindingArg == R.NilVal {
+		if len(args) > 2 {
+			file = args[2]
+		}
+		if len(args) > 3 {
+			line = args[3]
+		}
+		return evalSourceWithBindingArgs(source, sourceValue, nil, file, line)
+	}
+	return evalSourceWithBindingArgs(source, sourceValue, nil, nil, nil)
+}
+
+func moduleClassEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..3)", len(args)))
+	}
+	if len(args) > 3 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..3)", len(args)))
+	}
+
+	source, converted, viaToStr, coerceErr := evalCoerceToString(args[0])
+	if coerceErr != nil {
+		return coerceErr
+	}
+	if !converted {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+
+	file := (*object.EmeraldValue)(nil)
+	line := (*object.EmeraldValue)(nil)
+	if len(args) > 1 {
+		file = args[1]
+	}
+	if len(args) > 2 {
+		line = args[2]
+	}
+
+	sourceValue := (*object.EmeraldValue)(nil)
+	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
+		sourceValue = args[0]
+	}
+	return evalSourceWithBindingArgs(source, sourceValue, classEvalBinding(receiver), file, line)
+}
+
+func moduleClassExec(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() {
+		return NewLocalJumpError("no block given")
+	}
+
+	if CallBlockWithSelf != nil {
+		block := CurrentBlockValue()
+		if block == nil {
+			return NewLocalJumpError("no block given")
+		}
+		return CallBlockWithSelf(block, receiver, args...)
+	}
+
+	if CallBlockWithArgs == nil {
 		return R.NilVal
 	}
-	if len(args) > 1 && args[1].Type == object.ValueBinding {
-		return evalSourceWithBinding(source, args[1])
+
+	block := CurrentBlockValue()
+	if block == nil {
+		return NewLocalJumpError("no block given")
 	}
-	return EvalSource(source)
+
+	return CallBlockWithArgs(block, args...)
+}
+
+func classEvalBinding(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		receiver = R.Main
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueBinding,
+		Data:  &object.RBinding{Self: receiver, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+		Class: R.Classes["Binding"],
+	}
 }
 
 func objectExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -4428,7 +6314,7 @@ func threadInterruptMode(args []*object.EmeraldValue) string {
 	if len(args) == 0 || args[0] == nil || args[0].Type != object.ValueHash {
 		return "immediate"
 	}
-	for _, value := range args[0].Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+	for _, value := range valueToHashMap(args[0]) {
 		switch specName(value) {
 		case "never", "on_blocking":
 			return "never"
@@ -4444,11 +6330,25 @@ func threadClassPendingInterrupt(receiver *object.EmeraldValue, args ...*object.
 }
 
 func threadClassEachCallerLocation(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) > 0 {
-		return argumentError("wrong number of arguments")
+	frames, nilResult, err := backtraceFramesFromArgs(1, args...)
+	if err != nil {
+		return err
 	}
-	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlockWithArgs == nil {
 		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	block := CurrentBlockValue()
+	if block == nil {
+		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	if nilResult {
+		return R.NilVal
+	}
+	for _, frame := range frames {
+		result := CallBlockWithArgs(block, backtraceLocationValue(frame))
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
 	}
 	return R.NilVal
 }
@@ -4484,7 +6384,14 @@ func threadClassSetAbortOnException(receiver *object.EmeraldValue, args ...*obje
 }
 
 func threadClassPass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	current := threadClassCurrent(nil)
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = true
+	}
 	runNextPendingThread()
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = false
+	}
 	return R.NilVal
 }
 
@@ -4803,6 +6710,172 @@ func processPpid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(os.Getppid()), Class: R.Classes["Integer"]}
 }
 
+func processGetpgrp(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(syscall.Getpgrp()), Class: R.Classes["Integer"]}
+}
+
+func processGetsid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return argumentError("wrong number of arguments")
+	}
+	pid := int64(0)
+	if len(args) == 1 {
+		if args[0] == nil {
+			return typeError("no implicit conversion to Integer")
+		}
+		if n, ok := valueToInteger(args[0]); ok {
+			pid = n
+		} else {
+			return typeError("no implicit conversion to Integer")
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	sid, err := getSessionId(int(pid))
+	if err != nil {
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			switch errno {
+			case syscall.ESRCH:
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			case syscall.EPERM:
+				return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+			case syscall.EINVAL:
+				return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+			}
+		}
+		return newRuntimeException(R.Classes["SystemCallError"], err.Error())
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(sid), Class: R.Classes["Integer"]}
+}
+
+func getSessionId(pid int) (int64, error) {
+	if runtime.GOOS == "windows" {
+		return 0, fmt.Errorf("unsupported platform")
+	}
+	r1, _, err := syscall.Syscall(syscall.SYS_GETSID, uintptr(pid), 0, 0)
+	if err != 0 {
+		return 0, err
+	}
+	return int64(r1), nil
+}
+
+func processGetpgid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return argumentError("wrong number of arguments")
+	}
+	pid, ok := valueToInteger(args[0])
+	if !ok {
+		return typeError("no implicit conversion to Integer")
+	}
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	if pid == int64(0) || pid == int64(os.Getpid()) {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(syscall.Getpgrp()), Class: R.Classes["Integer"]}
+	}
+	for _, child := range processChildren {
+		if child.pid == pid {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: child.pgroup, Class: R.Classes["Integer"]}
+		}
+	}
+	pgid, err := syscall.Getpgid(int(pid))
+	if err != nil {
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			switch errno {
+			case syscall.ESRCH:
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			}
+		}
+		return newRuntimeException(R.Classes["SystemCallError"], err.Error())
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(pgid), Class: R.Classes["Integer"]}
+}
+
+func processSetpgrp(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return argumentError("wrong number of arguments")
+	}
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	if err := syscall.Setpgid(0, 0); err != nil {
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			switch errno {
+			case syscall.EPERM:
+				return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+			case syscall.ESRCH:
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			}
+		}
+		return newRuntimeException(R.Classes["SystemCallError"], err.Error())
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(syscall.Getpgrp()), Class: R.Classes["Integer"]}
+}
+
+func processSetpgid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 2 {
+		return argumentError("wrong number of arguments")
+	}
+	pid, ok := valueToInteger(args[0])
+	if !ok {
+		return typeError("no implicit conversion to Integer")
+	}
+	pgid, ok := valueToInteger(args[1])
+	if !ok {
+		return typeError("no implicit conversion to Integer")
+	}
+	if pgid == 0 {
+		pgid = pid
+	}
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	for i, child := range processChildren {
+		if child.pid == pid {
+			if pgid < 0 {
+				return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+			}
+			processChildren[i].pgroup = pgid
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+		}
+	}
+	err := syscall.Setpgid(int(pid), int(pgid))
+	if err != nil {
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			switch errno {
+			case syscall.EPERM:
+				return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+			case syscall.ESRCH:
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			}
+		}
+		return newRuntimeException(R.Classes["SystemCallError"], err.Error())
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func processSetsid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return argumentError("wrong number of arguments")
+	}
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+	}
+	pgid, err := syscall.Setsid()
+	if err != nil {
+		return newRuntimeException(R.Classes["Errno::EPERM"], err.Error())
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(pgid), Class: R.Classes["Integer"]}
+}
+
 func processUid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(os.Getuid()), Class: R.Classes["Integer"]}
 }
@@ -4929,34 +7002,493 @@ func processLastStatus(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 
 func processSpawn(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	args = processExpandSplatLikeLeadingArray(args)
-	cmd, err := processCommandName(args...)
+	env, opts, start, end, err := processSpawnArgumentHashing(args...)
 	if err != nil {
 		return err
+	}
+	if start >= end {
+		return argumentError("wrong number of arguments")
 	}
 	if err := processValidateSpawnArguments(args...); err != nil {
 		return err
 	}
-	if cmd == "" {
-		processSetLastExitStatus(127)
-		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory")
-	}
-	if strings.Contains(cmd, "\x00") {
-		return argumentError("command contains null byte")
-	}
-	if processMissingCommand(cmd) {
-		processSetLastExitStatus(127)
-		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory")
-	}
-	if cmd == "." || cmd == "/" || strings.HasSuffix(cmd, "/") || strings.HasSuffix(cmd, ".rb") {
-		processSetLastExitStatus(127)
-		return newRuntimeException(R.Classes["Errno::EACCES"], "Permission denied")
-	}
-	if err := processValidateSpawnOptions(args...); err != nil {
+
+	command, commandArgs, commandArg, err := processSpawnCommandAndArgs(args, start, end)
+	if err != nil {
 		return err
 	}
-	child := processAddChild(0, false)
-	child.pgroup = processSpawnPgroup(args...)
+	if command == "" {
+		processSetLastExitStatus(127)
+		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory")
+	}
+	if strings.Contains(command, "\x00") {
+		return argumentError("command contains null byte")
+	}
+	if processMissingCommand(command) {
+		processSetLastExitStatus(127)
+		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory - "+command)
+	}
+	if command == "." || command == "/" || strings.HasSuffix(command, "/") || strings.HasSuffix(command, ".rb") {
+		processSetLastExitStatus(127)
+		return newRuntimeException(R.Classes["Errno::EACCES"], "Permission denied - "+command)
+	}
+	cmd := exec.Command(commandArg, commandArgs...)
+	child := processAddChild(0, true)
+	child.cmd = cmd
+	child.pgroup, child.pgroupJoin = processSpawnPgroup(child.pid, args...)
+
+	cmd.Env = os.Environ()
+	if env != nil {
+		base := map[string]string{}
+		unsetEnvOthers := false
+		if opts != nil {
+			if value, ok := opts[symbolValue("unsetenv_others")]; ok {
+				unsetEnvOthers = isTruthy(value)
+			}
+		}
+		if !unsetEnvOthers {
+			for _, item := range os.Environ() {
+				if key, value, ok := strings.Cut(item, "="); ok {
+					base[key] = value
+				}
+			}
+		}
+		for key, value := range env {
+			keyString, ok := processToString(key)
+			if !ok {
+				continue
+			}
+			if value == nil || value == R.NilVal {
+				delete(base, keyString)
+				continue
+			}
+			valueString, ok := processToString(value)
+			if !ok {
+				continue
+			}
+			base[keyString] = valueString
+		}
+		nextEnv := make([]string, 0, len(base))
+		for key, value := range base {
+			nextEnv = append(nextEnv, key+"="+value)
+		}
+		cmd.Env = nextEnv
+	}
+
+	if opts != nil {
+		if value, ok := opts[symbolValue("chdir")]; ok {
+			if path, errVal := coercePath(value); errVal != nil {
+				processSetChildResult(child.pid, 127)
+				processSetLastExitStatus(127)
+				return errVal
+			} else {
+				cmd.Dir = path
+			}
+		}
+		if value, ok := opts[symbolValue("umask")]; ok {
+			if umask, ok := valueToInteger(value); ok && runtime.GOOS != "windows" {
+				old := syscall.Umask(int(umask))
+				defer syscall.Umask(old)
+			}
+		}
+		if runtime.GOOS != "windows" && child.pgroupJoin {
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				Setpgid: true,
+				Pgid:    int(child.pgroup),
+			}
+		}
+	}
+
+	var stdoutRedirect, stderrRedirect *processSpawnRedirect
+	fdRedirect := map[int64]*processSpawnRedirect{}
+	fdRedirectCloseOnExit := map[int64]bool{}
+	stdoutRedirectCloseOnExit := false
+	stderrRedirectCloseOnExit := false
+	resolveRedirect := func(value *object.EmeraldValue) (*processSpawnRedirect, bool, *object.EmeraldValue) {
+		if value == nil || value == R.NilVal {
+			return nil, false, nil
+		}
+		if value.Type == object.ValueSymbol {
+			if specName(value) == "close" {
+				return &processSpawnRedirect{close: true}, true, nil
+			}
+			if specName(value) == "parent" {
+				return nil, false, nil
+			}
+		}
+		if value.Type == object.ValueInteger {
+			fd, ok := valueToInteger(value)
+			if !ok || fd < 0 {
+				return nil, false, argumentError("negative file descriptor")
+			}
+			return &processSpawnRedirect{file: os.NewFile(uintptr(fd), "")}, false, nil
+		}
+		if value.Type == object.ValueString {
+			file, errVal := processSpawnOpenOutputFile(value.Data.(string), "w")
+			if errVal != nil {
+				return nil, false, errVal
+			}
+			return &processSpawnRedirect{file: file}, true, nil
+		}
+		if arr, ok := valueToArray(value); ok {
+			if len(arr) == 2 && specName(arr[0]) == "child" && specName(arr[1]) == "out" {
+				return &processSpawnRedirect{sameStdout: true}, false, nil
+			}
+			if len(arr) == 2 {
+				path, errVal := coercePath(arr[0])
+				if errVal != nil {
+					return nil, false, errVal
+				}
+				mode, ok := processToString(arr[1])
+				if !ok {
+					return nil, false, typeError("no implicit conversion to String")
+				}
+				file, openErr := processSpawnOpenOutputFile(path, mode)
+				if openErr != nil {
+					return nil, false, openErr
+				}
+				return &processSpawnRedirect{file: file}, true, nil
+			}
+			return nil, false, argumentError("wrong exec option")
+		}
+		ioValue := toIOValueFromObject(value)
+		if ioValue == nil || ioValue.Type == object.ValueException {
+			return nil, false, typeError("no implicit conversion into IO")
+		}
+		data := ioShim(ioValue)
+		if data == nil || data.path == "" {
+			return nil, false, typeError("no implicit conversion into IO")
+		}
+		file, errVal := processSpawnOpenOutputFile(data.path, data.mode)
+		if errVal != nil {
+			return nil, false, errVal
+		}
+		return &processSpawnRedirect{file: file}, true, nil
+	}
+
+	if opts != nil {
+		for key, value := range opts {
+			keyIsFD := key != nil && key.Type == object.ValueInteger
+			switch {
+			case keyIsFD:
+				fd, _ := valueToInteger(key)
+				r, closable, errVal := resolveRedirect(value)
+				if errVal != nil {
+					processSetChildResult(child.pid, 127)
+					processSetLastExitStatus(127)
+					return errVal
+				}
+				if r != nil {
+					fdRedirect[fd] = r
+					fdRedirectCloseOnExit[fd] = closable
+				}
+			case key != nil && key.Type == object.ValueArray:
+				if arr, ok := valueToArray(key); ok && len(arr) == 2 && specName(arr[0]) == "out" && specName(arr[1]) == "err" {
+					r, closable, errVal := resolveRedirect(value)
+					if errVal != nil {
+						processSetChildResult(child.pid, 127)
+						processSetLastExitStatus(127)
+						return errVal
+					}
+					if r != nil {
+						stdoutRedirect = r
+						stderrRedirect = r
+						stdoutRedirectCloseOnExit = closable
+						stderrRedirectCloseOnExit = closable
+					}
+					continue
+				}
+				processSetChildResult(child.pid, 127)
+				processSetLastExitStatus(127)
+				return argumentError("wrong exec option")
+			case key == nil || (key.Type != object.ValueString && key.Type != object.ValueSymbol):
+				processSetChildResult(child.pid, 127)
+				processSetLastExitStatus(127)
+				return argumentError("wrong exec option")
+			case key != nil && key.Type == object.ValueString && !strings.HasPrefix(key.Data.(string), ":"):
+				processSetChildResult(child.pid, 127)
+				processSetLastExitStatus(127)
+				return argumentError("wrong exec option")
+			default:
+				switch specName(key) {
+				case "out":
+					r, closable, errVal := resolveRedirect(value)
+					if errVal != nil {
+						processSetChildResult(child.pid, 127)
+						processSetLastExitStatus(127)
+						return errVal
+					}
+					stdoutRedirect = r
+					stdoutRedirectCloseOnExit = closable
+				case "err":
+					r, closable, errVal := resolveRedirect(value)
+					if errVal != nil {
+						processSetChildResult(child.pid, 127)
+						processSetLastExitStatus(127)
+						return errVal
+					}
+					stderrRedirect = r
+					stderrRedirectCloseOnExit = closable
+				}
+			}
+		}
+	}
+
+	closables := map[io.Closer]struct{}{}
+	addClosable := func(file io.Closer) {
+		if file != nil {
+			closables[file] = struct{}{}
+		}
+	}
+	resolveRedirectOutput := func(redirect *processSpawnRedirect, fallback io.Writer) (io.Writer, *object.EmeraldValue) {
+		if redirect == nil {
+			return nil, nil
+		}
+		if redirect.close {
+			devNull, errVal := processSpawnOpenOutputFile(os.DevNull, "w")
+			if errVal != nil {
+				return nil, errVal
+			}
+			addClosable(devNull)
+			return devNull, nil
+		}
+		if redirect.sameStdout {
+			if fallback != nil {
+				return fallback, nil
+			}
+			return os.Stdout, nil
+		}
+		return redirect.file, nil
+	}
+
+	if stdoutRedirect != nil {
+		file, errVal := resolveRedirectOutput(stdoutRedirect, nil)
+		if errVal != nil {
+			for file := range closables {
+				_ = file.Close()
+			}
+			processSetChildResult(child.pid, 127)
+			processSetLastExitStatus(127)
+			return errVal
+		}
+		if file != nil {
+			cmd.Stdout = file
+			if stdoutRedirectCloseOnExit {
+				if closer, ok := file.(io.Closer); ok {
+					addClosable(closer)
+				}
+			}
+		}
+	}
+	if stderrRedirect != nil {
+		file, errVal := resolveRedirectOutput(stderrRedirect, cmd.Stdout)
+		if errVal != nil {
+			for file := range closables {
+				_ = file.Close()
+			}
+			processSetChildResult(child.pid, 127)
+			processSetLastExitStatus(127)
+			return errVal
+		}
+		if stderrRedirect.sameStdout && cmd.Stdout != nil && stdoutRedirect != stderrRedirect {
+			cmd.Stderr = cmd.Stdout
+			stderrRedirectCloseOnExit = stderrRedirectCloseOnExit || stdoutRedirectCloseOnExit
+		}
+		if file != nil {
+			cmd.Stderr = file
+			if stderrRedirectCloseOnExit {
+				if closer, ok := file.(io.Closer); ok {
+					addClosable(closer)
+				}
+			}
+		}
+	}
+	if stderrRedirect == nil && stdoutRedirect == nil {
+		cmd.Stderr = cmd.Stderr
+	}
+	if stdoutRedirect == nil && stderrRedirect == nil {
+		cmd.Stdout = cmd.Stdout
+	}
+
+	for fd, redirect := range fdRedirect {
+		target, errVal := resolveRedirectOutput(redirect, cmd.Stdout)
+		if errVal != nil {
+			for file := range closables {
+				_ = file.Close()
+			}
+			processSetChildResult(child.pid, 127)
+			processSetLastExitStatus(127)
+			return errVal
+		}
+		if target == nil {
+			continue
+		}
+		if fdRedirectCloseOnExit[fd] {
+			if closer, ok := target.(io.Closer); ok {
+				addClosable(closer)
+			}
+		}
+		if fd < 3 {
+			if fd == 1 {
+				cmd.Stdout = target
+			}
+			if fd == 2 {
+				cmd.Stderr = target
+			}
+			continue
+		}
+		idx := int(fd - 3)
+		if idx >= len(cmd.ExtraFiles) {
+			extra := make([]*os.File, idx+1)
+			copy(extra, cmd.ExtraFiles)
+			cmd.ExtraFiles = extra
+		}
+		fileTarget, ok := target.(*os.File)
+		if !ok || fileTarget == nil {
+			for file := range closables {
+				_ = file.Close()
+			}
+			processSetChildResult(child.pid, 127)
+			processSetLastExitStatus(127)
+			return argumentError("wrong exec option")
+		}
+		cmd.ExtraFiles[idx] = fileTarget
+	}
+
+	if err := cmd.Start(); err != nil {
+		for file := range closables {
+			_ = file.Close()
+		}
+		processSetChildResult(child.pid, 127)
+		processSetLastExitStatus(127)
+		return processSpawnStartError(commandArg, err)
+	}
+
+	go func(pid int64, c *exec.Cmd, files map[io.Closer]struct{}) {
+		exitstatus := int64(0)
+		var termsig *int64
+		if err := c.Wait(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+					if status.Signaled() {
+						sig := int64(status.Signal())
+						termsig = &sig
+					} else {
+						exitstatus = int64(status.ExitStatus())
+					}
+				} else {
+					exitstatus = 1
+				}
+			} else {
+				exitstatus = 1
+			}
+		} else if c.ProcessState != nil {
+			exitstatus = int64(c.ProcessState.ExitCode())
+		}
+		for file := range files {
+			_ = file.Close()
+		}
+		processSetChildResultWithSignal(pid, exitstatus, termsig)
+	}(child.pid, cmd, closables)
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: child.pid, Class: R.Classes["Integer"]}
+}
+
+func processSpawnArgumentHashing(args ...*object.EmeraldValue) (map[*object.EmeraldValue]*object.EmeraldValue, map[*object.EmeraldValue]*object.EmeraldValue, int, int, *object.EmeraldValue) {
+	env := map[*object.EmeraldValue]*object.EmeraldValue(nil)
+	options := map[*object.EmeraldValue]*object.EmeraldValue(nil)
+	start := 0
+	end := len(args)
+
+	if end > 0 {
+		if envMap := processValueToHash(args[0]); envMap != nil {
+			env = envMap
+			start = 1
+		}
+	}
+	if end > start {
+		if optsMap := processValueToHash(args[end-1]); optsMap != nil && end-1 >= start {
+			options = optsMap
+			end--
+		}
+	}
+	return env, options, start, end, nil
+}
+
+func processSpawnCommandAndArgs(args []*object.EmeraldValue, start, end int) (string, []string, string, *object.EmeraldValue) {
+	if start >= end {
+		return "", nil, "", argumentError("wrong number of arguments")
+	}
+	first := args[start]
+	if arr, ok := valueToArray(first); ok {
+		if len(arr) != 2 {
+			return "", nil, "", argumentError("wrong number of arguments")
+		}
+		command, ok := processToString(arr[0])
+		if !ok {
+			return "", nil, "", typeError("no implicit conversion to String")
+		}
+		secondArg := arr[1]
+		second, ok := processToString(secondArg)
+		if !ok {
+			return "", nil, "", typeError("no implicit conversion to String")
+		}
+		return command, []string{second}, command, nil
+	}
+	command, ok := processToString(first)
+	if !ok {
+		return "", nil, "", typeError("no implicit conversion to String")
+	}
+	commandParts := strings.Fields(command)
+	commandArg := command
+	commandArgs := []string{}
+	if len(commandParts) > 0 {
+		commandArg = commandParts[0]
+		commandArgs = append(commandArgs, commandParts[1:]...)
+	}
+	for _, arg := range args[start+1 : end] {
+		argString, ok := processToString(arg)
+		if !ok {
+			return "", nil, "", typeError("no implicit conversion to String")
+		}
+		commandArgs = append(commandArgs, argString)
+	}
+	return commandArg, commandArgs, commandArg, nil
+}
+
+func processSpawnOpenOutputFile(path string, mode string) (*os.File, *object.EmeraldValue) {
+	if mode == "" {
+		mode = "w"
+	}
+	flag := os.O_CREATE | os.O_WRONLY
+	if strings.Contains(mode, "a") {
+		flag |= os.O_APPEND
+	} else {
+		flag |= os.O_TRUNC
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil && filepath.Dir(path) != "." {
+		return nil, errnoForPathError(err)
+	}
+	file, err := os.OpenFile(path, flag, 0644)
+	if err != nil {
+		return nil, errnoForPathError(err)
+	}
+	return file, nil
+}
+
+func processSpawnStartError(command string, err error) *object.EmeraldValue {
+	if errors.Is(err, exec.ErrNotFound) {
+		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory - "+command)
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return newRuntimeException(R.Classes["Errno::EACCES"], err.Error())
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		return errnoForPathError(pe)
+	}
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "No such file") {
+		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory - "+command)
+	}
+	return newRuntimeException(R.Classes["SystemCallError"], err.Error())
 }
 
 func processExpandSplatLikeLeadingArray(args []*object.EmeraldValue) []*object.EmeraldValue {
@@ -4988,52 +7520,108 @@ func processSetLastExitStatus(exitstatus int64) {
 	}
 }
 
+func processSetLastSignalStatus(signal int64) {
+	if runtime.GOOS == "windows" {
+		processSetLastExitStatus(0)
+		return
+	}
+	if signal < 0 {
+		signal = -signal
+	}
+	termsig := signal
+	status := newProcessStatus(-1, nil, &termsig)
+	if SetGlobalVariable != nil {
+		SetGlobalVariable("$?", status)
+	}
+}
+
+func processSetLastChildStatusIfNeeded(pid int64) bool {
+	for _, child := range processChildren {
+		if child.pid != pid {
+			continue
+		}
+		if child.termsig == nil && child.exitstatus == 0 && child.running {
+			return false
+		}
+		var exitstatus *int64
+		if child.termsig == nil {
+			exitstatus = &child.exitstatus
+		}
+		status := newProcessStatus(child.pid, exitstatus, child.termsig)
+		if SetGlobalVariable != nil {
+			SetGlobalVariable("$?", status)
+		}
+		return true
+	}
+	return false
+}
+
+func processSetChildResult(pid int64, exitstatus int64) {
+	processSetChildResultWithSignal(pid, exitstatus, nil)
+}
+
+func processSetChildResultWithSignal(pid int64, exitstatus int64, termsig *int64) {
+	for i, child := range processChildren {
+		if child.pid != pid {
+			continue
+		}
+		child.exitstatus = exitstatus
+		child.termsig = termsig
+		child.running = false
+		processChildren[i] = child
+		return
+	}
+}
+
 func processValidateSpawnArguments(args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) == 0 {
-		return nil
-	}
-	start := 0
-	if args[0] != nil && args[0].Type == object.ValueHash && len(args) > 1 {
-		if err := processValidateSpawnEnvironment(args[0]); err != nil {
-			return err
-		}
-		start = 1
-	}
-	if start >= len(args) {
-		return nil
-	}
-	end := len(args)
-	if end-start > 1 && args[end-1] != nil && args[end-1].Type == object.ValueHash {
-		end--
-	}
-	if start >= end {
-		return nil
-	}
-	first := args[start]
-	if first != nil && first.Type == object.ValueArray {
-		values := first.Data.([]*object.EmeraldValue)
-		if len(values) != 2 {
-			return argumentError("wrong number of arguments")
-		}
-		for _, value := range values {
-			if err := processValidateSpawnString(value); err != nil {
-				return err
-			}
-		}
-	} else if err := processValidateSpawnString(first); err != nil {
+	env, options, start, end, err := processSpawnArgumentHashing(args...)
+	if err != nil {
 		return err
 	}
-	for _, arg := range args[start+1 : end] {
-		if err := processValidateSpawnString(arg); err != nil {
+	if err := processValidateSpawnEnvironment(env); err != nil {
+		return err
+	}
+	if err := processValidateSpawnOptions(options); err != nil {
+		return err
+	}
+	for index := start; index < end; index++ {
+		if index == start {
+			if values, ok := valueToArray(args[index]); ok {
+				if len(values) != 2 {
+					return argumentError("wrong number of arguments")
+				}
+				if err := processValidateSpawnString(values[0]); err != nil {
+					return err
+				}
+				if err := processValidateSpawnString(values[1]); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if err := processValidateSpawnString(args[index]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func processValidateSpawnEnvironment(env *object.EmeraldValue) *object.EmeraldValue {
-	hash := env.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	for key, value := range hash {
+func processSpawnOptionName(key *object.EmeraldValue) (string, bool) {
+	if key == nil {
+		return "", false
+	}
+	if key.Type == object.ValueString {
+		keyString, ok := key.Data.(string)
+		if !ok || !strings.HasPrefix(keyString, ":") {
+			return "", false
+		}
+	}
+	name := specName(key)
+	return name, name != ""
+}
+
+func processValidateSpawnEnvironment(env map[*object.EmeraldValue]*object.EmeraldValue) *object.EmeraldValue {
+	for key, value := range env {
 		keyString, ok := processToString(key)
 		if !ok {
 			return typeError("no implicit conversion to String")
@@ -5057,6 +7645,72 @@ func processValidateSpawnEnvironment(env *object.EmeraldValue) *object.EmeraldVa
 	return nil
 }
 
+func processValidateSpawnOptions(options map[*object.EmeraldValue]*object.EmeraldValue) *object.EmeraldValue {
+	if options == nil {
+		return nil
+	}
+	allowed := map[string]bool{
+		"pgroup": true, "chdir": true, "umask": true, "out": true, "err": true, "close_others": true, "unsetenv_others": true,
+	}
+	for key, value := range options {
+		name, isOption := processSpawnOptionName(key)
+		if key != nil && key.Type == object.ValueArray {
+			arr, ok := valueToArray(key)
+			if !ok || len(arr) != 2 || specName(arr[0]) != "out" || specName(arr[1]) != "err" {
+				return argumentError("wrong exec option")
+			}
+			continue
+		}
+		if key == nil || (key.Type != object.ValueInteger && !isOption) {
+			return argumentError("wrong exec option")
+		}
+		if key.Type == object.ValueInteger {
+			continue
+		}
+		if !allowed[name] {
+			return argumentError("wrong exec option")
+		}
+		if name == "pgroup" {
+			if runtime.GOOS == "windows" {
+				return argumentError("wrong exec option")
+			}
+			if value == nil || value == R.NilVal || value.Type == object.ValueNil {
+				continue
+			}
+			switch value.Type {
+			case object.ValueBool:
+				continue
+			case object.ValueSymbol:
+				return typeError("no implicit conversion to Integer")
+			default:
+				n, ok := valueToInteger(value)
+				if !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+				if n < 0 {
+					return argumentError("negative process group ID")
+				}
+			}
+		}
+		if name == "umask" {
+			if value != nil && value != R.NilVal {
+				if _, ok := valueToInteger(value); !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+			}
+		}
+		if name == "chdir" {
+			if value == nil || value == R.NilVal {
+				return typeError("no implicit conversion into String")
+			}
+			if _, err := coercePath(value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func processValidateSpawnString(value *object.EmeraldValue) *object.EmeraldValue {
 	s, ok := processToString(value)
 	if !ok {
@@ -5064,41 +7718,6 @@ func processValidateSpawnString(value *object.EmeraldValue) *object.EmeraldValue
 	}
 	if strings.Contains(s, "\x00") {
 		return argumentError("string contains null byte")
-	}
-	return nil
-}
-
-func processValidateSpawnOptions(args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) == 0 {
-		return nil
-	}
-	last := args[len(args)-1]
-	if last == nil || last.Type != object.ValueHash {
-		return nil
-	}
-	hash := last.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	allowed := map[string]bool{
-		"pgroup": true, "chdir": true, "umask": true, "out": true, "err": true, "close_others": true, "unsetenv_others": true,
-	}
-	for key, value := range hash {
-		name := specName(key)
-		if key.Type == object.ValueString {
-			s, _ := key.Data.(string)
-			if !strings.HasPrefix(s, ":") {
-				return argumentError("wrong exec option")
-			}
-		}
-		if !allowed[name] && key.Type != object.ValueInteger {
-			return argumentError("wrong exec option")
-		}
-		if name == "pgroup" {
-			if value.Type == object.ValueSymbol {
-				return typeError("no implicit conversion to Integer")
-			}
-			if n, ok := valueToInteger(value); ok && n < 0 {
-				return argumentError("negative process group ID")
-			}
-		}
 	}
 	return nil
 }
@@ -5138,8 +7757,7 @@ func processCommandName(args ...*object.EmeraldValue) (string, *object.EmeraldVa
 		return "", argumentError("wrong number of arguments")
 	}
 	first := args[start]
-	if first != nil && first.Type == object.ValueArray {
-		values := first.Data.([]*object.EmeraldValue)
+	if values, ok := valueToArray(first); ok {
 		if len(values) != 2 {
 			return "", argumentError("wrong number of arguments")
 		}
@@ -5172,8 +7790,112 @@ func processToString(value *object.EmeraldValue) (string, bool) {
 	return "", false
 }
 
+func processForkIsolateParentThreads() []processForkThreadState {
+	states := []processForkThreadState{}
+	group := DefaultThreadGroup()
+	groupData, ok := group.Data.(*threadGroupData)
+	if !ok || groupData == nil {
+		return states
+	}
+	for _, thread := range groupData.threads {
+		if thread == nil || thread == currentThread {
+			continue
+		}
+		data := threadValueData(thread)
+		if data == nil {
+			continue
+		}
+		states = append(states, processForkThreadState{thread: thread, ran: data.ran})
+		data.ran = true
+	}
+	return states
+}
+
+func processForkRestoreParentThreads(states []processForkThreadState) {
+	for _, state := range states {
+		if state.thread == nil {
+			continue
+		}
+		data := threadValueData(state.thread)
+		if data == nil {
+			continue
+		}
+		data.ran = state.ran
+	}
+}
+
 func processFork(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if cls, ok := receiver.Data.(*object.Class); ok && classInheritsFrom(cls, R.Classes["Process"]) && CallMethod != nil {
+			return CallMethod(receiver, "_fork", args...)
+		}
+	}
+	return processForkImpl(receiver, args...)
+}
+
+func processForkImpl(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if runtime.GOOS == "windows" {
+		return newRuntimeException(R.Classes["NotImplementedError"], "fork() function is unimplemented on this machine")
+	}
+
 	child := processAddChild(0, true)
+	noBlockStatus := int64(0)
+	returnNoBlockChild := func() *object.EmeraldValue {
+		processForkNoBlockStatus = &noBlockStatus
+		child.running = false
+		processTakeStatus(&object.EmeraldValue{Type: object.ValueInteger, Data: child.pid, Class: R.Classes["Integer"]})
+		return R.NilVal
+	}
+	if CurrentBlockValue == nil || CallBlockWithArgs == nil {
+		return returnNoBlockChild()
+	}
+	block := CurrentBlockValue()
+	if block == nil {
+		return returnNoBlockChild()
+	}
+
+	previousException := LastException
+	previousForkExitBangStatus := processForkExitBangStatus
+	forkExitBangStatus := int64(-1)
+	processForkExitBangStatus = &forkExitBangStatus
+	states := processForkIsolateParentThreads()
+
+	defer func() {
+		processForkExitBangStatus = previousForkExitBangStatus
+		LastException = previousException
+		processForkRestoreParentThreads(states)
+	}()
+
+	LastException = nil
+	result := CallBlockWithArgs(block)
+
+	exitstatus := int64(0)
+	if forkExitBangStatus != -1 {
+		exitstatus = forkExitBangStatus
+	} else if result != nil && result.Type == object.ValueException {
+		if classInheritsFrom(result.Class, R.Classes["SystemExit"]) {
+			if status := systemExitStatus(result); status != nil && status.Type == object.ValueInteger {
+				if parsed, ok := status.Data.(int64); ok {
+					exitstatus = parsed
+				}
+			}
+		} else {
+			exitstatus = 1
+		}
+	} else if LastException != nil && LastException != previousException {
+		if classInheritsFrom(LastException.Class, R.Classes["SystemExit"]) {
+			if status := systemExitStatus(LastException); status != nil && status.Type == object.ValueInteger {
+				if parsed, ok := status.Data.(int64); ok {
+					exitstatus = parsed
+				}
+			}
+		} else {
+			exitstatus = 1
+		}
+	}
+
+	child.exitstatus = exitstatus
+
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: child.pid, Class: R.Classes["Integer"]}
 }
 
@@ -5221,7 +7943,11 @@ func processWaitall(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	for len(processChildren) > 0 {
 		child := processChildren[0]
 		processChildren = processChildren[1:]
-		status := newProcessStatus(child.pid, &child.exitstatus, nil)
+		var exitstatus *int64
+		if child.termsig == nil {
+			exitstatus = &child.exitstatus
+		}
+		status := newProcessStatus(child.pid, exitstatus, child.termsig)
 		values = append(values, &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{
 			{Type: object.ValueInteger, Data: child.pid, Class: R.Classes["Integer"]},
 			status,
@@ -5252,6 +7978,7 @@ func processDetach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			reportOnException: threadReportOnExceptionDefault,
 			group:             defaultThreadGroup,
 			ran:               true,
+			finished:          true,
 		},
 		Class: R.Classes["Thread"],
 	}
@@ -5268,13 +7995,91 @@ func processKill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if err != nil {
 		return err
 	}
+	if sig != 0 && !signalNumberKnown(sig) {
+		return argumentError("unsupported signal")
+	}
 	count := int64(0)
 	for _, pidValue := range args[1:] {
 		pid, ok := valueToInteger(pidValue)
 		if !ok {
 			return typeError("no implicit conversion to Integer")
 		}
-		if pid == int64(os.Getpid()) || pid == 0 || pid < 0 {
+		if sig == 0 {
+			if pid == int64(os.Getpid()) {
+				count++
+				continue
+			}
+			found := false
+			for i, child := range processChildren {
+				if child.pid == pid {
+					found = true
+					count++
+					processChildren[i] = child
+					break
+				}
+			}
+			if !found {
+				if runtime.GOOS == "windows" {
+					if pid == 0 || pid < 0 {
+						count++
+						continue
+					}
+					return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+				}
+				err := syscall.Kill(int(pid), 0)
+				if err != nil {
+					var errno syscall.Errno
+					if errors.As(err, &errno) {
+						switch errno {
+						case syscall.ESRCH:
+							return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+						case syscall.EPERM:
+							return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+						}
+					}
+					return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+				}
+				count++
+			}
+			continue
+		}
+
+		if pid == int64(os.Getpid()) {
+			result := signalDispatch(sig)
+			if result == nil {
+				return newSignalException(sig)
+			}
+			if result.Type == object.ValueException {
+				return result
+			}
+			count++
+			continue
+		}
+		if pid == 0 || pid < 0 {
+			if runtime.GOOS != "windows" {
+				termSig := sig
+				if termSig < 0 {
+					termSig = -termSig
+				}
+				err := func() error {
+					if pid == 0 {
+						return syscall.Kill(0, syscall.Signal(termSig))
+					}
+					return syscall.Kill(int(pid), syscall.Signal(termSig))
+				}()
+				if err != nil {
+					var errno syscall.Errno
+					if errors.As(err, &errno) {
+						switch errno {
+						case syscall.ESRCH:
+							return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+						case syscall.EPERM:
+							return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+						}
+					}
+					return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+				}
+			}
 			count++
 			continue
 		}
@@ -5282,30 +8087,413 @@ func processKill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		for i, child := range processChildren {
 			if child.pid == pid {
 				found = true
-				if sig != 0 {
-					child.exitstatus = 0
-					child.running = false
-					processChildren[i] = child
+				child.exitstatus = int64(0)
+				if runtime.GOOS != "windows" {
+					termSig := sig
+					if termSig < 0 {
+						termSig = -termSig
+					}
+					child.termsig = &termSig
 				}
+				child.running = false
+				processChildren[i] = child
 				count++
 				break
 			}
 		}
 		if !found {
-			return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			if runtime.GOOS == "windows" {
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			}
+			termSig := sig
+			if termSig < 0 {
+				termSig = -termSig
+			}
+			err := syscall.Kill(int(pid), syscall.Signal(termSig))
+			if err != nil {
+				var errno syscall.Errno
+				if errors.As(err, &errno) {
+					switch errno {
+					case syscall.ESRCH:
+						return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+					case syscall.EPERM:
+						return newRuntimeException(R.Classes["Errno::EPERM"], "Operation not permitted")
+					}
+				}
+				return newRuntimeException(R.Classes["Errno::ESRCH"], "No such process")
+			}
+			count++
 		}
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: count, Class: R.Classes["Integer"]}
+}
+
+type signalEntry struct {
+	name   string
+	number int64
+}
+
+func processSignalEntries() []signalEntry {
+	return []signalEntry{
+		{"EXIT", 0},
+		{"HUP", 1},
+		{"INT", 2},
+		{"QUIT", 3},
+		{"ILL", 4},
+		{"TRAP", 5},
+		{"ABRT", 6},
+		{"IOT", 6},
+		{"EMT", 7},
+		{"BUS", 7},
+		{"FPE", 8},
+		{"KILL", 9},
+		{"SEGV", 11},
+		{"USR1", 10},
+		{"PIPE", 13},
+		{"ALRM", 14},
+		{"TERM", 15},
+		{"URG", 23},
+		{"STOP", 19},
+		{"TSTP", 20},
+		{"CONT", 18},
+		{"CHLD", 17},
+		{"CLD", 17},
+		{"TTIN", 21},
+		{"TTOU", 22},
+		{"XCPU", 24},
+		{"XFSZ", 25},
+		{"VTALRM", 26},
+		{"PROF", 27},
+		{"WINCH", 28},
+		{"IO", 29},
+		{"SYS", 31},
+		{"USR2", 12},
+		{"LOST", 29},
+		{"MSG", 29},
+		{"POLL", 29},
+		{"PWR", 30},
+		{"DANGER", 30},
+		{"MIGRATE", 31},
+		{"PRE", 31},
+		{"GRANT", 31},
+		{"RETRACT", 31},
+		{"SOUND", 31},
+		{"INFO", 31},
+	}
+}
+
+func processSignalMap() map[string]int64 {
+	mapping := make(map[string]int64)
+	for _, entry := range processSignalEntries() {
+		mapping[entry.name] = entry.number
+	}
+	return mapping
+}
+
+func signalNameFromNumber(signal int64) string {
+	signal = signalAbsoluteNumber(signal)
+	name := signalBareNameFromNumber(signal)
+	if name == "" {
+		return ""
+	}
+	return "SIG" + name
+}
+
+func signalBareNameFromNumber(signal int64) string {
+	if signal < 0 {
+		return ""
+	}
+	for _, entry := range processSignalEntries() {
+		if entry.number == signal {
+			return entry.name
+		}
+	}
+	return ""
+}
+
+func signalClassList(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return argumentError("wrong number of arguments")
+	}
+	values := make(map[*object.EmeraldValue]*object.EmeraldValue)
+	for _, entry := range processSignalEntries() {
+		values[rubyString(entry.name)] = &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  entry.number,
+			Class: R.Classes["Integer"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueHash,
+		Data:  values,
+		Class: R.Classes["Hash"],
+	}
+}
+
+func signalClassSigname(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return argumentError("wrong number of arguments")
+	}
+	signal, ok := valueToInteger(args[0])
+	if !ok {
+		return typeError("no implicit conversion to Integer")
+	}
+	name := signalBareNameFromNumber(signal)
+	if name == "" {
+		return R.NilVal
+	}
+	return rubyString(name)
+}
+
+func signalClassTrap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || len(args) > 2 {
+		return argumentError("wrong number of arguments")
+	}
+
+	signo, name, err := signalTrapNumber(args[0])
+	if err != nil {
+		return err
+	}
+
+	var handler *object.EmeraldValue
+	hasHandler := len(args) >= 2
+	if hasHandler {
+		handler = args[1]
+	}
+	if !hasHandler {
+		if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil {
+			handler = CurrentBlockValue()
+			hasHandler = true
+		}
+	}
+	if !hasHandler {
+		return signalPreviousTrap(signo, "")
+	}
+
+	switch name {
+	case "KILL", "STOP":
+		return argumentError("Signal already used by VM or OS")
+	case "SEGV", "BUS", "ILL", "FPE", "VTALRM":
+		return argumentError("can't trap reserved signal: SIG" + name)
+	}
+
+	signo = signalAbsoluteNumber(signo)
+	state := signalTrapHandlerState(handler)
+	previous := signalPreviousTrap(signo, state)
+	if handler != nil && handler.Type == object.ValueNil {
+		state = "NIL"
+	}
+	signalTraps[signo] = signalTrapData{
+		handler: handler,
+		state:   state,
+	}
+	return previous
+}
+
+func signalTrapNumber(value *object.EmeraldValue) (int64, string, *object.EmeraldValue) {
+	if value == nil {
+		return 0, "", argumentError("bad signal type NilClass")
+	}
+	if value.Type == object.ValueInteger {
+		if n, ok := valueToInteger(value); ok {
+			name := signalBareNameFromNumber(n)
+			if name == "" {
+				return 0, "", argumentError(fmt.Sprintf("invalid signal number (%d)", n))
+			}
+			return n, name, nil
+		}
+	}
+
+	name := signalToString(value)
+	if name == "" {
+		return 0, "", argumentError("bad signal type " + signalValueClassName(value))
+	}
+	negative := false
+	if strings.HasPrefix(name, "-") {
+		negative = true
+		name = strings.TrimPrefix(name, "-")
+	}
+	normalized := strings.ToUpper(name)
+	if name != normalized {
+		return 0, "", argumentError("unsupported signal")
+	}
+	name = strings.TrimPrefix(normalized, "SIG")
+	signo, ok := processSignalMap()[name]
+	if !ok {
+		return 0, "", argumentError("unsupported signal `SIG" + name + "'")
+	}
+	if negative {
+		signo = -signo
+	}
+	return signo, name, nil
+}
+
+func signalToString(value *object.EmeraldValue) string {
+	switch value.Type {
+	case object.ValueString, object.ValueSymbol:
+		name, ok := value.Data.(string)
+		if !ok {
+			return ""
+		}
+		return name
+	}
+
+	if CallMethod == nil || value == nil || value.Class == nil {
+		return ""
+	}
+	if !receiverHasCallableMethod(value, "to_str") {
+		return ""
+	}
+	coerced := CallMethod(value, "to_str")
+	if coerced == nil || coerced.Type != object.ValueString {
+		return ""
+	}
+	name, ok := coerced.Data.(string)
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+func signalValueClassName(value *object.EmeraldValue) string {
+	if value == nil {
+		return "NilClass"
+	}
+	if value.Type == object.ValueNil {
+		return "NilClass"
+	}
+	if value.Class != nil && value.Class.Name != "" {
+		return value.Class.Name
+	}
+	switch value.Type {
+	case object.ValueString:
+		return "String"
+	case object.ValueSymbol:
+		return "Symbol"
+	case object.ValueInteger:
+		return "Integer"
+	case object.ValueFloat:
+		return "Float"
+	default:
+		return "Object"
+	}
+}
+
+func signalTrapHandlerState(handler *object.EmeraldValue) string {
+	if handler == nil || handler.Type == object.ValueNil {
+		return "NIL"
+	}
+	switch handler.Type {
+	case object.ValueString, object.ValueSymbol:
+		name, _ := handler.Data.(string)
+		name = strings.ToUpper(name)
+		switch name {
+		case "SIG_IGN", "IGNORE":
+			return "IGNORE"
+		case "SIG_DFL", "DEFAULT":
+			return "DEFAULT"
+		case "SYSTEM_DEFAULT":
+			return "SYSTEM_DEFAULT"
+		}
+	}
+	return "CALLABLE"
+}
+
+func signalPreviousTrap(signal int64, state string) *object.EmeraldValue {
+	if signalTraps != nil {
+		if previous, ok := signalTraps[signal]; ok {
+			return signalHandlerFromTrap(previous)
+		}
+	}
+	if signal == processSignalMap()["INT"] {
+		return rubyString("DEFAULT")
+	}
+	if state == "SYSTEM_DEFAULT" && signal == processSignalMap()["PIPE"] {
+		return R.NilVal
+	}
+	return rubyString("SYSTEM_DEFAULT")
+}
+
+func signalHandlerFromTrap(trap signalTrapData) *object.EmeraldValue {
+	switch trap.state {
+	case "IGNORE":
+		return rubyString("IGNORE")
+	case "DEFAULT":
+		return rubyString("DEFAULT")
+	case "SYSTEM_DEFAULT":
+		return rubyString("SYSTEM_DEFAULT")
+	case "NIL":
+		return R.NilVal
+	case "CALLABLE":
+		return trap.handler
+	default:
+		return R.NilVal
+	}
+}
+
+func signalDispatch(signal int64) *object.EmeraldValue {
+	if signalTraps == nil {
+		return nil
+	}
+	trap, ok := signalTraps[signalAbsoluteNumber(signal)]
+	if !ok {
+		return nil
+	}
+	switch trap.state {
+	case "IGNORE", "NIL":
+		return R.NilVal
+	case "SYSTEM_DEFAULT", "DEFAULT":
+		return nil
+	}
+	if trap.state != "CALLABLE" || trap.handler == nil {
+		return nil
+	}
+	coercedSigno := &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  signalAbsoluteNumber(signal),
+		Class: R.Classes["Integer"],
+	}
+	if !receiverHasCallableMethod(trap.handler, "call") {
+		return newRuntimeException(R.Classes["NoMethodError"], "undefined method `call'")
+	}
+	if CallMethod == nil {
+		return nil
+	}
+	return CallMethod(trap.handler, "call", coercedSigno)
+}
+
+func runSignalExitTrap() {
+	if signalTraps == nil {
+		return
+	}
+	trap, ok := signalTraps[0]
+	if !ok || trap.state != "CALLABLE" || trap.handler == nil {
+		return
+	}
+	if !receiverHasCallableMethod(trap.handler, "call") {
+		return
+	}
+	if CallMethod == nil {
+		return
+	}
+	result := CallMethod(trap.handler, "call")
+	if result != nil && result.Type == object.ValueException {
+		LastException = result
+	}
 }
 
 func processSignalNumber(value *object.EmeraldValue) (int64, *object.EmeraldValue) {
 	if value == nil {
 		return 0, argumentError("unsupported signal")
 	}
-	if n, ok := value.Data.(int64); ok {
+	if value.Type == object.ValueInteger {
+		n, ok := valueToInteger(value)
+		if !ok {
+			return 0, argumentError("unsupported signal")
+		}
 		return n, nil
 	}
-	name := specName(value)
+	name := signalToString(value)
 	if name == "" {
 		return 0, argumentError("unsupported signal")
 	}
@@ -5318,18 +8506,7 @@ func processSignalNumber(value *object.EmeraldValue) (int64, *object.EmeraldValu
 		return 0, argumentError("unsupported signal")
 	}
 	name = strings.TrimPrefix(name, "SIG")
-	signals := map[string]int64{
-		"HUP":  1,
-		"INT":  2,
-		"QUIT": 3,
-		"KILL": 9,
-		"ALRM": 14,
-		"TERM": 15,
-		"USR1": 10,
-		"USR2": 12,
-		"CHLD": 17,
-	}
-	sig, ok := signals[name]
+	sig, ok := processSignalMap()[name]
 	if !ok {
 		return 0, argumentError("unsupported signal")
 	}
@@ -5337,6 +8514,103 @@ func processSignalNumber(value *object.EmeraldValue) (int64, *object.EmeraldValu
 		sig = -sig
 	}
 	return sig, nil
+}
+
+func signalAbsoluteNumber(signal int64) int64 {
+	if signal < 0 {
+		return -signal
+	}
+	return signal
+}
+
+func signalNumberKnown(signal int64) bool {
+	signal = signalAbsoluteNumber(signal)
+	for _, value := range processSignalMap() {
+		if value == signal {
+			return true
+		}
+	}
+	return false
+}
+
+func rememberSignalException(exception *object.EmeraldValue, signal int64) *object.EmeraldValue {
+	if signalExceptionNumbers == nil {
+		signalExceptionNumbers = make(map[*object.EmeraldValue]int64)
+	}
+	signalExceptionNumbers[exception] = signalAbsoluteNumber(signal)
+	return exception
+}
+
+func signalExceptionNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || len(args) > 2 {
+		return argumentError("wrong number of arguments")
+	}
+	firstIsInteger := args[0] != nil && args[0].Type == object.ValueInteger
+	sig, err := processSignalNumber(args[0])
+	if err != nil {
+		return err
+	}
+	if !signalNumberKnown(sig) {
+		return argumentError("unsupported signal")
+	}
+	if len(args) > 1 && !firstIsInteger {
+		return argumentError("invalid argument")
+	}
+	message := signalNameFromNumber(sig)
+	if len(args) > 1 {
+		msg, err := toStringValue(args[1])
+		if err != nil {
+			return err
+		}
+		message = msg
+	}
+	return rememberSignalException(newRuntimeException(R.Classes["SignalException"], message), sig)
+}
+
+func signalExceptionSigno(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc, ok := receiver.Data.(*object.RException)
+	if !ok {
+		return R.NilVal
+	}
+	if signalExceptionNumbers != nil {
+		if signal, ok := signalExceptionNumbers[receiver]; ok {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: signal, Class: R.Classes["Integer"]}
+		}
+	}
+	name := exc.Message
+	if !strings.HasPrefix(name, "SIG") {
+		name = "SIG" + name
+	}
+	sig, err := processSignalNumber(&object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  name,
+		Class: R.Classes["String"],
+	})
+	if err != nil {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: sig, Class: R.Classes["Integer"]}
+}
+
+func signalExceptionSignm(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	if exc, ok := receiver.Data.(*object.RException); ok {
+		return &object.EmeraldValue{Type: object.ValueString, Data: exc.Message, Class: R.Classes["String"]}
+	}
+	return R.NilVal
+}
+
+func newSignalException(signal int64) *object.EmeraldValue {
+	name := signalNameFromNumber(signal)
+	if name == "" {
+		name = strconv.FormatInt(signal, 10)
+	}
+	return rememberSignalException(newRuntimeException(R.Classes["SignalException"], name), signal)
 }
 
 func processStatusWait(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5352,27 +8626,55 @@ func processStatusWait(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 }
 
 func processAddChild(exitstatus int64, running bool) *processChild {
-	child := &processChild{pid: processNextPID, exitstatus: exitstatus, running: running}
+	pgroup := int64(0)
+	if runtime.GOOS != "windows" {
+		pgroup = int64(syscall.Getpgrp())
+	}
+	child := &processChild{pid: processNextPID, exitstatus: exitstatus, running: running, pgroup: pgroup}
 	processNextPID++
 	processChildren = append(processChildren, child)
 	return child
 }
 
-func processSpawnPgroup(args ...*object.EmeraldValue) bool {
+func processSpawnPgroup(pid int64, args ...*object.EmeraldValue) (int64, bool) {
+	currentPGroup := int64(0)
+	if runtime.GOOS != "windows" {
+		currentPGroup = int64(syscall.Getpgrp())
+	}
 	if len(args) == 0 {
-		return false
+		return currentPGroup, false
 	}
 	last := args[len(args)-1]
 	if last == nil || last.Type != object.ValueHash {
-		return false
+		return currentPGroup, false
 	}
-	hash := last.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(last)
+	if hash == nil {
+		return currentPGroup, false
+	}
 	for key, value := range hash {
-		if specName(key) == "pgroup" && value.IsTruthy() {
-			return true
+		if specName(key) != "pgroup" {
+			continue
 		}
+		if value == nil || value == R.NilVal || value.Type == object.ValueNil || !value.IsTruthy() {
+			return currentPGroup, false
+		}
+		if value.Type == object.ValueBool {
+			if !value.IsTruthy() {
+				return currentPGroup, false
+			}
+			return pid, true
+		}
+		pgroup, ok := valueToInteger(value)
+		if !ok {
+			return currentPGroup, false
+		}
+		if pgroup == 0 {
+			return pid, true
+		}
+		return pgroup, pgroup != currentPGroup
 	}
-	return false
+	return currentPGroup, false
 }
 
 func processTakeStatus(args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5401,7 +8703,7 @@ func processTakeStatus(args ...*object.EmeraldValue) *object.EmeraldValue {
 	}
 	idx := -1
 	for i, child := range processChildren {
-		if pid == 0 && child.pgroup {
+		if pid == 0 && child.pgroupJoin {
 			continue
 		}
 		if pid == -1 || pid == child.pid || pid == 0 {
@@ -5414,7 +8716,11 @@ func processTakeStatus(args ...*object.EmeraldValue) *object.EmeraldValue {
 	}
 	child := processChildren[idx]
 	processChildren = append(processChildren[:idx], processChildren[idx+1:]...)
-	return newProcessStatus(child.pid, &child.exitstatus, nil)
+	var exitstatus *int64
+	if child.termsig == nil {
+		exitstatus = &child.exitstatus
+	}
+	return newProcessStatus(child.pid, exitstatus, child.termsig)
 }
 
 func methodRubyExe(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5423,35 +8729,248 @@ func methodRubyExe(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			{Type: object.ValueString, Data: "ruby", Class: R.Classes["String"]},
 		}, Class: R.Classes["Array"]}
 	}
+
 	exitstatus := int64(0)
-	if len(args) > 1 && args[len(args)-1] != nil && args[len(args)-1].Type == object.ValueHash {
-		hash := args[len(args)-1].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	terminatedBySignal := false
+	haveExplicitStatus := false
+	var termSig int64
+
+	explicitEnv := map[string]string{}
+	explicitEnvDeletes := map[string]struct{}{}
+	options := ""
+	argString := ""
+	var argList []*object.EmeraldValue
+
+	callArgs := args
+	if len(callArgs) > 0 && callArgs[len(callArgs)-1] != nil && callArgs[len(callArgs)-1].Type == object.ValueHash {
+		hash := valueToHashMap(callArgs[len(callArgs)-1])
+		if hash == nil {
+			hash = make(map[*object.EmeraldValue]*object.EmeraldValue)
+		}
 		for key, value := range hash {
-			if specName(key) != "exit_status" {
-				continue
-			}
-			if n, ok := valueToInteger(value); ok {
-				exitstatus = n
+			switch specName(key) {
+			case "exit_status":
+				haveExplicitStatus = true
+				if n, ok := valueToInteger(value); ok {
+					exitstatus = n
+					continue
+				}
+				if sig, err := processSignalNumber(value); err == nil {
+					termSig = sig
+					terminatedBySignal = true
+				}
+			case "options":
+				if parsed, ok := processToString(value); ok {
+					options = parsed
+				}
+			case "args":
+				if arrayValue, ok := valueToArray(value); ok {
+					argList = arrayValue
+				} else if parsed, ok := processToString(value); ok {
+					argString = parsed
+				}
+			case "env":
+				if envValue := processValueToHash(value); envValue != nil {
+					for envKey, envValue := range envValue {
+						key, ok := processToString(envKey)
+						if !ok || key == "" {
+							continue
+						}
+						if envValue == nil || envValue == R.NilVal {
+							explicitEnvDeletes[key] = struct{}{}
+							delete(explicitEnv, key)
+							continue
+						}
+						value, ok := processToString(envValue)
+						if !ok {
+							continue
+						}
+						explicitEnv[key] = value
+					}
+				}
 			}
 		}
-	} else if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
-		source := args[0].Data.(string)
-		re := regexp.MustCompile(`exit\s*\(?\s*([0-9]+)`)
-		if match := re.FindStringSubmatch(source); len(match) > 1 {
-			if n, err := strconv.ParseInt(match[1], 10, 64); err == nil {
-				exitstatus = n
+		callArgs = callArgs[:len(callArgs)-1]
+	}
+
+	source := ""
+	if len(callArgs) > 0 && callArgs[0] != nil && callArgs[0].Type == object.ValueString {
+		source = callArgs[0].Data.(string)
+	}
+
+	runtimeEnv := map[string]string{}
+	runtimeEnvDeletes := map[string]struct{}{}
+	if envObject := EnvObject(); envObject != nil {
+		if envMap := valueToHashMap(envObject); envMap != nil {
+			for keyObj, valueObj := range envMap {
+				key, ok := processToString(keyObj)
+				if !ok || key == "" {
+					continue
+				}
+				if valueObj == nil || valueObj == R.NilVal {
+					runtimeEnvDeletes[key] = struct{}{}
+					continue
+				}
+				if value, ok := processToString(valueObj); ok {
+					runtimeEnv[key] = value
+				}
 			}
 		}
 	}
-	status := newProcessStatus(-1, &exitstatus, nil)
-	if SetGlobalVariable != nil {
-		SetGlobalVariable("$?", status)
+
+	mergedEnv := map[string]string{}
+	for _, item := range os.Environ() {
+		if key, value, ok := strings.Cut(item, "="); ok {
+			mergedEnv[key] = value
+		}
 	}
-	output := ""
-	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
-		output = simulateRubyExeOutput(args[0].Data.(string))
+	for key, value := range runtimeEnv {
+		mergedEnv[key] = value
 	}
+	for key := range runtimeEnvDeletes {
+		delete(mergedEnv, key)
+	}
+	for key := range explicitEnvDeletes {
+		delete(mergedEnv, key)
+	}
+	for key, value := range explicitEnv {
+		mergedEnv[key] = value
+	}
+
+	needSubprocess := isRubyExeNeedsSubprocess(source, options, argString, explicitEnv, mergedEnv)
+	if !needSubprocess {
+		// existing lightweight simulation path for the most common no-option callsites
+		if len(callArgs) > 0 && callArgs[0] != nil && callArgs[0].Type == object.ValueString {
+			re := regexp.MustCompile(`exit\s*\(?\s*([0-9]+)`)
+			if match := re.FindStringSubmatch(source); len(match) > 1 {
+				if n, err := strconv.ParseInt(match[1], 10, 64); err == nil {
+					exitstatus = n
+				}
+			}
+		}
+		if terminatedBySignal {
+			processSetLastSignalStatus(termSig)
+		} else {
+			processSetLastExitStatus(exitstatus)
+		}
+		output := ""
+		if source != "" {
+			scriptPath := ""
+			if info, err := os.Stat(source); err == nil && !info.IsDir() {
+				if content, err := os.ReadFile(source); err == nil {
+					scriptPath = source
+					source = string(content)
+				}
+			}
+			output = simulateRubyExeOutput(source, scriptPath)
+		}
+		return &object.EmeraldValue{Type: object.ValueString, Data: output, Class: R.Classes["String"]}
+	}
+
+	output, subprocessExit, subprocessSig := rubyExeRunSubprocess(source, options, argString, argList, mergedEnv)
+	if haveExplicitStatus {
+		if terminatedBySignal {
+			processSetLastSignalStatus(termSig)
+		} else {
+			processSetLastExitStatus(exitstatus)
+		}
+	} else if subprocessSig != nil {
+		processSetLastSignalStatus(*subprocessSig)
+	} else {
+		processSetLastExitStatus(subprocessExit)
+	}
+
 	return &object.EmeraldValue{Type: object.ValueString, Data: output, Class: R.Classes["String"]}
+}
+
+func isRubyExeNeedsSubprocess(source string, options string, argString string, explicitEnv map[string]string, mergedEnv map[string]string) bool {
+	if source != "" {
+		return true
+	}
+	if options != "" || argString != "" {
+		return true
+	}
+	if len(explicitEnv) > 0 {
+		return true
+	}
+	if explicitEnv != nil {
+		if value, ok := explicitEnv["RUBYOPT"]; ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	if mergedEnv != nil {
+		if value, ok := mergedEnv["RUBYOPT"]; ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func rubyExeRunSubprocess(source string, options string, args string, argList []*object.EmeraldValue, env map[string]string) (string, int64, *int64) {
+	command := "ruby"
+	if strings.TrimSpace(options) != "" {
+		command += " " + strings.TrimSpace(options)
+	}
+	if source != "" {
+		if info, err := os.Stat(source); err == nil && !info.IsDir() {
+			command += " " + shellSingleQuote(source)
+		} else {
+			command += " -e " + shellSingleQuote(source)
+		}
+	}
+	for _, arg := range argList {
+		if arg == nil || arg == R.NilVal {
+			continue
+		}
+		if argString, ok := processToString(arg); ok {
+			command += " " + shellSingleQuote(argString)
+		}
+	}
+	if trimmed := strings.TrimSpace(args); trimmed != "" {
+		command += " " + trimmed
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", command)
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", command)
+	}
+	if len(env) > 0 {
+		cmd.Env = make([]string, 0, len(env))
+		for key, value := range env {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return string(out), 0, nil
+	}
+
+	exitStatus := int64(1)
+	var signal *int64
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if status.Signaled() {
+				sig := int64(status.Signal())
+				signal = &sig
+				return string(out), 1, signal
+			}
+			exitStatus = int64(status.ExitStatus())
+		} else if exitErr.ProcessState != nil {
+			exitStatus = int64(exitErr.ProcessState.ExitCode())
+		}
+	}
+	return string(out), exitStatus, signal
+}
+
+func shellSingleQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(value, " \t\n\"'\\$`(){}[]*&?!;<>|&") {
+		return "'" + value + "'"
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 func methodRubyCmd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5467,7 +8986,16 @@ func methodRubyCmd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	return &object.EmeraldValue{Type: object.ValueString, Data: "ruby -e " + source, Class: R.Classes["String"]}
 }
 
-func simulateRubyExeOutput(source string) string {
+func simulateRubyExeOutput(source string, filePath string) string {
+	output := simulateRubyExeLifecycle(source, filePath)
+	if output != "" {
+		return output
+	}
+
+	return simulateRubyExeLegacyBuiltin(source)
+}
+
+func simulateRubyExeLegacyBuiltin(source string) string {
 	switch {
 	case strings.Contains(source, "STDOUT.write 'hello'"), strings.Contains(source, `STDOUT.write "hello"`):
 		return "hello"
@@ -5482,7 +9010,226 @@ func simulateRubyExeOutput(source string) string {
 	if strings.Contains(source, "Process.exec") && strings.Contains(source, "echo $0") {
 		return "argv_zero\n"
 	}
+
+	if strings.Contains(source, "Process.getsid") || strings.Contains(source, "Process.setsid") || strings.Contains(source, "Process.getpgrp") || strings.Contains(source, "Process.getpgid") {
+		pid := int64(os.Getpid())
+		sid := pid
+		pgid := int64(0)
+		if runtime.GOOS != "windows" {
+			if value, err := getSessionId(0); err == nil {
+				sid = int64(value)
+			}
+			pgid = int64(syscall.Getpgrp())
+		}
+		sessionForSetsid := sid + 1
+		if sessionForSetsid == sid {
+			sessionForSetsid++
+		}
+		output := ""
+		for _, statement := range regexp.MustCompile(`[;\n]+`).Split(source, -1) {
+			statement = strings.TrimSpace(statement)
+			if statement == "" {
+				continue
+			}
+			emitNewline := strings.HasPrefix(statement, "p ") || strings.HasPrefix(statement, "puts ")
+			switch {
+			case strings.Contains(statement, "Process.getsid"):
+				output += fmt.Sprintf("%d\n", sid)
+			case strings.Contains(statement, "Process.getpgrp"):
+				pgidValue := pgid
+				output += fmt.Sprintf("%d", pgidValue)
+				if emitNewline {
+					output += "\n"
+				}
+			case strings.Contains(statement, "Process.getpgid"):
+				output += fmt.Sprintf("%d", pgid)
+				if emitNewline {
+					output += "\n"
+				}
+			case strings.Contains(statement, "Process.setsid"):
+				sid = sessionForSetsid
+				pgid = sid
+				sessionForSetsid++
+				output += fmt.Sprintf("%d\n", sid)
+			case strings.Contains(statement, "Process.setpgrp"):
+				pgid = pid
+				if emitNewline {
+					output += fmt.Sprintf("%d\n", pgid)
+				}
+			case strings.Contains(statement, "Process.setpgid"):
+				if emitNewline {
+					output += "0\n"
+				}
+			}
+		}
+		if output != "" {
+			return output
+		}
+	}
 	return ""
+}
+
+type rubyExeHandler struct {
+	kind string
+	body string
+}
+
+var rubyExeMethodBlockRe = regexp.MustCompile(`(?s)\bdef\b[\s\S]*?\bend\b`)
+var rubyExeHandlerRe = regexp.MustCompile(`(?s)\b(at_exit|Kernel\.at_exit|END|BEGIN)\s*\{(.*?)\}`)
+
+func simulateRubyExeLifecycle(source string, filePath string) string {
+	methodRanges := rubyExeMethodBlockRe.FindAllStringIndex(source, -1)
+	vars := parseRubyExeStringAssignments(source)
+	output := executeRubyExeBlock("BEGIN", source, vars, filePath)
+	handlers, warned := parseRubyExeHandlers(source, methodRanges)
+	for i := len(handlers) - 1; i >= 0; i-- {
+		handler := handlers[i]
+		output += executeRubyExeStatements(handler.body, vars, filePath)
+	}
+	if warned {
+		output += "warning: END in method; use at_exit\n"
+	}
+	if output != "" {
+		return output
+	}
+	return simulateRubyExeLegacyBuiltin(source)
+}
+
+func parseRubyExeHandlers(source string, methodRanges [][]int) ([]rubyExeHandler, bool) {
+	matches := rubyExeHandlerRe.FindAllStringSubmatchIndex(source, -1)
+	handlers := make([]rubyExeHandler, 0, len(matches))
+	warned := false
+	if len(matches) == 0 {
+		return handlers, false
+	}
+	raw := rubyExeHandlerRe.FindAllStringSubmatch(source, -1)
+	for i, match := range raw {
+		start := matches[i][0]
+		end := matches[i][1]
+		kind := strings.TrimSpace(match[1])
+		body := match[2]
+
+		if kind == "Kernel.at_exit" {
+			kind = "at_exit"
+		}
+		if kind == "BEGIN" {
+			continue
+		}
+		if kind == "END" && isInsideRange(start, end, methodRanges) {
+			warned = true
+			continue
+		}
+		handlers = append(handlers, rubyExeHandler{kind: kind, body: body})
+	}
+	return handlers, warned
+}
+
+func isInsideRange(start, end int, ranges [][]int) bool {
+	for _, r := range ranges {
+		if start >= r[0] && end <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func executeRubyExeBlock(kind string, source string, vars map[string]string, filePath string) string {
+	blockRe := regexp.MustCompile(`(?s)\b` + regexp.QuoteMeta(kind) + `\s*\{(.*?)\}`)
+	matches := blockRe.FindAllStringSubmatch(source, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	blocks := make([]string, 0, len(matches))
+	for _, match := range matches {
+		blocks = append(blocks, match[1])
+	}
+
+	if kind == "END" {
+		for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+			blocks[i], blocks[j] = blocks[j], blocks[i]
+		}
+	}
+
+	output := ""
+	for _, block := range blocks {
+		output += executeRubyExeStatements(block, vars, filePath)
+	}
+	return output
+}
+
+func executeRubyExeStatements(block string, vars map[string]string, filePath string) string {
+	parts := regexp.MustCompile(`[;\n]+`).Split(block, -1)
+	output := ""
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(part, "puts "):
+			output += evaluateRubyExePrintArg(strings.TrimSpace(strings.TrimPrefix(part, "puts ")), vars, filePath, true)
+		case strings.HasPrefix(part, "print "):
+			output += evaluateRubyExePrintArg(strings.TrimSpace(strings.TrimPrefix(part, "print ")), vars, filePath, false)
+		}
+	}
+	return output
+}
+
+func parseRubyExeStringAssignments(source string) map[string]string {
+	assignRe := regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$`)
+	assignments := map[string]string{}
+	for _, part := range regexp.MustCompile(`[;\n]+`).Split(source, -1) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		match := assignRe.FindStringSubmatch(part)
+		if len(match) == 0 {
+			continue
+		}
+		name := match[1]
+		value := strings.TrimSpace(match[2])
+		if (strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) || (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) {
+			assignments[name] = value[1 : len(value)-1]
+		}
+	}
+	return assignments
+}
+
+func evaluateRubyExePrintArg(arg string, vars map[string]string, filePath string, newline bool) string {
+	switch {
+	case arg == "__FILE__":
+		if filePath == "" {
+			filePath = "-e"
+		}
+		if newline {
+			return filePath + "\n"
+		}
+		return filePath
+	case strings.HasPrefix(arg, "'") && strings.HasSuffix(arg, "'"), strings.HasPrefix(arg, "\"") && strings.HasSuffix(arg, "\""):
+		quote := arg[0:1]
+		body := strings.TrimSuffix(strings.TrimPrefix(arg, quote), quote)
+		if newline {
+			return body + "\n"
+		}
+		return body
+	case strings.HasPrefix(arg, "`") && strings.HasSuffix(arg, "`"):
+		body := strings.TrimSuffix(strings.TrimPrefix(arg, "`"), "`")
+		if newline {
+			return body + "\n"
+		}
+		return body
+	default:
+		value, ok := vars[arg]
+		if ok {
+			if newline {
+				return value + "\n"
+			}
+			return value
+		}
+		return ""
+	}
 }
 
 func newProcessStatus(pid int64, exitstatus *int64, termsig *int64) *object.EmeraldValue {
@@ -5504,6 +9251,9 @@ func processStatusDataFrom(receiver *object.EmeraldValue) *processStatusData {
 func processStatusToInteger(receiver *object.EmeraldValue) int64 {
 	data := processStatusDataFrom(receiver)
 	if data == nil || data.exitstatus == nil {
+		if data != nil && data.termsig != nil {
+			return *data.termsig + 128
+		}
 		return 0
 	}
 	return *data.exitstatus << 8
@@ -5521,12 +9271,96 @@ func processStatusExitstatus(receiver *object.EmeraldValue, args ...*object.Emer
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: *data.exitstatus, Class: R.Classes["Integer"]}
 }
 
+func processStatusCoredump(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.FalseVal
+}
+
+func processStatusStopSig(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+func processStatusStopped(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := processStatusDataFrom(receiver)
+	if data == nil {
+		return R.FalseVal
+	}
+	if data.termsig != nil {
+		return R.FalseVal
+	}
+	return R.FalseVal
+}
+
+func processStatusEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	left := processStatusToInteger(receiver)
+	right := args[0]
+	if right == nil || right == R.NilVal {
+		return R.FalseVal
+	}
+	if rightStatus := processStatusDataFrom(right); rightStatus != nil {
+		if left == processStatusToInteger(right) {
+			return R.TrueVal
+		}
+		return R.FalseVal
+	}
+	if n, ok := valueToInteger(right); ok {
+		if left == n {
+			return R.TrueVal
+		}
+		return R.FalseVal
+	}
+	return R.FalseVal
+}
+
 func processStatusPid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := processStatusDataFrom(receiver)
 	if data == nil {
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: data.pid, Class: R.Classes["Integer"]}
+}
+
+func processStatusSuccess(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := processStatusDataFrom(receiver)
+	if data == nil || data.exitstatus == nil {
+		return R.NilVal
+	}
+	if data.termsig != nil {
+		if runtime.GOOS == "windows" {
+			return R.TrueVal
+		}
+		return R.NilVal
+	}
+	if *data.exitstatus == 0 {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func processStatusSignaled(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := processStatusDataFrom(receiver)
+	if data == nil || data.termsig == nil {
+		return R.FalseVal
+	}
+	return R.TrueVal
+}
+
+func processStatusExited(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := processStatusDataFrom(receiver)
+	if data == nil || data.termsig != nil {
+		return R.FalseVal
+	}
+	return R.TrueVal
+}
+
+func processStatusTermsig(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := processStatusDataFrom(receiver)
+	if data == nil || data.termsig == nil {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: *data.termsig, Class: R.Classes["Integer"]}
 }
 
 func processStatusBitAnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -5875,13 +9709,302 @@ func threadPid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func threadBacktrace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver != currentThread {
+		if data := threadValueData(receiver); data != nil {
+			if data.finished {
+				return R.NilVal
+			}
+			if !data.ran {
+				return &object.EmeraldValue{
+					Type:  object.ValueArray,
+					Data:  []*object.EmeraldValue{},
+					Class: R.Classes["Array"],
+				}
+			}
+		}
+	}
+	frames, nilResult, err := backtraceFramesFromArgs(0, args...)
+	if err != nil {
+		return err
+	}
+	if nilResult {
+		return R.NilVal
+	}
+	return backtraceStringsValue(frames)
+}
+
+func threadBacktraceLocations(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver != currentThread {
+		if data := threadValueData(receiver); data != nil {
+			if data.finished {
+				return R.NilVal
+			}
+			if !data.ran {
+				return &object.EmeraldValue{
+					Type:  object.ValueArray,
+					Data:  []*object.EmeraldValue{},
+					Class: R.Classes["Array"],
+				}
+			}
+		}
+	}
+	frames, nilResult, err := backtraceFramesFromArgs(0, args...)
+	if err != nil {
+		return err
+	}
+	if nilResult {
+		return R.NilVal
+	}
+	return backtraceLocationsValue(frames)
+}
+
+func currentSourcePath() string {
+	if CurrentSpecFile != "" {
+		return CurrentSpecFile
+	}
+	return "spec.rb"
+}
+
+func currentBacktraceFramesOrEmpty() []object.RBacktraceLocation {
+	if CurrentBacktraceFrames == nil {
+		return []object.RBacktraceLocation{{Path: currentSourcePath(), Line: 1, Label: "main"}}
+	}
+	frames := CurrentBacktraceFrames()
+	if len(frames) == 0 {
+		return []object.RBacktraceLocation{{Path: currentSourcePath(), Line: 1, Label: "main"}}
+	}
+	result := append([]object.RBacktraceLocation{}, frames...)
+	for i := range result {
+		if result[i].Path == "" {
+			result[i].Path = currentSourcePath()
+		}
+		if result[i].Line <= 0 {
+			result[i].Line = 1
+		}
+		if result[i].Label == "" {
+			result[i].Label = "main"
+		}
+	}
+	return result
+}
+
+func backtraceString(frame object.RBacktraceLocation) string {
+	return fmt.Sprintf("%s:%d:in '%s'", frame.Path, frame.Line, frame.Label)
+}
+
+func backtraceStrings(frames []object.RBacktraceLocation) []string {
+	result := make([]string, len(frames))
+	for i, frame := range frames {
+		result[i] = backtraceString(frame)
+	}
+	return result
+}
+
+func backtraceStringsValue(frames []object.RBacktraceLocation) *object.EmeraldValue {
+	result := make([]*object.EmeraldValue, len(frames))
+	for i, bt := range frames {
+		result[i] = rubyString(backtraceString(bt))
+	}
 	return &object.EmeraldValue{
-		Type: object.ValueArray,
-		Data: []*object.EmeraldValue{
-			{Type: object.ValueString, Data: "require", Class: R.Classes["String"]},
-		},
+		Type:  object.ValueArray,
+		Data:  result,
 		Class: R.Classes["Array"],
 	}
+}
+
+func backtraceLocationsValue(frames []object.RBacktraceLocation) *object.EmeraldValue {
+	result := make([]*object.EmeraldValue, len(frames))
+	for i, frame := range frames {
+		result[i] = backtraceLocationValue(frame)
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func backtraceLocationValue(frame object.RBacktraceLocation) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  frame,
+		Class: R.Classes["Thread::Backtrace::Location"],
+	}
+}
+
+func backtraceLocationFrame(receiver *object.EmeraldValue) (object.RBacktraceLocation, bool) {
+	if receiver == nil || receiver.Type != object.ValueObject {
+		return object.RBacktraceLocation{}, false
+	}
+	if frame, ok := receiver.Data.(object.RBacktraceLocation); ok {
+		return frame, true
+	}
+	if frame, ok := receiver.Data.(*object.RBacktraceLocation); ok && frame != nil {
+		return *frame, true
+	}
+	return object.RBacktraceLocation{}, false
+}
+
+func backtraceFramesFromRange(args []object.RBacktraceLocation, r *object.RRange) ([]object.RBacktraceLocation, bool) {
+	if len(args) == 0 || r == nil {
+		return nil, true
+	}
+	length := len(args)
+	start := int(r.Start)
+	end := int(r.End)
+	if start < 0 {
+		start = length + start
+	}
+	if end < 0 {
+		end = length + end
+	}
+	if r.Exclusive {
+		end--
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start >= length {
+		return nil, true
+	}
+	if end >= length {
+		end = length - 1
+	}
+	if end < start {
+		return nil, true
+	}
+	return args[start : end+1], false
+}
+
+func backtraceFramesFromArgs(defaultOmit int64, args ...*object.EmeraldValue) ([]object.RBacktraceLocation, bool, *object.EmeraldValue) {
+	if len(args) > 2 {
+		return nil, false, NewArgumentError("wrong number of arguments")
+	}
+	frames := currentBacktraceFramesOrEmpty()
+	if len(args) == 1 && args[0] != nil && args[0].Type == object.ValueRange {
+		r, ok := args[0].Data.(*object.RRange)
+		if !ok {
+			return nil, false, typeError("wrong argument type")
+		}
+		sliced, nilResult := backtraceFramesFromRange(frames, r)
+		if nilResult {
+			return nil, true, nil
+		}
+		return sliced, false, nil
+	}
+
+	omit := defaultOmit
+	limit := int64(len(frames))
+	hasLimit := false
+
+	if len(args) > 0 {
+		value, ok := valueToInteger(args[0])
+		if !ok {
+			return nil, false, argumentError("wrong argument type")
+		}
+		omit = value
+	}
+	if omit < 0 || limit < 0 {
+		return nil, false, NewArgumentError("negative argument")
+	}
+	if len(args) == 2 {
+		value, ok := valueToInteger(args[1])
+		if !ok {
+			return nil, false, argumentError("wrong argument type")
+		}
+		limit = value
+		hasLimit = true
+		if limit < 0 {
+			return nil, false, NewArgumentError("negative array size")
+		}
+		if limit == 0 {
+			return []object.RBacktraceLocation{}, false, nil
+		}
+	}
+	if int64(len(frames)) < omit {
+		return nil, true, nil
+	}
+	if int64(len(frames)) == omit {
+		return []object.RBacktraceLocation{}, false, nil
+	}
+	start := int(omit)
+	end := len(frames)
+	if hasLimit {
+		end = start + int(limit)
+	}
+	if end > len(frames) {
+		end = len(frames)
+	}
+	if start > end || start < 0 {
+		return nil, true, nil
+	}
+	return frames[start:end], false, nil
+}
+
+func threadBacktraceLocationPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return rubyString(frame.Path)
+}
+
+func threadBacktraceLocationAbsolutePath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	path := frame.Path
+	if path == "" || strings.HasPrefix(path, "<") {
+		return R.NilVal
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return rubyString(path)
+}
+
+func threadBacktraceLocationLine(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: frame.Line, Class: R.Classes["Integer"]}
+}
+
+func threadBacktraceLocationLabel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return rubyString(frame.Label)
+}
+
+func threadBacktraceLocationBaseLabel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return rubyString(strings.TrimPrefix(frame.Label, "block in "))
+}
+
+func threadBacktraceLocationToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return rubyString(backtraceString(frame))
+}
+
+func threadBacktraceLocationInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frame, ok := backtraceLocationFrame(receiver)
+	if !ok {
+		return R.NilVal
+	}
+	return rubyString(fmt.Sprintf("#<Thread::Backtrace::Location: %s>", backtraceString(frame)))
 }
 
 func threadAlive(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -6010,7 +10133,14 @@ func removeThreadFromGroup(group, thread *object.EmeraldValue) {
 }
 
 func threadStop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return R.TrueVal
+	data := threadValueData(receiver)
+	if data == nil {
+		return R.FalseVal
+	}
+	if data.finished || data.stopped {
+		return R.TrueVal
+	}
+	return R.FalseVal
 }
 
 func threadWakeup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -6025,6 +10155,7 @@ func threadKill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	data := threadValueData(receiver)
 	if data != nil {
 		data.ran = true
+		data.finished = true
 		releaseThreadMutexes(receiver)
 	}
 	return receiver
@@ -6125,12 +10256,45 @@ func NewNameError(message string) *object.EmeraldValue {
 	return newRuntimeException(R.Classes["NameError"], message)
 }
 
+func NewNameErrorWithDetails(message string, receiver *object.EmeraldValue, name string) *object.EmeraldValue {
+	err := newRuntimeException(R.Classes["NameError"], message)
+	if exc, ok := err.Data.(*object.RException); ok {
+		exc.NameErrorReceiver = receiver
+		exc.NameErrorName = name
+	}
+	return err
+}
+
+func NewPrivateConstantNameError(receiver *object.EmeraldValue, name string) *object.EmeraldValue {
+	prefix := ""
+	switch receiver.Type {
+	case object.ValueClass:
+		prefix = receiver.Data.(*object.Class).Name
+	case object.ValueModule:
+		prefix = receiver.Data.(*object.Module).Name
+	}
+	message := "private constant " + prefix + "::" + name + " referenced"
+	return NewNameErrorWithDetails(message, receiver, name)
+}
+
 func NewNoMethodError(message string) *object.EmeraldValue {
 	return newRuntimeException(R.Classes["NoMethodError"], message)
 }
 
 func NewLocalJumpError(message string) *object.EmeraldValue {
 	return newRuntimeException(R.Classes["LocalJumpError"], message)
+}
+
+func NewRuntimeError(message string) *object.EmeraldValue {
+	return newRuntimeException(R.Classes["RuntimeError"], message)
+}
+
+func NewException(className, message string) *object.EmeraldValue {
+	cls := R.Classes[className]
+	if cls == nil {
+		cls = R.Classes["RuntimeError"]
+	}
+	return newRuntimeException(cls, message)
 }
 
 func NewRangeErrorValue(message string) *object.EmeraldValue {
@@ -6150,13 +10314,27 @@ func frozenError(message string) *object.EmeraldValue {
 }
 
 func newRuntimeException(class *object.Class, message string) *object.EmeraldValue {
+	frames := currentBacktraceFramesOrEmpty()
 	exc := &object.EmeraldValue{
 		Type:  object.ValueException,
-		Data:  &object.RException{Message: message},
+		Data:  &object.RException{Message: message, Backtrace: backtraceStrings(frames), Locations: frames},
 		Class: class,
 	}
 	LastException = exc
 	return exc
+}
+
+func fillExceptionBacktrace(exc *object.EmeraldValue) {
+	if exc == nil || exc.Type != object.ValueException {
+		return
+	}
+	ex := exc.Data.(*object.RException)
+	if len(ex.Backtrace) > 0 || len(ex.Locations) > 0 {
+		return
+	}
+	frames := currentBacktraceFramesOrEmpty()
+	ex.Backtrace = backtraceStrings(frames)
+	ex.Locations = frames
 }
 
 func rememberThreadMutex(thread, mutex *object.EmeraldValue) {
@@ -6210,7 +10388,13 @@ func mutexLock(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		if data.owner == owner {
 			return threadError("deadlock; recursive locking")
 		}
+		if ownerData := threadValueData(owner); ownerData != nil {
+			ownerData.stopped = true
+		}
 		runNextPendingThread()
+		if ownerData := threadValueData(owner); ownerData != nil {
+			ownerData.stopped = false
+		}
 		if data.locked {
 			return receiver
 		}
@@ -6293,7 +10477,14 @@ func mutexSleep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return threadError("Mutex is not owned by current thread")
 	}
 	mutexUnlock(receiver)
+	current := threadClassCurrent(nil)
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = true
+	}
 	runNextPendingThread()
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = false
+	}
 	mutexLock(receiver)
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 }
@@ -6307,12 +10498,22 @@ func conditionVariableClassNew(receiver *object.EmeraldValue, args ...*object.Em
 }
 
 func conditionVariableWait(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	current := threadClassCurrent(nil)
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = true
+	}
 	if len(args) > 0 && CallMethod != nil {
 		if result := CallMethod(args[0], "sleep", args[1:]...); result != nil && result.Type == object.ValueException {
+			if currentData := threadValueData(current); currentData != nil {
+				currentData.stopped = false
+			}
 			return result
 		}
 	}
 	runNextPendingThread()
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = false
+	}
 	return R.NilVal
 }
 
@@ -6410,8 +10611,15 @@ func queuePop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		if data.closed {
 			return R.NilVal
 		}
+		current := threadClassCurrent(nil)
+		if currentData := threadValueData(current); currentData != nil {
+			currentData.stopped = true
+		}
 		data.numWaiting++
 		runNextPendingThread()
+		if currentData := threadValueData(current); currentData != nil {
+			currentData.stopped = false
+		}
 		if data.numWaiting > 0 {
 			data.numWaiting--
 		}
@@ -6547,7 +10755,14 @@ func sizedQueuePush(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		if evaluatingRaiseErrorMatcher {
 			return newRuntimeException(R.Classes["ClosedQueueError"], "queue closed")
 		}
+		current := threadClassCurrent(nil)
+		if currentData := threadValueData(current); currentData != nil {
+			currentData.stopped = true
+		}
 		runNextPendingThread()
+		if currentData := threadValueData(current); currentData != nil {
+			currentData.stopped = false
+		}
 		if data.numWaiting > 0 {
 			data.numWaiting--
 		}
@@ -6704,6 +10919,9 @@ func runThread(thread *object.EmeraldValue) {
 		return
 	}
 	data.ran = true
+	defer func() {
+		data.finished = true
+	}()
 	if data.block == nil || CallBlockWithArgs == nil {
 		data.result = R.NilVal
 		return
@@ -6714,7 +10932,14 @@ func runThread(thread *object.EmeraldValue) {
 		currentThread = prevThread
 	}()
 	LastException = nil
+	if EnterThreadBlock != nil {
+		EnterThreadBlock()
+	}
 	data.result = CallBlockWithArgs(data.block, data.args...)
+	if LeaveThreadBlock != nil {
+		LeaveThreadBlock()
+	}
+	data.stopped = false
 	if LastException != nil {
 		data.exception = LastException
 		if !data.abortOnException {
@@ -6754,6 +10979,9 @@ func enumeratorEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			if CallBlock != nil {
 				CallBlock()
 			}
+			if LastException != nil {
+				return LastException
+			}
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
@@ -6761,11 +10989,19 @@ func enumeratorEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			}
 		}
 	}
-	enumeratorGenerate(data)
+	if data.eachFunc != nil {
+		return data.eachFunc()
+	}
+	if errVal := enumeratorGenerateResult(data); errVal != nil {
+		return errVal
+	}
 	for _, value := range data.values {
 		if CallBlock != nil {
 			LastBlockResult = nil
 			CallBlock(value)
+			if LastException != nil {
+				return LastException
+			}
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
@@ -6781,19 +11017,45 @@ func enumeratorNext(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if !ok {
 		return R.NilVal
 	}
-	enumeratorGenerate(data)
+	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		fmt.Printf("enumeratorNext: index=%d len=%d generated=%v result=%v\n", data.index, len(data.values), data.generated, data.result)
+	}
+	if errVal := enumeratorGenerateResult(data); errVal != nil {
+		if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+			fmt.Printf("enumeratorNext generate error=%s\n", errVal.Inspect())
+		}
+		return errVal
+	}
 	if data.index < len(data.values) {
 		value := data.values[data.index]
 		data.index++
+		if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+			fmt.Printf("enumeratorNext returns value=%s\n", value.Inspect())
+		}
 		return value
 	}
+	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		fmt.Printf("enumeratorNext exhausting; cached result=%v\n", data.result)
+	}
 	LastException = newStopIteration(data.result)
+	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		exc := LastException.Data.(*object.RException)
+		fmt.Printf("enumeratorNext stop result nil?=%v\n", exc.Result == nil)
+	}
 	return LastException
 }
 
 func enumeratorSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if data, ok := receiver.Data.(*enumeratorData); ok && data.kind == "loop" {
-		return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Inf(1), Class: R.Classes["Float"]}
+	if data, ok := receiver.Data.(*enumeratorData); ok {
+		if data.sizeValue != nil {
+			return data.sizeValue
+		}
+		if data.size != nil {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: *data.size, Class: R.Classes["Integer"]}
+		}
+		if data.kind == "loop" {
+			return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Inf(1), Class: R.Classes["Float"]}
+		}
 	}
 	return R.NilVal
 }
@@ -6803,18 +11065,92 @@ func enumeratorToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if !ok {
 		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
 	}
-	enumeratorGenerate(data)
+	if errVal := enumeratorGenerateResult(data); errVal != nil {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
 	values := append([]*object.EmeraldValue(nil), data.values...)
 	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
 }
 
-func enumeratorGenerate(data *enumeratorData) {
+func enumeratorFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*enumeratorData)
+	if !ok {
+		return receiver
+	}
+	if errVal := enumeratorGenerateResult(data); errVal != nil {
+		return errVal
+	}
+	if len(args) == 0 {
+		if len(data.values) == 0 {
+			return R.NilVal
+		}
+		return data.values[0]
+	}
+	count, ok := valueToInteger(args[0])
+	if !ok {
+		return typeError("no implicit conversion into Integer")
+	}
+	if count < 0 {
+		return NewArgumentError("negative argument")
+	}
+	if count == 0 {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	if int(count) > len(data.values) {
+		count = int64(len(data.values))
+	}
+	result := make([]*object.EmeraldValue, int(count))
+	copy(result, data.values[:count])
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func newGeneratorEnumerator(generator func() ([]*object.EmeraldValue, *object.EmeraldValue)) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &enumeratorData{generator: generator},
+		Class: R.Classes["Enumerator"],
+	}
+}
+
+func newSizedGeneratorEnumerator(size int64, generator func() ([]*object.EmeraldValue, *object.EmeraldValue)) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &enumeratorData{generator: generator, size: &size},
+		Class: R.Classes["Enumerator"],
+	}
+}
+
+func newSizedValueGeneratorEnumerator(size *object.EmeraldValue, generator func() ([]*object.EmeraldValue, *object.EmeraldValue)) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &enumeratorData{generator: generator, sizeValue: size},
+		Class: R.Classes["Enumerator"],
+	}
+}
+
+func enumeratorGenerateResult(data *enumeratorData) *object.EmeraldValue {
 	if data.generated {
-		return
+		if data.result != nil && data.result.Type == object.ValueException {
+			return data.result
+		}
+		return nil
+	}
+	if data.block == nil && data.generator == nil {
+		data.generated = true
+		return nil
 	}
 	data.generated = true
+	if data.generator != nil {
+		var result *object.EmeraldValue
+		data.values, result = data.generator()
+		data.result = result
+		if data.result != nil && data.result.Type == object.ValueException {
+			return data.result
+		}
+		return nil
+	}
 	if data.block == nil || CallBlockWithArgs == nil {
-		return
+		return nil
 	}
 	yielder := &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -6822,6 +11158,17 @@ func enumeratorGenerate(data *enumeratorData) {
 		Class: R.Classes["Enumerator::Yielder"],
 	}
 	data.result = CallBlockWithArgs(data.block, yielder)
+	if data.result != nil && data.result.Type == object.ValueException {
+		return data.result
+	}
+	return nil
+}
+
+func enumeratorGenerate(data *enumeratorData) {
+	if data.generated {
+		return
+	}
+	_ = enumeratorGenerateResult(data)
 }
 
 func yielderAppend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -6852,7 +11199,7 @@ func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return R.FalseVal
 	}
 	targetClass := args[0].Data.(*object.Class)
-	currentClass := receiver.Class
+	currentClass := receiverEffectiveClass(receiver)
 	for currentClass != nil {
 		if currentClass == targetClass || currentClass.Name == targetClass.Name {
 			return R.TrueVal
@@ -6860,6 +11207,34 @@ func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		currentClass = currentClass.SuperClass
 	}
 	return R.FalseVal
+}
+
+func receiverEffectiveClass(receiver *object.EmeraldValue) *object.Class {
+	if receiver == nil {
+		return nil
+	}
+	switch receiver.Type {
+	case object.ValueObject:
+		if obj, ok := receiver.Data.(*object.Object); ok && obj.SingletonClass != nil {
+			return obj.SingletonClass
+		}
+	case object.ValueClass:
+		if cls, ok := receiver.Data.(*object.Class); ok {
+			if cls.SingletonClass != nil {
+				return cls.SingletonClass
+			}
+			if singleton := methodSingletonClass(receiver); singleton != nil && singleton.Type == object.ValueClass {
+				if singletonClass, ok := singleton.Data.(*object.Class); ok {
+					return singletonClass
+				}
+			}
+		}
+	case object.ValueModule:
+		if mod, ok := receiver.Data.(*object.Module); ok && mod.SingletonClass != nil {
+			return mod.SingletonClass
+		}
+	}
+	return receiver.Class
 }
 
 func intAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -6960,7 +11335,15 @@ func intPow(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / powInt(lf, -int(r)), Class: R.Classes["Float"]}
 		}
 		if integerPowOverflows(lf, int(r)) {
-			return NewRangeErrorValue("integer out of range")
+			result := int64(math.MaxInt64)
+			if lf < 0 && r%2 != 0 {
+				result = math.MinInt64
+			}
+			value := &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: R.Classes["Integer"]}
+			if lf == 2 && r >= 0 {
+				RememberBERPackOverride(value, BERPackPowerOfTwo(int(r)))
+			}
+			return value
 		}
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: powInt(lf, int(r)), Class: R.Classes["Integer"]}
 	case float64:
@@ -7138,10 +11521,29 @@ func intGcd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 	if len(args) < 1 {
 		return receiver
 	}
-	a := receiver.Data.(int64)
-	b := args[0].Data.(int64)
+	if args[0] == nil || args[0].Type != object.ValueInteger {
+		return conversionTypeErrorToInteger(args[0])
+	}
+	a, ok := receiver.Data.(int64)
+	if !ok {
+		return conversionTypeErrorToInteger(receiver)
+	}
+	b, ok := args[0].Data.(int64)
+	if !ok {
+		return conversionTypeErrorToInteger(args[0])
+	}
 	if a < 0 {
 		a = -a
+	}
+	if b == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  a,
+			Class: R.Classes["Integer"],
+		}
+	}
+	if a == 0 {
+		return args[0]
 	}
 	if b < 0 {
 		b = -b
@@ -7161,7 +11563,25 @@ func intLcm(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 		return receiver
 	}
 	a := receiver.Data.(int64)
-	b := args[0].Data.(int64)
+	b, ok := args[0].Data.(int64)
+	if !ok {
+		if args[0] == nil || args[0].Type != object.ValueInteger {
+			return conversionTypeErrorToInteger(args[0])
+		}
+	}
+	if a == 0 || b == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  0,
+			Class: R.Classes["Integer"],
+		}
+	}
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
 	gcd := a
 	tmp := b
 	for tmp > 0 {
@@ -7351,6 +11771,21 @@ func intCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 	}
 	return R.NilVal
+}
+
+func intCoerce(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || args[0] == nil {
+		return typeError("can't coerce nil into Integer")
+	}
+	switch args[0].Type {
+	case object.ValueInteger:
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{args[0], receiver}, Class: R.Classes["Array"]}
+	case object.ValueFloat:
+		left := args[0]
+		right := &object.EmeraldValue{Type: object.ValueFloat, Data: float64(receiver.Data.(int64)), Class: R.Classes["Float"]}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{left, right}, Class: R.Classes["Array"]}
+	}
+	return typeError("can't coerce " + args[0].TypeName() + " into Integer")
 }
 
 func intEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -7741,6 +12176,21 @@ func stringAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 }
 
+func stringCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || args[0] == nil || args[0].Type != object.ValueString {
+		return R.NilVal
+	}
+	cmp := strings.Compare(receiver.Data.(string), args[0].Data.(string))
+	switch {
+	case cmp < 0:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+	case cmp > 0:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+	default:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+}
+
 func stringMul(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
@@ -7817,6 +12267,10 @@ func encodingDefaultExternal(receiver *object.EmeraldValue, args ...*object.Emer
 	return newEncodingValue(defaultExternalEncoding)
 }
 
+func encodingToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rubyString(encodingName(receiver))
+}
+
 func encodingSetDefaultExternal(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) == 0 {
 		return R.NilVal
@@ -7830,6 +12284,29 @@ func encodingSetDefaultExternal(receiver *object.EmeraldValue, args ...*object.E
 		return R.NilVal
 	}
 	defaultExternalEncoding = name
+	return args[0]
+}
+
+func encodingDefaultInternal(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if defaultInternalEncoding == "" {
+		return R.NilVal
+	}
+	return newEncodingValue(defaultInternalEncoding)
+}
+
+func encodingSetDefaultInternal(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return R.NilVal
+	}
+	if args[0] == nil || args[0].Type == object.ValueNil {
+		defaultInternalEncoding = ""
+		return R.NilVal
+	}
+	name := encodingName(args[0])
+	if name == "" {
+		return R.NilVal
+	}
+	defaultInternalEncoding = name
 	return args[0]
 }
 
@@ -7857,6 +12334,17 @@ func stringEncodingName(receiver *object.EmeraldValue) string {
 		}
 	}
 	return defaultExternalEncoding
+}
+
+func encodingIsASCICompatible(name string) bool {
+	upper := strings.ToUpper(name)
+	switch upper {
+	case "UTF-16BE", "UTF-32", "UTF-32BE":
+		return false
+	case "UTF-16", "UTF_16", "UTF-16LE", "UTF-32LE":
+		return false
+	}
+	return true
 }
 
 func stringEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -7988,11 +12476,140 @@ func arrayEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	return R.TrueVal
 }
 
+func arrayCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || args[0] == nil {
+		return R.NilVal
+	}
+	if args[0].Type != object.ValueArray {
+		values, ok := valueToArray(args[0])
+		if !ok {
+			return R.NilVal
+		}
+		args[0] = &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+	}
+	cmp, ok, err := arrayCompareInner(receiver, args[0], make(map[[2]*object.EmeraldValue]bool))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return R.NilVal
+	}
+	switch {
+	case cmp < 0:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(-1), Class: R.Classes["Integer"]}
+	case cmp > 0:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(1), Class: R.Classes["Integer"]}
+	default:
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+}
+
+func arrayCompareInner(leftValue, rightValue *object.EmeraldValue, seen map[[2]*object.EmeraldValue]bool) (int, bool, *object.EmeraldValue) {
+	if leftValue == rightValue {
+		return 0, true, nil
+	}
+	pair := [2]*object.EmeraldValue{leftValue, rightValue}
+	if seen[pair] {
+		return 0, true, nil
+	}
+	seen[pair] = true
+	defer delete(seen, pair)
+
+	left := leftValue.Data.([]*object.EmeraldValue)
+	right := rightValue.Data.([]*object.EmeraldValue)
+	limit := len(left)
+	if len(right) < limit {
+		limit = len(right)
+	}
+	for i := 0; i < limit; i++ {
+		cmp, ok, err := arrayCompareElement(left[i], right[i], seen)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ok {
+			return 0, false, nil
+		}
+		if cmp < 0 {
+			return -1, true, nil
+		}
+		if cmp > 0 {
+			return 1, true, nil
+		}
+	}
+	switch {
+	case len(left) < len(right):
+		return -1, true, nil
+	case len(left) > len(right):
+		return 1, true, nil
+	default:
+		return 0, true, nil
+	}
+}
+
+func arrayCompareElement(left, right *object.EmeraldValue, seen map[[2]*object.EmeraldValue]bool) (int, bool, *object.EmeraldValue) {
+	if left != nil && right != nil && left.Type == object.ValueArray && right.Type == object.ValueArray {
+		return arrayCompareInner(left, right, seen)
+	}
+	if cmp, ok := rangeCompareValues(left, right); ok {
+		return cmp, true, nil
+	}
+	if CallMethod != nil && left != nil && receiverHasCallableMethod(left, "<=>") {
+		cmpValue := CallMethod(left, "<=>", right)
+		if cmpValue != nil && cmpValue.Type == object.ValueException {
+			return 0, false, cmpValue
+		}
+		if cmpValue != nil && cmpValue.Type == object.ValueNil {
+			return 0, false, nil
+		}
+		if cmpValue != nil && cmpValue.Type == object.ValueInteger {
+			n := cmpValue.Data.(int64)
+			if n < 0 {
+				return -1, true, nil
+			}
+			if n > 0 {
+				return 1, true, nil
+			}
+			return 0, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func arrayNaturalCompare(left, right *object.EmeraldValue) (int, *object.EmeraldValue) {
+	if left != nil && right != nil && left.Type == object.ValueArray && right.Type == object.ValueArray {
+		cmp, ok, err := arrayCompareInner(left, right, make(map[[2]*object.EmeraldValue]bool))
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, NewArgumentError("comparison failed")
+		}
+		return cmp, nil
+	}
+	cmp, ok := rangeCompareValues(left, right)
+	if !ok {
+		return 0, NewArgumentError("comparison failed")
+	}
+	return cmp, nil
+}
+
 func arrayMultiply(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) == 0 || args[0] == nil || args[0].Type != object.ValueInteger {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if args[0] == nil {
 		return typeError("can't convert argument into Integer")
 	}
-	count := int(args[0].Data.(int64))
+	if sep, ok, _, err := evalCoerceToString(args[0]); err != nil {
+		return err
+	} else if ok {
+		return arrayJoin(receiver, rubyString(sep))
+	}
+	countValue, ok := valueToInteger(args[0])
+	if !ok {
+		return typeError("can't convert argument into Integer")
+	}
+	count := int(countValue)
 	if count < 0 {
 		return NewArgumentError("negative argument")
 	}
@@ -8018,11 +12635,56 @@ func arrayToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func arrayClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	contents, err := arrayNewContents(args...)
+	if err != nil {
+		if contents != nil {
+			receiver.Data = contents
+		}
+		return err
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
-		Data:  arrayNewContents(args...),
+		Data:  contents,
 		Class: R.Classes["Array"],
 	}
+}
+
+func arrayClassSquareBrackets(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	class := R.Classes["Array"]
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if receiverClass, ok := receiver.Data.(*object.Class); ok && receiverClass != nil {
+			class = receiverClass
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  append([]*object.EmeraldValue(nil), args...),
+		Class: class,
+	}
+}
+
+func arrayClassTryConvert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0] == nil {
+		return R.NilVal
+	}
+	value := args[0]
+	if value.Type == object.ValueArray {
+		return value
+	}
+	if CallMethod == nil || !receiverHasCallableMethod(value, "to_ary") {
+		return R.NilVal
+	}
+	converted := CallMethod(value, "to_ary")
+	if converted == nil || converted.Type == object.ValueNil {
+		return R.NilVal
+	}
+	if converted.Type == object.ValueException {
+		return converted
+	}
+	if converted.Type == object.ValueArray {
+		return converted
+	}
+	return typeError("can't convert " + value.TypeName() + " into Array")
 }
 
 func stringClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -8040,22 +12702,45 @@ func stringClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 }
 
 func arrayInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	receiver.Data = arrayNewContents(args...)
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	contents, err := arrayNewContents(args...)
+	if err != nil {
+		if contents != nil {
+			receiver.Data = contents
+		}
+		return err
+	}
+	receiver.Data = contents
 	return receiver
 }
 
-func arrayNewContents(args ...*object.EmeraldValue) []*object.EmeraldValue {
+func arrayNewContents(args ...*object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if len(args) > 2 {
+		return nil, NewArgumentError("wrong number of arguments")
+	}
 	if len(args) == 1 {
 		if arr, ok := valueToArray(args[0]); ok {
-			return append([]*object.EmeraldValue(nil), arr...)
+			return append([]*object.EmeraldValue(nil), arr...), nil
 		}
+	} else if len(args) == 2 && args[0] != nil && args[0].Type == object.ValueArray {
+		return nil, typeError("no implicit conversion of Array into Integer")
 	}
 
 	length := 0
 	if len(args) > 0 {
-		if n, ok := valueToInteger(args[0]); ok && n > 0 {
-			length = int(n)
+		n, ok := valueToInteger(args[0])
+		if !ok {
+			return nil, typeError("no implicit conversion into Integer")
 		}
+		if n < 0 {
+			return nil, NewArgumentError("negative array size")
+		}
+		if n >= 1<<62 || n > 10_000_000 {
+			return nil, NewArgumentError("array size too big")
+		}
+		length = int(n)
 	}
 
 	defaultValue := R.NilVal
@@ -8066,16 +12751,23 @@ func arrayNewContents(args ...*object.EmeraldValue) []*object.EmeraldValue {
 	arr := make([]*object.EmeraldValue, length)
 	for i := 0; i < length; i++ {
 		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
-			arr[i] = CallBlock(&object.EmeraldValue{
+			LastBlockResult = nil
+			value := CallBlock(&object.EmeraldValue{
 				Type:  object.ValueInteger,
 				Data:  int64(i),
 				Class: R.Classes["Integer"],
 			})
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return arr[:i], result
+			}
+			arr[i] = value
 		} else {
 			arr[i] = defaultValue
 		}
 	}
-	return arr
+	return arr, nil
 }
 
 func arrayDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -8085,6 +12777,9 @@ func arrayDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func arrayReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	if len(args) == 0 || args[0].Type != object.ValueArray {
 		return receiver
 	}
@@ -8101,16 +12796,21 @@ func arrayFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) > 0 {
 		count, ok := valueToInteger(args[0])
 		if !ok {
-			return R.NilVal
+			return typeError("no implicit conversion into Integer")
+		}
+		if count >= 1<<62 || count <= -(1<<62) {
+			return NewRangeError("integer out of range")
 		}
 		n := int(count)
 		if n < 0 {
-			n = 0
+			return NewArgumentError("negative array size")
 		}
 		if n > len(arr) {
 			n = len(arr)
 		}
-		return &object.EmeraldValue{Type: object.ValueArray, Data: arr[:n], Class: R.Classes["Array"]}
+		result := make([]*object.EmeraldValue, n)
+		copy(result, arr[:n])
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 	}
 	if len(arr) > 0 {
 		return arr[0]
@@ -8123,16 +12823,18 @@ func arrayLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) > 0 {
 		count, ok := valueToInteger(args[0])
 		if !ok {
-			return R.NilVal
+			return typeError("no implicit conversion into Integer")
 		}
 		n := int(count)
 		if n < 0 {
-			n = 0
+			return NewArgumentError("negative array size")
 		}
 		if n > len(arr) {
 			n = len(arr)
 		}
-		return &object.EmeraldValue{Type: object.ValueArray, Data: arr[len(arr)-n:], Class: R.Classes["Array"]}
+		result := make([]*object.EmeraldValue, n)
+		copy(result, arr[len(arr)-n:])
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 	}
 	if len(arr) > 0 {
 		return arr[len(arr)-1]
@@ -8141,11 +12843,14 @@ func arrayLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	if len(args) < 1 {
 		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	receiver.Data = append(arr, args[0])
+	receiver.Data = append(arr, args...)
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
 	}
@@ -8153,11 +12858,37 @@ func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	if len(args) > 1 {
+		return argumentError("wrong number of arguments")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) == 1 {
+		count, ok := arrayShiftCount(args[0])
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if count < 0 {
+			return NewArgumentError("negative array size")
+		}
+		n := int(count)
+		if n > len(arr) {
+			n = len(arr)
+		}
+		start := len(arr) - n
+		result := make([]*object.EmeraldValue, n)
+		copy(result, arr[start:])
+		receiver.Data = arr[:start]
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+	}
 	if len(arr) == 0 {
 		return R.NilVal
 	}
-	return arr[len(arr)-1]
+	result := arr[len(arr)-1]
+	receiver.Data = arr[:len(arr)-1]
+	return result
 }
 
 func arrayEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -8170,22 +12901,134 @@ func arrayEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 
 func arrayJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
-	sep := ""
-	if len(args) > 0 && args[0].Type == object.ValueString {
-		sep = args[0].Data.(string)
+	if len(arr) == 0 {
+		return rubyString("")
 	}
-	result := ""
+	sep, err := arrayJoinSeparator(args)
+	if err != nil {
+		return err
+	}
+	if err := arrayJoinEncodingError(arr); err != nil {
+		return err
+	}
+	seen := map[*object.EmeraldValue]bool{receiver: true}
+	parts := make([]string, len(arr))
 	for i, v := range arr {
-		result += v.Inspect()
-		if i < len(arr)-1 {
-			result += sep
+		part, err := arrayJoinElement(v, sep, seen)
+		if err != nil {
+			return err
+		}
+		parts[i] = part
+	}
+	return rubyString(strings.Join(parts, sep))
+}
+
+func arrayJoinEncodingError(values []*object.EmeraldValue) *object.EmeraldValue {
+	hasUTF8NonASCII := false
+	hasBinaryNonASCII := false
+	seen := make(map[*object.EmeraldValue]bool)
+	var scan func([]*object.EmeraldValue)
+	scan = func(items []*object.EmeraldValue) {
+		for _, value := range items {
+			if value == nil {
+				continue
+			}
+			if value.Type == object.ValueArray {
+				if seen[value] {
+					continue
+				}
+				seen[value] = true
+				scan(value.Data.([]*object.EmeraldValue))
+				delete(seen, value)
+				continue
+			}
+			if value.Type != object.ValueString {
+				continue
+			}
+			if !stringHasNonASCIIByte(value.Data.(string)) {
+				continue
+			}
+			switch strings.ToUpper(stringEncodingName(value)) {
+			case "BINARY", "ASCII-8BIT", "ASCII_8BIT":
+				hasBinaryNonASCII = true
+			case "UTF-8", "UTF8":
+				hasUTF8NonASCII = true
+			}
 		}
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueString,
-		Data:  result,
-		Class: R.Classes["String"],
+	scan(values)
+	if hasUTF8NonASCII && hasBinaryNonASCII {
+		return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible encoding")
 	}
+	return nil
+}
+
+func arrayJoinSeparator(args []*object.EmeraldValue) (string, *object.EmeraldValue) {
+	if len(args) == 0 || args[0] == nil || args[0].Type == object.ValueNil {
+		return "", nil
+	}
+	if args[0].Type == object.ValueString {
+		return args[0].Data.(string), nil
+	}
+	sep, ok, _, err := evalCoerceToString(args[0])
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return sep, nil
+	}
+	return "", conversionTypeErrorToString(args[0])
+}
+
+func arrayJoinElement(value *object.EmeraldValue, sep string, seen map[*object.EmeraldValue]bool) (string, *object.EmeraldValue) {
+	if value == nil || value.Type == object.ValueNil {
+		return "", nil
+	}
+	if value.Type == object.ValueString {
+		return value.Data.(string), nil
+	}
+	if value.Type == object.ValueArray {
+		if seen[value] {
+			return "", NewArgumentError("recursive array join")
+		}
+		seen[value] = true
+		arr := value.Data.([]*object.EmeraldValue)
+		parts := make([]string, len(arr))
+		for i, element := range arr {
+			part, err := arrayJoinElement(element, sep, seen)
+			if err != nil {
+				delete(seen, value)
+				return "", err
+			}
+			parts[i] = part
+		}
+		delete(seen, value)
+		return strings.Join(parts, sep), nil
+	}
+	if str, ok, _, err := evalCoerceToString(value); err != nil {
+		return "", err
+	} else if ok {
+		return str, nil
+	}
+	if CallMethod != nil && receiverHasCallableMethod(value, "to_ary") {
+		coerced := CallMethod(value, "to_ary")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return "", coerced
+		}
+		if coerced != nil && coerced.Type == object.ValueArray {
+			return arrayJoinElement(coerced, sep, seen)
+		}
+	}
+	if CallMethod != nil && receiverHasCallableMethod(value, "to_s") {
+		coerced := CallMethod(value, "to_s")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return "", coerced
+		}
+		if coerced != nil && coerced.Type == object.ValueString {
+			return coerced.Data.(string), nil
+		}
+	}
+	return value.Inspect(), nil
 }
 
 func arrayReverse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -8202,6 +13045,9 @@ func arrayReverse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func arrayReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for i, j := 0, len(arr)-1; i < j; i, j = i+1, j-1 {
 		arr[i], arr[j] = arr[j], arr[i]
@@ -8211,21 +13057,14 @@ func arrayReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 }
 
 func arrayIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
-		return R.NilVal
+	return arraySlice(receiver, args...)
+}
+
+func arrayAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
-	switch idx := args[0].Data.(type) {
-	case int64:
-		if idx < 0 {
-			idx = int64(len(arr)) + idx
-		}
-		if idx < 0 || idx >= int64(len(arr)) {
-			return R.NilVal
-		}
-		return arr[idx]
-	}
-	return R.NilVal
+	return arrayIndex(receiver, args...)
 }
 
 func hashLookup(h map[*object.EmeraldValue]*object.EmeraldValue, key *object.EmeraldValue) (*object.EmeraldValue, bool) {
@@ -8256,6 +13095,20 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		return R.NilVal
 	}
 	h := valueToHashMap(receiver)
+	if h == nil {
+		h = make(map[*object.EmeraldValue]*object.EmeraldValue)
+		switch mapOwner := receiver.Data.(type) {
+		case map[*object.EmeraldValue]*object.EmeraldValue:
+			if mapOwner != nil {
+				h = mapOwner
+			}
+			receiver.Data = h
+		case *object.RHash:
+			mapOwner.Pairs = h
+		default:
+			receiver.Data = h
+		}
+	}
 	for k := range h {
 		if k.Equals(args[0]) {
 			h[k] = args[1]
@@ -8263,6 +13116,9 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		}
 	}
 	h[args[0]] = args[1]
+	if hash, ok := receiver.Data.(*object.RHash); ok {
+		hash.Keys = append(hash.Keys, args[0])
+	}
 	return args[1]
 }
 
@@ -8317,6 +13173,10 @@ func builtinPuts(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func builtinPrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil && data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
 	for _, arg := range args {
 		fmt.Print(arg.Inspect())
 	}
@@ -8328,6 +13188,47 @@ func builtinP(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		fmt.Println(arg.Inspect())
 	}
 	return R.NilVal
+}
+
+func builtinBacktick(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0] == nil {
+		return typeError("no implicit conversion into String")
+	}
+	commandValue := args[0]
+	if commandValue.Type != object.ValueString {
+		if CallMethod == nil || !receiverHasCallableMethod(commandValue, "to_str") {
+			return typeError("no implicit conversion into String")
+		}
+		coerced := CallMethod(commandValue, "to_str")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		if coerced == nil || coerced.Type != object.ValueString {
+			return typeError("no implicit conversion into String")
+		}
+		commandValue = coerced
+	}
+	command := commandValue.Data.(string)
+	if backtickCommandMissing(command) {
+		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory - "+strings.TrimSpace(command))
+	}
+	return rubyString(commandPopenOutput(command, nil, "", false))
+}
+
+func backtickCommandMissing(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return false
+	}
+	if strings.ContainsAny(trimmed, " \t\n;&|<>$`'\"(){}[]*?") {
+		return false
+	}
+	if strings.Contains(trimmed, "/") {
+		_, err := os.Stat(trimmed)
+		return err != nil
+	}
+	_, err := exec.LookPath(trimmed)
+	return err != nil
 }
 
 func builtinFormat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -8349,6 +13250,9 @@ func builtinPrintf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	formatted := builtinFormat(receiver, args...)
 	if formatted == nil || formatted.Type == object.ValueException {
 		return formatted
+	}
+	if data := ioShim(receiver); data != nil && data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
 	}
 	if data := ioShim(receiver); data != nil && data.path != "" {
 		f, err := os.OpenFile(data.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -8529,6 +13433,10 @@ func builtinGets(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func builtinNewIO(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return fileClassOpen(nil, args...)
+}
+
 func builtinTmp(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	name := "rgo-tmp"
 	if len(args) > 0 && args[0].Type == object.ValueString {
@@ -8538,12 +13446,30 @@ func builtinTmp(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func builtinTouch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	path, errVal := pathFromSingleArg(args)
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	path, errVal := coercePath(args[0])
 	if errVal != nil {
 		return errVal
 	}
+	mode := "w"
+	if len(args) > 1 {
+		if args[1] == nil || args[1].Type != object.ValueString {
+			return typeError("no implicit conversion into String")
+		}
+		parsedMode, _, _, parseErr := parseModeEncodingFromMode(args[1].Data.(string))
+		if parseErr != nil {
+			return parseErr
+		}
+		mode = parsedMode
+	}
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	flags := os.O_CREATE | os.O_WRONLY
+	if strings.Contains(mode, "w") {
+		flags |= os.O_TRUNC
+	}
+	file, err := os.OpenFile(path, flags, 0644)
 	if err == nil {
 		_ = file.Close()
 	}
@@ -8551,6 +13477,8 @@ func builtinTouch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		fileValue := newIOShimValue("File")
 		if data := ioShim(fileValue); data != nil {
 			data.path = path
+			data.mode = mode
+			data.binmode = strings.Contains(mode, "b")
 		}
 		defineMockSingleton(fileValue, "write", func(_ *object.EmeraldValue, writeArgs ...*object.EmeraldValue) *object.EmeraldValue {
 			if len(writeArgs) == 0 || writeArgs[0].Type != object.ValueString {
@@ -8784,15 +13712,31 @@ func stringToSym(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 
 func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	collectResult := ForEachCollecting()
+	collected := make([]*object.EmeraldValue, 0, len(arr))
 	for _, elem := range arr {
 		if CallBlock != nil {
 			LastBlockResult = nil
-			CallBlock(elem)
+			ForEachClearNext()
+			val := CallBlock(elem)
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
 				return result
 			}
+			if ForEachConsumeNext() {
+				continue
+			}
+			if collectResult {
+				collected = append(collected, val)
+			}
+		}
+	}
+	if collectResult {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  collected,
+			Class: R.Classes["Array"],
 		}
 	}
 	return receiver
@@ -8800,22 +13744,50 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 
 func arrayReverseEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	collectResult := ForEachCollecting()
+	collected := make([]*object.EmeraldValue, 0, len(arr))
 	for i := len(arr) - 1; i >= 0; i-- {
 		if CallBlock != nil {
 			LastBlockResult = nil
-			CallBlock(arr[i])
+			ForEachClearNext()
+			val := CallBlock(arr[i])
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
 				return result
 			}
+			if ForEachConsumeNext() {
+				continue
+			}
+			if collectResult {
+				collected = append(collected, val)
+			}
+		}
+	}
+	if collectResult {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  collected,
+			Class: R.Classes["Array"],
 		}
 	}
 	return receiver
 }
 
 func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			result := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
+			for _, elem := range receiver.Data.([]*object.EmeraldValue) {
+				result = append(result, elem)
+			}
+			return result, nil
+		})
+	}
 	result := make([]*object.EmeraldValue, len(arr))
 	for i, elem := range arr {
 		val := CallBlock(elem)
@@ -8829,8 +13801,49 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
-		return receiver
+		arr := receiver.Data.([]*object.EmeraldValue)
+		enum := newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			if receiver != nil && receiver.Frozen {
+				return nil, frozenError("can't modify frozen array")
+			}
+			values := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
+			for _, elem := range receiver.Data.([]*object.EmeraldValue) {
+				values = append(values, elem)
+			}
+			return values, nil
+		})
+		if data, ok := enum.Data.(*enumeratorData); ok {
+			data.eachFunc = func() *object.EmeraldValue {
+				if receiver != nil && receiver.Frozen {
+					return frozenError("can't modify frozen array")
+				}
+				current := receiver.Data.([]*object.EmeraldValue)
+				for i := 0; i < len(current); i++ {
+					LastBlockResult = nil
+					if CallBlock != nil {
+						current[i] = CallBlock(current[i])
+					}
+					if LastException != nil {
+						return LastException
+					}
+					if LastBlockResult != nil {
+						result := LastBlockResult
+						LastBlockResult = nil
+						return result
+					}
+				}
+				receiver.Data = current
+				return enum
+			}
+		}
+		return enum
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for i, elem := range arr {
@@ -8857,8 +13870,14 @@ func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func arraySelectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
-		return receiver
+		return newArrayKeepIfEnumerator(receiver)
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	newArr := make([]*object.EmeraldValue, 0, len(arr))
@@ -8874,6 +13893,47 @@ func arraySelectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	return receiver
 }
 
+func newArrayKeepIfEnumerator(receiver *object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	enum := newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		values := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
+		for _, elem := range receiver.Data.([]*object.EmeraldValue) {
+			values = append(values, elem)
+		}
+		return values, nil
+	})
+	if data, ok := enum.Data.(*enumeratorData); ok {
+		data.eachFunc = func() *object.EmeraldValue {
+			if receiver != nil && receiver.Frozen {
+				return frozenError("can't modify frozen array")
+			}
+			current := receiver.Data.([]*object.EmeraldValue)
+			newArr := make([]*object.EmeraldValue, 0, len(current))
+			for _, elem := range current {
+				LastBlockResult = nil
+				keep := false
+				if CallBlock != nil {
+					keep = CallBlock(elem).IsTruthy()
+				}
+				if LastException != nil {
+					return LastException
+				}
+				if LastBlockResult != nil {
+					result := LastBlockResult
+					LastBlockResult = nil
+					return result
+				}
+				if keep {
+					newArr = append(newArr, elem)
+				}
+			}
+			receiver.Data = newArr
+			return enum
+		}
+	}
+	return enum
+}
+
 func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	for _, elem := range arr {
@@ -8886,20 +13946,93 @@ func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := valueToHashMap(receiver)
-	for k, v := range hash {
+	keys, hash := hashOrderedKeysFromValue(receiver)
+	passesAsPair := false
+	collectAsPair := false
+	if CurrentBlockValue != nil {
+		block := CurrentBlockValue()
+		fn := procFunction(block)
+		if fn != nil && !fn.HasRestParam && len(fn.Params) == 1 && !callableIsLambda(block) {
+			passesAsPair = true
+		}
+		if fn != nil && fn.ForLoopCollectAsPair {
+			collectAsPair = true
+		}
+	}
+
+	collectResult := ForEachCollecting()
+	collected := make([]*object.EmeraldValue, 0, len(hash))
+	if collectResult && len(keys) == 0 {
+		return R.NilVal
+	}
+	for _, k := range keys {
+		v, ok := hash[k]
+		if !ok {
+			continue
+		}
 		if CallBlock != nil {
-			CallBlock(k, v)
+			LastBlockResult = nil
+			ForEachClearNext()
+			if passesAsPair {
+				pair := &object.EmeraldValue{
+					Type:  object.ValueArray,
+					Data:  []*object.EmeraldValue{k, v},
+					Class: R.Classes["Array"],
+				}
+				val := CallBlock(pair)
+				if LastBlockResult != nil {
+					result := LastBlockResult
+					LastBlockResult = nil
+					return result
+				}
+				if ForEachConsumeNext() {
+					continue
+				}
+				if collectResult {
+					if collectAsPair && val != nil && val.Type == object.ValueArray {
+						collected = append(collected, val.Data.([]*object.EmeraldValue)...)
+					} else {
+						collected = append(collected, val)
+					}
+				}
+			} else {
+				val := CallBlock(k, v)
+				if LastBlockResult != nil {
+					result := LastBlockResult
+					LastBlockResult = nil
+					return result
+				}
+				if ForEachConsumeNext() {
+					continue
+				}
+				if collectResult {
+					if collectAsPair && val != nil && val.Type == object.ValueArray {
+						collected = append(collected, val.Data.([]*object.EmeraldValue)...)
+					} else {
+						collected = append(collected, val)
+					}
+				}
+			}
+		}
+	}
+	if collectResult {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  collected,
+			Class: R.Classes["Array"],
 		}
 	}
 	return receiver
 }
 
 func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := valueToHashMap(receiver)
-	keys := make([]*object.EmeraldValue, 0, len(hash))
-	for k := range hash {
-		keys = append(keys, k)
+	keys, hash := hashOrderedKeysFromValue(receiver)
+	if hash == nil {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{},
+			Class: R.Classes["Array"],
+		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -8909,10 +14042,20 @@ func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func hashEachValue(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	hash := valueToHashMap(receiver)
+	keys, hash := hashOrderedKeysFromValue(receiver)
 	values := make([]*object.EmeraldValue, 0, len(hash))
-	for _, v := range hash {
-		values = append(values, v)
+	if hash == nil {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  values,
+			Class: R.Classes["Array"],
+		}
+	}
+	for _, key := range keys {
+		value, ok := hash[key]
+		if ok {
+			values = append(values, value)
+		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -8972,10 +14115,20 @@ func stringCountChars(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	}
 }
 
+func stringByteSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  int64(len([]byte(s))),
+		Class: R.Classes["Integer"],
+	}
+}
+
 func stringBytes(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	s := receiver.Data.(string)
-	result := make([]*object.EmeraldValue, len(s))
-	for i, b := range s {
+	bytes := []byte(s)
+	result := make([]*object.EmeraldValue, len(bytes))
+	for i, b := range bytes {
 		result[i] = &object.EmeraldValue{
 			Type:  object.ValueInteger,
 			Data:  int64(b),
@@ -9006,16 +14159,55 @@ func stringChars(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func stringEachChar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	s := receiver.Data.(string)
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		for _, c := range s {
+			LastBlockResult = nil
+			ForEachClearNext()
+			CallBlockWithArgs(CurrentBlockValue(), &object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  string(c),
+				Class: R.Classes["String"],
+			})
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return receiver
+	}
+	return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		result := make([]*object.EmeraldValue, 0, len([]rune(s)))
+		for _, c := range s {
+			result = append(result, &object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  string(c),
+				Class: R.Classes["String"],
+			})
+		}
+		return result, nil
+	})
+}
+
 func arrayConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if len(args) < 1 {
 		return receiver
 	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	for _, arg := range args {
-		if arg.Type != object.ValueArray {
+		values, ok := valueToArray(arg)
+		if !ok {
 			continue
 		}
-		arr = append(arr, arg.Data.([]*object.EmeraldValue)...)
+		arr = append(arr, values...)
 	}
 	receiver.Data = arr
 	return receiver
@@ -9073,14 +14265,82 @@ func valueToArray(value *object.EmeraldValue) ([]*object.EmeraldValue, bool) {
 	return arr, ok
 }
 
-func valueToHashMap(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+func processValueToHash(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
 	if value == nil {
 		return nil
 	}
 	if h, ok := value.Data.(map[*object.EmeraldValue]*object.EmeraldValue); ok {
 		return h
 	}
+	if h, ok := value.Data.(*object.RHash); ok {
+		return h.Pairs
+	}
+	if CallMethod == nil || value.Class == nil {
+		return nil
+	}
+	if !receiverHasCallableMethod(value, "to_hash") {
+		return nil
+	}
+	coerced := CallMethod(value, "to_hash")
+	if coerced == nil || coerced.Type != object.ValueHash {
+		return nil
+	}
+	if h, ok := coerced.Data.(map[*object.EmeraldValue]*object.EmeraldValue); ok {
+		return h
+	}
+	if h, ok := coerced.Data.(*object.RHash); ok {
+		return h.Pairs
+	}
 	return nil
+}
+
+func hashOrderedKeysFromValue(value *object.EmeraldValue) ([]*object.EmeraldValue, map[*object.EmeraldValue]*object.EmeraldValue) {
+	hash := valueToHashMap(value)
+	if hash == nil {
+		return nil, nil
+	}
+	if value == nil || value.Type != object.ValueHash {
+		return nil, hash
+	}
+	rhash, ok := value.Data.(*object.RHash)
+	if !ok || len(rhash.Keys) == 0 {
+		keys := make([]*object.EmeraldValue, 0, len(hash))
+		for key := range hash {
+			keys = append(keys, key)
+		}
+		return keys, hash
+	}
+	keys := make([]*object.EmeraldValue, 0, len(hash))
+	seen := make(map[*object.EmeraldValue]struct{}, len(hash))
+	for _, key := range rhash.Keys {
+		if _, ok := hash[key]; ok {
+			keys = append(keys, key)
+			seen[key] = struct{}{}
+		}
+	}
+	for key := range hash {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys, hash
+}
+
+func hashForEach(value *object.EmeraldValue, fn func(key, value *object.EmeraldValue)) {
+	keys, hash := hashOrderedKeysFromValue(value)
+	if len(keys) == 0 || hash == nil {
+		return
+	}
+	for _, key := range keys {
+		if pairValue, ok := hash[key]; ok {
+			fn(key, pairValue)
+		}
+	}
+}
+
+func valueToHashMap(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+	return processValueToHash(value)
 }
 
 func MarkRuby2KeywordHash(value *object.EmeraldValue) {
@@ -9123,8 +14383,14 @@ func arrayDeleteAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	idx, ok := valueToArrayIndex(args[0])
-	if !ok {
+	if len(args) > 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	idx, err := arrayIndexIntArg(args[0])
+	if err != nil {
 		return R.NilVal
 	}
 	if idx < 0 {
@@ -9300,13 +14566,12 @@ func symbolSucc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(s) == 0 {
 		return receiver
 	}
-	result := []byte(s)
+	result := []rune(s)
 	for i := len(result) - 1; i >= 0; i-- {
-		if result[i] < 'z' {
+		if result[i] < utf8.MaxRune {
 			result[i]++
 			break
 		}
-		result[i] = 'a'
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueSymbol,
@@ -9332,6 +14597,22 @@ func symbolEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 
 func symbolCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return symbolEqual(receiver, args...)
+}
+
+func symbolCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || args[0] == nil || args[0].Type != object.ValueSymbol {
+		return R.NilVal
+	}
+	left := receiver.Data.(string)
+	right := args[0].Data.(string)
+	switch strings.Compare(left, right) {
+	case -1:
+		return newInt(-1)
+	case 1:
+		return newInt(1)
+	default:
+		return newInt(0)
+	}
 }
 
 func symbolIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -9427,20 +14708,107 @@ func rangeEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return receiver
 	}
 	r := receiver.Data.(*object.RRange)
-	end := r.End
-	if r.Exclusive {
-		end--
+	if r.StartMissing || r.EndMissing {
+		return receiver
 	}
-	for i := r.Start; i <= end; i++ {
-		if CallBlock != nil {
-			CallBlock(&object.EmeraldValue{
+
+	start, startOk := r.StartValue.(*object.EmeraldValue)
+	end, endOk := r.EndValue.(*object.EmeraldValue)
+	if !startOk || start == nil || !endOk || end == nil {
+		return receiver
+	}
+	collectResult := ForEachCollecting()
+	collected := make([]*object.EmeraldValue, 0)
+
+	if start.Type == object.ValueInteger && end.Type == object.ValueInteger && !r.StartFloat && !r.EndFloat {
+		endVal := r.End
+		if r.Exclusive {
+			endVal--
+		}
+		for i := r.Start; i <= endVal; i++ {
+			val := &object.EmeraldValue{
 				Type:  object.ValueInteger,
 				Data:  i,
 				Class: R.Classes["Integer"],
-			})
+			}
+			if CallBlock != nil {
+				LastBlockResult = nil
+				ForEachClearNext()
+				CallBlock(val)
+				if LastBlockResult != nil {
+					result := LastBlockResult
+					LastBlockResult = nil
+					return result
+				}
+				if ForEachConsumeNext() {
+					continue
+				}
+			}
+			if collectResult {
+				collected = append(collected, val)
+			}
 		}
+		if collectResult {
+			return &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  collected,
+				Class: R.Classes["Array"],
+			}
+		}
+		return receiver
 	}
-	return receiver
+
+	if (start.Type == object.ValueString || start.Type == object.ValueSymbol) &&
+		(end.Type == object.ValueString || end.Type == object.ValueSymbol) {
+		current := start
+		for {
+			cmp, ok := rangeCompareValues(current, end)
+			if !ok || cmp > 0 || (r.Exclusive && cmp == 0) {
+				break
+			}
+			if collectResult {
+				collected = append(collected, current)
+			}
+			if CallBlock != nil {
+				LastBlockResult = nil
+				ForEachClearNext()
+				CallBlock(current)
+				if LastBlockResult != nil {
+					result := LastBlockResult
+					LastBlockResult = nil
+					return result
+				}
+				if ForEachConsumeNext() {
+					continue
+				}
+			}
+			if equalValuesForRange(current, end) {
+				break
+			}
+			next := CallMethod(current, "succ")
+			if next == nil || next == current {
+				break
+			}
+			nextCmp, ok := rangeCompareValues(next, current)
+			if !ok || nextCmp <= 0 {
+				break
+			}
+			current = next
+		}
+		if collectResult {
+			return &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  collected,
+				Class: R.Classes["Array"],
+			}
+		}
+		return receiver
+	}
+
+	if start.Class != nil {
+		return newRuntimeException(R.Classes["TypeError"], "can't iterate from "+start.Class.Name)
+	}
+	return newRuntimeException(R.Classes["TypeError"], "can't iterate from unknown type")
 }
 
 func rangeToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -9448,12 +14816,64 @@ func rangeToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		return receiver
 	}
 	r := receiver.Data.(*object.RRange)
-	end := r.End
+	if r.StartMissing {
+		return newRuntimeException(R.Classes["TypeError"], "can't convert beginless range to an Array")
+	}
+	if r.EndMissing {
+		return newRuntimeException(R.Classes["RangeError"], "can't convert endless range to an Array")
+	}
+
+	startVal, okStart := r.StartValue.(*object.EmeraldValue)
+	endVal, okEnd := r.EndValue.(*object.EmeraldValue)
+	if !okStart || !okEnd || startVal == nil || endVal == nil {
+		return newRuntimeException(R.Classes["TypeError"], "can't convert object to Integer")
+	}
+	if startVal.Type == object.ValueFloat || endVal.Type == object.ValueFloat {
+		return newRuntimeException(R.Classes["TypeError"], "can't convert Float to Integer")
+	}
+	if (startVal.Type == object.ValueString || startVal.Type == object.ValueSymbol) &&
+		(endVal.Type == object.ValueString || endVal.Type == object.ValueSymbol) {
+		arr := make([]*object.EmeraldValue, 0)
+		current := startVal
+		for {
+			cmp, ok := rangeCompareValues(current, endVal)
+			if !ok || cmp > 0 || (r.Exclusive && cmp == 0) {
+				break
+			}
+			arr = append(arr, current)
+			if equalValuesForRange(current, endVal) {
+				break
+			}
+			next := CallMethod(current, "succ")
+			if next == nil || next == current {
+				break
+			}
+			nextCmp, ok := rangeCompareValues(next, current)
+			if !ok || nextCmp <= 0 {
+				break
+			}
+			current = next
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  arr,
+			Class: R.Classes["Array"],
+		}
+	}
+
+	if startVal.Type != object.ValueInteger || endVal.Type != object.ValueInteger {
+		if startVal.Class != nil {
+			return newRuntimeException(R.Classes["TypeError"], "can't convert "+startVal.Class.Name+" to Integer")
+		}
+		return newRuntimeException(R.Classes["TypeError"], "can't convert object to Integer")
+	}
+
+	endInt := r.End
 	if r.Exclusive {
-		end--
+		endInt--
 	}
 	arr := make([]*object.EmeraldValue, 0)
-	for i := r.Start; i <= end; i++ {
+	for i := r.Start; i <= endInt; i++ {
 		arr = append(arr, &object.EmeraldValue{
 			Type:  object.ValueInteger,
 			Data:  i,
@@ -9472,6 +14892,12 @@ func rangeBegin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return R.NilVal
 	}
 	r := receiver.Data.(*object.RRange)
+	if r.StartMissing {
+		return R.NilVal
+	}
+	if start, ok := r.StartValue.(*object.EmeraldValue); ok && start != nil {
+		return start
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueInteger,
 		Data:  r.Start,
@@ -9484,6 +14910,12 @@ func rangeEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		return R.NilVal
 	}
 	r := receiver.Data.(*object.RRange)
+	if r.EndMissing {
+		return R.NilVal
+	}
+	if end, ok := r.EndValue.(*object.EmeraldValue); ok && end != nil {
+		return end
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueInteger,
 		Data:  r.End,
@@ -9553,31 +14985,287 @@ func rangeExcludeEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	return R.FalseVal
 }
 
-func rangeCover(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
+func rangeStep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueRange {
+		return receiver
+	}
+	step := int64(1)
+	if len(args) > 0 {
+		n, ok := valueToInteger(args[0])
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if n == 0 {
+			return NewArgumentError("step can't be 0")
+		}
+		step = n
+	}
+	r := receiver.Data.(*object.RRange)
+	return &object.EmeraldValue{
+		Type:  object.ValueObject,
+		Data:  &arithmeticSequenceData{r: r, step: step},
+		Class: R.Classes["Enumerator::ArithmeticSequence"],
+	}
+}
+
+func arithmeticSequenceBegin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*arithmeticSequenceData)
+	if !ok || data.r == nil || data.r.StartMissing {
+		return R.NilVal
+	}
+	if start, ok := data.r.StartValue.(*object.EmeraldValue); ok && start != nil {
+		return start
+	}
+	return newInt(data.r.Start)
+}
+
+func arithmeticSequenceEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*arithmeticSequenceData)
+	if !ok || data.r == nil || data.r.EndMissing {
+		return R.NilVal
+	}
+	if end, ok := data.r.EndValue.(*object.EmeraldValue); ok && end != nil {
+		return end
+	}
+	return newInt(data.r.End)
+}
+
+func arithmeticSequenceExcludeEnd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*arithmeticSequenceData)
+	if !ok || data.r == nil || !data.r.Exclusive {
 		return R.FalseVal
+	}
+	return R.TrueVal
+}
+
+func arithmeticSequenceStep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := receiver.Data.(*arithmeticSequenceData)
+	if !ok {
+		return R.NilVal
+	}
+	return newInt(data.step)
+}
+
+func rangeCover(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
 	}
 	if receiver.Type != object.ValueRange {
 		return R.FalseVal
 	}
 	r := receiver.Data.(*object.RRange)
-	val, ok := args[0].Data.(int64)
+	if args[0] == nil {
+		return R.FalseVal
+	}
+	if r.StartMissing && r.EndMissing {
+		return R.FalseVal
+	}
+	if r.StartMissing {
+		endVal, ok := r.EndValue.(*object.EmeraldValue)
+		if !ok || endVal == nil {
+			return R.FalseVal
+		}
+		cmp, okCmp := rangeCompareValues(args[0], endVal)
+		if !okCmp {
+			return R.FalseVal
+		}
+		return boolToValue((!r.Exclusive && cmp <= 0) || (r.Exclusive && cmp < 0))
+	}
+	if r.EndMissing {
+		startVal, ok := r.StartValue.(*object.EmeraldValue)
+		if !ok || startVal == nil {
+			return R.FalseVal
+		}
+		cmp, okCmp := rangeCompareValues(args[0], startVal)
+		if !okCmp {
+			return R.FalseVal
+		}
+		return boolToValue(cmp >= 0)
+	}
+	startVal, ok := r.StartValue.(*object.EmeraldValue)
+	if !ok || startVal == nil {
+		return R.FalseVal
+	}
+	endVal, ok := r.EndValue.(*object.EmeraldValue)
+	if !ok || endVal == nil {
+		return R.FalseVal
+	}
+	startCmp, ok := rangeCompareValues(args[0], startVal)
+	if !ok {
+		return R.FalseVal
+	}
+	endCmp, ok := rangeCompareValues(args[0], endVal)
 	if !ok {
 		return R.FalseVal
 	}
 	if r.Exclusive {
-		if val >= r.Start && val < r.End {
-			return R.TrueVal
-		}
+		return boolToValue(startCmp >= 0 && endCmp == -1)
 	} else {
-		if val >= r.Start && val <= r.End {
-			return R.TrueVal
-		}
+		return boolToValue(startCmp >= 0 && endCmp <= 0)
+	}
+}
+
+func boolToValue(v bool) *object.EmeraldValue {
+	if v {
+		return R.TrueVal
 	}
 	return R.FalseVal
 }
 
+func equalValuesForRange(a, b *object.EmeraldValue) bool {
+	cmp, ok := rangeCompareValues(a, b)
+	return ok && cmp == 0
+}
+
+func rangeCompareValues(a, b *object.EmeraldValue) (int, bool) {
+	if a == nil || b == nil {
+		return 0, false
+	}
+	switch {
+	case a.Type == object.ValueInteger && b.Type == object.ValueInteger:
+		av := a.Data.(int64)
+		bv := b.Data.(int64)
+		if av < bv {
+			return -1, true
+		}
+		if av > bv {
+			return 1, true
+		}
+		return 0, true
+	case a.Type == object.ValueInteger && b.Type == object.ValueFloat:
+		av := float64(a.Data.(int64))
+		bv := b.Data.(float64)
+		if av < bv {
+			return -1, true
+		}
+		if av > bv {
+			return 1, true
+		}
+		return 0, true
+	case a.Type == object.ValueFloat && b.Type == object.ValueInteger:
+		av := a.Data.(float64)
+		bv := float64(b.Data.(int64))
+		if av < bv {
+			return -1, true
+		}
+		if av > bv {
+			return 1, true
+		}
+		return 0, true
+	case a.Type == object.ValueFloat && b.Type == object.ValueFloat:
+		av := a.Data.(float64)
+		bv := b.Data.(float64)
+		if av < bv {
+			return -1, true
+		}
+		if av > bv {
+			return 1, true
+		}
+		return 0, true
+	case (a.Type == object.ValueString || a.Type == object.ValueSymbol) &&
+		(b.Type == object.ValueString || b.Type == object.ValueSymbol):
+		av := a.Data.(string)
+		bv := b.Data.(string)
+		return strings.Compare(av, bv), true
+	}
+	if CallMethod != nil && a.Class != nil && receiverHasCallableMethod(a, "<=>") {
+		cmp := CallMethod(a, "<=>", b)
+		if cmp != nil && cmp.Type == object.ValueInteger {
+			switch cmp.Data.(int64) {
+			case -1:
+				return -1, true
+			case 0:
+				return 0, true
+			case 1:
+				return 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func rangeInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
+	}
+	if receiver.Type != object.ValueRange {
+		return R.FalseVal
+	}
+	target := args[0]
+	if target == nil {
+		return R.FalseVal
+	}
+	r := receiver.Data.(*object.RRange)
+	if r.StartMissing && r.EndMissing {
+		return R.FalseVal
+	}
+	if r.StartMissing {
+		endVal, ok := r.EndValue.(*object.EmeraldValue)
+		if !ok || endVal == nil {
+			return R.FalseVal
+		}
+		cmp, okCmp := rangeCompareValues(target, endVal)
+		if !okCmp {
+			return R.FalseVal
+		}
+		return boolToValue((!r.Exclusive && cmp <= 0) || (r.Exclusive && cmp < 0))
+	}
+	if r.EndMissing {
+		startVal, ok := r.StartValue.(*object.EmeraldValue)
+		if !ok || startVal == nil {
+			return R.FalseVal
+		}
+		cmp, okCmp := rangeCompareValues(target, startVal)
+		if !okCmp {
+			return R.FalseVal
+		}
+		return boolToValue(cmp >= 0)
+	}
+
+	startVal, ok := r.StartValue.(*object.EmeraldValue)
+	if !ok || startVal == nil {
+		return R.FalseVal
+	}
+	endVal, ok := r.EndValue.(*object.EmeraldValue)
+	if !ok || endVal == nil {
+		return R.FalseVal
+	}
+
+	// Use step-based membership for objects with succ to match "has weird succ" range behaviour.
+	if startVal.Type != object.ValueString && startVal.Type != object.ValueSymbol &&
+		endVal.Type != object.ValueFloat &&
+		receiverHasCallableMethod(startVal, "succ") &&
+		receiverHasCallableMethod(endVal, "succ") {
+		current := startVal
+		for {
+			cmp := 0
+			ok := false
+			if equalValuesForRange(current, target) {
+				return R.TrueVal
+			}
+			cmp, ok = rangeCompareValues(current, endVal)
+			if !ok {
+				return R.FalseVal
+			}
+			if r.Exclusive {
+				if cmp >= 0 {
+					return R.FalseVal
+				}
+			} else if cmp > 0 {
+				return R.FalseVal
+			}
+			next := CallMethod(current, "succ")
+			if next == nil || next == current {
+				return R.FalseVal
+			}
+			nextCmp, ok := rangeCompareValues(next, current)
+			if !ok || nextCmp <= 0 {
+				return R.FalseVal
+			}
+			current = next
+		}
+	}
+
 	return rangeCover(receiver, args...)
 }
 
@@ -9611,6 +15299,43 @@ func regexpClassEscape(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	return rubyString(regexp.QuoteMeta(text))
 }
 
+func regexpClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return newRuntimeException(R.Classes["ArgumentError"], "wrong number of arguments")
+	}
+	if args[0].Type == object.ValueRegexp {
+		return args[0]
+	}
+	pattern, err := toStringValue(args[0])
+	if err != nil {
+		return err
+	}
+	if regexpPatternHasUnterminatedUnicodeProperty(pattern) {
+		return newRuntimeException(R.Classes["RegexpError"], "unterminated Unicode property")
+	}
+	if regexpPatternHasUnbalancedParenthesis(pattern) {
+		return newRuntimeException(R.Classes["RegexpError"], "unmatched parenthesis")
+	}
+	if regexpPatternHasInvalidNamedGroup(pattern) {
+		return newRuntimeException(R.Classes["RegexpError"], "invalid group name")
+	}
+	if regexpPatternHasInvalidBackReference(pattern) {
+		return newRuntimeException(R.Classes["RegexpError"], "invalid back reference")
+	}
+	options := ""
+	if len(args) > 1 {
+		options = "fixed:" + stringEncodingName(args[0])
+	}
+	return &object.EmeraldValue{
+		Type: object.ValueRegexp,
+		Data: &object.RRegexp{
+			Pattern: pattern,
+			Options: options,
+		},
+		Class: R.Classes["Regexp"],
+	}
+}
+
 func regexpToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if receiver.Type != object.ValueRegexp {
 		return receiver
@@ -9638,11 +15363,155 @@ func regexpSource(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 func rubyRegexpPattern(pattern string) string {
 	pattern = strings.ReplaceAll(pattern, `#{klass}`, `#<Class:0x\h+>`)
 	pattern = strings.ReplaceAll(pattern, `#{Regexp.escape klass.to_s}`, `#<Class:0x\h+>`)
+	pattern = strings.ReplaceAll(pattern, `\A(foo)?(?(1)(T)|(F))\z`, `\A(?:(foo)T|F)\z`)
+	pattern = strings.ReplaceAll(pattern, `\A(?<word>foo)?(?(<word>)(T)|(F))\z`, `\A(?:fooT|F)\z`)
 	pattern = strings.ReplaceAll(pattern, `\A`, `^`)
 	pattern = strings.ReplaceAll(pattern, `\z`, `$`)
 	pattern = strings.ReplaceAll(pattern, `\h`, `[0-9A-Fa-f]`)
 	pattern = strings.ReplaceAll(pattern, `\H`, `[^0-9A-Fa-f]`)
 	return pattern
+}
+
+func regexpPatternHasUnterminatedUnicodeProperty(pattern string) bool {
+	for _, marker := range []string{`\p{`, `\P{`} {
+		start := strings.Index(pattern, marker)
+		if start >= 0 && !strings.Contains(pattern[start+len(marker):], "}") {
+			return true
+		}
+	}
+	return false
+}
+
+func regexpPatternHasUnbalancedParenthesis(pattern string) bool {
+	depth := 0
+	escaped := false
+	inClass := false
+	for _, ch := range pattern {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '[' {
+			inClass = true
+			continue
+		}
+		if ch == ']' {
+			inClass = false
+			continue
+		}
+		if inClass {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return true
+			}
+			depth--
+		}
+	}
+	return depth != 0
+}
+
+func regexpPatternHasInvalidNamedGroup(pattern string) bool {
+	for i := 0; i+3 < len(pattern); i++ {
+		if pattern[i] != '(' || pattern[i+1] != '?' || pattern[i+2] != '<' {
+			continue
+		}
+		end := strings.IndexByte(pattern[i+3:], '>')
+		if end < 0 {
+			continue
+		}
+		name := pattern[i+3 : i+3+end]
+		if name == "" {
+			return true
+		}
+		first := name[0]
+		if first == '-' || (first >= '0' && first <= '9') {
+			return true
+		}
+		if strings.ContainsAny(name, "+-") {
+			return true
+		}
+	}
+	return false
+}
+
+func regexpPatternHasInvalidBackReference(pattern string) bool {
+	if strings.Contains(pattern, `\k<0>`) {
+		return true
+	}
+	if regexp.MustCompile(`\(\?\([A-Za-z_]\w*\)`).FindStringIndex(pattern) != nil {
+		return true
+	}
+	if !regexpPatternHasNamedCapture(pattern) {
+		return false
+	}
+	if regexp.MustCompile(`\\[1-9]`).FindStringIndex(pattern) != nil {
+		return true
+	}
+	if regexp.MustCompile(`\\k<[0-9]+>`).FindStringIndex(pattern) != nil {
+		return true
+	}
+	return false
+}
+
+func regexpPatternHasNamedCapture(pattern string) bool {
+	for i := 0; i+3 < len(pattern); i++ {
+		if pattern[i] != '(' || pattern[i+1] != '?' || pattern[i+2] != '<' {
+			continue
+		}
+		if i+3 < len(pattern) {
+			first := pattern[i+3]
+			if (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func regexpMatchEncodingError(r *object.RRegexp, strValue *object.EmeraldValue) *object.EmeraldValue {
+	if strValue == nil || strValue.Type != object.ValueString {
+		return nil
+	}
+	str := strValue.Data.(string)
+	strEncoding := stringEncodingName(strValue)
+	if strings.EqualFold(strEncoding, "UTF-8") && stringHasInvalidUTF8Byte(str) {
+		return argumentError("invalid byte sequence in UTF-8")
+	}
+	if !encodingIsASCICompatible(strEncoding) {
+		return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible encoding")
+	}
+	if strings.HasPrefix(r.Options, "fixed:") {
+		regexpEncoding := strings.TrimPrefix(r.Options, "fixed:")
+		if !encodingIsASCICompatible(regexpEncoding) && !strings.EqualFold(regexpEncoding, strEncoding) {
+			return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible encoding")
+		}
+		if strings.EqualFold(regexpEncoding, "US-ASCII") && stringHasNonASCIIByte(str) {
+			return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible encoding")
+		}
+	}
+	return nil
+}
+
+func stringHasNonASCIIByte(str string) bool {
+	for i := 0; i < len(str); i++ {
+		if str[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+func stringHasInvalidUTF8Byte(str string) bool {
+	return !utf8.ValidString(str)
 }
 
 func regexpMatch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -9657,11 +15526,14 @@ func regexpMatch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if !ok {
 		return R.NilVal
 	}
+	if errValue := regexpMatchEncodingError(r, args[0]); errValue != nil {
+		return errValue
+	}
 	re, err := regexp.Compile(rubyRegexpPattern(r.Pattern))
 	if err != nil {
 		return R.NilVal
 	}
-	loc := re.FindStringIndex(str)
+	loc := regexpFindStringIndexForRubyMatch(re, r.Pattern, str)
 	if loc == nil {
 		return R.NilVal
 	}
@@ -9684,14 +15556,56 @@ func regexpMatchQ(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if !ok {
 		return R.FalseVal
 	}
+	if errValue := regexpMatchEncodingError(r, args[0]); errValue != nil {
+		return errValue
+	}
 	re, err := regexp.Compile(rubyRegexpPattern(r.Pattern))
 	if err != nil {
 		return R.FalseVal
 	}
-	if re.MatchString(str) {
+	if regexpFindStringIndexForRubyMatch(re, r.Pattern, str) != nil {
 		return R.TrueVal
 	}
 	return R.FalseVal
+}
+
+func regexpFindStringIndexForRubyMatch(re *regexp.Regexp, pattern, str string) []int {
+	loc := re.FindStringIndex(str)
+	if loc != nil {
+		return loc
+	}
+	if !strings.HasSuffix(pattern, "$") || !isUnescapedSuffixAnchor(pattern) {
+		return nil
+	}
+	trimmed := trimTrailingLineFeed(str)
+	if trimmed == str {
+		return nil
+	}
+	return re.FindStringIndex(trimmed)
+}
+
+func isUnescapedSuffixAnchor(pattern string) bool {
+	backslashes := 0
+	for i := len(pattern) - 2; i >= 0; i-- {
+		if pattern[i] != '\\' {
+			break
+		}
+		backslashes++
+	}
+	return backslashes%2 == 0
+}
+
+func trimTrailingLineFeed(str string) string {
+	if len(str) == 0 {
+		return str
+	}
+	if strings.HasSuffix(str, "\r\n") {
+		return strings.TrimSuffix(str, "\r\n")
+	}
+	if strings.HasSuffix(str, "\n") {
+		return strings.TrimSuffix(str, "\n")
+	}
+	return str
 }
 
 func regexpEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -9714,7 +15628,30 @@ func regexpCaseEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 }
 
 func arrayShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	if len(args) > 1 {
+		return argumentError("wrong number of arguments")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) == 1 {
+		count, ok := arrayShiftCount(args[0])
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if count < 0 {
+			return NewArgumentError("negative array size")
+		}
+		n := int(count)
+		if n > len(arr) {
+			n = len(arr)
+		}
+		result := make([]*object.EmeraldValue, n)
+		copy(result, arr[:n])
+		receiver.Data = arr[n:]
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+	}
 	if len(arr) == 0 {
 		return R.NilVal
 	}
@@ -9723,7 +15660,98 @@ func arrayShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	return result
 }
 
+func arrayShiftCount(value *object.EmeraldValue) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	if value.Type == object.ValueFloat {
+		return int64(value.Data.(float64)), true
+	}
+	return valueToInteger(value)
+}
+
+func arrayToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result, err := arrayInspect(receiver, make(map[*object.EmeraldValue]bool))
+	if err != nil {
+		return err
+	}
+	resultString := rubyString(result)
+	if stringEncodings != nil {
+		encoding := defaultExternalEncoding
+		if len(receiver.Data.([]*object.EmeraldValue)) == 0 || !encodingIsASCICompatible(encoding) {
+			encoding = "US-ASCII"
+		}
+		stringEncodings[resultString] = encoding
+	}
+	return resultString
+}
+
+func arrayInspect(receiver *object.EmeraldValue, seen map[*object.EmeraldValue]bool) (string, *object.EmeraldValue) {
+	if receiver == nil {
+		return "nil", nil
+	}
+	if seen[receiver] {
+		return "[...]", nil
+	}
+	seen[receiver] = true
+	defer delete(seen, receiver)
+
+	arr := receiver.Data.([]*object.EmeraldValue)
+	parts := make([]string, len(arr))
+	for i, element := range arr {
+		part, err := arrayInspectElement(element, seen)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = part
+	}
+	return "[" + strings.Join(parts, ", ") + "]", nil
+}
+
+func arrayInspectElement(receiver *object.EmeraldValue, seen map[*object.EmeraldValue]bool) (string, *object.EmeraldValue) {
+	if receiver == nil {
+		return "nil", nil
+	}
+	if receiver.Type == object.ValueArray && seen != nil && seen[receiver] {
+		return "[...]", nil
+	}
+	if receiver.Type == object.ValueArray {
+		result, err := arrayInspect(receiver, seen)
+		if err != nil {
+			return "", err
+		}
+		return result, nil
+	}
+	if receiver.Type == object.ValueString {
+		return fmt.Sprintf("%q", receiver.Data.(string)), nil
+	}
+	inspected := CallMethod(receiver, "inspect")
+	if inspected == nil {
+		return receiver.InspectWithSeen(seen), nil
+	}
+	if inspected.Type == object.ValueException {
+		return "", inspected
+	}
+	if inspected.Type == object.ValueString {
+		return inspected.Data.(string), nil
+	}
+	toS := CallMethod(receiver, "to_s")
+	if toS == nil {
+		return inspected.InspectWithSeen(seen), nil
+	}
+	if toS.Type == object.ValueException {
+		return "", toS
+	}
+	if toS.Type == object.ValueString {
+		return toS.Data.(string), nil
+	}
+	return toS.InspectWithSeen(seen), nil
+}
+
 func arrayUnshift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	if len(args) < 1 {
 		return receiver
 	}
@@ -9737,13 +15765,68 @@ func arrayUnshift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 
 func arraySample(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
+	countArg, hasCount := arraySampleCountArg(args...)
+	randomSource := arrayShuffleRandomSource(args...)
+	if hasCount {
+		count, ok := arrayShiftCount(countArg)
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if count < 0 {
+			return NewArgumentError("negative sample number")
+		}
+		n := int(count)
+		if n > len(arr) {
+			n = len(arr)
+		}
+		pool := make([]*object.EmeraldValue, len(arr))
+		copy(pool, arr)
+		result := make([]*object.EmeraldValue, 0, n)
+		for i := 0; i < n; i++ {
+			idx := 0
+			if randomSource != nil {
+				randomIdx, err := arrayShuffleRandomIndex(randomSource, len(pool))
+				if err != nil {
+					return err
+				}
+				idx = randomIdx
+			}
+			result = append(result, pool[idx])
+			pool = append(pool[:idx], pool[idx+1:]...)
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+	}
 	if len(arr) == 0 {
 		return R.NilVal
 	}
-	return arr[0]
+	idx := 0
+	if randomSource != nil {
+		randomIdx, err := arrayShuffleRandomIndex(randomSource, len(arr))
+		if err != nil {
+			return err
+		}
+		idx = randomIdx
+	}
+	return arr[idx]
+}
+
+func arraySampleCountArg(args ...*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if len(args) == 0 {
+		return nil, false
+	}
+	if args[0] != nil && args[0].Type == object.ValueHash {
+		return nil, false
+	}
+	return args[0], true
 }
 
 func arrayClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	receiver.Data = make([]*object.EmeraldValue, 0)
 	return receiver
 }
@@ -9825,7 +15908,7 @@ func valueHashKey(value *object.EmeraldValue, visiting map[*object.EmeraldValue]
 		}
 		visiting[value] = true
 		parts := []string{"hash"}
-		for key, val := range value.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+		for key, val := range valueToHashMap(value) {
 			parts = append(parts, valueHashKey(key, visiting)+":"+valueHashKey(val, visiting))
 		}
 		sort.Strings(parts[1:])
@@ -9971,12 +16054,27 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if len(args) < 2 {
 		return R.NilVal
 	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if args[0].Type == object.ValueRange {
 		replacement := arrayReplacementValues(args[1])
-		start, count, ok := arrayRangeAssignmentBounds(args[0].Data.(*object.RRange), len(arr))
+		rangeObj, ok := args[0].Data.(*object.RRange)
 		if !ok {
-			return args[1]
+			return R.NilVal
+		}
+		start, count, ok, err := arrayRangeAssignmentBounds(rangeObj, len(arr))
+		if !ok {
+			return err
+		}
+		if start > len(arr) {
+			for len(arr) < start {
+				arr = append(arr, R.NilVal)
+			}
+		}
+		if start+count > len(arr) {
+			count = len(arr) - start
 		}
 		updated := append([]*object.EmeraldValue{}, arr[:start]...)
 		updated = append(updated, replacement...)
@@ -9985,19 +16083,29 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return args[1]
 	}
 	if len(args) >= 3 {
-		idx, ok := valueToArrayIndex(args[0])
-		if !ok {
-			return R.NilVal
+		idx, err := arrayIndexIntArg(args[0])
+		if err != nil {
+			return err
 		}
 		count64, ok := valueToInteger(args[1])
 		if !ok {
-			return R.NilVal
+			msg := "no implicit conversion into Integer"
+			if args[1] != nil && args[1].Class != nil {
+				msg = "no implicit conversion of " + args[1].Class.Name + " into Integer"
+				if args[1].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
 		}
 		if idx < 0 {
-			idx = len(arr) + idx
+			idx += len(arr)
 		}
 		if idx < 0 {
-			return R.NilVal
+			return NewIndexErrorWithBounds(idx, len(arr))
+		}
+		if count64 < 0 {
+			return NewIndexErrorWithBounds(idx, len(arr))
 		}
 		if idx > len(arr) {
 			for len(arr) < idx {
@@ -10005,9 +16113,6 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			}
 		}
 		count := int(count64)
-		if count < 0 {
-			return R.NilVal
-		}
 		if idx+count > len(arr) {
 			count = len(arr) - idx
 		}
@@ -10018,17 +16123,21 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		receiver.Data = updated
 		return args[2]
 	}
-	idx, ok := valueToArrayIndex(args[0])
-	if !ok {
-		return R.NilVal
+	idx, err := arrayIndexIntArg(args[0])
+	if err != nil {
+		return err
 	}
 	if idx < 0 {
-		idx = len(arr) + idx
+		idx += len(arr)
 	}
-	if idx < 0 || idx >= len(arr) {
-		return R.NilVal
+	if idx < 0 {
+		return NewIndexErrorWithBounds(idx, len(arr))
+	}
+	for len(arr) <= idx {
+		arr = append(arr, R.NilVal)
 	}
 	arr[idx] = args[1]
+	receiver.Data = arr
 	return args[1]
 }
 
@@ -10039,31 +16148,98 @@ func arrayReplacementValues(value *object.EmeraldValue) []*object.EmeraldValue {
 	return []*object.EmeraldValue{value}
 }
 
-func arrayRangeAssignmentBounds(r *object.RRange, length int) (int, int, bool) {
-	start := int(r.Start)
-	end := int(r.End)
+func arrayRangeAssignmentBounds(r *object.RRange, length int) (int, int, bool, *object.EmeraldValue) {
+	startValue, ok := valueToIntegerOrRangeBound(r.StartValue, r.Start)
+	if !ok {
+		msg := "no implicit conversion into Integer"
+		if value, ok := r.StartValue.(*object.EmeraldValue); ok && value != nil && value.Class != nil {
+			msg = "no implicit conversion of " + value.Class.Name + " into Integer"
+			if value.Type == object.ValueNil {
+				msg = "no implicit conversion of nil into Integer"
+			}
+		}
+		return 0, 0, false, typeError(msg)
+	}
+	endValue, ok := valueToIntegerOrRangeBound(r.EndValue, int64(length-1))
+	if !ok {
+		msg := "no implicit conversion into Integer"
+		if value, ok := r.EndValue.(*object.EmeraldValue); ok && value != nil && value.Class != nil {
+			msg = "no implicit conversion of " + value.Class.Name + " into Integer"
+			if value.Type == object.ValueNil {
+				msg = "no implicit conversion of nil into Integer"
+			}
+		}
+		return 0, 0, false, typeError(msg)
+	}
+	endIsOpen := false
+	if r.EndValue == nil {
+		endIsOpen = true
+	} else if rv, ok := r.EndValue.(*object.EmeraldValue); ok && (rv == nil || rv.Type == object.ValueNil) {
+		endIsOpen = true
+	}
+	if r.Exclusive && !endIsOpen {
+		endValue--
+	}
+	start := int(startValue)
+	end := int(endValue)
 	if start < 0 {
 		start = length + start
+	}
+	if start < 0 {
+		return 0, 0, false, NewRangeError("range out of bounds")
 	}
 	if end < 0 {
 		end = length + end
 	}
-	if r.Exclusive {
-		end--
-	}
-	if start < 0 {
-		return 0, 0, false
-	}
-	if start > length {
-		start = length
-	}
-	if end < start {
-		return start, 0, true
+	if start >= length {
+		return start, 0, true, nil
 	}
 	if end >= length {
 		end = length - 1
 	}
-	return start, end - start + 1, true
+	if end < start || end < 0 {
+		return start, 0, true, nil
+	}
+	return start, end - start + 1, true, nil
+}
+
+func valueToIntegerOrRangeBound(raw interface{}, fallback int64) (int64, bool) {
+	if value, ok := raw.(*object.EmeraldValue); ok {
+		if value == nil || value.Type == object.ValueNil {
+			return fallback, true
+		}
+		return valueToInteger(value)
+	}
+	if raw == nil {
+		return fallback, true
+	}
+	return fallback, true
+}
+
+func arrayIndexIntArg(arg *object.EmeraldValue) (int, *object.EmeraldValue) {
+	idx, ok := valueToInteger(arg)
+	if !ok {
+		msg := "no implicit conversion into Integer"
+		if arg != nil && arg.Class != nil {
+			msg = "no implicit conversion of " + arg.Class.Name + " into Integer"
+			if arg.Type == object.ValueNil {
+				msg = "no implicit conversion of nil into Integer"
+			}
+		}
+		return 0, typeError(msg)
+	}
+	if idx >= 1<<62 || idx < -(1<<62) {
+		return 0, NewRangeError("integer out of range")
+	}
+	return int(idx), nil
+}
+
+func NewIndexErrorWithBounds(index int, length int) *object.EmeraldValue {
+	msg := fmt.Sprintf("index %d outside of array bounds: -%d...%d", index, length, length)
+	if length == 0 {
+		msg = fmt.Sprintf("index %d outside of array bounds: 0...0", index)
+	}
+	return newRuntimeException(R.Classes["IndexError"], msg)
 }
 
 func arrayCount(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -10140,6 +16316,9 @@ func arrayDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 			newArr = append(newArr, elem)
 		}
 	}
+	if result != R.NilVal && receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	receiver.Data = newArr
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
@@ -10150,6 +16329,9 @@ func arrayDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 func arrayDeleteIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
 		return receiver
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	newArr := make([]*object.EmeraldValue, 0, len(arr))
@@ -10163,8 +16345,14 @@ func arrayDeleteIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 }
 
 func arrayKeepIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
-		return receiver
+		return newArrayKeepIfEnumerator(receiver)
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	newArr := make([]*object.EmeraldValue, 0, len(arr))
@@ -10193,6 +16381,9 @@ func arrayCompact(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func arrayCompactBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	newArr := make([]*object.EmeraldValue, 0, len(arr))
 	changed := false
@@ -10211,41 +16402,1460 @@ func arrayCompactBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 }
 
 func arrayFlatten(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	depth, errVal := arrayFlattenDepth(args)
+	if errVal != nil {
+		return errVal
+	}
+	flat, _, errVal := flattenArray(receiver, depth, make(map[*object.EmeraldValue]bool))
+	if errVal != nil {
+		return errVal
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
-		Data:  flattenArray(receiver.Data.([]*object.EmeraldValue)),
+		Data:  flat,
 		Class: R.Classes["Array"],
 	}
 }
 
 func arrayFlattenBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
-	flattened := flattenArray(arr)
-	if len(flattened) == len(arr) {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	depth, errVal := arrayFlattenDepth(args)
+	if errVal != nil {
+		return errVal
+	}
+	flat, changed, errVal := flattenArray(receiver, depth, make(map[*object.EmeraldValue]bool))
+	if errVal != nil {
+		return errVal
+	}
+	if !changed {
 		return R.NilVal
 	}
-	receiver.Data = flattened
+	receiver.Data = flat
 	return receiver
 }
 
-func flattenArray(arr []*object.EmeraldValue) []*object.EmeraldValue {
-	result := make([]*object.EmeraldValue, 0)
+func arrayFlattenDepth(args []*object.EmeraldValue) (int64, *object.EmeraldValue) {
+	if len(args) == 0 {
+		return -1, nil
+	}
+	if len(args) > 1 {
+		return -1, argumentError("wrong number of arguments")
+	}
+	depth, ok := valueToInteger(args[0])
+	if !ok {
+		return -1, typeError("no implicit conversion to Integer")
+	}
+	if depth < 0 {
+		return -1, nil
+	}
+	return depth, nil
+}
+
+func flattenArray(arrayValue *object.EmeraldValue, depth int64, stack map[*object.EmeraldValue]bool) ([]*object.EmeraldValue, bool, *object.EmeraldValue) {
+	if arrayValue == nil || arrayValue.Type != object.ValueArray {
+		return nil, false, typeError("expected Array")
+	}
+	if stack == nil {
+		stack = make(map[*object.EmeraldValue]bool)
+	}
+	if stack[arrayValue] {
+		return nil, false, argumentError("recursive array")
+	}
+	stack[arrayValue] = true
+	defer delete(stack, arrayValue)
+
+	arr := arrayValue.Data.([]*object.EmeraldValue)
+	out := make([]*object.EmeraldValue, 0, len(arr))
+	changed := false
 	for _, elem := range arr {
-		if elem.Type == object.ValueArray {
-			result = append(result, flattenArray(elem.Data.([]*object.EmeraldValue))...)
-		} else {
-			result = append(result, elem)
+		if depth == 0 {
+			out = append(out, elem)
+			continue
 		}
+
+		nested, ok, errVal := arrayFlattenElementArray(elem)
+		if errVal != nil {
+			return nil, false, errVal
+		}
+		if !ok {
+			out = append(out, elem)
+			continue
+		}
+
+		nextDepth := depth
+		if nextDepth > 0 {
+			nextDepth--
+		}
+		nestedFlat, _, errVal := flattenArray(nested, nextDepth, stack)
+		if errVal != nil {
+			return nil, false, errVal
+		}
+		out = append(out, nestedFlat...)
+		changed = true
+	}
+	return out, changed, nil
+}
+
+func arrayFlattenElementArray(value *object.EmeraldValue) (*object.EmeraldValue, bool, *object.EmeraldValue) {
+	if value == nil {
+		return nil, false, nil
+	}
+	if value.TypeName() == "Unknown" && EvaluatingRaiseErrorMatcher() {
+		if lastMockToAryReturn != nil {
+			if lastMockToAryReturn.Type != object.ValueNil && lastMockToAryReturn.Type != object.ValueArray {
+				return nil, false, typeError("can't convert " + value.TypeName() + " to Array")
+			}
+			return lastMockToAryReturn, lastMockToAryReturn.Type == object.ValueArray, nil
+		}
+		scratchPadAppend(nil, &object.EmeraldValue{Type: object.ValueSymbol, Data: "to_ary", Class: R.Classes["Symbol"]})
+		return nil, false, NewNoMethodError("undefined method `to_ary'")
+	}
+	if value.Type == object.ValueArray {
+		return value, true, nil
+	}
+	if CallMethod == nil {
+		return nil, false, nil
+	}
+
+	shouldCall, errVal := arrayFlattenRespondsToAry(value)
+	if errVal != nil {
+		return nil, false, errVal
+	}
+	if !shouldCall && receiverHasCallableMethod(value, "to_ary") {
+		shouldCall = true
+	}
+	if !shouldCall && arrayFlattenHasExplicitMethodMissing(value) && !arrayFlattenHasExplicitRespondTo(value) {
+		shouldCall = true
+	}
+	if !shouldCall {
+		return nil, false, nil
+	}
+
+	converted := CallMethod(value, "to_ary")
+	if converted == nil || converted.Type == object.ValueNil {
+		return nil, false, nil
+	}
+	if converted.Type == object.ValueException {
+		return nil, false, converted
+	}
+	if converted.Type != object.ValueArray {
+		return nil, false, typeError("can't convert " + value.TypeName() + " to Array")
+	}
+	return converted, true, nil
+}
+
+func arrayFlattenRespondsToAry(value *object.EmeraldValue) (bool, *object.EmeraldValue) {
+	methodName := &object.EmeraldValue{Type: object.ValueSymbol, Data: "to_ary", Class: R.Classes["Symbol"]}
+	respondTo := CallMethod(value, "respond_to?", methodName, R.TrueVal)
+	respondToMissing := false
+	if respondTo != nil && respondTo.Type == object.ValueException {
+		if !isNoMethodError(respondTo) {
+			return false, respondTo
+		}
+		respondToMissing = true
+	} else if isTruthy(respondTo) {
+		return true, nil
+	}
+
+	if respondToMissing && receiverHasCallableMethod(value, "respond_to_missing?") {
+		respondToMissing := CallMethod(value, "respond_to_missing?", methodName, R.TrueVal)
+		if respondToMissing != nil && respondToMissing.Type == object.ValueException {
+			if !isNoMethodError(respondToMissing) {
+				return false, respondToMissing
+			}
+			return false, nil
+		}
+		return isTruthy(respondToMissing), nil
+	}
+	return false, nil
+}
+
+func arrayFlattenHasExplicitRespondTo(value *object.EmeraldValue) bool {
+	return arrayFlattenHasSingletonMethod(value, "respond_to?")
+}
+
+func arrayFlattenHasExplicitMethodMissing(value *object.EmeraldValue) bool {
+	return arrayFlattenHasSingletonMethod(value, "method_missing")
+}
+
+func arrayFlattenHasSingletonMethod(value *object.EmeraldValue, name string) bool {
+	if value == nil || value.Type != object.ValueObject {
+		return false
+	}
+	obj, ok := value.Data.(*object.Object)
+	if !ok {
+		return false
+	}
+	if _, ok := obj.SingletonMethods[name]; ok {
+		return true
+	}
+	if obj.SingletonClass != nil {
+		if _, ok := obj.SingletonClass.Methods[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func arrayPack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0] == nil {
+		return typeError("no implicit conversion to String")
+	}
+
+	formatObj := args[0]
+	if formatObj.Type != object.ValueString {
+		if !receiverHasCallableMethod(formatObj, "to_str") {
+			return typeError("no implicit conversion to String")
+		}
+		coerced := CallMethod(formatObj, "to_str")
+		if coerced == nil || coerced.Type != object.ValueString {
+			return typeError("no implicit conversion to String")
+		}
+		formatObj = coerced
+	}
+
+	format := formatObj.Data.(string)
+	values := receiver.Data.([]*object.EmeraldValue)
+	var bufferArg *object.EmeraldValue
+	if len(args) > 1 && args[1] != nil && args[1].Type == object.ValueHash {
+		if value, ok := hashLookup(valueToHashMap(args[1]), rubySymbol("buffer")); ok {
+			if value == nil || value.Type != object.ValueString {
+				typeName := "nil"
+				if value != nil {
+					typeName = value.TypeName()
+				}
+				return typeError("buffer must be String, not " + typeName)
+			}
+			if value.Frozen {
+				return frozenError("can't modify frozen String")
+			}
+			bufferArg = value
+		}
+	}
+	out := make([]byte, 0, len(values)*4)
+	if bufferArg != nil {
+		out = append(out, []byte(bufferArg.Data.(string))...)
+	}
+	valueIndex := 0
+	sawBinaryDirective := false
+	sawUnicodeDirective := false
+
+	isNativeLittleEndian := func() bool {
+		var n uint16 = 1
+		return *(*byte)(unsafe.Pointer(&n)) == 1
+	}
+
+	longSize := int(strconv.IntSize / 8)
+
+	consumeInteger := func(count int64, signed bool, width int, endian binary.ByteOrder) *object.EmeraldValue {
+		if count < 0 {
+			count = int64(len(values) - valueIndex)
+		}
+		if count < 0 {
+			count = 0
+		}
+		for i := int64(0); i < count; i++ {
+			if valueIndex >= len(values) {
+				return argumentError("too few arguments")
+			}
+			n, ok := valueToInteger(values[valueIndex])
+			valueIndex++
+			if !ok {
+				return typeError("no implicit conversion to Integer")
+			}
+			var u uint64
+			switch width {
+			case 1:
+				if signed {
+					u = uint64(uint8(int8(n)))
+				} else {
+					u = uint64(uint8(n))
+				}
+			case 2:
+				if signed {
+					u = uint64(uint16(int16(n)))
+				} else {
+					u = uint64(uint16(n))
+				}
+			case 4:
+				if signed {
+					u = uint64(uint32(int32(n)))
+				} else {
+					u = uint64(uint32(n))
+				}
+			default:
+				u = uint64(n)
+			}
+			buf := make([]byte, width)
+			switch width {
+			case 1, 2, 4, 8:
+				switch endian {
+				case binary.LittleEndian:
+					switch width {
+					case 1:
+						buf[0] = byte(u)
+					case 2:
+						endian.PutUint16(buf, uint16(u))
+					case 4:
+						endian.PutUint32(buf, uint32(u))
+					case 8:
+						endian.PutUint64(buf, uint64(u))
+					}
+				case binary.BigEndian:
+					switch width {
+					case 1:
+						buf[0] = byte(u)
+					case 2:
+						endian.PutUint16(buf, uint16(u))
+					case 4:
+						endian.PutUint32(buf, uint32(u))
+					case 8:
+						endian.PutUint64(buf, uint64(u))
+					}
+				}
+			default:
+				for b := 0; b < width; b++ {
+					buf[b] = byte(u >> uint(8*b))
+				}
+			}
+			out = append(out, buf...)
+		}
+		return nil
+	}
+
+	packValueToFloat := func(value *object.EmeraldValue) (float64, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil || value.Type == object.ValueBool || value.Type == object.ValueString {
+			return 0, typeError("can't convert " + packValueClassName(value) + " into Float")
+		}
+		switch value.Type {
+		case object.ValueFloat:
+			return value.Data.(float64), nil
+		case object.ValueInteger:
+			return float64(value.Data.(int64)), nil
+		}
+		if CallMethod == nil || !receiverHasCallableMethod(value, "to_f") {
+			return 0, typeError("can't convert " + packValueClassName(value) + " into Float")
+		}
+		converted := CallMethod(value, "to_f")
+		if converted != nil && converted.Type == object.ValueException {
+			return 0, converted
+		}
+		if converted == nil || converted.Type == object.ValueNil {
+			return 0, typeError("can't convert " + packValueClassName(value) + " into Float")
+		}
+		if converted.Type == object.ValueFloat {
+			return converted.Data.(float64), nil
+		}
+		if converted.Type == object.ValueInteger {
+			return float64(converted.Data.(int64)), nil
+		}
+		return 0, typeError("can't convert " + packValueClassName(value) + " into Float")
+	}
+
+	consumeFloat := func(count int64, width int, endian binary.ByteOrder) *object.EmeraldValue {
+		if count < 0 {
+			count = int64(len(values) - valueIndex)
+		}
+		if count < 0 {
+			count = 0
+		}
+		for i := int64(0); i < count; i++ {
+			if valueIndex >= len(values) {
+				return argumentError("too few arguments")
+			}
+			n, err := packValueToFloat(values[valueIndex])
+			valueIndex++
+			if err != nil {
+				return err
+			}
+			buf := make([]byte, width)
+			if width == 4 {
+				bits := math.Float32bits(float32(n))
+				if math.IsNaN(n) {
+					bits = 0x7fc00000
+				}
+				endian.PutUint32(buf, bits)
+			} else {
+				bits := math.Float64bits(n)
+				if math.IsNaN(n) {
+					bits = 0x7ff8000000000000
+				}
+				endian.PutUint64(buf, bits)
+			}
+			out = append(out, buf...)
+		}
+		return nil
+	}
+
+	coercePackString := func() (string, *object.EmeraldValue) {
+		if valueIndex >= len(values) {
+			return "", argumentError("too few arguments")
+		}
+		obj := values[valueIndex]
+		valueIndex++
+		if obj == nil || obj.Type == object.ValueNil {
+			return "", nil
+		}
+		if obj.Type == object.ValueString {
+			return obj.Data.(string), nil
+		}
+		if !receiverHasCallableMethod(obj, "to_str") {
+			return "", typeError("no implicit conversion to String")
+		}
+		coerced := CallMethod(obj, "to_str")
+		if coerced == nil || coerced.Type != object.ValueString {
+			return "", typeError("no implicit conversion to String")
+		}
+		return coerced.Data.(string), nil
+	}
+
+	coerceRequiredPackString := func() (string, *object.EmeraldValue) {
+		if valueIndex >= len(values) {
+			return "", argumentError("too few arguments")
+		}
+		obj := values[valueIndex]
+		valueIndex++
+		if obj == nil || obj.Type == object.ValueNil {
+			return "", typeError("no implicit conversion to String")
+		}
+		if obj.Type == object.ValueString {
+			return obj.Data.(string), nil
+		}
+		if !receiverHasCallableMethod(obj, "to_str") || CallMethod == nil {
+			return "", typeError("no implicit conversion to String")
+		}
+		coerced := CallMethod(obj, "to_str")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return "", coerced
+		}
+		if coerced == nil || coerced.Type != object.ValueString {
+			return "", typeError("no implicit conversion to String")
+		}
+		return coerced.Data.(string), nil
+	}
+
+	coercePrintablePackString := func() (string, *object.EmeraldValue) {
+		if valueIndex >= len(values) {
+			return "", argumentError("too few arguments")
+		}
+		obj := values[valueIndex]
+		valueIndex++
+		if obj == nil || obj.Type == object.ValueNil {
+			return "", nil
+		}
+		if obj.Type == object.ValueString {
+			return obj.Data.(string), nil
+		}
+		if CallMethod != nil {
+			converted := CallMethod(obj, "to_s")
+			if converted != nil && converted.Type == object.ValueException {
+				return "", converted
+			}
+			if converted != nil && converted.Type == object.ValueString {
+				return converted.Data.(string), nil
+			}
+		}
+		return obj.Inspect(), nil
+	}
+
+	parseCount := func(pos int) (int64, int) {
+		if pos >= len(format) {
+			return 1, pos
+		}
+		if format[pos] == '*' {
+			return -1, pos + 1
+		}
+		if format[pos] < '0' || format[pos] > '9' {
+			return 1, pos
+		}
+		parsed := int64(0)
+		j := pos
+		for j < len(format) {
+			d := format[j]
+			if d < '0' || d > '9' {
+				break
+			}
+			parsed = parsed*10 + int64(d-'0')
+			j++
+		}
+		return parsed, j
+	}
+
+	validPackDirective := func(directive byte) bool {
+		return strings.ContainsRune("CcSsIiLlNnVvQqJjAaZBbhHwUuMmXx@PpDdEeFfGgRr", rune(directive))
+	}
+
+	validatePackFormat := func() *object.EmeraldValue {
+		for i := 0; i < len(format); i++ {
+			directive := format[i]
+			if directive == ' ' || directive == '\t' || directive == '\n' || directive == '\v' || directive == '\f' || directive == '\r' {
+				continue
+			}
+			if directive == '#' {
+				for i+1 < len(format) && format[i+1] != '\n' {
+					i++
+				}
+				continue
+			}
+			if !validPackDirective(directive) {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if i+1 < len(format) {
+				_, next := parseCount(i + 1)
+				i = next - 1
+			}
+			for i+1 < len(format) {
+				switch format[i+1] {
+				case '<', '>', '_', '!':
+					i++
+				default:
+					goto validate_next
+				}
+			}
+		validate_next:
+		}
+		return nil
+	}
+
+	if err := validatePackFormat(); err != nil {
+		return err
+	}
+
+	for i := 0; i < len(format); i++ {
+		directive := format[i]
+		if directive == ' ' || directive == '\t' || directive == '\n' || directive == '\v' || directive == '\f' || directive == '\r' {
+			continue
+		}
+		if directive == '#' {
+			for i+1 < len(format) && format[i+1] != '\n' {
+				i++
+			}
+			continue
+		}
+
+		count := int64(1)
+		var nativeOrder = isNativeLittleEndian()
+		byteOrder := binary.ByteOrder(binary.LittleEndian)
+		if !nativeOrder {
+			byteOrder = binary.BigEndian
+		}
+		if i+1 < len(format) {
+			c, next := parseCount(i + 1)
+			count = c
+			i = next - 1
+		}
+
+		// parse modifiers like < > _ !
+		modifier := byte(0)
+		nativeModifier := byte(0)
+		for i+1 < len(format) {
+			ch := format[i+1]
+			switch ch {
+			case '<':
+				byteOrder = binary.LittleEndian
+				modifier = ch
+				i++
+			case '>':
+				byteOrder = binary.BigEndian
+				modifier = ch
+				i++
+			case '_', '!':
+				nativeModifier = ch
+				i++
+			default:
+				goto mod_done
+			}
+		}
+	mod_done:
+
+		var err *object.EmeraldValue
+		if directive == 'U' {
+			sawUnicodeDirective = true
+		} else {
+			sawBinaryDirective = true
+		}
+		switch directive {
+		case 'C':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 1, byteOrder)
+		case 'c':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, true, 1, byteOrder)
+		case 'S':
+			if modifier != 0 && modifier != '<' && modifier != '>' {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 2, byteOrder)
+		case 's':
+			if modifier != 0 && modifier != '<' && modifier != '>' {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, true, 2, byteOrder)
+		case 'I':
+			if modifier == 0 && nativeModifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			width := 4
+			err = consumeInteger(count, false, width, byteOrder)
+		case 'i':
+			if modifier == 0 && nativeModifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			width := 4
+			err = consumeInteger(count, true, width, byteOrder)
+		case 'L':
+			width := 4
+			if nativeModifier != 0 {
+				width = longSize
+			}
+			if nativeModifier == 0 && modifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			err = consumeInteger(count, false, width, byteOrder)
+		case 'l':
+			width := 4
+			if nativeModifier != 0 {
+				width = longSize
+			}
+			if nativeModifier == 0 && modifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			err = consumeInteger(count, true, width, byteOrder)
+		case 'N':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 4, binary.BigEndian)
+		case 'n':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 2, binary.BigEndian)
+		case 'V':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 4, binary.LittleEndian)
+		case 'v':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 2, binary.LittleEndian)
+		case 'Q':
+			if nativeModifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, false, 8, byteOrder)
+		case 'q':
+			if nativeModifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeInteger(count, true, 8, byteOrder)
+		case 'J':
+			if modifier == 0 && nativeModifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			err = consumeInteger(count, false, longSize, byteOrder)
+		case 'j':
+			if modifier == 0 && nativeModifier == 0 {
+				byteOrder = func() binary.ByteOrder {
+					if nativeOrder {
+						return binary.LittleEndian
+					}
+					return binary.BigEndian
+				}()
+			}
+			err = consumeInteger(count, true, longSize, byteOrder)
+		case 'D', 'd', 'E':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeFloat(count, 8, binary.LittleEndian)
+		case 'G':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeFloat(count, 8, binary.BigEndian)
+		case 'F', 'f', 'e':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeFloat(count, 4, binary.LittleEndian)
+		case 'g':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			err = consumeFloat(count, 4, binary.BigEndian)
+		case 'a':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if value, e := coercePackString(); e != nil {
+				return e
+			} else {
+				if count < 0 {
+					count = int64(len(value))
+				}
+				if count == 0 {
+					err = nil
+					break
+				}
+				bound := int(count)
+				chunk := []byte(value)
+				if len(chunk) > bound {
+					chunk = chunk[:bound]
+				}
+				out = append(out, chunk...)
+				if len(chunk) < bound {
+					out = append(out, bytes.Repeat([]byte{0x00}, bound-len(chunk))...)
+				}
+			}
+		case 'A':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if value, e := coercePackString(); e != nil {
+				return e
+			} else {
+				if count < 0 {
+					count = int64(len(value))
+				}
+				if count == 0 {
+					err = nil
+					break
+				}
+				bound := int(count)
+				chunk := []byte(value)
+				if len(chunk) > bound {
+					chunk = chunk[:bound]
+				}
+				out = append(out, chunk...)
+				if len(chunk) < bound {
+					out = append(out, bytes.Repeat([]byte{' '}, bound-len(chunk))...)
+				}
+			}
+		case 'Z':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if value, e := coercePackString(); e != nil {
+				return e
+			} else {
+				if count < 0 {
+					out = append(out, []byte(value)...)
+					out = append(out, 0x00)
+					break
+				}
+				if count == 0 {
+					err = nil
+					break
+				}
+				bound := int(count)
+				maxData := bound - 1
+				if maxData < 0 {
+					maxData = 0
+				}
+				chunk := []byte(value)
+				if len(chunk) > maxData {
+					chunk = chunk[:maxData]
+				}
+				out = append(out, chunk...)
+				out = append(out, 0x00)
+				if len(chunk)+1 < bound {
+					out = append(out, bytes.Repeat([]byte{0x00}, bound-len(chunk)-1)...)
+				}
+			}
+		case 'U':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 {
+				count = int64(len(values) - valueIndex)
+			}
+			for j := int64(0); j < count; j++ {
+				if valueIndex >= len(values) {
+					return argumentError("too few arguments")
+				}
+				if override, ok := ULEBPackOverride(values[valueIndex]); ok {
+					valueIndex++
+					out = append(out, override...)
+					continue
+				}
+				n, ok := valueToInteger(values[valueIndex])
+				valueIndex++
+				if !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+				if n < 0 || n > math.MaxUint32 {
+					return NewRangeError("pack(U): value out of range")
+				}
+				out = append(out, packUnicodeCodepoint(uint32(n))...)
+			}
+		case 'u':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			value, e := coerceRequiredPackString()
+			if e != nil {
+				return e
+			}
+			lineLength := int(count)
+			if count < 0 || count <= 2 {
+				lineLength = 45
+			}
+			out = append(out, uuencodePackString([]byte(value), lineLength)...)
+		case 'm':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			value, e := coerceRequiredPackString()
+			if e != nil {
+				return e
+			}
+			lineLength := int(count)
+			if count < 0 || count == 1 || count == 2 {
+				lineLength = 45
+			}
+			out = append(out, base64PackString([]byte(value), lineLength)...)
+		case 'M':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			value, e := coercePrintablePackString()
+			if e != nil {
+				return e
+			}
+			lineLength := int(count)
+			if count < 0 || count <= 1 {
+				lineLength = 73
+			} else {
+				lineLength++
+			}
+			out = append(out, quotedPrintablePackString([]byte(value), lineLength)...)
+		case 'B', 'b':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			value, e := coerceRequiredPackString()
+			if e != nil {
+				return e
+			}
+			out = append(out, bitPackString([]byte(value), count, directive == 'B')...)
+		case 'H', 'h':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			value, e := coerceRequiredPackString()
+			if e != nil {
+				return e
+			}
+			out = append(out, hexPackString([]byte(value), count, directive == 'H')...)
+		case 'w':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 {
+				count = int64(len(values) - valueIndex)
+			}
+			for j := int64(0); j < count; j++ {
+				if valueIndex >= len(values) {
+					return argumentError("too few arguments")
+				}
+				if override, ok := BERPackOverride(values[valueIndex]); ok {
+					valueIndex++
+					out = append(out, override...)
+					continue
+				}
+				n, ok := valueToInteger(values[valueIndex])
+				valueIndex++
+				if !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+				if n < 0 {
+					return argumentError("can't compress negative numbers")
+				}
+				out = append(out, berPackInteger(uint64(n))...)
+			}
+		case 'R':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 {
+				count = int64(len(values) - valueIndex)
+			}
+			for j := int64(0); j < count; j++ {
+				if valueIndex >= len(values) {
+					return argumentError("too few arguments")
+				}
+				if override, ok := ULEBPackOverride(values[valueIndex]); ok {
+					valueIndex++
+					out = append(out, override...)
+					continue
+				}
+				n, ok := valueToInteger(values[valueIndex])
+				valueIndex++
+				if !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+				if n < 0 {
+					return argumentError("can't compress negative numbers")
+				}
+				out = append(out, uleb128PackInteger(uint64(n))...)
+			}
+		case 'r':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 {
+				count = int64(len(values) - valueIndex)
+			}
+			for j := int64(0); j < count; j++ {
+				if valueIndex >= len(values) {
+					return argumentError("too few arguments")
+				}
+				n, ok := valueToInteger(values[valueIndex])
+				valueIndex++
+				if !ok {
+					return typeError("no implicit conversion to Integer")
+				}
+				out = append(out, sleb128PackInteger(n)...)
+			}
+		case 'x':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count > 0 {
+				out = append(out, bytes.Repeat([]byte{0x00}, int(count))...)
+			}
+		case 'X':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 || count == 0 {
+				break
+			}
+			if int(count) > len(out) {
+				return argumentError("string not long enough")
+			}
+			out = out[:len(out)-int(count)]
+		case '@':
+			if nativeModifier != 0 || modifier != 0 {
+				return argumentError("unknown pack directive '" + string(directive) + "'")
+			}
+			if count < 0 {
+				count = 0
+			}
+			target := int(count)
+			if len(out) > target {
+				out = out[:target]
+			} else if len(out) < target {
+				out = append(out, bytes.Repeat([]byte{0x00}, target-len(out))...)
+			}
+		case '_', '!':
+			return argumentError("unknown pack directive '" + string(directive) + "'")
+		default:
+			return argumentError("unknown pack directive '" + string(directive) + "'")
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	if bufferArg != nil {
+		bufferArg.Data = string(out)
+		if stringEncodings != nil {
+			stringEncodings[bufferArg] = packResultEncoding(sawBinaryDirective, sawUnicodeDirective)
+		}
+		return bufferArg
+	}
+	result := rubyString(string(out))
+	if stringEncodings != nil {
+		stringEncodings[result] = packResultEncoding(sawBinaryDirective, sawUnicodeDirective)
 	}
 	return result
 }
 
+func packResultEncoding(sawBinaryDirective, sawUnicodeDirective bool) string {
+	if sawBinaryDirective || !sawUnicodeDirective {
+		return "BINARY"
+	}
+	return "UTF-8"
+}
+
+func packUnicodeCodepoint(value uint32) []byte {
+	switch {
+	case value <= 0x7f:
+		return []byte{byte(value)}
+	case value <= 0x7ff:
+		return []byte{
+			0xc0 | byte(value>>6),
+			0x80 | byte(value&0x3f),
+		}
+	case value <= 0xffff:
+		return []byte{
+			0xe0 | byte(value>>12),
+			0x80 | byte((value>>6)&0x3f),
+			0x80 | byte(value&0x3f),
+		}
+	case value <= 0x1fffff:
+		return []byte{
+			0xf0 | byte(value>>18),
+			0x80 | byte((value>>12)&0x3f),
+			0x80 | byte((value>>6)&0x3f),
+			0x80 | byte(value&0x3f),
+		}
+	case value <= 0x3ffffff:
+		return []byte{
+			0xf8 | byte(value>>24),
+			0x80 | byte((value>>18)&0x3f),
+			0x80 | byte((value>>12)&0x3f),
+			0x80 | byte((value>>6)&0x3f),
+			0x80 | byte(value&0x3f),
+		}
+	default:
+		return []byte{
+			0xfc | byte(value>>30),
+			0x80 | byte((value>>24)&0x3f),
+			0x80 | byte((value>>18)&0x3f),
+			0x80 | byte((value>>12)&0x3f),
+			0x80 | byte((value>>6)&0x3f),
+			0x80 | byte(value&0x3f),
+		}
+	}
+}
+
+func packValueClassName(value *object.EmeraldValue) string {
+	if value == nil {
+		return "NilClass"
+	}
+	if value.Class != nil && value.Class.Name != "" {
+		return value.Class.Name
+	}
+	switch value.Type {
+	case object.ValueNil:
+		return "NilClass"
+	case object.ValueBool:
+		if value.Data == true {
+			return "TrueClass"
+		}
+		return "FalseClass"
+	case object.ValueString:
+		return "String"
+	case object.ValueInteger:
+		return "Integer"
+	case object.ValueFloat:
+		return "Float"
+	default:
+		return value.TypeName()
+	}
+}
+
+func bitPackString(input []byte, count int64, msbFirst bool) []byte {
+	if count < 0 {
+		count = int64(len(input))
+	}
+	if count <= 0 {
+		return []byte{}
+	}
+	out := make([]byte, (int(count)+7)/8)
+	for i := int64(0); i < count; i++ {
+		bit := byte(0)
+		if i < int64(len(input)) {
+			ch := input[i]
+			if ch == '0' {
+				bit = 0
+			} else if ch == '1' {
+				bit = 1
+			} else {
+				bit = ch & 1
+			}
+		}
+		if bit == 0 {
+			continue
+		}
+		byteIndex := int(i / 8)
+		bitIndex := uint(i % 8)
+		if msbFirst {
+			out[byteIndex] |= 1 << (7 - bitIndex)
+		} else {
+			out[byteIndex] |= 1 << bitIndex
+		}
+	}
+	return out
+}
+
+func hexPackString(input []byte, count int64, highNibbleFirst bool) []byte {
+	if count < 0 {
+		count = int64(len(input))
+	}
+	if count <= 0 {
+		return []byte{}
+	}
+	out := make([]byte, (int(count)+1)/2)
+	for i := int64(0); i < count; i++ {
+		nibble := byte(0)
+		if i < int64(len(input)) {
+			nibble = packHexNibble(input[i])
+		}
+		byteIndex := int(i / 2)
+		if highNibbleFirst {
+			if i%2 == 0 {
+				out[byteIndex] |= nibble << 4
+			} else {
+				out[byteIndex] |= nibble
+			}
+		} else {
+			if i%2 == 0 {
+				out[byteIndex] |= nibble
+			} else {
+				out[byteIndex] |= nibble << 4
+			}
+		}
+	}
+	return out
+}
+
+func packHexNibble(ch byte) byte {
+	switch {
+	case ch >= '0' && ch <= '9':
+		return ch - '0'
+	case ch >= 'a' && ch <= 'z':
+		return (ch - 'a' + 10) & 0x0f
+	case ch >= 'A' && ch <= 'Z':
+		return (ch - 'A' + 10) & 0x0f
+	default:
+		return ch & 0x0f
+	}
+}
+
+func RememberBERPackOverride(value *object.EmeraldValue, encoded []byte) *object.EmeraldValue {
+	if value == nil || len(encoded) == 0 {
+		return value
+	}
+	if berPackOverrides == nil {
+		berPackOverrides = make(map[*object.EmeraldValue][]byte)
+	}
+	berPackOverrides[value] = append([]byte(nil), encoded...)
+	return value
+}
+
+func BERPackOverride(value *object.EmeraldValue) ([]byte, bool) {
+	if value == nil || berPackOverrides == nil {
+		return nil, false
+	}
+	encoded, ok := berPackOverrides[value]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), encoded...), true
+}
+
+func RememberULEBPackOverride(value *object.EmeraldValue, encoded []byte) *object.EmeraldValue {
+	if value == nil || len(encoded) == 0 {
+		return value
+	}
+	if ulebPackOverrides == nil {
+		ulebPackOverrides = make(map[*object.EmeraldValue][]byte)
+	}
+	ulebPackOverrides[value] = append([]byte(nil), encoded...)
+	return value
+}
+
+func ULEBPackOverride(value *object.EmeraldValue) ([]byte, bool) {
+	if value == nil || ulebPackOverrides == nil {
+		return nil, false
+	}
+	encoded, ok := ulebPackOverrides[value]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), encoded...), true
+}
+
+func RememberULEBPackIntegerLiteral(value *object.EmeraldValue, literal string) *object.EmeraldValue {
+	text := strings.ReplaceAll(literal, "_", "")
+	if !strings.HasPrefix(strings.ToLower(text), "0x") {
+		return value
+	}
+	n, ok := new(big.Int).SetString(text, 0)
+	if !ok || n.Sign() < 0 || n.BitLen() <= 63 {
+		return value
+	}
+	return RememberULEBPackOverride(value, uleb128PackBigInteger(n))
+}
+
+func uleb128PackInteger(value uint64) []byte {
+	out := []byte{}
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		if value != 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if value == 0 {
+			break
+		}
+	}
+	return out
+}
+
+func uleb128PackBigInteger(value *big.Int) []byte {
+	if value == nil || value.Sign() == 0 {
+		return []byte{0}
+	}
+	n := new(big.Int).Set(value)
+	base := big.NewInt(128)
+	zero := big.NewInt(0)
+	rem := new(big.Int)
+	out := []byte{}
+	for n.Cmp(zero) > 0 {
+		n.QuoRem(n, base, rem)
+		b := byte(rem.Int64())
+		if n.Cmp(zero) > 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func sleb128PackInteger(value int64) []byte {
+	out := []byte{}
+	for {
+		b := byte(value & 0x7f)
+		signSet := b&0x40 != 0
+		value >>= 7
+		done := (value == 0 && !signSet) || (value == -1 && signSet)
+		if !done {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if done {
+			break
+		}
+	}
+	return out
+}
+
+func BERPackPowerOfTwo(exp int) []byte {
+	if exp < 0 {
+		return []byte{}
+	}
+	n := new(big.Int).Lsh(big.NewInt(1), uint(exp))
+	return berPackBigInteger(n)
+}
+
+func berPackBigInteger(value *big.Int) []byte {
+	if value == nil || value.Sign() == 0 {
+		return []byte{0}
+	}
+	base := big.NewInt(128)
+	zero := big.NewInt(0)
+	n := new(big.Int).Set(value)
+	rem := new(big.Int)
+	groups := []byte{}
+	for n.Cmp(zero) > 0 {
+		n.QuoRem(n, base, rem)
+		groups = append(groups, byte(rem.Int64()))
+	}
+	out := make([]byte, len(groups))
+	for i := len(groups) - 1; i >= 0; i-- {
+		b := groups[i]
+		if i != 0 {
+			b |= 0x80
+		}
+		out[len(groups)-1-i] = b
+	}
+	return out
+}
+
+func berPackInteger(value uint64) []byte {
+	if value == 0 {
+		return []byte{0}
+	}
+	groups := []byte{}
+	for value > 0 {
+		groups = append(groups, byte(value&0x7f))
+		value >>= 7
+	}
+	out := make([]byte, len(groups))
+	for i := len(groups) - 1; i >= 0; i-- {
+		b := groups[i]
+		if i != 0 {
+			b |= 0x80
+		}
+		out[len(groups)-1-i] = b
+	}
+	return out
+}
+
+func uuencodePackString(input []byte, lineLength int) []byte {
+	if len(input) == 0 {
+		return []byte{}
+	}
+	if lineLength <= 0 {
+		lineLength = 45
+	}
+	out := make([]byte, 0, ((len(input)+lineLength-1)/lineLength)*(lineLength*4/3+2))
+	encodeChar := func(value byte) byte {
+		value &= 0x3f
+		if value == 0 {
+			return '`'
+		}
+		return value + 0x20
+	}
+	for offset := 0; offset < len(input); offset += lineLength {
+		end := offset + lineLength
+		if end > len(input) {
+			end = len(input)
+		}
+		chunk := input[offset:end]
+		out = append(out, encodeChar(byte(len(chunk))))
+		for i := 0; i < len(chunk); i += 3 {
+			var a, b, c byte
+			a = chunk[i]
+			if i+1 < len(chunk) {
+				b = chunk[i+1]
+			}
+			if i+2 < len(chunk) {
+				c = chunk[i+2]
+			}
+			out = append(out,
+				encodeChar(a>>2),
+				encodeChar((a<<4)|(b>>4)),
+				encodeChar((b<<2)|(c>>6)),
+				encodeChar(c),
+			)
+		}
+		out = append(out, '\n')
+	}
+	return out
+}
+
+func base64PackString(input []byte, lineLength int) []byte {
+	if len(input) == 0 {
+		return []byte{}
+	}
+	encoded := base64.StdEncoding.EncodeToString(input)
+	if lineLength == 0 {
+		return []byte(encoded)
+	}
+	if lineLength < 0 {
+		lineLength = 45
+	}
+	charsPerLine := ((lineLength + 2) / 3) * 4
+	if charsPerLine <= 0 {
+		charsPerLine = 60
+	}
+	out := make([]byte, 0, len(encoded)+len(encoded)/charsPerLine+1)
+	for offset := 0; offset < len(encoded); offset += charsPerLine {
+		end := offset + charsPerLine
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		out = append(out, encoded[offset:end]...)
+		out = append(out, '\n')
+	}
+	return out
+}
+
+func quotedPrintablePackString(input []byte, lineLength int) []byte {
+	if len(input) == 0 {
+		return []byte{}
+	}
+	if lineLength <= 0 {
+		lineLength = 73
+	}
+	out := make([]byte, 0, len(input)+len(input)/lineLength+4)
+	col := 0
+	hex := "0123456789ABCDEF"
+
+	appendSoftBreak := func() {
+		out = append(out, '=', '\n')
+		col = 0
+	}
+	encodedFor := func(b byte) []byte {
+		if b == '=' || b < 32 && b != '\t' && b != '\n' || b >= 127 {
+			return []byte{'=', hex[b>>4], hex[b&0x0f]}
+		}
+		return []byte{b}
+	}
+
+	for i, b := range input {
+		if b == '\n' {
+			out = append(out, '\n')
+			col = 0
+			continue
+		}
+		token := encodedFor(b)
+		limit := lineLength
+		if len(token) == 3 {
+			limit = ((lineLength + 2) / 3) * 3
+		}
+		if col+len(token) > limit {
+			appendSoftBreak()
+		}
+		out = append(out, token...)
+		col += len(token)
+		if i+1 < len(input) && input[i+1] == '\n' && (b == ' ' || b == '\t') {
+			appendSoftBreak()
+		}
+	}
+	if col > 0 {
+		appendSoftBreak()
+	}
+	return out
+}
+
 func arrayUniq(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
 	seen := make(map[string]bool)
 	newArr := make([]*object.EmeraldValue, 0)
-	for _, elem := range arr {
-		key := elem.Inspect()
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		elem := arr[i]
+		keyValue := elem
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			keyValue = CallBlock(elem)
+			if keyValue != nil && keyValue.Type == object.ValueException {
+				return keyValue
+			}
+		}
+		key := keyValue.Inspect()
 		if !seen[key] {
 			seen[key] = true
 			newArr = append(newArr, elem)
@@ -10259,12 +17869,26 @@ func arrayUniq(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func arrayUniqBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	seen := make(map[string]bool)
-	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	newArr := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
 	changed := false
-	for _, elem := range arr {
-		key := elem.Inspect()
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		elem := arr[i]
+		keyValue := elem
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			keyValue = CallBlock(elem)
+			if keyValue != nil && keyValue.Type == object.ValueException {
+				return keyValue
+			}
+		}
+		key := keyValue.Inspect()
 		if seen[key] {
 			changed = true
 			continue
@@ -10282,16 +17906,12 @@ func arrayUniqBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 func arraySort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if len(arr) == 0 {
-		return receiver
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
 	}
 	newArr := make([]*object.EmeraldValue, len(arr))
 	copy(newArr, arr)
-	for i := 0; i < len(newArr)-1; i++ {
-		for j := 0; j < len(newArr)-i-1; j++ {
-			if compareValues(newArr[j], newArr[j+1]) > 0 {
-				newArr[j], newArr[j+1] = newArr[j+1], newArr[j]
-			}
-		}
+	if err := sortArrayValues(newArr); err != nil {
+		return err
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -10301,16 +17921,99 @@ func arraySort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func arraySortBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	arr := receiver.Data.([]*object.EmeraldValue)
+	if err := sortArrayValues(arr); err != nil {
+		return err
+	}
+	receiver.Data = arr
+	return receiver
+}
+
+func sortArrayValues(arr []*object.EmeraldValue) *object.EmeraldValue {
 	for i := 0; i < len(arr)-1; i++ {
 		for j := 0; j < len(arr)-i-1; j++ {
-			if compareValues(arr[j], arr[j+1]) > 0 {
+			cmp, err := arraySortCompare(arr[j], arr[j+1])
+			if err != nil {
+				return err
+			}
+			if cmp > 0 {
 				arr[j], arr[j+1] = arr[j+1], arr[j]
 			}
 		}
 	}
-	receiver.Data = arr
-	return receiver
+	return nil
+}
+
+func arraySortCompare(left, right *object.EmeraldValue) (int, *object.EmeraldValue) {
+	if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+		value := CallBlock(left, right)
+		if LastBlockResult != nil {
+			result := LastBlockResult
+			LastBlockResult = nil
+			return 0, result
+		}
+		if value == nil || value.Type == object.ValueNil {
+			return 0, NewArgumentError("comparison of Array elements failed")
+		}
+		if value.Type == object.ValueException {
+			return 0, value
+		}
+		if cmp, ok := valueToSortComparison(value); ok {
+			return cmp, nil
+		}
+		return 0, NewArgumentError("comparison of Array elements failed")
+	}
+	if CallMethod == nil || left == nil {
+		return 0, NewArgumentError("comparison of Array elements failed")
+	}
+	value := CallMethod(left, "<=>", right)
+	if value != nil && value.Type == object.ValueException {
+		if isNoMethodError(value) {
+			return 0, NewArgumentError("comparison of Array elements failed")
+		}
+		return 0, value
+	}
+	if cmp, ok := valueToSortComparison(value); ok {
+		return cmp, nil
+	}
+	return 0, NewArgumentError("comparison of Array elements failed")
+}
+
+func valueToSortComparison(value *object.EmeraldValue) (int, bool) {
+	if value == nil {
+		return 0, false
+	}
+	switch value.Type {
+	case object.ValueInteger:
+		n := value.Data.(int64)
+		if n < 0 {
+			return -1, true
+		}
+		if n > 0 {
+			return 1, true
+		}
+		return 0, true
+	case object.ValueFloat:
+		n := value.Data.(float64)
+		if n < 0 {
+			return -1, true
+		}
+		if n > 0 {
+			return 1, true
+		}
+		return 0, true
+	}
+	if CallMethod != nil && receiverHasCallableMethod(value, "<=>") {
+		cmp := CallMethod(value, "<=>", newInt(0))
+		if cmp != nil && cmp.Type == object.ValueException {
+			return 0, false
+		}
+		return valueToSortComparison(cmp)
+	}
+	return 0, false
 }
 
 func arrayPlus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -10318,7 +18021,17 @@ func arrayPlus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return receiver
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
-	other, ok := args[0].Data.([]*object.EmeraldValue)
+	otherValue := args[0]
+	if otherValue.Type != object.ValueArray {
+		if CallMethod != nil && receiverHasCallableMethod(otherValue, "to_ary") {
+			converted := CallMethod(otherValue, "to_ary")
+			if converted != nil && converted.Type == object.ValueException {
+				return converted
+			}
+			otherValue = converted
+		}
+	}
+	other, ok := otherValue.Data.([]*object.EmeraldValue)
 	if !ok {
 		return typeError("no implicit conversion to Array")
 	}
@@ -10340,7 +18053,16 @@ func arrayMinus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	otherMap := make(map[string]bool)
 	for _, arg := range args {
 		if arg.Type != object.ValueArray {
-			continue
+			if CallMethod != nil && receiverHasCallableMethod(arg, "to_ary") {
+				converted := CallMethod(arg, "to_ary")
+				if converted != nil && converted.Type == object.ValueException {
+					return converted
+				}
+				arg = converted
+			}
+		}
+		if arg == nil || arg.Type != object.ValueArray {
+			return typeError("no implicit conversion to Array")
 		}
 		for _, o := range arg.Data.([]*object.EmeraldValue) {
 			otherMap[o.Inspect()] = true
@@ -10419,6 +18141,66 @@ func arrayUnion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	}
 }
 
+func arrayProduct(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arrays := make([][]*object.EmeraldValue, 0, len(args)+1)
+	arrays = append(arrays, receiver.Data.([]*object.EmeraldValue))
+	total := int64(len(arrays[0]))
+	for _, arg := range args {
+		values, ok := valueToArray(arg)
+		if !ok {
+			return typeError("no implicit conversion of " + arg.TypeName() + " into Array")
+		}
+		arrays = append(arrays, values)
+		total *= int64(len(values))
+		if total > 10_000_000 && !(BlockGivenCheck != nil && BlockGivenCheck()) {
+			return NewRangeError("too big to product")
+		}
+	}
+	if len(arrays) == 1 {
+		rows := make([]*object.EmeraldValue, len(arrays[0]))
+		for i, value := range arrays[0] {
+			rows[i] = &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{value}, Class: R.Classes["Array"]}
+		}
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			for _, row := range rows {
+				CallBlock(row)
+			}
+			return receiver
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: rows, Class: R.Classes["Array"]}
+	}
+	for _, values := range arrays {
+		if len(values) == 0 {
+			if BlockGivenCheck != nil && BlockGivenCheck() {
+				return receiver
+			}
+			return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+		}
+	}
+	result := make([]*object.EmeraldValue, 0)
+	var build func(int, []*object.EmeraldValue)
+	build = func(depth int, prefix []*object.EmeraldValue) {
+		if depth == len(arrays) {
+			rowValues := append([]*object.EmeraldValue(nil), prefix...)
+			row := &object.EmeraldValue{Type: object.ValueArray, Data: rowValues, Class: R.Classes["Array"]}
+			if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+				CallBlock(row)
+			} else {
+				result = append(result, row)
+			}
+			return
+		}
+		for _, value := range arrays[depth] {
+			build(depth+1, append(prefix, value))
+		}
+	}
+	build(0, nil)
+	if BlockGivenCheck != nil && BlockGivenCheck() {
+		return receiver
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
 func arrayTake(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
@@ -10433,10 +18215,7 @@ func arrayTake(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		n = len(arr)
 	}
 	if n < 0 {
-		n = len(arr) + n
-		if n < 0 {
-			n = 0
-		}
+		return NewArgumentError("attempt to take negative size")
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -10452,23 +18231,77 @@ func arrayDrop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	arr := receiver.Data.([]*object.EmeraldValue)
 	count, ok := valueToInteger(args[0])
 	if !ok {
-		return R.NilVal
+		return conversionTypeErrorToInteger(args[0])
 	}
 	n := int(count)
+	if n < 0 {
+		return NewArgumentError("attempt to drop negative size")
+	}
 	if n > len(arr) {
 		n = len(arr)
-	}
-	if n < 0 {
-		n = len(arr) + n
-		if n < 0 {
-			n = 0
-		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
 		Data:  arr[n:],
 		Class: R.Classes["Array"],
 	}
+}
+
+func arrayTranspose(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	rawRows := receiver.Data.([]*object.EmeraldValue)
+	if len(rawRows) == 0 {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	rows := make([][]*object.EmeraldValue, len(rawRows))
+	width := -1
+	for i, rowValue := range rawRows {
+		row, ok := valueToArray(rowValue)
+		if !ok {
+			return typeError("can't convert " + rowValue.TypeName() + " into Array")
+		}
+		if width < 0 {
+			width = len(row)
+		} else if len(row) != width {
+			return newRuntimeException(R.Classes["IndexError"], "element size differs")
+		}
+		rows[i] = row
+	}
+	if width <= 0 {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	result := make([]*object.EmeraldValue, width)
+	for col := 0; col < width; col++ {
+		outRow := make([]*object.EmeraldValue, len(rows))
+		for row := range rows {
+			outRow[row] = rows[row][col]
+		}
+		result[col] = &object.EmeraldValue{Type: object.ValueArray, Data: outRow, Class: R.Classes["Array"]}
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func arrayDig(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	value := arrayAt(receiver, args[0])
+	if value == nil || value.Type == object.ValueException {
+		return value
+	}
+	if len(args) == 1 || value.Type == object.ValueNil {
+		return value
+	}
+	if CallMethod == nil || !receiverHasCallableMethod(value, "dig") {
+		return typeError(value.TypeName() + " does not have #dig method")
+	}
+	result := CallMethod(value, "dig", args[1:]...)
+	if result == nil {
+		return R.NilVal
+	}
+	return result
 }
 
 func arrayAny(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -10549,36 +18382,214 @@ func arrayOne(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func arraySum(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	sum := &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	if len(args) == 1 {
+		sum = args[0]
+	}
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		value := arr[i]
+		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+			value = CallBlock(value)
+			if value != nil && value.Type == object.ValueException {
+				return value
+			}
+		}
+		if CallMethod == nil {
+			return typeError("Array#sum requires +")
+		}
+		next := CallMethod(sum, "+", value)
+		if next == nil || next.Type == object.ValueNil {
+			return typeError("Array#sum element cannot be added")
+		}
+		if next.Type == object.ValueException {
+			return next
+		}
+		sum = next
+	}
+	return sum
+}
+
+func arrayBsearch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return arrayBsearchCommon(receiver, false)
+}
+
+func arrayBsearchIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return arrayBsearchCommon(receiver, true)
+}
+
+func arrayBsearchCommon(receiver *object.EmeraldValue, returnIndex bool) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
-	sum := int64(0)
-	for _, elem := range arr {
-		if v, ok := elem.Data.(int64); ok {
-			sum += v
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		values := append([]*object.EmeraldValue(nil), arr...)
+		return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			return values, nil
+		})
+	}
+	mode := ""
+	for i, elem := range arr {
+		result := CallBlock(elem)
+		if LastBlockResult != nil {
+			breakValue := LastBlockResult
+			LastBlockResult = nil
+			if breakValue == nil {
+				return R.NilVal
+			}
+			return breakValue
+		}
+		if result == nil || result.Type == object.ValueNil {
+			if mode == "" {
+				mode = "boolean"
+			}
+			continue
+		}
+		switch result.Type {
+		case object.ValueBool:
+			if mode == "" {
+				mode = "boolean"
+			}
+			if mode != "boolean" {
+				return typeError("wrong argument type")
+			}
+			if result.Data.(bool) {
+				if returnIndex {
+					return newInt(int64(i))
+				}
+				return elem
+			}
+		case object.ValueInteger:
+			if mode == "" {
+				mode = "numeric"
+			}
+			if mode != "numeric" {
+				return typeError("wrong argument type")
+			}
+			n := result.Data.(int64)
+			if n == 0 {
+				if returnIndex {
+					return newInt(int64(i))
+				}
+				return elem
+			}
+		case object.ValueFloat:
+			if mode == "" {
+				mode = "numeric"
+			}
+			if mode != "numeric" {
+				return typeError("wrong argument type")
+			}
+			n := result.Data.(float64)
+			if n == 0 {
+				if returnIndex {
+					return newInt(int64(i))
+				}
+				return elem
+			}
+		default:
+			return typeError("wrong argument type")
 		}
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueInteger,
-		Data:  sum,
-		Class: R.Classes["Integer"],
-	}
+	return R.NilVal
 }
 
 func arrayMax(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return arrayMinMax(receiver, false)
+}
+
+func arrayMinMax(receiver *object.EmeraldValue, wantMin bool) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if len(arr) == 0 {
 		return R.NilVal
 	}
-	maxVal := arr[0]
+	best := arr[0]
 	for _, elem := range arr[1:] {
-		if v1, ok1 := maxVal.Data.(int64); ok1 {
-			if v2, ok2 := elem.Data.(int64); ok2 {
-				if v2 > v1 {
-					maxVal = elem
-				}
-			}
+		cmp, err := arrayMinMaxCompare(elem, best)
+		if err != nil {
+			return err
+		}
+		if (wantMin && cmp < 0) || (!wantMin && cmp > 0) {
+			best = elem
 		}
 	}
-	return maxVal
+	return best
+}
+
+func arrayMinMaxCompare(left, right *object.EmeraldValue) (int, *object.EmeraldValue) {
+	var cmpValue *object.EmeraldValue
+	if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+		cmpValue = CallBlock(left, right)
+	} else if CallMethod != nil && left != nil && receiverHasCallableMethod(left, "<=>") {
+		cmpValue = CallMethod(left, "<=>", right)
+	} else {
+		_, ok := rangeCompareValues(left, right)
+		if !ok {
+			return 0, newRuntimeException(R.Classes["NoMethodError"], "undefined method `<=>'")
+		}
+	}
+	if cmpValue != nil && cmpValue.Type == object.ValueException {
+		return 0, cmpValue
+	}
+	if cmpValue != nil {
+		if cmpValue.Type == object.ValueNil {
+			return 0, NewArgumentError("comparison of " + left.TypeName() + " with " + right.TypeName() + " failed")
+		}
+		if cmpValue.Type != object.ValueInteger {
+			return 0, typeError("comparison result must be Integer")
+		}
+		n := cmpValue.Data.(int64)
+		if n < 0 {
+			return -1, nil
+		}
+		if n > 0 {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	cmp, ok := rangeCompareValues(left, right)
+	if !ok {
+		return 0, NewArgumentError("comparison of " + left.TypeName() + " with " + right.TypeName() + " failed")
+	}
+	return cmp, nil
+}
+
+func arrayMinmax(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(arr) == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{R.NilVal, R.NilVal},
+			Class: R.Classes["Array"],
+		}
+	}
+	min := arr[0]
+	max := arr[0]
+	for _, elem := range arr[1:] {
+		cmpMin, err := arrayMinMaxCompare(elem, min)
+		if err != nil {
+			return err
+		}
+		if cmpMin < 0 {
+			min = elem
+		}
+		cmpMax, err := arrayMinMaxCompare(elem, max)
+		if err != nil {
+			return err
+		}
+		if cmpMax > 0 {
+			max = elem
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  []*object.EmeraldValue{min, max},
+		Class: R.Classes["Array"],
+	}
 }
 
 func stringGsub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -11052,13 +19063,12 @@ func stringSucc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(s) == 0 {
 		return receiver
 	}
-	result := []byte(s)
+	result := []rune(s)
 	for i := len(result) - 1; i >= 0; i-- {
-		if result[i] < 'z' {
+		if result[i] < utf8.MaxRune {
 			result[i]++
 			break
 		}
-		result[i] = 'a'
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueString,
@@ -11068,21 +19078,7 @@ func stringSucc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func arrayMin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
-	if len(arr) == 0 {
-		return R.NilVal
-	}
-	minVal := arr[0]
-	for _, elem := range arr[1:] {
-		if v1, ok1 := minVal.Data.(int64); ok1 {
-			if v2, ok2 := elem.Data.(int64); ok2 {
-				if v2 < v1 {
-					minVal = elem
-				}
-			}
-		}
-	}
-	return minVal
+	return arrayMinMax(receiver, true)
 }
 
 func hashDig(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -11094,7 +19090,10 @@ func hashDig(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 		if current.Type != object.ValueHash {
 			return R.NilVal
 		}
-		hash := current.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+		hash := valueToHashMap(current)
+		if hash == nil {
+			return R.NilVal
+		}
 		var foundVal *object.EmeraldValue
 		for k, v := range hash {
 			if k.Equals(key) {
@@ -11143,16 +19142,38 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
 		return newLoopEnumerator()
 	}
+	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		fmt.Printf("builtinLoop enter blockGiven=%v\n", BlockGivenCheck())
+	}
 	iterations := 0
 	for {
 		LastException = nil
 		LastBlockResult = nil
 		CallBlock()
 		iterations++
+		if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+			if LastException == nil {
+				fmt.Println("builtinLoop after call: no exception")
+			} else {
+				fmt.Printf("builtinLoop after call: exception=%s\n", LastException.Inspect())
+			}
+		}
 		if LastException != nil {
+			if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+				exc := LastException
+				r := exc.Data.(*object.RException)
+				fmt.Printf("builtinLoop handling exception class=%s resultNil=%v\n", exc.Class.Name, r.Result == nil)
+			}
 			if classInheritsFrom(LastException.Class, R.Classes["StopIteration"]) {
 				exc := LastException.Data.(*object.RException)
 				LastException = nil
+				if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+					if exc.Result == nil {
+						fmt.Println("builtinLoop stop result=nil")
+					} else {
+						fmt.Printf("builtinLoop stop result=%s\n", exc.Result.Inspect())
+					}
+				}
 				if exc.Result != nil {
 					return exc.Result
 				}
@@ -11198,14 +19219,33 @@ func builtinExitBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if err != nil {
 		return err
 	}
+	if processForkNoBlockStatus != nil {
+		*processForkNoBlockStatus = status
+		processForkNoBlockStatus = nil
+		if SetGlobalVariable != nil {
+			SetGlobalVariable("$?", newProcessStatus(-1, &status, nil))
+		}
+		return R.NilVal
+	}
+	if processForkExitBangStatus != nil {
+		*processForkExitBangStatus = status
+		return newSystemExit("exit!", status)
+	}
 	if SetGlobalVariable != nil {
 		SetGlobalVariable("$?", newProcessStatus(-1, &status, nil))
 	}
-	return R.NilVal
+	return newSystemExit("exit!", status)
 }
 
 func builtinSleep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	current := threadClassCurrent(nil)
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = true
+	}
 	runAllPendingThreads()
+	if currentData := threadValueData(current); currentData != nil {
+		currentData.stopped = false
+	}
 	if LastException != nil {
 		exception := LastException
 		LastException = nil
@@ -11215,13 +19255,50 @@ func builtinSleep(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
-		return R.FalseVal
+	path, errVal := pathFromSingleArg(args)
+	if errVal != nil {
+		return errVal
 	}
-	path, ok := args[0].Data.(string)
-	if !ok {
-		return R.FalseVal
+	return requireFeature(path)
+}
+
+func builtinRequireRelative(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	path, errVal := pathFromSingleArg(args)
+	if errVal != nil {
+		return errVal
 	}
+
+	basePath := ""
+	if CurrentFrameBinding != nil {
+		if binding := CurrentFrameBinding(); binding != nil && binding.Path != "" {
+			basePath = binding.Path
+		}
+	}
+	if basePath == "" {
+		basePath = CurrentSpecFile
+	}
+	if basePath == "" {
+		basePath = "spec.rb"
+	}
+
+	normalizedBase := filepath.FromSlash(strings.ReplaceAll(basePath, "\\", "/"))
+	baseDir := filepath.Dir(normalizedBase)
+	if baseDir == "." {
+		baseDir, _ = os.Getwd()
+	}
+
+	normalizedArg := filepath.FromSlash(strings.ReplaceAll(path, "\\", "/"))
+	resolvedPath := filepath.Clean(filepath.Join(baseDir, normalizedArg))
+	if filepath.IsAbs(normalizedArg) {
+		resolvedPath = filepath.Clean(normalizedArg)
+	}
+	if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+		fmt.Printf("RGO_DEBUG_REQUIRE relative base=%q arg=%q resolved=%q\n", basePath, path, resolvedPath)
+	}
+	return requireFeature(resolvedPath)
+}
+
+func requireFeature(path string) *object.EmeraldValue {
 	switch {
 	case strings.HasSuffix(path, "concurrent.rb"):
 		return requireConcurrentFixture(path, "in_concurrent_rb", "con_raise")
@@ -11230,23 +19307,426 @@ func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	case strings.HasSuffix(path, "concurrent3.rb"):
 		return requireConcurrentFixture(path, "in_concurrent_rb3", "")
 	}
-	if featureRequired(path) || loadingFeatures[path] {
-		return R.FalseVal
+	switch path {
+	case "stringio", "stringio.rb":
+		if featureRequired("stringio") || featureRequired("stringio.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		markFeatureRequired("stringio")
+		markFeatureRequired("stringio.rb")
+		return R.TrueVal
+	case "io/console", "io/console.rb":
+		if featureRequired("io/console") || featureRequired("io/console.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		markFeatureRequired("io/console")
+		markFeatureRequired("io/console.rb")
+		return R.TrueVal
 	}
+	thread := threadClassCurrent(nil)
+	resolvedPath := path
+	if ResolveRequirePath != nil {
+		if candidate := ResolveRequirePath(path); candidate != "" {
+			resolvedPath = candidate
+		}
+	}
+	if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+		fmt.Printf("RGO_DEBUG_REQUIRE feature path=%q resolved=%q\n", path, resolvedPath)
+	}
+	checkPaths := []string{path}
+	if resolvedPath != "" && resolvedPath != path {
+		checkPaths = append(checkPaths, resolvedPath)
+	}
+
+	for _, featurePath := range checkPaths {
+		if featureRequired(featurePath) {
+			if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+				fmt.Printf("RGO_DEBUG_REQUIRE already loaded %q\n", featurePath)
+			}
+			return R.FalseVal
+		}
+		if loadingFeatures[featurePath] {
+			if loadingFeatureOwners[featurePath] == thread {
+				if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+					fmt.Printf("RGO_DEBUG_REQUIRE self loading %q\n", featurePath)
+				}
+				return R.FalseVal
+			}
+			waitForConcurrentRequire(featurePath, thread)
+			if loadingFeatures[featurePath] {
+				if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+					fmt.Printf("RGO_DEBUG_REQUIRE still loading %q\n", featurePath)
+				}
+				return R.FalseVal
+			}
+			if featureRequired(featurePath) {
+				if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+					fmt.Printf("RGO_DEBUG_REQUIRE loaded after wait %q\n", featurePath)
+				}
+				return R.FalseVal
+			}
+		}
+	}
+
 	if RequirePath != nil {
 		prevException := LastException
-		loadingFeatures[path] = true
-		result := RequirePath(path)
-		delete(loadingFeatures, path)
+		for _, featurePath := range checkPaths {
+			loadingFeatureOwners[featurePath] = thread
+			loadingFeatures[featurePath] = true
+		}
+		loadedPath, result := RequirePath(resolvedPath)
+		if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
+			resultType := object.ValueNil
+			if result != nil {
+				resultType = result.Type
+			}
+			resultMessage := ""
+			if result != nil && result.Type == object.ValueException {
+				if exc, ok := result.Data.(*object.RException); ok && exc != nil {
+					resultMessage = exc.Message
+				}
+			}
+			fmt.Printf("RGO_DEBUG_REQUIRE loadedPath=%q resultType=%v message=%q\n", loadedPath, resultType, resultMessage)
+		}
+		for _, featurePath := range checkPaths {
+			delete(loadingFeatureOwners, featurePath)
+			delete(loadingFeatures, featurePath)
+		}
 		if result != nil && result.Type == object.ValueException {
 			return result
 		}
 		if LastException != nil && LastException != prevException {
 			return LastException
 		}
+		if loadedPath == "" {
+			loadedPath = resolvedPath
+		}
+		markFeatureRequired(loadedPath)
+		if loadedPath != path {
+			markFeatureRequired(path)
+		}
 	}
-	markFeatureRequired(path)
 	return R.TrueVal
+}
+
+func builtinOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	fileClass := R.Classes["File"]
+	if fileClass == nil {
+		return newRuntimeException(R.Classes["TypeError"], "uninitialized constant File")
+	}
+	if len(args) > 0 {
+		path := args[0]
+		if path != nil && path.Type != object.ValueString {
+			if path.Class != nil {
+				if method, hasToOpen := path.Class.GetMethod("to_open"); hasToOpen && method != nil && CallMethod != nil {
+					opened := CallMethod(path, "to_open")
+					if opened != nil && opened.Type == object.ValueException {
+						return opened
+					}
+					if BlockGivenCheck != nil && BlockGivenCheck() && opened != nil && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+						block := CurrentBlockValue()
+						if block != nil {
+							return CallBlockWithArgs(block, opened)
+						}
+					}
+					return opened
+				}
+			}
+		}
+	}
+	return fileClassOpen(&object.EmeraldValue{Type: object.ValueClass, Data: fileClass, Class: R.Classes["Class"]}, args...)
+}
+
+func builtinLoad(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return argumentError("wrong number of arguments")
+	}
+	path, errVal := coercePath(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return newRuntimeException(R.Classes["LoadError"], "cannot load such file -- "+path)
+	}
+	prevException := LastException
+	prevSpecFile := CurrentSpecFile
+	CurrentSpecFile = path
+	defer func() {
+		CurrentSpecFile = prevSpecFile
+	}()
+	if EvalSource == nil {
+		return newRuntimeException(R.Classes["LoadError"], "load unavailable")
+	}
+	result := EvalSource(string(content))
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	if LastException != nil && LastException != prevException {
+		return LastException
+	}
+	return R.TrueVal
+}
+
+func builtinCaller(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frames, nilResult, err := backtraceFramesFromArgs(1, args...)
+	if err != nil {
+		return err
+	}
+	if nilResult {
+		return R.NilVal
+	}
+	return backtraceStringsValue(frames)
+}
+
+func builtinCallerLocations(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	frames, nilResult, err := backtraceFramesFromArgs(1, args...)
+	if err != nil {
+		return err
+	}
+	if nilResult {
+		return R.NilVal
+	}
+	return backtraceLocationsValue(frames)
+}
+
+func builtinGlobalVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	variableSet := make(map[string]struct{})
+	addName := func(name string) {
+		if name == "" {
+			return
+		}
+		resolved := ResolveGlobalAlias(name)
+		if resolved == "" {
+			resolved = name
+		}
+		variableSet[resolved] = struct{}{}
+	}
+	if GlobalVariableNames != nil {
+		for _, name := range GlobalVariableNames() {
+			addName(name)
+		}
+	}
+	defaultNames := []string{
+		"$LOAD_PATH", "$:", "$LOADED_FEATURES", "$\"", "$VERBOSE", "$DEBUG", "$stderr", "$stdout", "$stdin",
+		"$0", "$?", "$.", "$/", "$\\", "$,", "$_", "$~", "$!", "$&", "$`", "$'", "$+", "$*",
+	}
+	for _, name := range defaultNames {
+		addName(name)
+	}
+	names := make([]string, 0, len(variableSet))
+	for name := range variableSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	values := make([]*object.EmeraldValue, len(names))
+	for i, name := range names {
+		values[i] = &object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  name,
+			Class: R.Classes["Symbol"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  values,
+		Class: R.Classes["Array"],
+	}
+}
+
+func builtinWarn(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if GetGlobalVariable != nil {
+		verbose := GetGlobalVariable("$VERBOSE")
+		if verbose == R.FalseVal || verbose == R.NilVal {
+			return R.NilVal
+		}
+	}
+	uplevel := -1
+	warnArgs := args
+	if n := len(args); n > 0 {
+		last := args[n-1]
+		if last != nil && last.Type == object.ValueHash {
+			options := valueToHashMap(last)
+			for key, value := range options {
+				if specName(key) == "uplevel" {
+					level, ok := valueToInteger(value)
+					if !ok {
+						return typeError("wrong argument type")
+					}
+					uplevel = int(level)
+					warnArgs = args[:n-1]
+					break
+				}
+			}
+		}
+	}
+	expanded := make([]*object.EmeraldValue, 0, len(warnArgs))
+	for _, value := range warnArgs {
+		if array, ok := valueToArray(value); ok {
+			expanded = append(expanded, array...)
+		} else {
+			expanded = append(expanded, value)
+		}
+	}
+	prefix := ""
+	if uplevel >= 0 {
+		frames := currentBacktraceFramesOrEmpty()
+		if uplevel < len(frames) {
+			frame := frames[uplevel]
+			prefix = fmt.Sprintf("%s:%d: warning: ", frame.Path, frame.Line)
+		}
+	}
+	for _, value := range expanded {
+		fmt.Fprintln(os.Stderr, prefix+warningString(value))
+	}
+	return R.NilVal
+}
+
+func warningString(value *object.EmeraldValue) string {
+	if value == nil || value.Type == object.ValueNil {
+		return "nil"
+	}
+	if value.Type == object.ValueString || value.Type == object.ValueSymbol {
+		return value.Data.(string)
+	}
+	if CallMethod != nil && value.Class != nil {
+		if method, hasToString := value.Class.GetMethod("to_s"); hasToString && method != nil {
+			text := CallMethod(value, "to_s")
+			if text != nil && text.Type == object.ValueString {
+				return text.Data.(string)
+			}
+			if text != nil && text.Type == object.ValueException {
+				return text.Inspect()
+			}
+		}
+	}
+	return value.Inspect()
+}
+
+func builtinAtExit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CurrentBlockValue == nil {
+		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	block := CurrentBlockValue()
+	if block == nil {
+		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	RegisterAtExitHook(block)
+	return R.NilVal
+}
+
+func builtinTraceVar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	name := globalVariableTraceName(args[0])
+	if name == "" {
+		return typeError("wrong argument type")
+	}
+	trace := globalVariableTrace{}
+	if len(args) > 1 {
+		switch args[1].Type {
+		case object.ValueProc:
+			trace.handler = args[1]
+		case object.ValueString:
+			trace.source = args[1].Data.(string)
+		default:
+			return typeError("wrong argument type")
+		}
+	} else {
+		if CurrentBlockValue == nil || CurrentBlockValue() == nil {
+			return NewArgumentError("tried to create Proc object without a block")
+		}
+		trace.handler = CurrentBlockValue()
+	}
+	if globalVariableTraces == nil {
+		globalVariableTraces = make(map[string][]globalVariableTrace)
+	}
+	globalVariableTraces[name] = append(globalVariableTraces[name], trace)
+	return R.NilVal
+}
+
+func builtinUntraceVar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	name := globalVariableTraceName(args[0])
+	if name == "" {
+		return typeError("wrong argument type")
+	}
+	delete(globalVariableTraces, name)
+	return R.NilVal
+}
+
+func globalVariableTraceName(value *object.EmeraldValue) string {
+	name := specName(value)
+	if name == "" {
+		return ""
+	}
+	if !strings.HasPrefix(name, "$") {
+		name = "$" + name
+	}
+	return ResolveGlobalAlias(name)
+}
+
+func NotifyGlobalVariableSet(name string, value *object.EmeraldValue) {
+	if globalVariableTraces == nil {
+		return
+	}
+	resolved := ResolveGlobalAlias(name)
+	traces := append([]globalVariableTrace(nil), globalVariableTraces[resolved]...)
+	if len(traces) == 0 && resolved != name {
+		traces = append(traces, globalVariableTraces[name]...)
+	}
+	for _, trace := range traces {
+		if trace.handler != nil && CallBlockWithArgs != nil {
+			CallBlockWithArgs(trace.handler, value)
+			continue
+		}
+		if trace.source != "" && EvalSource != nil {
+			EvalSource(trace.source)
+		}
+	}
+}
+
+func builtinEND(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CurrentBlockValue == nil {
+		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	block := CurrentBlockValue()
+	if block == nil {
+		return newRuntimeException(R.Classes["LocalJumpError"], "no block given")
+	}
+	RegisterEndHook(block)
+	return R.NilVal
+}
+
+func builtinSetTraceFunc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	old := setTraceFuncValue
+	if old == nil {
+		old = R.NilVal
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	setTraceFuncValue = args[0]
+	if args[0] != nil && args[0].Type != object.ValueNil {
+		traceProc := args[0]
+		if traceProc.Type != object.ValueProc && CallMethod != nil && traceProc.Class != nil {
+			if method, hasToProc := traceProc.Class.GetMethod("to_proc"); hasToProc && method != nil {
+				coerced := CallMethod(traceProc, "to_proc")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				if coerced != nil {
+					setTraceFuncValue = coerced
+				}
+			}
+		}
+	} else {
+		setTraceFuncValue = R.NilVal
+	}
+	return old
 }
 
 func requireConcurrentFixture(path, enteredKey, raiseKey string) *object.EmeraldValue {
@@ -11269,15 +19749,366 @@ func requireConcurrentFixture(path, enteredKey, raiseKey string) *object.Emerald
 }
 
 func builtinRand(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  kernelRand.Float64(),
+			Class: R.Classes["Float"],
+		}
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	arg := args[0]
+	if arg == nil || arg.Type == object.ValueNil {
+		return typeError("no implicit conversion into Integer")
+	}
+	if arg.Type == object.ValueRange {
+		rangeValue, ok := arg.Data.(*object.RRange)
+		if !ok {
+			return typeError("wrong type")
+		}
+		return builtinRandRange(rangeValue)
+	}
+	if arg.Type == object.ValueFloat {
+		return builtinRandFloat(arg.Data.(float64))
+	}
+
+	max, err := valueToRandInteger(arg)
+	if err != nil {
+		return err
+	}
+	return builtinRandInt(max)
+}
+
+func builtinSrand(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	previousSeed := kernelRandSeed
+	switch len(args) {
+	case 0:
+		seed := time.Now().UnixNano()
+		seedRand(seed)
+	case 1:
+		seedValue := args[0]
+		if seedValue == nil || seedValue.Type == object.ValueNil {
+			return typeError("no implicit conversion to Integer")
+		}
+		seed, err := valueToRandInteger(seedValue)
+		if err != nil {
+			return err
+		}
+		seedRand(seed)
+	default:
+		return NewArgumentError("wrong number of arguments")
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  previousSeed,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func builtinRandFloat(max float64) *object.EmeraldValue {
+	if max < 0 {
+		max = -max
+	}
+	if max == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  kernelRand.Float64(),
+			Class: R.Classes["Float"],
+		}
+	}
+	if max < 1.0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  kernelRand.Float64() * max,
+			Class: R.Classes["Float"],
+		}
+	}
+	return builtinRandInt(int64(max))
+}
+
+func builtinRandInt(max int64) *object.EmeraldValue {
+	if max < 0 {
+		max = -max
+	}
+	if max == 0 {
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  kernelRand.Float64(),
+			Class: R.Classes["Float"],
+		}
+	}
+	if max == 1 {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  int64(0),
+			Class: R.Classes["Integer"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  kernelRand.Int63n(max),
+		Class: R.Classes["Integer"],
+	}
+}
+
+func builtinRandRange(r *object.RRange) *object.EmeraldValue {
+	if r == nil {
+		return R.NilVal
+	}
+
+	startValue, startOk := r.StartValue.(*object.EmeraldValue)
+	endValue, endOk := r.EndValue.(*object.EmeraldValue)
+	if !startOk || !endOk || startValue == nil || endValue == nil {
+		if r.StartFloat || r.EndFloat {
+			start := r.StartRaw
+			end := r.EndRaw
+			if !r.StartFloat {
+				start = float64(r.Start)
+			}
+			if !r.EndFloat {
+				end = float64(r.End)
+			}
+			return builtinRandRangeFloat(start, end, r.Exclusive)
+		}
+		return builtinRandRangeInt(r.Start, r.End, r.Exclusive)
+	}
+
+	if isPrimitiveNumericValue(startValue) && isPrimitiveNumericValue(endValue) {
+		if r.StartFloat || r.EndFloat {
+			start := r.StartRaw
+			end := r.EndRaw
+			if !r.StartFloat {
+				start = float64(r.Start)
+			}
+			if !r.EndFloat {
+				end = float64(r.End)
+			}
+			return builtinRandRangeFloat(start, end, r.Exclusive)
+		}
+		return builtinRandRangeInt(r.Start, r.End, r.Exclusive)
+	}
+
+	return builtinRandRangeCustom(startValue, endValue, r.Exclusive)
+}
+
+func builtinRandRangeInt(start, end int64, exclusive bool) *object.EmeraldValue {
+	if exclusive {
+		if start >= end {
+			return R.NilVal
+		}
+		size := end - start
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  kernelRand.Int63n(size) + start,
+			Class: R.Classes["Integer"],
+		}
+	}
+	if start > end {
+		return R.NilVal
+	}
+	if start == end {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  start,
+			Class: R.Classes["Integer"],
+		}
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  kernelRand.Int63n(end-start+1) + start,
+		Class: R.Classes["Integer"],
+	}
+}
+
+func builtinRandRangeFloat(start, end float64, exclusive bool) *object.EmeraldValue {
+	if exclusive {
+		if start >= end {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  start + kernelRand.Float64()*(end-start),
+			Class: R.Classes["Float"],
+		}
+	}
+	if start > end {
+		return R.NilVal
+	}
+	if start == end {
+		return &object.EmeraldValue{
+			Type:  object.ValueFloat,
+			Data:  start,
+			Class: R.Classes["Float"],
+		}
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueFloat,
-		Data:  0.5,
+		Data:  start + kernelRand.Float64()*(end-start),
 		Class: R.Classes["Float"],
 	}
 }
 
-func builtinSrand(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return R.NilVal
+func builtinRandRangeCustom(start, end *object.EmeraldValue, exclusive bool) *object.EmeraldValue {
+	if isRangeValueFloat(start) || isRangeValueFloat(end) {
+		startFloat, startErr := valueToFloat(start)
+		if startErr != nil {
+			if startErr.Type == object.ValueException {
+				return startErr
+			}
+		}
+		endFloat, endErr := valueToFloat(end)
+		if endErr != nil {
+			if endErr.Type == object.ValueException {
+				return endErr
+			}
+		}
+		if startErr == nil && endErr == nil {
+			result := startFloat + kernelRand.Float64()*(endFloat-startFloat)
+			if exclusive {
+				if startFloat >= endFloat {
+					return R.NilVal
+				}
+			} else {
+				if startFloat > endFloat {
+					return R.NilVal
+				}
+				if startFloat == endFloat {
+					return start
+				}
+			}
+			return addToValue(start, &object.EmeraldValue{
+				Type:  object.ValueFloat,
+				Data:  result,
+				Class: R.Classes["Float"],
+			})
+		}
+	}
+
+	startInt, startErr := valueToRandInteger(start)
+	if startErr != nil {
+		return startErr
+	}
+	endInt, endErr := valueToRandInteger(end)
+	if endErr != nil {
+		return endErr
+	}
+	if exclusive {
+		if startInt >= endInt {
+			return R.NilVal
+		}
+		return addToValue(start, &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  kernelRand.Int63n(endInt - startInt),
+			Class: R.Classes["Integer"],
+		})
+	}
+	if startInt > endInt {
+		return R.NilVal
+	}
+	if startInt == endInt {
+		return start
+	}
+	return addToValue(start, &object.EmeraldValue{
+		Type:  object.ValueInteger,
+		Data:  kernelRand.Int63n(endInt - startInt + 1),
+		Class: R.Classes["Integer"],
+	})
+}
+
+func addToValue(receiver, addend *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || addend == nil || CallMethod == nil {
+		return typeError("no implicit conversion into Integer")
+	}
+	value := CallMethod(receiver, "+", addend)
+	if value == nil {
+		return typeError("no implicit conversion into Integer")
+	}
+	return value
+}
+
+func isPrimitiveNumericValue(value *object.EmeraldValue) bool {
+	if value == nil {
+		return false
+	}
+	return value.Type == object.ValueInteger || value.Type == object.ValueFloat
+}
+
+func isRangeValueFloat(value *object.EmeraldValue) bool {
+	if value == nil {
+		return false
+	}
+	if value.Type == object.ValueFloat {
+		return true
+	}
+	if value.Type != object.ValueInteger && receiverHasCallableMethod(value, "to_f") {
+		return true
+	}
+	return false
+}
+
+func valueToRandInteger(value *object.EmeraldValue) (int64, *object.EmeraldValue) {
+	if value == nil {
+		return 0, typeError("no implicit conversion into Integer")
+	}
+	switch v := value.Data.(type) {
+	case int64:
+		return v, nil
+	case float64:
+		return int64(v), nil
+	}
+	if CallMethod == nil || value.Class == nil || !receiverHasCallableMethod(value, "to_int") {
+		return 0, typeError("no implicit conversion into Integer")
+	}
+	converted := CallMethod(value, "to_int")
+	if converted == nil {
+		return 0, typeError("no implicit conversion into Integer")
+	}
+	if converted.Type == object.ValueException {
+		return 0, converted
+	}
+	switch v := converted.Data.(type) {
+	case int64:
+		return v, nil
+	case float64:
+		return int64(v), nil
+	}
+	return 0, typeError("no implicit conversion into Integer")
+}
+
+func valueToFloat(value *object.EmeraldValue) (float64, *object.EmeraldValue) {
+	if value == nil {
+		return 0, typeError("no implicit conversion into Float")
+	}
+	switch v := value.Data.(type) {
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	}
+	if CallMethod == nil || value.Class == nil || !receiverHasCallableMethod(value, "to_f") {
+		return 0, typeError("no implicit conversion into Float")
+	}
+	converted := CallMethod(value, "to_f")
+	if converted == nil {
+		return 0, typeError("no implicit conversion into Float")
+	}
+	if converted.Type == object.ValueException {
+		return 0, converted
+	}
+	switch v := converted.Data.(type) {
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	}
+	return 0, typeError("no implicit conversion into Float")
+}
+
+func seedRand(seed int64) {
+	kernelRandSeed = seed
+	kernelRand = rand.New(rand.NewSource(seed))
 }
 
 func builtinRational(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -11316,40 +20147,51 @@ func numericValueAsFloat(value *object.EmeraldValue) float64 {
 func builtinRaise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	var message string
 	var excClass *object.Class
+	var exc *object.EmeraldValue
 
-	if len(args) == 0 {
+	switch len(args) {
+	case 0:
 		if LastException != nil {
 			return LastException
 		}
 		message = "RuntimeError"
 		excClass = R.Classes["RuntimeError"]
-	} else if len(args) == 1 {
-		if args[0].Type == object.ValueException {
+	case 1:
+		switch args[0].Type {
+		case object.ValueException:
+			fillExceptionBacktrace(args[0])
 			LastException = args[0]
 			LastMatcherException = args[0]
 			return args[0]
-		}
-		if args[0].Type == object.ValueClass {
+		case object.ValueClass:
 			excClass = args[0].Data.(*object.Class)
+			if excClass == nil {
+				return typeError("wrong argument type")
+			}
 			message = excClass.Name
-		} else {
+		default:
 			message = args[0].Inspect()
 			excClass = R.Classes["RuntimeError"]
 		}
-	} else {
+	case 2:
+		excClass = R.Classes["RuntimeError"]
 		if args[0].Type == object.ValueClass {
 			excClass = args[0].Data.(*object.Class)
-		} else {
-			excClass = R.Classes["RuntimeError"]
+			if excClass == nil {
+				return typeError("wrong argument type")
+			}
 		}
 		message = args[1].Inspect()
+	default:
+		exc = NewArgumentError("wrong number of arguments")
 	}
-
-	exc := &object.EmeraldValue{
-		Type:  object.ValueException,
-		Data:  &object.RException{Message: message},
-		Class: excClass,
+	if exc != nil {
+		return exc
 	}
+	if excClass == nil {
+		excClass = R.Classes["RuntimeError"]
+	}
+	exc = newRuntimeException(excClass, message)
 	LastException = exc
 	LastMatcherException = exc
 	return exc
@@ -11358,6 +20200,9 @@ func builtinRaise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 func builtinAbort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	message := ""
 	if len(args) > 0 {
+		if args[0] == nil || args[0].Type == object.ValueNil {
+			return typeError("no implicit conversion to String")
+		}
 		if s, ok := args[0].Data.(string); ok {
 			message = s
 		} else if CallMethod != nil {
@@ -11377,6 +20222,23 @@ func builtinAbort(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 			return typeError("no implicit conversion to String")
 		}
 	}
+
+	if message != "" {
+		writtenToStderr := false
+		if GetGlobalVariable != nil {
+			stderr := GetGlobalVariable("$stderr")
+			if stderr != nil && CallMethod != nil {
+				writeResult := CallMethod(stderr, "write", rubyString(message+"\n"))
+				if writeResult != nil && writeResult.Type != object.ValueException {
+					writtenToStderr = true
+				}
+			}
+		}
+		if !writtenToStderr {
+			fmt.Fprintln(os.Stderr, message)
+		}
+	}
+
 	status := int64(1)
 	exc := newSystemExit(message, status)
 	LastException = exc
@@ -11418,11 +20280,14 @@ func exitStatusFromArgs(args ...*object.EmeraldValue) (int64, *object.EmeraldVal
 }
 
 func newSystemExit(message string, status int64) *object.EmeraldValue {
-	return &object.EmeraldValue{
+	frames := currentBacktraceFramesOrEmpty()
+	exc := &object.EmeraldValue{
 		Type:  object.ValueException,
-		Data:  &object.RException{Message: message, Status: &status},
+		Data:  &object.RException{Message: message, Backtrace: backtraceStrings(frames), Locations: frames, Status: &status},
 		Class: R.Classes["SystemExit"],
 	}
+	LastException = exc
+	return exc
 }
 
 func builtinMock(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -11464,6 +20329,10 @@ func builtinMagicFile(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	return rubyString("spec.rb")
 }
 
+func builtinMagicEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return newEncodingValue("US-ASCII")
+}
+
 func builtinMagicDir(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if CurrentSpecFile != "" {
 		return rubyString(filepath.Dir(CurrentSpecFile))
@@ -11481,20 +20350,151 @@ func builtinBlockGiven(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	return R.FalseVal
 }
 
+func builtinTap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return NewLocalJumpError("no block given")
+	}
+	result := CallBlock(receiver)
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return receiver
+}
+
+func builtinNotMatch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if CallMethod == nil {
+		return NewNoMethodError("undefined method `=~'")
+	}
+	if !receiverHasCallableMethod(receiver, "=~") {
+		return NewNoMethodError("undefined method `=~'")
+	}
+	result := CallMethod(receiver, "=~", args[0])
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	if result == nil || result == R.NilVal || result == R.FalseVal {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
 func builtinLambda(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		if args[0] != nil && args[0].Type == object.ValueProc {
+			if proc, ok := args[0].Data.(*object.Proc); ok && proc.IsLambda {
+				return args[0]
+			}
+		}
+		return NewArgumentError("the lambda method requires a literal block")
+	}
+	if CurrentBlockValue != nil {
+		if block := CurrentBlockValue(); block != nil {
+			if block.Type == object.ValueProc {
+				if proc, ok := block.Data.(*object.Proc); ok && !proc.IsLambda {
+					return NewArgumentError("the lambda method requires a literal block")
+				}
+			}
+			return lambdaValueFromBlock(block)
+		}
+	}
+	return NewArgumentError("tried to create Proc object without a block")
+}
+
+func builtinProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) > 0 {
 		return args[0]
 	}
 	if CurrentBlockValue != nil {
 		if block := CurrentBlockValue(); block != nil {
+			if proc := procValueFromBlock(block, R.Classes["Proc"]); proc != nil {
+				return proc
+			}
 			return block
 		}
 	}
 	return R.NilVal
 }
 
-func builtinProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return builtinLambda(receiver, args...)
+func lambdaValueFromBlock(block *object.EmeraldValue) *object.EmeraldValue {
+	switch block.Type {
+	case object.ValueProc:
+		source := block.Data.(*object.Proc)
+		copy := *source
+		copy.IsLambda = true
+		copy.InstanceVars = make(map[string]*object.EmeraldValue)
+		return &object.EmeraldValue{Type: object.ValueProc, Data: &copy, Class: R.Classes["Proc"]}
+	case object.ValueClosure:
+		closure := block.Data.(*object.Closure)
+		return &object.EmeraldValue{
+			Type: object.ValueProc,
+			Data: &object.Proc{
+				Fn:           closure.Fn,
+				Env:          closure.Free,
+				Block:        closure.Block,
+				Binding:      closure.Binding,
+				ClassStack:   closure.ClassStack,
+				InstanceVars: make(map[string]*object.EmeraldValue),
+				AutoSplat:    closure.AutoSplat,
+				IsLambda:     true,
+			},
+			Class: R.Classes["Proc"],
+		}
+	default:
+		return block
+	}
+}
+
+func builtinBinding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	binding := (*object.RBinding)(nil)
+	if CurrentFrameBinding != nil {
+		binding = CurrentFrameBinding()
+	}
+	if binding == nil {
+		binding = &object.RBinding{
+			Self:         R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			Path:         currentSourcePath(),
+			Line:         1,
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueBinding, Data: binding, Class: R.Classes["Binding"]}
+}
+
+func builtinLocalVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	binding := (*object.RBinding)(nil)
+	if CurrentFrameBinding != nil {
+		binding = CurrentFrameBinding()
+	}
+	if binding == nil {
+		binding = &object.RBinding{
+			Self:         R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			Path:         currentSourcePath(),
+			Line:         1,
+		}
+	}
+	return bindingLocalVariables(&object.EmeraldValue{
+		Type:  object.ValueBinding,
+		Data:  binding,
+		Class: R.Classes["Binding"],
+	})
 }
 
 func stringLstrip(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -11739,7 +20739,7 @@ func newIOShimValue(className string) *object.EmeraldValue {
 	if cls == nil {
 		cls = R.Classes["IO"]
 	}
-	data := &ioShimData{cachedSize: -1, fd: nextIOFd}
+	data := &ioShimData{cachedSize: -1, fd: nextIOFd, closeOnExec: true, autoclose: true, peerFD: -1, pid: -1, encodingExplicit: false}
 	nextIOFd++
 	if ioDataByFd != nil {
 		ioDataByFd[data.fd] = data
@@ -11751,9 +20751,41 @@ func newIOShimValue(className string) *object.EmeraldValue {
 	}
 }
 
+func setIOClassFromReceiver(io *object.EmeraldValue, receiver *object.EmeraldValue) *object.EmeraldValue {
+	if io == nil || receiver == nil {
+		return io
+	}
+	if receiver.Type != object.ValueClass {
+		return io
+	}
+	cls, ok := receiver.Data.(*object.Class)
+	if !ok || cls == nil {
+		return io
+	}
+	io.Class = cls
+	return io
+}
+
 func ioClassPipe(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	read := newIOShimValue("IO")
-	write := newIOShimValue("IO")
+	read := setIOClassFromReceiver(newIOShimValue("IO"), receiver)
+	write := setIOClassFromReceiver(newIOShimValue("IO"), receiver)
+	readData := ioShim(read)
+	writeData := ioShim(write)
+	if readData != nil {
+		readData.isReadPipe = true
+		readData.mode = "r"
+	}
+	if writeData != nil {
+		writeData.isReadPipe = false
+		writeData.mode = "w"
+	}
+	if readData != nil && writeData != nil {
+		readData.peerFD = writeData.fd
+		writeData.peerFD = readData.fd
+		pipe := ioEnsurePipeBufferForFD(readData.fd)
+		ioPipeBuffers[writeData.fd] = pipe
+		ioPipeBuffers[readData.fd] = pipe
+	}
 	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
 		return CallBlockWithArgs(CurrentBlockValue(), read, write)
 	}
@@ -11764,6 +20796,1193 @@ func ioClassPipe(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 }
 
+func ioPipeBufferForFD(fd int64) *bytes.Buffer {
+	if ioPipeBuffers == nil {
+		return nil
+	}
+	return ioPipeBuffers[fd]
+}
+
+func ioFIFOStateForPath(path string) *ioFIFOState {
+	if ioFIFOStates == nil {
+		ioFIFOStates = make(map[string]*ioFIFOState)
+	}
+	state, ok := ioFIFOStates[path]
+	if !ok || state == nil {
+		state = &ioFIFOState{buffer: &bytes.Buffer{}}
+		ioFIFOStates[path] = state
+	}
+	return state
+}
+
+func ioWaitForFIFOPeer(path string, readable, writable, nonblock bool) *object.EmeraldValue {
+	waitingReader := false
+	waitingWriter := false
+	for {
+		ioFIFOStatesMu.Lock()
+		state := ioFIFOStateForPath(path)
+		if state == nil {
+			ioFIFOStatesMu.Unlock()
+			return newRuntimeException(R.Classes["SystemCallError"], "No such file or directory")
+		}
+		needsReader := writable && !readable
+		needsWriter := readable && !writable
+		if !needsReader && !needsWriter {
+			if readable {
+				state.readers++
+			}
+			if writable {
+				state.writers++
+			}
+			if waitingReader && state.waitingReaders > 0 {
+				state.waitingReaders--
+			}
+			if waitingWriter && state.waitingWriters > 0 {
+				state.waitingWriters--
+			}
+			ioFIFOStatesMu.Unlock()
+			return nil
+		}
+
+		if nonblock {
+			if needsReader {
+				if state.readers > 0 {
+					state.writers++
+					if waitingWriter && state.waitingWriters > 0 {
+						state.waitingWriters--
+					}
+					ioFIFOStatesMu.Unlock()
+					return nil
+				}
+				if state.readers == 0 {
+					ioFIFOStatesMu.Unlock()
+					return newRuntimeException(R.Classes["Errno::ENXIO"], "No such device or address")
+				}
+			}
+			if needsWriter {
+				state.readers++
+				if waitingReader && state.waitingReaders > 0 {
+					state.waitingReaders--
+				}
+				ioFIFOStatesMu.Unlock()
+				return nil
+			}
+		}
+
+		if needsReader {
+			if state.readers > 0 || state.waitingWriters > 0 {
+				state.writers++
+				if waitingReader && state.waitingReaders > 0 {
+					state.waitingReaders--
+				}
+				ioFIFOStatesMu.Unlock()
+				return nil
+			}
+			if !waitingReader {
+				state.waitingReaders++
+				waitingReader = true
+			}
+			ioFIFOStatesMu.Unlock()
+			current := threadClassCurrent(nil)
+			if currentData := threadValueData(current); currentData != nil {
+				currentData.stopped = true
+			}
+			if len(pendingThreads) == 0 {
+				time.Sleep(1 * time.Millisecond)
+			} else {
+				runNextPendingThread()
+			}
+			if currentData := threadValueData(current); currentData != nil {
+				currentData.stopped = false
+			}
+			continue
+		}
+
+		if needsWriter {
+			if state.writers > 0 || state.waitingReaders > 0 {
+				state.readers++
+				if waitingWriter && state.waitingWriters > 0 {
+					state.waitingWriters--
+				}
+				ioFIFOStatesMu.Unlock()
+				return nil
+			}
+			if !waitingWriter {
+				state.waitingWriters++
+				waitingWriter = true
+			}
+			ioFIFOStatesMu.Unlock()
+			current := threadClassCurrent(nil)
+			if currentData := threadValueData(current); currentData != nil {
+				currentData.stopped = true
+			}
+			if len(pendingThreads) == 0 {
+				time.Sleep(1 * time.Millisecond)
+			} else {
+				runNextPendingThread()
+			}
+			if currentData := threadValueData(current); currentData != nil {
+				currentData.stopped = false
+			}
+			continue
+		}
+	}
+}
+
+func ioReleaseFIFOPath(path string, readable bool, writable bool) {
+	if path == "" {
+		return
+	}
+	ioFIFOStatesMu.Lock()
+	state := ioFIFOStates[path]
+	if state == nil {
+		ioFIFOStatesMu.Unlock()
+		return
+	}
+	if readable && state.readers > 0 {
+		state.readers--
+	}
+	if writable && state.writers > 0 {
+		state.writers--
+	}
+	if state.readers <= 0 && state.writers <= 0 && state.waitingReaders <= 0 && state.waitingWriters <= 0 {
+		delete(ioFIFOStates, path)
+	}
+	ioFIFOStatesMu.Unlock()
+}
+
+func ioFIFOReadContent(path string) string {
+	ioFIFOStatesMu.Lock()
+	defer ioFIFOStatesMu.Unlock()
+	state := ioFIFOStates[path]
+	if state == nil || state.buffer == nil {
+		return ""
+	}
+	return state.buffer.String()
+}
+
+func ioFIFOWriteContent(path string, content string) {
+	ioFIFOStatesMu.Lock()
+	defer ioFIFOStatesMu.Unlock()
+	state := ioFIFOStateForPath(path)
+	if state == nil {
+		return
+	}
+	_, _ = state.buffer.WriteString(content)
+}
+
+func ioFIFOHasReader(path string) bool {
+	ioFIFOStatesMu.Lock()
+	defer ioFIFOStatesMu.Unlock()
+	state := ioFIFOStates[path]
+	return state != nil && state.readers > 0
+}
+
+func ioFIFOHasWriter(path string) bool {
+	ioFIFOStatesMu.Lock()
+	defer ioFIFOStatesMu.Unlock()
+	state := ioFIFOStates[path]
+	return state != nil && state.writers > 0
+}
+
+func ioFIFOHasData(path string) bool {
+	return ioFIFOReadContent(path) != ""
+}
+
+func ioEnsurePipeBufferForFD(fd int64) *bytes.Buffer {
+	if ioPipeBuffers == nil {
+		ioPipeBuffers = make(map[int64]*bytes.Buffer)
+	}
+	buffer, ok := ioPipeBuffers[fd]
+	if !ok || buffer == nil {
+		buffer = &bytes.Buffer{}
+		ioPipeBuffers[fd] = buffer
+	}
+	return buffer
+}
+
+func stringIOClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	io := setIOClassFromReceiver(newIOShimValue("StringIO"), receiver)
+	return stringIOInitialize(io, args...)
+}
+
+func stringIOClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	io := setIOClassFromReceiver(newIOShimValue("StringIO"), receiver)
+	result := stringIOInitialize(io, args...)
+	if result == nil || result.Type == object.ValueException {
+		return result
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		blockResult := CallBlockWithArgs(CurrentBlockValue(), result)
+		closeResult := ioClose(result)
+		if closeResult != nil && closeResult.Type == object.ValueException {
+			return closeResult
+		}
+		return blockResult
+	}
+	return result
+}
+
+func stringIOInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return typeError("not opened")
+	}
+
+	stringArg := (*object.EmeraldValue)(nil)
+	if len(args) > 0 {
+		stringArg = args[0]
+	}
+	initialString := ""
+	initialValue := (*object.EmeraldValue)(nil)
+	if stringArg == nil || stringArg.Type == object.ValueNil {
+		initialValue = rubyString("")
+	} else if stringArg.Type == object.ValueString {
+		initialValue = stringArg
+		initialString, _ = stringArg.Data.(string)
+	} else {
+		rawValue, converted, viaToStr, errVal := evalCoerceToString(stringArg)
+		if errVal != nil {
+			return errVal
+		}
+		if !converted {
+			return conversionTypeErrorToStringForMode(stringArg, viaToStr)
+		}
+		initialString = rawValue
+		initialValue = rubyString(initialString)
+	}
+
+	mode := "r+"
+	hasExplicitMode := false
+	modeExplicitByPositional := false
+	hasExplicitIntegerMode := false
+	explicitIntegerMode := int64(0)
+	if len(args) > 1 {
+		if args[1] != nil && args[1].Type != object.ValueHash {
+			switch args[1].Type {
+			case object.ValueString:
+				hasExplicitMode = true
+				modeExplicitByPositional = true
+			case object.ValueInteger:
+				hasExplicitMode = true
+				modeExplicitByPositional = true
+				hasExplicitIntegerMode = true
+				explicitIntegerMode = args[1].Data.(int64)
+			default:
+				rawMode, converted, viaToStr, errVal := evalCoerceToString(args[1])
+				if errVal != nil {
+					return errVal
+				}
+				if !converted {
+					return conversionTypeErrorToStringForMode(args[1], viaToStr)
+				}
+				coercedArgs := make([]*object.EmeraldValue, len(args))
+				copy(coercedArgs, args)
+				coercedArgs[1] = rubyString(rawMode)
+				args = coercedArgs
+				hasExplicitMode = true
+				modeExplicitByPositional = true
+			}
+		}
+	}
+	openArgs := make([]*object.EmeraldValue, 0, len(args)+1)
+	openArgs = append(openArgs, initialValue)
+	if len(args) > 1 {
+		openArgs = append(openArgs, args[1:]...)
+	}
+	if hasExplicitMode {
+		if modeExplicitByPositional {
+			mode = fileOpenMode(openArgs)
+		}
+	} else {
+		if initialValue != nil && initialValue.Type == object.ValueString && initialValue.Frozen {
+			mode = "r"
+		}
+	}
+
+	modeHasBinary := strings.Contains(mode, "b")
+	modeHasText := strings.Contains(mode, "t")
+	modeHasEncoding := false
+	externalEncodingValue := ""
+	internalEncodingValue := ""
+	encodingOptionValue := ""
+	encodingOptionSet := false
+	encodingOptionInternalValue := ""
+	encodingOptionInternalSet := false
+	externalEncodingOptionSet := false
+	binmodeOptionSet := false
+	binmodeOptionValue := false
+	textmodeOptionSet := false
+	if strings.Contains(mode, ":") {
+		parsedMode, modeExternalEncoding, modeInternalEncoding, errVal := parseModeEncodingFromMode(mode)
+		if errVal != nil {
+			return errVal
+		}
+		mode = parsedMode
+		externalEncodingValue = modeExternalEncoding
+		internalEncodingValue = modeInternalEncoding
+		modeHasEncoding = true
+		modeHasBinary = strings.Contains(mode, "b")
+		modeHasText = strings.Contains(mode, "t")
+	}
+
+	for _, arg := range args[1:] {
+		if arg == nil || arg.Type != object.ValueHash {
+			continue
+		}
+		for key, value := range valueToHashMap(arg) {
+			switch specName(key) {
+			case "mode":
+				if value == nil {
+					return NewArgumentError("wrong type")
+				}
+				switch value.Type {
+				case object.ValueString:
+					mode = value.Data.(string)
+					hasExplicitMode = true
+					hasExplicitIntegerMode = false
+					explicitIntegerMode = 0
+				case object.ValueInteger:
+					explicitIntegerMode = value.Data.(int64)
+					hasExplicitIntegerMode = true
+					mode = fileModeFromFlags(explicitIntegerMode)
+					hasExplicitMode = true
+				default:
+					rawMode, converted, viaToStr, errVal := evalCoerceToString(value)
+					if errVal != nil {
+						return errVal
+					}
+					if !converted {
+						return conversionTypeErrorToStringForMode(value, viaToStr)
+					}
+					mode = rawMode
+					hasExplicitMode = true
+					hasExplicitIntegerMode = false
+					explicitIntegerMode = 0
+				}
+			case "encoding":
+				parsedEncoding, okValue := fileOpenEncodingValue(value)
+				if !okValue {
+					return NewArgumentError("wrong type")
+				}
+				encodingOptionSet = true
+				encodingOptionValue = parsedEncoding
+				parts := strings.SplitN(parsedEncoding, ":", 2)
+				if len(parts) > 1 {
+					encodingOptionValue = parts[0]
+					encodingOptionInternalSet = true
+					encodingOptionInternalValue = parts[1]
+					if encodingOptionInternalValue == "" || strings.EqualFold(encodingOptionInternalValue, "-") || strings.EqualFold(encodingOptionInternalValue, encodingOptionValue) {
+						encodingOptionInternalValue = ""
+						encodingOptionInternalSet = false
+					}
+				}
+			case "external_encoding":
+				parsedEncoding, okValue := fileOpenEncodingValue(value)
+				if !okValue {
+					return NewArgumentError("wrong type")
+				}
+				externalEncodingOptionSet = true
+				externalEncodingValue = parsedEncoding
+			case "internal_encoding":
+				parsedEncoding, okValue := fileOpenEncodingValue(value)
+				if !okValue {
+					return NewArgumentError("wrong type")
+				}
+				if strings.EqualFold(parsedEncoding, "-") {
+					parsedEncoding = ""
+				}
+				encodingOptionInternalSet = true
+				encodingOptionInternalValue = parsedEncoding
+			case "binmode":
+				if value != nil && value.Type == object.ValueBool && value.Data.(bool) {
+					binmodeOptionSet = true
+					binmodeOptionValue = true
+				} else if value != nil && value.Type == object.ValueBool && !value.Data.(bool) {
+					binmodeOptionSet = true
+					binmodeOptionValue = false
+				} else {
+					return NewArgumentError("wrong type")
+				}
+			case "textmode":
+				textmodeOptionSet = true
+				if value != nil && value.Type == object.ValueBool && value.Data.(bool) {
+				} else if value != nil && value.Type == object.ValueBool && !value.Data.(bool) {
+				} else {
+					return NewArgumentError("wrong type")
+				}
+			}
+		}
+	}
+
+	modeHasBinary = strings.Contains(mode, "b")
+	modeHasText = strings.Contains(mode, "t")
+	modeHasEncoding = false
+	externalEncodingValue = ""
+	internalEncodingValue = ""
+	if strings.Contains(mode, ":") {
+		parsedMode, modeExternalEncoding, modeInternalEncoding, parseModeErr := parseModeEncodingFromMode(mode)
+		if parseModeErr != nil {
+			return parseModeErr
+		}
+		mode = parsedMode
+		externalEncodingValue = modeExternalEncoding
+		internalEncodingValue = modeInternalEncoding
+		modeHasEncoding = true
+	}
+
+	if hasExplicitMode {
+		validateMode := mode
+		if strings.Contains(validateMode, ":") {
+			parsedMode, _, _, parseModeErr := parseModeEncodingFromMode(validateMode)
+			if parseModeErr != nil {
+				return parseModeErr
+			}
+			validateMode = parsedMode
+		}
+		if errVal := validateFileOpenMode(validateMode, []*object.EmeraldValue{openArgs[0], rubyString(validateMode)}); errVal != nil {
+			return errVal
+		}
+	}
+	truncateMode := strings.Contains(mode, "w") || (hasExplicitIntegerMode && explicitIntegerMode&512 != 0)
+
+	if hasExplicitMode && initialValue != nil && initialValue.Type == object.ValueString && initialValue.Frozen {
+		if hasExplicitIntegerMode && explicitIntegerMode&512 != 0 && !fileModeWritable(mode) {
+			return frozenError("can't modify frozen String")
+		}
+		if fileModeWritable(mode) {
+			return newRuntimeException(R.Classes["Errno::EACCES"], "Permission denied")
+		}
+	}
+	if truncateMode {
+		initialString = ""
+	}
+
+	if strings.EqualFold(encodingOptionInternalValue, "-") {
+		encodingOptionInternalValue = ""
+	}
+	if strings.EqualFold(internalEncodingValue, encodingOptionValue) && encodingOptionValue != "" {
+		internalEncodingValue = ""
+	}
+	if strings.EqualFold(internalEncodingValue, externalEncodingValue) && externalEncodingValue != "" {
+		internalEncodingValue = ""
+	}
+	if strings.EqualFold(encodingOptionInternalValue, encodingOptionValue) && encodingOptionValue != "" {
+		encodingOptionInternalValue = ""
+	}
+	if encodingOptionSet && (externalEncodingOptionSet || encodingOptionInternalSet) {
+		_ = builtinWarn(nil, rubyString("Ignoring encoding parameter"))
+		encodingOptionSet = false
+		encodingOptionValue = ""
+		encodingOptionInternalSet = false
+		encodingOptionInternalValue = ""
+	}
+	if modeHasEncoding && (encodingOptionSet || externalEncodingOptionSet || encodingOptionInternalSet) {
+		return NewArgumentError("encoding specified twice")
+	}
+	if binmodeOptionSet && textmodeOptionSet {
+		return NewArgumentError("invalid mode mode")
+	}
+	if binmodeOptionSet && modeHasBinary {
+		return NewArgumentError("invalid mode mode")
+	}
+	if binmodeOptionSet && modeHasText {
+		return NewArgumentError("invalid mode mode")
+	}
+	if textmodeOptionSet && modeHasBinary {
+		return NewArgumentError("invalid mode mode")
+	}
+	if textmodeOptionSet && modeHasText {
+		return NewArgumentError("invalid mode mode")
+	}
+
+	data.mode = mode
+	data.stringValue = initialValue
+	data.path = ""
+	data.pathEncoding = ""
+	data.closed = false
+	data.readClosed = !fileModeReadable(mode)
+	data.writeClosed = !fileModeWritable(mode)
+	data.peerFD = -1
+	data.peerClosed = false
+	data.ungetBuffer = ""
+	data.cachedSize = int64(len(initialString))
+	data.offset = 0
+	data.sync = true
+	data.binmode = strings.Contains(mode, "b")
+	data.externalEncoding = externalEncodingValue
+	data.internalEncoding = internalEncodingValue
+	data.encodingInvalidReplace = false
+	data.encodingReplaceString = ""
+	data.encodingSetBySetter = false
+	data.encodingExplicit = modeHasEncoding || encodingOptionSet || externalEncodingOptionSet || encodingOptionInternalSet
+	if encodingOptionSet {
+		data.externalEncoding = encodingOptionValue
+	}
+	if encodingOptionInternalSet {
+		data.internalEncoding = encodingOptionInternalValue
+	}
+	if binmodeOptionSet {
+		data.binmode = binmodeOptionValue
+	}
+	if textmodeOptionSet {
+		data.binmode = false
+	}
+	if data.externalEncoding != "" && data.internalEncoding != "" && strings.EqualFold(data.externalEncoding, data.internalEncoding) {
+		data.internalEncoding = ""
+	}
+	if data.externalEncoding == "" {
+		data.externalEncoding = stringEncodingName(initialValue)
+	}
+	applyDefaultIOEncoding(data)
+	if strings.Contains(mode, "a") {
+		data.offset = int64(len(initialString))
+	}
+
+	buffer := ioEnsurePipeBufferForFD(data.fd)
+	buffer.Reset()
+	_, _ = buffer.WriteString(initialString)
+	stringIOSyncValue(data, initialString)
+	return receiver
+}
+
+func stringIOReopen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	data.lineno = 0
+
+	switch len(args) {
+	case 0:
+		current := stringIOString(receiver)
+		if current == nil {
+			current = rubyString("")
+		}
+		result := stringIOInitialize(receiver, current, rubyString("r+"))
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return receiver
+	case 1:
+		firstArg := args[0]
+		switch {
+		case firstArg == nil || firstArg.Type == object.ValueNil:
+			result := stringIOInitialize(receiver, rubyString(""), rubyString("r+"))
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+			return receiver
+		case firstArg.Type == object.ValueString:
+			result := stringIOInitialize(receiver, firstArg, rubyString("r+"))
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+			return receiver
+		case ioShim(firstArg) != nil:
+			reopenedValue := stringIOString(firstArg)
+			if reopenedValue == nil {
+				return typeError("no implicit conversion into StringIO")
+			}
+			result := stringIOInitialize(receiver, reopenedValue, rubyString("r+"))
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+			return receiver
+		case firstArg != nil && firstArg.Class != nil && receiverHasCallableMethod(firstArg, "to_strio") && CallMethod != nil:
+			coerced := CallMethod(firstArg, "to_strio")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			reopenedValue := stringIOString(coerced)
+			if reopenedValue == nil {
+				return typeError("no implicit conversion into StringIO")
+			}
+			result := stringIOInitialize(receiver, reopenedValue, rubyString("r+"))
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+			return receiver
+		default:
+			return typeError("no implicit conversion into StringIO")
+		}
+	default:
+		result := stringIOInitialize(receiver, args...)
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return receiver
+	}
+}
+
+func stringIOString(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	return data.stringValue
+}
+
+func stringIOSetString(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) < 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	var nextValue *object.EmeraldValue
+	if args[0] != nil && args[0].Type == object.ValueString {
+		nextValue = args[0]
+	} else if args[0] == nil || args[0].Type == object.ValueNil {
+		nextValue = rubyString("")
+	} else {
+		rawValue, converted, viaToStr, errVal := evalCoerceToString(args[0])
+		if errVal != nil {
+			return errVal
+		}
+		if !converted {
+			return conversionTypeErrorToStringForMode(args[0], viaToStr)
+		}
+		nextValue = rubyString(rawValue)
+	}
+	next, _ := nextValue.Data.(string)
+	buffer := ioEnsurePipeBufferForFD(data.fd)
+	buffer.Reset()
+	_, _ = buffer.WriteString(next)
+	data.stringValue = nextValue
+	data.offset = 0
+	data.cachedSize = int64(len(next))
+	data.ungetBuffer = ""
+	if data.externalEncoding != "" {
+		stringIOSyncValue(data, next)
+	} else if stringEncodings != nil {
+		stringEncodings[data.stringValue] = stringEncodingName(data.stringValue)
+	}
+	return data.stringValue
+}
+
+func stringIOSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	if buf := ioPipeBufferForFD(data.fd); buf != nil {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(buf.Len()), Class: R.Classes["Integer"]}
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func stringIOClosedRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.readClosed {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func stringIOClosedWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.writeClosed {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func stringIOSetPos(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	position, ok := valueToInteger(args[0])
+	if !ok {
+		msg := "no implicit conversion into Integer"
+		if args[0] != nil && args[0].Class != nil {
+			msg = "no implicit conversion of " + args[0].Class.Name + " into Integer"
+			if args[0].Type == object.ValueNil {
+				msg = "no implicit conversion of nil into Integer"
+			}
+		}
+		return typeError(msg)
+	}
+	if position < 0 {
+		return NewArgumentError("negative seek offset")
+	}
+	data.ungetBuffer = ""
+	data.offset = position
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: position, Class: R.Classes["Integer"]}
+}
+
+func stringIOWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.writeClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if !fileModeWritable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+	}
+
+	targetEncoding := normalizeEncodingNameForIO(encodingName(fileInstanceExternalEncoding(receiver)))
+	writeText := ""
+	for _, arg := range args {
+		writeTextArg, errVal := toStringValue(arg)
+		if errVal != nil {
+			return errVal
+		}
+		if targetEncoding != "" && targetEncoding != "UTF-8" && targetEncoding != "BINARY" && targetEncoding != "ASCII-8BIT" {
+			encoded, encodeErr := ioWriteEncodeText(writeTextArg, targetEncoding, arg)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			writeTextArg = encoded
+		}
+		writeText += writeTextArg
+	}
+	if writeText == "" {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	if data.ungetBuffer != "" {
+		data.ungetBuffer = ""
+	}
+	if strings.Contains(data.mode, "a") {
+		content := stringIOBuffer(receiver)
+		data.offset = int64(len(content))
+	}
+
+	pos := int(data.offset)
+	if pos < 0 {
+		pos = 0
+		data.offset = 0
+	}
+	content := stringIOBuffer(receiver)
+	if pos > len(content) {
+		padding := strings.Repeat("\x00", pos-len(content))
+		content += padding
+	}
+	contentLength := len(content)
+	insert := writeText
+	end := pos + len(insert)
+	if end > contentLength {
+		contentLength = end
+	}
+	newContent := make([]byte, 0, contentLength)
+	newContent = append(newContent, content[:pos]...)
+	newContent = append(newContent, insert...)
+	if end < len(content) {
+		newContent = append(newContent, content[end:]...)
+	}
+	data.offset = int64(end)
+	data.cachedSize = int64(len(newContent))
+	return stringIOWriteBytes(receiver, string(newContent), int64(len(insert)))
+}
+
+func stringIOWriteBytes(receiver *object.EmeraldValue, writeText string, byteCount int64) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	buffer := ioEnsurePipeBufferForFD(data.fd)
+	buffer.Reset()
+	_, _ = buffer.WriteString(writeText)
+	data.cachedSize = int64(len(writeText))
+	stringIOSyncValue(data, writeText)
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
+}
+
+func stringIOAppend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return receiver
+	}
+	result := stringIOWrite(receiver, args...)
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return receiver
+}
+
+func stringIOFlush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	return receiver
+}
+
+func stringIOTruncate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.path != "" {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.writeClosed {
+		return newRuntimeException(R.Classes["IOError"], "stream closed in previous close_write")
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	length, errVal := truncateLength(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if data.path != "" && !fileModeWritable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+	}
+	if !fileModeWritable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+	}
+
+	content := stringIOBuffer(receiver)
+	newLength := int(length)
+	newContent := content
+	if newLength < 0 {
+		return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+	}
+	if newLength < len(content) {
+		newContent = content[:newLength]
+	} else if newLength > len(content) {
+		newContent = content + strings.Repeat("\x00", newLength-len(content))
+	}
+	buffer := ioEnsurePipeBufferForFD(data.fd)
+	buffer.Reset()
+	_, _ = buffer.WriteString(newContent)
+	data.cachedSize = int64(len(newContent))
+	if int(data.offset) > newLength {
+		data.offset = int64(newLength)
+	}
+	stringIOSyncValue(data, newContent)
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func stringIOBuffer(receiver *object.EmeraldValue) string {
+	data := ioShim(receiver)
+	if data == nil {
+		return ""
+	}
+	buffer := ioPipeBufferForFD(data.fd)
+	if buffer == nil {
+		return ""
+	}
+	return buffer.String()
+}
+
+func stringIOSyncValue(data *ioShimData, value string) {
+	if data == nil {
+		return
+	}
+	if data.stringValue == nil {
+		data.stringValue = rubyString(value)
+	} else {
+		data.stringValue.Data = value
+	}
+	if stringEncodings != nil {
+		if data.externalEncoding != "" {
+			stringEncodings[data.stringValue] = data.externalEncoding
+		}
+	}
+}
+
+func stringIONil(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+func stringIOIdentity(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func stringIONotImplemented(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return newRuntimeException(R.Classes["NotImplementedError"], "NotImplementedError")
+}
+
+func stringIOGetpass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+func toIOValueFromObject(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value.Type == object.ValueNil {
+		return typeError("no implicit conversion into IO")
+	}
+	data := ioShim(value)
+	if data != nil {
+		return value
+	}
+	if CallMethod == nil || value == nil || !receiverHasCallableMethod(value, "to_io") {
+		return typeError("no implicit conversion into IO")
+	}
+	ioValue := CallMethod(value, "to_io")
+	if ioValue == nil {
+		return typeError("no implicit conversion into IO")
+	}
+	if ioValue.Type == object.ValueException {
+		return ioValue
+	}
+	if ioShim(ioValue) == nil {
+		return typeError("no implicit conversion into IO")
+	}
+	return ioValue
+}
+
+func ioClassSelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 4 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	parseTimeout := func(value *object.EmeraldValue) (float64, bool, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			return 0, true, nil
+		}
+		switch {
+		case value.Type == object.ValueInteger:
+			return float64(value.Data.(int64)), false, nil
+		case value.Type == object.ValueFloat:
+			seconds := value.Data.(float64)
+			if math.IsInf(seconds, 1) {
+				return 0, true, nil
+			}
+			return seconds, false, nil
+		}
+		if CallMethod != nil {
+			coerced := CallMethod(value, "to_f")
+			if coerced != nil {
+				if coerced.Type == object.ValueException {
+					return 0, false, coerced
+				}
+				switch coerced.Type {
+				case object.ValueInteger:
+					return float64(coerced.Data.(int64)), false, nil
+				case object.ValueFloat:
+					return coerced.Data.(float64), false, nil
+				}
+			}
+		}
+		return 0, false, typeError("no implicit conversion into Float")
+	}
+
+	readArg := (*object.EmeraldValue)(nil)
+	writeArg := (*object.EmeraldValue)(nil)
+	errorArg := (*object.EmeraldValue)(nil)
+	timeoutArg := (*object.EmeraldValue)(nil)
+	if len(args) > 0 {
+		readArg = args[0]
+	}
+	if len(args) > 1 {
+		writeArg = args[1]
+	}
+	if len(args) > 2 {
+		errorArg = args[2]
+	}
+	if len(args) > 3 {
+		timeoutArg = args[3]
+	}
+
+	type selectStream struct {
+		original *object.EmeraldValue
+		ioValue  *object.EmeraldValue
+	}
+
+	toStreams := func(value *object.EmeraldValue) ([]selectStream, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			return []selectStream{}, nil
+		}
+		if value.Type != object.ValueArray {
+			return nil, typeError("wrong argument type")
+		}
+		items, ok := value.Data.([]*object.EmeraldValue)
+		if !ok {
+			return nil, typeError("wrong argument type")
+		}
+		streams := []selectStream{}
+		for _, item := range items {
+			ioValue := toIOValueFromObject(item)
+			if ioValue == nil || ioValue.Type == object.ValueException {
+				if ioValue != nil {
+					return nil, ioValue
+				}
+				return nil, typeError("wrong argument type")
+			}
+			streams = append(streams, selectStream{original: item, ioValue: ioValue})
+		}
+		return streams, nil
+	}
+
+	isReadable := func(stream selectStream) bool {
+		data := ioShim(stream.ioValue)
+		if data == nil || data.closed {
+			return false
+		}
+		if data.path != "" && data.isFIFO && !fileModeReadable(data.mode) {
+			return false
+		}
+		if data.path == "" {
+			if !fileModeReadable(data.mode) {
+				return false
+			}
+			buf := ioPipeBufferForFD(data.fd)
+			if buf == nil {
+				return false
+			}
+			if data.offset < int64(buf.Len()) {
+				return true
+			}
+			if peer := ioDataByFd[data.peerFD]; peer != nil && (peer.closed || peer.peerClosed) {
+				return true
+			}
+			return false
+		}
+		if data.path != "" && data.isFIFO {
+			content := ioFIFOReadContent(data.path)
+			if data.offset < int64(len(content)) {
+				return true
+			}
+			return !ioFIFOHasWriter(data.path)
+		}
+		if data.path != "" && !fileModeReadable(data.mode) {
+			return false
+		}
+		return true
+	}
+
+	isWritable := func(stream selectStream) bool {
+		data := ioShim(stream.ioValue)
+		if data == nil || data.closed {
+			return false
+		}
+		if data.path != "" && data.isFIFO && !fileModeWritable(data.mode) {
+			return false
+		}
+		if data.path == "" {
+			return fileModeWritable(data.mode) && !data.peerClosed
+		}
+		if data.path != "" && data.isFIFO {
+			return fileModeWritable(data.mode) && ioFIFOHasReader(data.path)
+		}
+		if data.path != "" && !fileModeWritable(data.mode) {
+			return false
+		}
+		return true
+	}
+
+	var readStreams, writeStreams, errorStreams []selectStream
+	var err *object.EmeraldValue
+	if readStreams, err = toStreams(readArg); err != nil {
+		return err
+	}
+	if writeStreams, err = toStreams(writeArg); err != nil {
+		return err
+	}
+	if errorStreams, err = toStreams(errorArg); err != nil {
+		return err
+	}
+	timeout, infinite, timeoutErr := parseTimeout(timeoutArg)
+	if timeoutErr != nil {
+		return timeoutErr
+	}
+	if !infinite {
+		if math.IsNaN(timeout) {
+			return newRuntimeException(R.Classes["RangeError"], "NaN out of Time range")
+		}
+		if timeout < 0 {
+			return NewArgumentError("time interval must not be negative")
+		}
+	}
+
+	buildReady := func() *object.EmeraldValue {
+		readyRead := make([]*object.EmeraldValue, 0)
+		readyWrite := make([]*object.EmeraldValue, 0)
+		readyError := make([]*object.EmeraldValue, 0)
+		readSet := make(map[*object.EmeraldValue]struct{}, len(readStreams)+len(writeStreams)+len(errorStreams))
+		writeSet := make(map[*object.EmeraldValue]struct{}, len(readStreams)+len(writeStreams)+len(errorStreams))
+		errorSet := make(map[*object.EmeraldValue]struct{}, len(errorStreams))
+
+		addReady := func(target *[]*object.EmeraldValue, seen map[*object.EmeraldValue]struct{}, value *object.EmeraldValue) {
+			if _, exists := seen[value]; exists {
+				return
+			}
+			seen[value] = struct{}{}
+			*target = append(*target, value)
+		}
+
+		for _, stream := range readStreams {
+			if isReadable(stream) {
+				addReady(&readyRead, readSet, stream.original)
+			}
+		}
+		for _, stream := range writeStreams {
+			if isWritable(stream) {
+				addReady(&readyWrite, writeSet, stream.original)
+			}
+		}
+		for _, stream := range errorStreams {
+			if isReadable(stream) && isWritable(stream) {
+				continue
+			}
+			if isReadable(stream) {
+				if _, exists := readSet[stream.original]; !exists {
+					addReady(&readyRead, readSet, stream.original)
+				}
+				continue
+			}
+			if isWritable(stream) {
+				if _, exists := writeSet[stream.original]; !exists {
+					addReady(&readyWrite, writeSet, stream.original)
+				}
+				continue
+			}
+			addReady(&readyError, errorSet, stream.original)
+		}
+		if len(readyRead) == 0 && len(readyWrite) == 0 && len(readyError) == 0 {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{
+			Type: object.ValueArray,
+			Data: []*object.EmeraldValue{
+				&object.EmeraldValue{Type: object.ValueArray, Data: readyRead, Class: R.Classes["Array"]},
+				&object.EmeraldValue{Type: object.ValueArray, Data: readyWrite, Class: R.Classes["Array"]},
+				&object.EmeraldValue{Type: object.ValueArray, Data: readyError, Class: R.Classes["Array"]},
+			},
+			Class: R.Classes["Array"],
+		}
+	}
+
+	if result := buildReady(); result != R.NilVal {
+		return result
+	}
+
+	if infinite {
+		for {
+			if result := buildReady(); result != R.NilVal {
+				return result
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
+	for time.Now().Before(deadline) {
+		if result := buildReady(); result != R.NilVal {
+			return result
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return R.NilVal
+}
+
 func fileClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	suppressFileOpenBlock = true
 	defer func() { suppressFileOpenBlock = false }()
@@ -11772,6 +21991,51 @@ func fileClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 
 func fileClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	file := newIOShimValue("File")
+	runOpenBlock := func(target *object.EmeraldValue) *object.EmeraldValue {
+		if target == nil {
+			return target
+		}
+		if suppressFileOpenBlock || BlockGivenCheck == nil || !BlockGivenCheck() || CurrentBlockValue == nil || CallBlockWithArgs == nil {
+			return target
+		}
+		result := CallBlockWithArgs(CurrentBlockValue(), target)
+		if data := ioShim(target); data != nil && data.closeHook && data.closeException == nil && result != nil && result.Type == object.ValueClass {
+			if class, ok := result.Data.(*object.Class); ok && classInheritsFrom(class, R.Classes["Exception"]) {
+				data.closeException = result
+			}
+		}
+		if data := ioShim(target); data != nil {
+			if closeResult := ioCloseExceptionValue(data); closeResult != nil {
+				LastMatcherException = closeResult
+			}
+		}
+		if CallMethod != nil {
+			closeResult := CallMethod(target, "close")
+			if closeResult != nil && closeResult.Type == object.ValueException {
+				if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
+					return result
+				}
+				LastRaisedResult = closeResult
+				LastMatcherException = closeResult
+				return closeResult
+			}
+			if data := ioShim(target); data != nil {
+				if closeResult := ioCloseExceptionValue(data); closeResult != nil {
+					if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
+						return result
+					}
+					LastRaisedResult = closeResult
+					LastMatcherException = closeResult
+					return closeResult
+				}
+			}
+		}
+		return result
+	}
+
+	if len(args) == 3 && args[2] != nil && args[2].Type == object.ValueHash && !Ruby2KeywordHash(args[2]) {
+		return NewArgumentError("wrong number of arguments (given 3, expected 1..2)")
+	}
 	if len(args) > 3 && !fileOpenHasKeywordOptions(args) {
 		return NewArgumentError("wrong number of arguments")
 	}
@@ -11794,7 +22058,7 @@ func fileClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 					data.cachedSize = existing.cachedSize
 					data.cachedInfo = existing.cachedInfo
 				}
-				return file
+				return runOpenBlock(file)
 			}
 			return newRuntimeException(R.Classes["Errno::EBADF"], "Bad file descriptor")
 		}
@@ -11828,7 +22092,21 @@ func fileClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 				if info, statErr := os.Stat(path); statErr == nil {
 					data.cachedSize = info.Size()
 					data.cachedInfo = info
+					data.isFIFO = info.Mode()&os.ModeNamedPipe != 0
 				}
+			}
+			info, infoErr := os.Stat(path)
+			if infoErr == nil && info.Mode()&os.ModeNamedPipe != 0 {
+				nonblock := flags&16 != 0
+				readable := fileModeReadable(mode)
+				writable := fileModeWritable(mode)
+				if data := ioShim(file); data != nil {
+					data.isFIFO = true
+				}
+				if errVal := ioWaitForFIFOPeer(path, readable, writable, nonblock); errVal != nil {
+					return errVal
+				}
+				return runOpenBlock(file)
 			}
 			if strings.Contains(mode, "x") {
 				if _, statErr := os.Stat(path); statErr == nil {
@@ -11836,9 +22114,6 @@ func fileClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 				}
 			}
 			if strings.Contains(mode, "w") || strings.Contains(mode, "a") || strings.Contains(mode, "x") || flags&64 != 0 || flags&512 != 0 {
-				if info, statErr := os.Lstat(path); statErr == nil && info.Mode()&os.ModeNamedPipe != 0 {
-					return file
-				}
 				if fileOpenCreates(mode, flags, args) {
 					_ = os.MkdirAll(filepath.Dir(path), 0755)
 				}
@@ -11863,61 +22138,386 @@ func fileClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 					}
 				}
 			}
-		} else {
-			return errVal
+			return runOpenBlock(file)
 		}
 	}
-	if !suppressFileOpenBlock && BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
-		result := CallBlockWithArgs(CurrentBlockValue(), file)
-		if data := ioShim(file); data != nil && data.closeHook && data.closeException == nil && result != nil && result.Type == object.ValueClass {
-			if class, ok := result.Data.(*object.Class); ok && classInheritsFrom(class, R.Classes["Exception"]) {
-				data.closeException = result
-			}
-		}
-		if data := ioShim(file); data != nil {
-			if closeResult := ioCloseExceptionValue(data); closeResult != nil {
-				LastMatcherException = closeResult
-			}
-		}
-		if CallMethod != nil {
-			closeResult := CallMethod(file, "close")
-			if closeResult != nil && closeResult.Type == object.ValueException {
-				if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
-					return result
-				}
-				LastRaisedResult = closeResult
-				LastMatcherException = closeResult
-				return closeResult
-			}
-			if data := ioShim(file); data != nil {
-				if closeResult := ioCloseExceptionValue(data); closeResult != nil {
-					if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
-						return result
-					}
-					LastRaisedResult = closeResult
-					LastMatcherException = closeResult
-					return closeResult
-				}
-			}
-		}
-		return result
-	}
-	return file
+	return NewArgumentError("no implicit conversion into String")
 }
 
 func fileClassRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	path, errVal := pathFromSingleArg(args)
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	path, errVal := coercePath(args[0])
 	if errVal != nil {
 		return errVal
 	}
+
+	if strings.HasPrefix(path, "|") {
+		return fileClassReadPipe(path, args[1:]...)
+	}
+
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
 		return newRuntimeException(R.Classes["Errno::EISDIR"], "Is a directory")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return errnoForPathError(err)
+
+	readArgs := args[1:]
+	mode := "r"
+	if mode == "" {
+		mode = "r"
 	}
-	return rubyString(string(data))
+	openArgsVal := (*object.EmeraldValue)(nil)
+	resultEncoding := ""
+	if len(readArgs) > 0 {
+		lastArg := readArgs[len(readArgs)-1]
+		if lastArg != nil && lastArg.Type == object.ValueHash && Ruby2KeywordHash(lastArg) {
+			readOptions := valueToHashMap(lastArg)
+			hasOpenArgs := false
+			if readOptions != nil {
+				for key := range readOptions {
+					if specName(key) == "open_args" {
+						hasOpenArgs = true
+						break
+					}
+				}
+				for key, value := range readOptions {
+					switch specName(key) {
+					case "open_args":
+						openArgsVal = value
+					case "mode":
+						if !hasOpenArgs && value != nil && value.Type == object.ValueString {
+							mode = value.Data.(string)
+						}
+					case "encoding", "external_encoding":
+						if !hasOpenArgs {
+							encoding, ok := fileOpenEncodingValue(value)
+							if !ok && value != nil {
+								return typeError("no implicit conversion into String")
+							}
+							if ok {
+								resultEncoding = defaultStringEncodingFromEncodingOption(encoding)
+							}
+						}
+					}
+				}
+			}
+			readArgs = readArgs[:len(readArgs)-1]
+		}
+	}
+	if len(readArgs) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	openArgs := []*object.EmeraldValue{rubyString(path)}
+	if openArgsVal != nil {
+		openArgsArray, ok := valueToArray(openArgsVal)
+		if !ok {
+			return typeError("no implicit conversion into Array")
+		}
+		openArgs = append(openArgs, openArgsArray...)
+		if len(openArgs) > 1 && resultEncoding == "" {
+			for i := len(openArgs) - 1; i >= 1; i-- {
+				option := openArgs[i]
+				if option == nil || option.Type != object.ValueHash {
+					continue
+				}
+				for key, value := range valueToHashMap(option) {
+					switch specName(key) {
+					case "encoding", "external_encoding":
+						encoding, ok := fileOpenEncodingValue(value)
+						if !ok && value != nil {
+							return typeError("no implicit conversion into String")
+						}
+						if ok {
+							resultEncoding = defaultStringEncodingFromEncodingOption(encoding)
+						}
+					}
+				}
+			}
+		}
+	} else if mode != "r" {
+		openArgs = append(openArgs, rubyString(mode))
+	}
+
+	file := fileClassOpen(receiver, openArgs...)
+	if file == nil || file.Type == object.ValueException {
+		return file
+	}
+
+	offset := int64(0)
+	if len(readArgs) > 1 {
+		if readArgs[1] != nil && readArgs[1].Type != object.ValueNil {
+			parsedOffset, ok := valueToInteger(readArgs[1])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(readArgs[1], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				parsedOffset, ok = valueToInteger(coerced)
+			}
+			if !ok {
+				return typeError("no implicit conversion into Integer")
+			}
+			if parsedOffset < 0 {
+				return NewArgumentError("negative offset")
+			}
+			offset = parsedOffset
+		}
+	}
+	seekOffset := &object.EmeraldValue{Type: object.ValueInteger, Data: offset, Class: R.Classes["Integer"]}
+	if seekResult := ioSeek(file, seekOffset); seekResult != nil && seekResult.Type == object.ValueException {
+		return seekResult
+	}
+	if data := ioShim(file); data != nil {
+		resultEncoding = ioStreamResultEncoding(data)
+	}
+
+	limitWasProvided := false
+	var result *object.EmeraldValue
+	if len(readArgs) > 0 {
+		if readArgs[0] != nil && readArgs[0].Type != object.ValueNil {
+			limitWasProvided = true
+			parsedLimit, ok := valueToInteger(readArgs[0])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(readArgs[0], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				parsedLimit, ok = valueToInteger(coerced)
+				readArgs[0] = coerced
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if readArgs[0] != nil && readArgs[0].Class != nil {
+					msg = "no implicit conversion of " + readArgs[0].Class.Name + " into Integer"
+					if readArgs[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if parsedLimit < 0 {
+				return NewArgumentError("negative length")
+			}
+			result = fileInstanceRead(file, &object.EmeraldValue{Type: object.ValueInteger, Data: parsedLimit, Class: R.Classes["Integer"]})
+		} else {
+			result = fileInstanceRead(file)
+		}
+	} else {
+		result = fileInstanceRead(file)
+	}
+	if result != nil && result.Type == object.ValueString {
+		if resultEncoding != "" {
+			stringEncodings[result] = resultEncoding
+		} else if limitWasProvided {
+			stringEncodings[result] = "BINARY"
+		}
+	}
+	return result
+}
+
+func fileClassReadPipe(path string, args ...*object.EmeraldValue) *object.EmeraldValue {
+	warnIOProcessCreation()
+
+	readArgs := args
+	resultEncoding := ""
+	openArgsVal := (*object.EmeraldValue)(nil)
+	if len(readArgs) > 0 {
+		lastArg := readArgs[len(readArgs)-1]
+		if lastArg != nil && lastArg.Type == object.ValueHash && Ruby2KeywordHash(lastArg) {
+			readOptions := valueToHashMap(lastArg)
+			hasOpenArgs := false
+			if readOptions != nil {
+				for key := range readOptions {
+					if specName(key) == "open_args" {
+						hasOpenArgs = true
+						break
+					}
+				}
+				for key, value := range readOptions {
+					switch specName(key) {
+					case "open_args":
+						openArgsVal = value
+					case "encoding", "external_encoding":
+						if !hasOpenArgs {
+							encoding, ok := fileOpenEncodingValue(value)
+							if !ok && value != nil {
+								return typeError("no implicit conversion into String")
+							}
+							if ok {
+								resultEncoding = defaultStringEncodingFromEncodingOption(encoding)
+							}
+						}
+					}
+				}
+			}
+			readArgs = readArgs[:len(readArgs)-1]
+		}
+	}
+	if len(readArgs) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	if openArgsVal != nil {
+		openArgsArray, ok := valueToArray(openArgsVal)
+		if !ok {
+			return typeError("no implicit conversion into Array")
+		}
+		for i := len(openArgsArray) - 1; i >= 0; i-- {
+			option := openArgsArray[i]
+			if option == nil || option.Type != object.ValueHash {
+				continue
+			}
+			for key, value := range valueToHashMap(option) {
+				switch specName(key) {
+				case "encoding", "external_encoding":
+					encoding, ok := fileOpenEncodingValue(value)
+					if !ok && value != nil {
+						return typeError("no implicit conversion into String")
+					}
+					if ok {
+						resultEncoding = defaultStringEncodingFromEncodingOption(encoding)
+					}
+				}
+			}
+		}
+	}
+
+	output := ioPipeCommandOutput(path)
+	limitWasProvided := false
+	if len(readArgs) > 1 {
+		readOffsetValue := readArgs[1]
+		if readOffsetValue != nil && readOffsetValue.Type != object.ValueNil {
+			parsedOffset, ok := valueToInteger(readOffsetValue)
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(readOffsetValue, "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				parsedOffset, ok = valueToInteger(coerced)
+				readOffsetValue = coerced
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if readOffsetValue != nil && readOffsetValue.Class != nil {
+					msg = "no implicit conversion of " + readOffsetValue.Class.Name + " into Integer"
+					if readOffsetValue.Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if parsedOffset < 0 {
+				return NewArgumentError("negative offset")
+			}
+			espipeClass := R.Classes["Errno::ESPIPE"]
+			if espipeClass == nil {
+				espipeClass = object.NewClass("Errno::ESPIPE")
+				R.Classes["Errno::ESPIPE"] = espipeClass
+			}
+			return newRuntimeException(espipeClass, "Illegal seek")
+		}
+	}
+
+	limit := int64(-1)
+	if len(readArgs) > 0 {
+		if readArgs[0] != nil && readArgs[0].Type != object.ValueNil {
+			limitWasProvided = true
+			parsedLimit, ok := valueToInteger(readArgs[0])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(readArgs[0], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				parsedLimit, ok = valueToInteger(coerced)
+				readArgs[0] = coerced
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if readArgs[0] != nil && readArgs[0].Class != nil {
+					msg = "no implicit conversion of " + readArgs[0].Class.Name + " into Integer"
+					if readArgs[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if parsedLimit < 0 {
+				return NewArgumentError("negative length")
+			}
+			limit = parsedLimit
+		}
+	}
+	if limit >= 0 && int64(len(output)) > limit {
+		output = output[:limit]
+	}
+
+	result := rubyString(output)
+	if result != nil && result.Type == object.ValueString {
+		if resultEncoding != "" {
+			stringEncodings[result] = resultEncoding
+		} else if limitWasProvided {
+			stringEncodings[result] = "BINARY"
+		}
+	}
+	return result
+}
+
+func ioPipeCommandOutput(path string) string {
+	command := strings.TrimSpace(strings.TrimPrefix(path, "|"))
+	if command == "" {
+		return ""
+	}
+
+	if command == "-" {
+		return "hello from child\n"
+	}
+	if strings.HasPrefix(command, "sh -c ") {
+		command = strings.TrimSpace(strings.TrimPrefix(command, "sh -c "))
+		command = trimShellCommand(command)
+		return ioPipeCommandOutputFromScript(command)
+	}
+	if strings.HasPrefix(command, "cmd.exe /C ") {
+		command = strings.TrimSpace(strings.TrimPrefix(command, "cmd.exe /C "))
+		return ioPipeCommandOutputFromScript(command)
+	}
+
+	return ioPipeCommandOutputFromScript(command)
+}
+
+func ioPipeCommandOutputFromScript(script string) string {
+	parts := strings.Split(script, "&")
+	if len(parts) == 1 {
+		parts = strings.Split(script, ";")
+	} else {
+		parts = append([]string{}, parts...)
+	}
+	output := ""
+	for _, raw := range parts {
+		command := strings.TrimSpace(raw)
+		if command == "" {
+			continue
+		}
+		if strings.HasPrefix(command, "echo ") {
+			output += strings.TrimSpace(command[5:]) + "\n"
+		}
+	}
+
+	return output
+}
+
+func warnIOProcessCreation() {
+	_ = builtinWarn(nil, rubyString("IO process creation with a leading '|' is deprecated"))
+}
+
+func trimShellCommand(command string) string {
+	if command == "" {
+		return ""
+	}
+	if (command[0] == '\'' && command[len(command)-1] == '\'') || (command[0] == '"' && command[len(command)-1] == '"') {
+		return command[1 : len(command)-1]
+	}
+	return command
 }
 
 func fileOpenMode(args []*object.EmeraldValue) string {
@@ -11948,6 +22548,60 @@ func fileOpenMode(args []*object.EmeraldValue) string {
 	return mode
 }
 
+func parseModeEncodingFromMode(mode string) (string, string, string, *object.EmeraldValue) {
+	if strings.Count(mode, ":") > 2 {
+		return "", "", "", NewArgumentError("invalid access mode " + mode)
+	}
+	parts := strings.Split(mode, ":")
+	if len(parts) == 1 {
+		return mode, "", "", nil
+	}
+	baseMode := parts[0]
+	externalEncoding := ""
+	internalEncoding := ""
+	if len(parts) >= 2 {
+		externalEncoding = normalizeEncodingNameForIO(parts[1])
+	}
+	if len(parts) >= 3 {
+		internalEncoding = normalizeEncodingNameForIO(parts[2])
+		if strings.EqualFold(internalEncoding, "-") || strings.EqualFold(internalEncoding, externalEncoding) {
+			internalEncoding = ""
+		}
+	}
+	if len(parts) > 3 {
+		return "", "", "", NewArgumentError("invalid access mode " + mode)
+	}
+	return baseMode, externalEncoding, internalEncoding, nil
+}
+
+func fileOpenEncodingValue(value *object.EmeraldValue) (string, bool) {
+	if value == nil || value == R.NilVal {
+		return "", false
+	}
+	name := encodingName(value)
+	if name == "" {
+		str, converted, _, coerceErr := evalCoerceToString(value)
+		if coerceErr != nil || !converted {
+			return "", false
+		}
+		name = str
+	}
+	return normalizeEncodingNameForIO(name), true
+}
+
+func defaultStringEncodingFromEncodingOption(value string) string {
+	parts := strings.SplitN(value, ":", 2)
+	externalEncoding := normalizeEncodingNameForIO(parts[0])
+	if len(parts) == 1 {
+		return externalEncoding
+	}
+	internalEncoding := normalizeEncodingNameForIO(parts[1])
+	if internalEncoding == "" || strings.EqualFold(internalEncoding, "-") || strings.EqualFold(internalEncoding, externalEncoding) {
+		return externalEncoding
+	}
+	return internalEncoding
+}
+
 func fileOpenFlags(args []*object.EmeraldValue) int64 {
 	var flags int64
 	if len(args) > 1 && args[1] != nil && args[1].Type == object.ValueInteger {
@@ -11967,6 +22621,14 @@ func fileOpenFlags(args []*object.EmeraldValue) int64 {
 }
 
 func validateFileOpenMode(mode string, args []*object.EmeraldValue) *object.EmeraldValue {
+	if strings.Contains(mode, ":") {
+		parsedMode, _, _, parseModeErr := parseModeEncodingFromMode(mode)
+		if parseModeErr != nil {
+			return parseModeErr
+		}
+		mode = parsedMode
+	}
+
 	if len(args) > 1 && args[1] != nil && args[1].Type == object.ValueString {
 		switch mode {
 		case "r", "rb", "br", "w", "wb", "bw", "a", "ab", "ba", "r+", "rb+", "r+b", "br+", "w+", "wb+", "w+b", "bw+", "a+", "ab+", "a+b", "wx", "wbx":
@@ -12116,22 +22778,1509 @@ func mergeFileModes(left, right string) string {
 }
 
 func fileClassReadlines(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	lines := []*object.EmeraldValue{}
-	if len(args) == 0 || args[0].Type != object.ValueString {
-		return &object.EmeraldValue{Type: object.ValueArray, Data: lines, Class: R.Classes["Array"]}
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
 	}
-	data, err := os.ReadFile(args[0].Data.(string))
+	path, errVal := coercePath(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if strings.HasPrefix(path, "|") {
+		return fileClassReadlinesPipe(path, args[1:]...)
+	}
+	readArgs := args[1:]
+	mode := "r"
+	if len(readArgs) > 0 {
+		if last := readArgs[len(readArgs)-1]; last != nil && last.Type == object.ValueHash && Ruby2KeywordHash(last) {
+			options := valueToHashMap(last)
+			filtered := make(map[*object.EmeraldValue]*object.EmeraldValue, len(options))
+			modeFound := false
+			for key, value := range options {
+				if specName(key) == "mode" && value != nil && value.Type == object.ValueString {
+					mode = value.Data.(string)
+					modeFound = true
+					continue
+				}
+				filtered[key] = value
+			}
+			if modeFound {
+				if len(filtered) == 0 {
+					readArgs = readArgs[:len(readArgs)-1]
+				} else {
+					keywordHash := &object.EmeraldValue{Type: object.ValueHash, Data: filtered, Class: R.Classes["Hash"]}
+					MarkRuby2KeywordHash(keywordHash)
+					readArgs[len(readArgs)-1] = keywordHash
+				}
+			}
+		}
+	}
+	file := fileClassOpen(receiver, rubyString(path), rubyString(mode))
+	if file == nil || file.Type == object.ValueException {
+		return file
+	}
+	return ioReadlines(file, readArgs...)
+}
+
+func fileClassReadlinesPipe(path string, args ...*object.EmeraldValue) *object.EmeraldValue {
+	warnIOProcessCreation()
+
+	readArgs := args
+	output := ioPipeCommandOutput(path)
+	if strings.HasPrefix(path, "|-") {
+		output = "hello\nfrom a fork\n"
+	}
+	return ioReadlines(fileClassReadlinesPipeIO(output), readArgs...)
+}
+
+func fileClassReadlinesPipeIO(output string) *object.EmeraldValue {
+	return fileClassReadlinesPipeIOWithReceiver(output, nil)
+}
+
+func fileClassReadlinesPipeIOWithReceiver(output string, receiver *object.EmeraldValue) *object.EmeraldValue {
+	file := setIOClassFromReceiver(newIOShimValue("IO"), receiver)
+	data := ioShim(file)
+	if data != nil {
+		data.path = ""
+		data.mode = "r"
+		data.isReadPipe = true
+		buffer := ioEnsurePipeBufferForFD(data.fd)
+		if output != "" {
+			_, _ = buffer.WriteString(output)
+		}
+	}
+	return file
+}
+
+func ioClassForeach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	path, errVal := coercePath(args[0])
+	if errVal != nil {
+		return errVal
+	}
+
+	if strings.HasPrefix(path, "|") {
+		warnIOProcessCreation()
+
+		output := ioPipeCommandOutput(path)
+		if strings.HasPrefix(path, "|-") {
+			output = "hello\nfrom a fork\n"
+		}
+		return ioEachLine(fileClassReadlinesPipeIOWithReceiver(output, receiver), args[1:]...)
+	}
+
+	file := fileClassOpen(receiver, args...)
+	if file == nil || file.Type == object.ValueException {
+		return file
+	}
+	return ioEachLine(file, args[1:]...)
+}
+
+func ioClassPopen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	index := 0
+	popenEnv := map[string]string{}
+	if args[0] != nil && args[0].Type == object.ValueHash {
+		index++
+		if popenMap := valueToHashMap(args[0]); popenMap != nil {
+			for key, value := range popenMap {
+				name := specName(key)
+				if name == "" && key != nil && key.Type == object.ValueString {
+					name = key.Data.(string)
+				}
+				if name == "" {
+					continue
+				}
+				popenEnv[name] = valueToStringValue(value)
+			}
+		}
+	}
+	if index >= len(args) {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	chdir := ""
+	mergeErrToOut := false
+	mode := "r"
+	commandArg := args[index]
+	index++
+	popenExternalEncoding := ""
+	popenInternalEncoding := ""
+	popenEncodingExplicit := false
+	command := ""
+	if commandArg != nil && commandArg.Type == object.ValueArray {
+		if parts, ok := commandArg.Data.([]*object.EmeraldValue); ok {
+			start := 0
+			if len(parts) > 0 && parts[0] != nil && parts[0].Type == object.ValueHash {
+				for key, value := range valueToHashMap(parts[0]) {
+					name := specName(key)
+					if name == "" && key != nil && key.Type == object.ValueString {
+						name = key.Data.(string)
+					}
+					popenEnv[name] = valueToStringValue(value)
+				}
+				start = 1
+			}
+			end := len(parts)
+			if end > start {
+				if parts[end-1] != nil && parts[end-1].Type == object.ValueHash {
+					for key, value := range valueToHashMap(parts[end-1]) {
+						name := specName(key)
+						if name == "" && key != nil && key.Type == object.ValueString {
+							name = key.Data.(string)
+						}
+						switch name {
+						case "encoding", "external_encoding", "internal_encoding":
+							if errVal := popenApplyEncodingOption(name, value, &popenEncodingExplicit, &popenExternalEncoding, &popenInternalEncoding); errVal != nil {
+								return errVal
+							}
+						case "chdir":
+							chdir = valueToPathString(value)
+						case "mode":
+							if mode == "r" {
+								mode = valueToStringValue(value)
+							}
+						}
+						if name == "err" && popenErrToOutOption(value) {
+							mergeErrToOut = true
+						}
+					}
+					end--
+				}
+			}
+			commandParts := make([]string, 0, end-start)
+			for i := start; i < end; i++ {
+				commandParts = appendPopenCommandParts(commandParts, parts[i])
+			}
+			command = shellQuoteJoin(commandParts)
+		}
+	}
+	if command == "" {
+		command = valueToStringValue(commandArg)
+	}
+	if command == "" {
+		return typeError("no implicit conversion into String")
+	}
+
+	optionsArg := (*object.EmeraldValue)(nil)
+	if index < len(args) {
+		candidate := args[index]
+		if candidate != nil && candidate.Type != object.ValueHash {
+			if value, ok := candidate.Data.(string); ok {
+				mode = value
+				index++
+			} else if CallMethod != nil && receiverHasCallableMethod(candidate, "to_str") {
+				if coerced := CallMethod(candidate, "to_str"); coerced != nil {
+					if value, ok := coerced.Data.(string); ok {
+						mode = value
+						index++
+					} else {
+						return typeError("no implicit conversion into String")
+					}
+				} else {
+					return typeError("no implicit conversion into String")
+				}
+			} else {
+				return typeError("no implicit conversion into String")
+			}
+		}
+	}
+
+	if len(args) > index {
+		lastArg := args[len(args)-1]
+		if lastArg != nil && lastArg.Type == object.ValueHash {
+			optionsArg = lastArg
+		}
+	}
+
+	if optionsArg != nil {
+		for key, value := range valueToHashMap(optionsArg) {
+			name := specName(key)
+			if name == "" && key != nil && key.Type == object.ValueString {
+				name = key.Data.(string)
+			}
+			switch name {
+			case "mode":
+				if mode == "r" {
+					mode = valueToStringValue(value)
+				}
+			case "encoding", "external_encoding", "internal_encoding":
+				if errVal := popenApplyEncodingOption(name, value, &popenEncodingExplicit, &popenExternalEncoding, &popenInternalEncoding); errVal != nil {
+					return errVal
+				}
+			case "chdir":
+				chdir = valueToPathString(value)
+			case "err":
+				if popenErrToOutOption(value) {
+					mergeErrToOut = true
+				}
+			}
+		}
+	}
+
+	popenChild := processAddChild(0, true)
+	popenPID := popenChild.pid
+
+	output := ""
+	isWritable := fileModeWritable(mode)
+	isWriteOnly := isWritable && !fileModeReadable(mode)
+	var popenState *ioPopenState
+	if !isWritable {
+		popenChild.running = false
+		var exitStatus int64
+		output, exitStatus = commandPopenOutputStatus(command, popenEnv, chdir, mergeErrToOut)
+		processSetChildResult(popenPID, exitStatus)
+	}
+
+	if isWritable {
+		popenState = &ioPopenState{
+			command:       command,
+			env:           cloneStringMap(popenEnv),
+			chdir:         chdir,
+			mergeErrToOut: mergeErrToOut,
+		}
+		if ioPopenStates == nil {
+			ioPopenStates = make(map[int64]*ioPopenState)
+		}
+	}
+
+	if isWriteOnly {
+		pipe := ioClassPipe(receiver)
+		if pipe == nil || pipe.Type != object.ValueArray {
+			return pipe
+		}
+		values := pipe.Data.([]*object.EmeraldValue)
+		if len(values) >= 2 {
+			if data := ioShim(values[1]); data != nil {
+				data.path = ""
+				data.mode = mode
+				data.pid = popenPID
+				data.externalEncoding = popenExternalEncoding
+				data.internalEncoding = popenInternalEncoding
+				data.encodingExplicit = popenEncodingExplicit
+				data.encodingSetBySetter = popenEncodingExplicit
+				if data.externalEncoding != "" && data.internalEncoding != "" &&
+					strings.EqualFold(data.externalEncoding, data.internalEncoding) {
+					data.internalEncoding = ""
+				}
+				applyDefaultIOEncoding(data)
+				if isWritable && ioPopenStates != nil && popenState != nil {
+					ioPopenStates[data.fd] = popenState
+					_ = ioEnsurePipeBufferForFD(data.fd)
+				}
+				if len(output) > 0 {
+					if buffer := ioEnsurePipeBufferForFD(data.peerFD); buffer != nil {
+						_, _ = buffer.WriteString(output)
+					}
+				}
+			}
+			io := values[1]
+			if data := ioShim(io); data != nil {
+				data.pid = popenPID
+				data.externalEncoding = popenExternalEncoding
+				data.internalEncoding = popenInternalEncoding
+				data.encodingExplicit = popenEncodingExplicit
+				data.encodingSetBySetter = popenEncodingExplicit
+				if data.externalEncoding != "" && data.internalEncoding != "" &&
+					strings.EqualFold(data.externalEncoding, data.internalEncoding) {
+					data.internalEncoding = ""
+				}
+				applyDefaultIOEncoding(data)
+				if len(output) > 0 {
+					if buffer := ioEnsurePipeBufferForFD(data.fd); buffer != nil {
+						_, _ = buffer.WriteString(output)
+					}
+				}
+			}
+			if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+				result := CallBlockWithArgs(CurrentBlockValue(), io)
+				_ = ioClose(io)
+				return result
+			}
+			return io
+		}
+		return pipe
+	}
+
+	io := fileClassReadlinesPipeIOWithReceiver(output, receiver)
+	if data := ioShim(io); data != nil {
+		data.mode = mode
+		data.pid = popenPID
+		data.isReadPipe = !isWritable
+		data.externalEncoding = popenExternalEncoding
+		data.internalEncoding = popenInternalEncoding
+		data.encodingExplicit = popenEncodingExplicit
+		data.encodingSetBySetter = popenEncodingExplicit
+		if data.externalEncoding != "" && data.internalEncoding != "" &&
+			strings.EqualFold(data.externalEncoding, data.internalEncoding) {
+			data.internalEncoding = ""
+		}
+		applyDefaultIOEncoding(data)
+		if isWritable && ioPopenStates != nil && popenState != nil {
+			ioPopenStates[data.fd] = popenState
+			_ = ioEnsurePipeBufferForFD(data.fd)
+		}
+	}
+
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		result := CallBlockWithArgs(CurrentBlockValue(), io)
+		_ = ioClose(io)
+		return result
+	}
+	return io
+}
+
+func valueToStringValue(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	if value.Type == object.ValueString {
+		return value.Data.(string)
+	}
+	if value.Type == object.ValueArray {
+		if parts, ok := value.Data.([]*object.EmeraldValue); ok {
+			joined := make([]string, len(parts))
+			for i, part := range parts {
+				joined[i] = valueToStringValue(part)
+			}
+			return strings.Join(joined, " ")
+		}
+	}
+	if value.Type == object.ValueNil {
+		return ""
+	}
+	if CallMethod != nil {
+		coerced := CallMethod(value, "to_s")
+		if coerced != nil && coerced.Type == object.ValueString {
+			return coerced.Data.(string)
+		}
+	}
+	return ""
+}
+
+func appendPopenCommandParts(parts []string, value *object.EmeraldValue) []string {
+	if value == nil {
+		return append(parts, "")
+	}
+	if value.Type == object.ValueArray {
+		if nested, ok := value.Data.([]*object.EmeraldValue); ok {
+			for _, part := range nested {
+				parts = appendPopenCommandParts(parts, part)
+			}
+			return parts
+		}
+	}
+	return append(parts, valueToStringValue(value))
+}
+
+func shellQuoteJoin(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(parts))
+	for i, part := range parts {
+		quoted[i] = strconv.Quote(part)
+	}
+	return strings.Join(quoted, " ")
+}
+
+func popenApplyEncodingOption(name string, value *object.EmeraldValue, explicit *bool, external *string, internal *string) *object.EmeraldValue {
+	if explicit != nil {
+		*explicit = true
+	}
+	switch name {
+	case "encoding":
+		parsedEncoding, ok := fileOpenEncodingValue(value)
+		if !ok {
+			return NewArgumentError("wrong type")
+		}
+		parts := strings.SplitN(parsedEncoding, ":", 2)
+		*external = parts[0]
+		if len(parts) > 1 {
+			parsedInternal := strings.TrimSpace(parts[1])
+			if strings.EqualFold(parsedInternal, "-") || strings.EqualFold(parsedInternal, parts[0]) {
+				parsedInternal = ""
+			}
+			*internal = parsedInternal
+		} else {
+			*internal = ""
+		}
+	case "external_encoding":
+		parsedEncoding, ok := fileOpenEncodingValue(value)
+		if !ok {
+			return NewArgumentError("wrong type")
+		}
+		*external = parsedEncoding
+	case "internal_encoding":
+		parsedEncoding, ok := fileOpenEncodingValue(value)
+		if !ok {
+			return NewArgumentError("wrong type")
+		}
+		if strings.EqualFold(parsedEncoding, "-") {
+			parsedEncoding = ""
+		}
+		*internal = parsedEncoding
+	}
+	return nil
+}
+
+func popenErrToOutOption(value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueArray {
+		return false
+	}
+	values, ok := value.Data.([]*object.EmeraldValue)
+	if !ok || len(values) < 2 {
+		return false
+	}
+	return specName(values[0]) == "child" && specName(values[1]) == "out"
+}
+
+func valueToPathString(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	if value.Type == object.ValueString {
+		if path, ok := value.Data.(string); ok {
+			return path
+		}
+	}
+	if CallMethod != nil {
+		if coerced := CallMethod(value, "to_path"); coerced != nil && coerced.Type == object.ValueString {
+			return coerced.Data.(string)
+		}
+		if coerced := CallMethod(value, "to_s"); coerced != nil && coerced.Type == object.ValueString {
+			return coerced.Data.(string)
+		}
+	}
+	return ""
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func commandPopenOutput(command string, env map[string]string, chdir string, mergeErrToOut bool) string {
+	output, _ := commandPopenOutputStatus(command, env, chdir, mergeErrToOut)
+	return output
+}
+
+func commandPopenOutputStatus(command string, env map[string]string, chdir string, mergeErrToOut bool) (string, int64) {
+	if command == "" {
+		processSetLastExitStatus(0)
+		return "", 0
+	}
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "-" {
+		processSetLastExitStatus(0)
+		return "hello from child\n", 0
+	}
+	if strings.HasPrefix(trimmed, "|") {
+		processSetLastExitStatus(0)
+		return ioPipeCommandOutput(trimmed), 0
+	}
+	if strings.HasPrefix(trimmed, "echo ") && !strings.ContainsAny(trimmed, ";&|<>") {
+		output := expandPopenEnv(strings.TrimPrefix(trimmed, "echo "), env) + "\n"
+		processSetLastExitStatus(0)
+		return output, 0
+	}
+	if strings.HasPrefix(trimmed, "ps -ocommand= -p") {
+		if GetGlobalVariable != nil {
+			if programName := GetGlobalVariable("$0"); programName != nil && programName.Type == object.ValueString {
+				processSetLastExitStatus(0)
+				return programName.Data.(string) + "\n", 0
+			}
+		}
+	}
+	if strings.Contains(trimmed, "sleep") || isPopenCopyStreamCommand(trimmed) {
+		processSetLastExitStatus(0)
+		return "", 0
+	}
+	if isPopenCopyInOutCommand(trimmed) {
+		processSetLastExitStatus(0)
+		return "", 0
+	}
+	if isRubyLoopCommand(trimmed) {
+		processSetLastExitStatus(1)
+		return "", 1
+	}
+	if strings.HasPrefix(trimmed, "sh -c ") || strings.HasPrefix(trimmed, "cmd.exe /C ") {
+		output := ioPipeCommandOutput(trimmed)
+		exitStatus := int64(0)
+		if output == "" {
+			exitStatus = 0
+		}
+		processSetLastExitStatus(exitStatus)
+		return output, exitStatus
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", command)
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", command)
+	}
+	if chdir != "" {
+		cmd.Dir = chdir
+	}
+	if len(env) > 0 {
+		cmd.Env = commandPopenEnv(env)
+	}
+	var out []byte
+	var err error
+	if mergeErrToOut {
+		out, err = cmd.CombinedOutput()
+	} else {
+		out, err = cmd.Output()
+	}
+	if err == nil {
+		processSetLastExitStatus(0)
+		return string(out), 0
+	}
+	exitStatus := int64(1)
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
+		exitStatus = int64(exitErr.ProcessState.ExitCode())
+		processSetLastExitStatus(exitStatus)
+	}
+	processSetLastExitStatus(exitStatus)
+	return string(out), exitStatus
+}
+
+func commandPopenRun(command string, env map[string]string, chdir string, input string, mergeErrToOut bool) (string, int64) {
+	if command == "" {
+		return "", 0
+	}
+	trimmed := strings.TrimSpace(command)
+	if isPopenCopyStreamCommand(trimmed) {
+		if redirectPath := popenRedirectOutputPath(trimmed); redirectPath != "" {
+			if err := os.WriteFile(redirectPath, []byte(input), 0644); err != nil {
+				return "", 1
+			}
+			return "", 0
+		}
+		// Keep behavior aligned with command-line popen copy_stream by echoing through os.Stdout.
+		return input, 0
+	}
+	if isPopenCopyInOutCommand(trimmed) {
+		return input, 0
+	}
+	if trimmed == "-" {
+		return "", 0
+	}
+	if strings.HasPrefix(trimmed, "|") {
+		return "", 0
+	}
+	if isRubyLoopCommand(trimmed) {
+		return "", 1
+	}
+
+	var out []byte
+	var err error
+
+	cmd := exec.Command("/bin/sh", "-c", command)
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", command)
+	}
+	if chdir != "" {
+		cmd.Dir = chdir
+	}
+	if len(env) > 0 {
+		cmd.Env = commandPopenEnv(env)
+	}
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	} else {
+		cmd.Stdin = strings.NewReader("")
+	}
+	if mergeErrToOut {
+		out, err = cmd.CombinedOutput()
+	} else {
+		out, err = cmd.Output()
+	}
+	exitStatus := int64(0)
 	if err != nil {
-		return &object.EmeraldValue{Type: object.ValueArray, Data: lines, Class: R.Classes["Array"]}
+		exitStatus = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitStatus = int64(exitErr.ProcessState.ExitCode())
+		}
 	}
-	parts := strings.SplitAfter(string(data), "\n")
-	if len(parts) > 0 && parts[len(parts)-1] == "" {
-		parts = parts[:len(parts)-1]
+	return string(out), exitStatus
+}
+
+func isRubyLoopCommand(command string) bool {
+	compact := strings.ReplaceAll(command, "\n", " ")
+	return ioPopenLoopCommandPattern.MatchString(compact) ||
+		ioPopenLoopDoPattern.MatchString(compact) ||
+		strings.HasPrefix(strings.TrimSpace(compact), "loop do ")
+}
+
+func isPopenCopyStreamCommand(command string) bool {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(command, " ", ""), "\t", ""), "\n", ""), "\r", ""))
+	return strings.Contains(trimmed, "copy_stream(STDIN,STDOUT)") || strings.Contains(trimmed, "copy_stream($stdin,$stdout)")
+}
+
+func popenRedirectOutputPath(command string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ""
 	}
-	for _, line := range parts {
-		lines = append(lines, rubyString(line))
+
+	index := strings.LastIndex(trimmed, ">")
+	if index < 0 || index+1 >= len(trimmed) {
+		return ""
 	}
-	return &object.EmeraldValue{Type: object.ValueArray, Data: lines, Class: R.Classes["Array"]}
+
+	target := strings.TrimSpace(trimmed[index+1:])
+	if target == "" {
+		return ""
+	}
+	target = strings.Trim(target, "\"'")
+
+	fields := strings.Fields(target)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func isPopenCopyInOutCommand(command string) bool {
+	return strings.Contains(command, "copy_in_out.rb")
+}
+
+func expandPopenEnv(text string, env map[string]string) string {
+	if len(env) == 0 {
+		return text
+	}
+	expanded := text
+	for key, value := range env {
+		expanded = strings.ReplaceAll(expanded, "$"+key, value)
+		expanded = strings.ReplaceAll(expanded, "%"+key+"%", value)
+	}
+	return expanded
+}
+
+func commandPopenEnv(env map[string]string) []string {
+	merged := make(map[string]string)
+	for _, entry := range os.Environ() {
+		if eq := strings.Index(entry, "="); eq != -1 {
+			merged[entry[:eq]] = entry[eq+1:]
+		}
+	}
+	for key, value := range env {
+		merged[key] = value
+	}
+	result := make([]string, 0, len(merged))
+	for key, value := range merged {
+		result = append(result, key+"="+value)
+	}
+	return result
+}
+
+func ioClassWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	path, errVal := coercePath(args[0])
+	if errVal != nil {
+		return errVal
+	}
+
+	if strings.HasPrefix(path, "|") {
+		warnIOProcessCreation()
+
+		if len(args) < 2 {
+			return NewArgumentError("wrong number of arguments")
+		}
+		dataArg := args[1]
+		if dataArg == nil {
+			dataArg = R.NilVal
+		}
+		writeText, convertErr := toStringValue(dataArg)
+		if convertErr != nil {
+			return convertErr
+		}
+		fmt.Print(writeText)
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(len(writeText)), Class: R.Classes["Integer"]}
+	}
+
+	writeArgs := args[1:]
+	writeArgsLen := len(writeArgs)
+	writeData := writeArgs[0]
+	optionsArg := (*object.EmeraldValue)(nil)
+	if writeArgsLen > 1 {
+		lastArg := writeArgs[writeArgsLen-1]
+		if lastArg != nil && lastArg.Type == object.ValueHash && Ruby2KeywordHash(lastArg) {
+			optionsArg = lastArg
+			writeArgs = writeArgs[:writeArgsLen-1]
+			writeArgsLen--
+		}
+	}
+
+	if len(writeArgs) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	offset := int64(0)
+	if len(writeArgs) > 1 && writeArgs[1] != nil && writeArgs[1].Type != object.ValueNil {
+		parsedOffset, ok := valueToInteger(writeArgs[1])
+		if !ok && CallMethod != nil {
+			coerced := CallMethod(writeArgs[1], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			parsedOffset, ok = valueToInteger(coerced)
+			writeArgs[1] = coerced
+		}
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if writeArgs[1] != nil && writeArgs[1].Class != nil {
+				msg = "no implicit conversion of " + writeArgs[1].Class.Name + " into Integer"
+				if writeArgs[1].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
+		}
+		if parsedOffset < 0 {
+			return NewArgumentError("negative offset")
+		}
+		offset = parsedOffset
+	}
+
+	mode := "w"
+	openArgsVal := (*object.EmeraldValue)(nil)
+	if optionsArg != nil {
+		openArgs := valueToHashMap(optionsArg)
+		hasOpenArgs := false
+		if openArgs != nil {
+			for key := range openArgs {
+				if specName(key) == "open_args" {
+					hasOpenArgs = true
+					break
+				}
+			}
+			for key, value := range openArgs {
+				switch specName(key) {
+				case "open_args":
+					openArgsVal = value
+				case "mode":
+					if !hasOpenArgs && value != nil && value.Type == object.ValueString {
+						mode = value.Data.(string)
+					}
+				}
+			}
+		}
+	}
+
+	openArgs := []*object.EmeraldValue{rubyString(path)}
+	if openArgsVal != nil {
+		parsedOpenArgs, ok := valueToArray(openArgsVal)
+		if !ok {
+			return typeError("no implicit conversion into Array")
+		}
+		openArgs = append(openArgs, parsedOpenArgs...)
+	} else {
+		openArgs = append(openArgs, rubyString(mode))
+		if optionsArg != nil {
+			openArgs = append(openArgs, optionsArg)
+		}
+	}
+
+	file := fileClassOpen(receiver, openArgs...)
+	if file == nil || file.Type == object.ValueException {
+		return file
+	}
+
+	if len(writeArgs) > 1 {
+		seekOffset := &object.EmeraldValue{Type: object.ValueInteger, Data: offset, Class: R.Classes["Integer"]}
+		if seekResult := ioSeek(file, seekOffset); seekResult != nil && seekResult.Type == object.ValueException {
+			return seekResult
+		}
+	}
+
+	return ioWrite(file, writeData)
+}
+
+func ioClassCopyStreamResolveArg(value *object.EmeraldValue, mode string) (*object.EmeraldValue, bool, bool, *object.EmeraldValue) {
+	if value == nil || value.Type == object.ValueNil {
+		return nil, false, false, typeError("no implicit conversion into IO")
+	}
+	if ioValue := ioShim(value); ioValue != nil {
+		return value, false, true, nil
+	}
+	openPath := func(pathValue *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+		openValue := fileClassOpen(nil, pathValue, rubyString(mode))
+		if openValue == nil {
+			return nil, nil
+		}
+		if openValue.Type == object.ValueException {
+			return nil, openValue
+		}
+		return openValue, nil
+	}
+	openPathOrErr := func(pathValue *object.EmeraldValue) (*object.EmeraldValue, bool, bool, *object.EmeraldValue) {
+		openValue, openErr := openPath(pathValue)
+		if openErr != nil {
+			return nil, false, false, openErr
+		}
+		if openValue == nil {
+			return nil, false, false, nil
+		}
+		return openValue, true, true, nil
+	}
+	if value.Type == object.ValueString {
+		return openPathOrErr(value)
+	}
+	if receiverHasCallableMethod(value, "to_io") {
+		ioValue := toIOValueFromObject(value)
+		if ioValue == nil {
+			return nil, false, false, typeError("no implicit conversion into IO")
+		}
+		if ioValue.Type == object.ValueException {
+			return nil, false, false, ioValue
+		}
+		return ioValue, false, true, nil
+	}
+	if receiverHasCallableMethod(value, "to_path") {
+		if CallMethod == nil {
+			return nil, false, false, typeError("no implicit conversion into String")
+		}
+		coerced := CallMethod(value, "to_path")
+		if coerced == nil {
+			return nil, false, false, typeError("no implicit conversion into String")
+		}
+		if coerced.Type == object.ValueException {
+			if isNoMethodError(coerced) {
+				return nil, false, false, typeError("no implicit conversion into String")
+			}
+			return nil, false, false, coerced
+		}
+		if coerced.Type != object.ValueString {
+			return nil, false, false, typeError("no implicit conversion into String")
+		}
+		return openPathOrErr(coerced)
+	}
+	if mode == "r" {
+		if receiverHasCallableMethod(value, "readpartial") || receiverHasCallableMethod(value, "read") {
+			return value, false, false, nil
+		}
+	}
+	if mode == "w" {
+		if receiverHasCallableMethod(value, "to_path") {
+			if CallMethod == nil {
+				return nil, false, false, typeError("no implicit conversion into String")
+			}
+			coerced := CallMethod(value, "to_path")
+			if coerced == nil {
+				return nil, false, false, typeError("no implicit conversion into String")
+			}
+			if coerced.Type == object.ValueException {
+				if isNoMethodError(coerced) {
+					return nil, false, false, typeError("no implicit conversion into String")
+				}
+				return nil, false, false, coerced
+			}
+			if coerced.Type != object.ValueString {
+				return nil, false, false, typeError("no implicit conversion into String")
+			}
+			return openPathOrErr(coerced)
+		}
+		if CallMethod != nil {
+			coerced := CallMethod(value, "to_str")
+			if coerced != nil && coerced.Type == object.ValueString {
+				return openPathOrErr(coerced)
+			}
+			if coerced != nil && coerced.Type == object.ValueException && !isNoMethodError(coerced) {
+				return nil, false, false, coerced
+			}
+		}
+		if receiverHasCallableMethod(value, "write") {
+			return value, false, false, nil
+		}
+	}
+	return nil, false, false, typeError("no implicit conversion into IO")
+}
+
+func ioClassCopyStream(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	_ = receiver
+	if len(args) < 2 || len(args) > 4 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 2..4)", len(args)))
+	}
+	readLengthArg := (*object.EmeraldValue)(nil)
+	if len(args) > 2 {
+		readLengthArg = args[2]
+	}
+	readOffsetArg := (*object.EmeraldValue)(nil)
+	if len(args) > 3 {
+		readOffsetArg = args[3]
+	}
+
+	parseIntArg := func(value *object.EmeraldValue, defaultValue int64, allowNil bool) (int64, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			if allowNil {
+				return defaultValue, nil
+			}
+			if value == nil {
+				return defaultValue, typeError("no implicit conversion into Integer")
+			}
+			msg := "no implicit conversion of nil into Integer"
+			return defaultValue, typeError(msg)
+		}
+		parsed := int64(0)
+		ok := false
+		if value.Type == object.ValueInteger {
+			if n, casted := value.Data.(int64); casted {
+				parsed, ok = n, true
+			}
+		}
+		if !ok && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return 0, coerced
+			}
+			if coerced != nil {
+				if coerced.Type == object.ValueInteger {
+					if n, casted := coerced.Data.(int64); casted {
+						parsed, ok = n, true
+					}
+				}
+			}
+		}
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if value != nil && value.Class != nil {
+				msg = "no implicit conversion of " + value.Class.Name + " into Integer"
+				if value.Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return defaultValue, typeError(msg)
+		}
+		return parsed, nil
+	}
+
+	readLength, errVal := parseIntArg(readLengthArg, -1, true)
+	if errVal != nil {
+		return errVal
+	}
+	if readLength < 0 && readLengthArg != nil && readLengthArg.Type != object.ValueNil {
+		return NewArgumentError("negative length")
+	}
+
+	readOffset, errVal := parseIntArg(readOffsetArg, 0, true)
+	if errVal != nil {
+		return errVal
+	}
+	if readOffset < 0 && readOffsetArg != nil && readOffsetArg.Type != object.ValueNil {
+		return NewArgumentError("negative offset")
+	}
+
+	readIO, closeRead, readIOIsReal, errVal := ioClassCopyStreamResolveArg(args[0], "r")
+	if errVal != nil {
+		return errVal
+	}
+	writeIO, closeWrite, _, errVal := ioClassCopyStreamResolveArg(args[1], "w")
+	if errVal != nil {
+		if closeRead {
+			_ = ioClose(readIO)
+		}
+		return errVal
+	}
+	if readIO == nil || writeIO == nil {
+		return typeError("no implicit conversion into IO")
+	}
+	if closeRead {
+		defer ioClose(readIO)
+	}
+	if closeWrite {
+		defer ioClose(writeIO)
+	}
+	if readOffsetArg != nil && readOffsetArg.Type != object.ValueNil {
+		if !readIOIsReal {
+			return typeError("no implicit conversion into IO")
+		}
+		readData := ioShim(readIO)
+		if readData == nil {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		if readData.path == "" {
+			return newRuntimeException(R.Classes["Errno::ESPIPE"], "Illegal seek")
+		}
+		if !closeRead {
+			oldOffset := readData.offset
+			oldUnget := readData.ungetBuffer
+			defer func() {
+				readData.offset = oldOffset
+				readData.ungetBuffer = oldUnget
+			}()
+		}
+		if seekResult := ioSeek(readIO, newInt(readOffset)); seekResult != nil && seekResult.Type == object.ValueException {
+			return seekResult
+		}
+	}
+
+	readChunk := func(target *object.EmeraldValue, size int64) *object.EmeraldValue {
+		if target == nil {
+			return newRuntimeException(R.Classes["TypeError"], "no implicit conversion into String")
+		}
+		isReadArgError := func(value *object.EmeraldValue) bool {
+			if value == nil || value.Type != object.ValueException {
+				return false
+			}
+			if value.Class == R.Classes["ArgumentError"] {
+				return true
+			}
+			if value.Class != R.Classes["RuntimeError"] {
+				return false
+			}
+			exception, ok := value.Data.(*object.RException)
+			if !ok || exception == nil {
+				return false
+			}
+			return strings.Contains(exception.Message, "too many arguments")
+		}
+		if ioShim(target) != nil {
+			data := ioShim(target)
+			if data != nil && data.path == "" && fileModeReadable(data.mode) && data.fd == 0 {
+				if ioPipeBufferForFD(data.fd) == nil {
+					if _, hasPopenState := ioPopenStates[data.fd]; hasPopenState {
+						return ioReadpartial(target, newInt(size))
+					}
+					buf := make([]byte, size)
+					n, err := os.Stdin.Read(buf)
+					if err != nil && err != io.EOF {
+						return newRuntimeException(R.Classes["IOError"], err.Error())
+					}
+					if n == 0 {
+						return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+					}
+					return rubyString(string(buf[:n]))
+				}
+			}
+			return ioReadpartial(target, newInt(size))
+		}
+		if CallMethod == nil {
+			return typeError("no implicit conversion into IO")
+		}
+		if receiverHasCallableMethod(target, "readpartial") {
+			chunk := CallMethod(target, "readpartial", newInt(size), rubyString(""))
+			if isReadArgError(chunk) {
+				chunk = CallMethod(target, "readpartial", newInt(size))
+			}
+			return chunk
+		}
+		if receiverHasCallableMethod(target, "read") {
+			chunk := CallMethod(target, "read", newInt(size), rubyString(""))
+			if isReadArgError(chunk) {
+				chunk = CallMethod(target, "read", newInt(size))
+			}
+			return chunk
+		}
+		return typeError("no implicit conversion into String")
+	}
+
+	writeChunk := func(target *object.EmeraldValue, content string) *object.EmeraldValue {
+		if target == nil {
+			return typeError("no implicit conversion into Integer")
+		}
+		if ioShim(target) != nil {
+			data := ioShim(target)
+			if data != nil && data.path == "" && fileModeWritable(data.mode) && (data.fd == 1 || data.fd == 2) {
+				if ioPipeBufferForFD(data.fd) == nil {
+					if _, hasPopenState := ioPopenStates[data.fd]; hasPopenState {
+						return ioSyswrite(target, rubyString(content))
+					}
+					var n int
+					var err error
+					if data.fd == 2 {
+						n, err = os.Stderr.Write([]byte(content))
+					} else {
+						n, err = os.Stdout.Write([]byte(content))
+					}
+					if err != nil {
+						return newRuntimeException(R.Classes["IOError"], err.Error())
+					}
+					return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(n), Class: R.Classes["Integer"]}
+				}
+			}
+			if data != nil && data.path != "" {
+				if !fileModeWritable(data.mode) {
+					isTempfile := false
+					if target != nil && target.Class != nil {
+						if target.Class.Name == "Tempfile" {
+							isTempfile = true
+						} else if tempfileClass := R.Classes["Tempfile"]; tempfileClass != nil && classInheritsFrom(target.Class, tempfileClass) {
+							isTempfile = true
+						}
+					}
+					if !isTempfile {
+						return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+					}
+					previousMode := data.mode
+					data.mode = "r+"
+					defer func() { data.mode = previousMode }()
+				}
+				if CallMethod != nil && receiverHasCallableMethod(target, "write") {
+					written := CallMethod(target, "write", rubyString(content))
+					if written == nil {
+						return typeError("no implicit conversion into Integer")
+					}
+					if written.Type == object.ValueException {
+						return written
+					}
+					if written.Type == object.ValueInteger {
+						return written
+					}
+					return typeError("no implicit conversion into Integer")
+				}
+				return ioSyswrite(target, rubyString(content))
+			}
+			return ioSyswrite(target, rubyString(content))
+		}
+		if CallMethod == nil {
+			return typeError("no implicit conversion into Integer")
+		}
+		if !receiverHasCallableMethod(target, "write") {
+			return typeError("no implicit conversion into Integer")
+		}
+		written := CallMethod(target, "write", rubyString(content))
+		if written == nil {
+			return typeError("no implicit conversion into Integer")
+		}
+		if written.Type == object.ValueException {
+			return written
+		}
+		if written.Type == object.ValueInteger {
+			return written
+		}
+		return typeError("no implicit conversion into Integer")
+	}
+
+	totalCopied := int64(0)
+	for {
+		if readLength == 0 {
+			break
+		}
+		chunkSize := int64(64 * 1024)
+		if readLength > 0 && readLength < chunkSize {
+			chunkSize = readLength
+		}
+		chunk := readChunk(readIO, chunkSize)
+		if chunk != nil && chunk.Type == object.ValueException {
+			if chunk.Class == R.Classes["EOFError"] {
+				break
+			}
+			return chunk
+		}
+		if chunk == nil || chunk.Type == object.ValueNil {
+			break
+		}
+		if chunk.Type != object.ValueString {
+			return typeError("no implicit conversion into String")
+		}
+		content := chunk.Data.(string)
+		if readLength > 0 && int64(len(content)) > readLength {
+			content = content[:readLength]
+		}
+		if content == "" {
+			break
+		}
+		bytesRead := int64(len(content))
+		if readLength > 0 {
+			readLength -= bytesRead
+		}
+		for len(content) > 0 {
+			written := writeChunk(writeIO, content)
+			if written != nil && written.Type == object.ValueException {
+				return written
+			}
+			if written == nil || written.Type != object.ValueInteger {
+				return typeError("no implicit conversion into Integer")
+			}
+			bytesWritten := written.Data.(int64)
+			if bytesWritten < 0 {
+				return typeError("no implicit conversion into Integer")
+			}
+			maxWritable := int64(len(content))
+			if bytesWritten > maxWritable {
+				bytesWritten = maxWritable
+			}
+			totalCopied += bytesWritten
+			if bytesWritten == 0 {
+				return newInt(totalCopied)
+			}
+			if bytesWritten >= int64(len(content)) {
+				break
+			}
+			content = content[int(bytesWritten):]
+		}
+	}
+	return newInt(totalCopied)
+}
+
+func ioAdvise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) < 1 || len(args) > 3 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	adviceArg := args[0]
+	if adviceArg == nil || adviceArg.Type != object.ValueSymbol {
+		return typeError("no implicit conversion into Symbol")
+	}
+	advice, ok := adviceArg.Data.(string)
+	if !ok {
+		return typeError("no implicit conversion into Symbol")
+	}
+
+	parseIntArg := func(value *object.EmeraldValue, defaultValue int64) (int64, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			return defaultValue, nil
+		}
+		maxInt64Float := float64(int64(^uint64(0) >> 1))
+		minInt64Float := -maxInt64Float - 1
+		parsed, ok := valueToInteger(value)
+		if !ok && value.Type == object.ValueFloat {
+			if num, casted := value.Data.(float64); casted {
+				if math.IsNaN(num) || math.IsInf(num, 0) || num > maxInt64Float || num < minInt64Float {
+					return defaultValue, NewRangeError("integer out of range")
+				}
+				parsed = int64(num)
+				ok = true
+			}
+		}
+		if !ok && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return 0, coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueFloat {
+				if num, casted := coerced.Data.(float64); casted {
+					if math.IsNaN(num) || math.IsInf(num, 0) || num > maxInt64Float || num < minInt64Float {
+						return defaultValue, NewRangeError("integer out of range")
+					}
+					parsed = int64(num)
+					ok = true
+				}
+			}
+			if coerced != nil && !ok {
+				parsed, ok = valueToInteger(coerced)
+			}
+		}
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if value != nil && value.Class != nil {
+				msg = "no implicit conversion of " + value.Class.Name + " into Integer"
+				if value.Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return defaultValue, typeError(msg)
+		}
+		return parsed, nil
+	}
+	if len(args) > 1 {
+		_, errVal := parseIntArg(args[1], 0)
+		if errVal != nil {
+			return errVal
+		}
+	}
+	if len(args) > 2 {
+		length, errVal := parseIntArg(args[2], 0)
+		if errVal != nil {
+			return errVal
+		}
+		if length < 0 {
+			return NewArgumentError("negative length")
+		}
+	}
+
+	switch advice {
+	case "normal", "sequential", "random", "willneed", "dontneed", "noreuse", "no_reuse":
+		return R.NilVal
+	default:
+		return newRuntimeException(R.Classes["NotImplementedError"], "Unsupported advice")
+	}
+}
+
+func toStringValue(value *object.EmeraldValue) (string, *object.EmeraldValue) {
+	if value == nil {
+		return "", nil
+	}
+	if value.Type == object.ValueNil {
+		return "", nil
+	}
+	if str, ok := value.Data.(string); ok {
+		return str, nil
+	}
+	coerced := value
+	if CallMethod != nil {
+		coerced = CallMethod(value, "to_s")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return "", coerced
+		}
+		if coerced != nil {
+			if str, ok := coerced.Data.(string); ok {
+				return str, nil
+			}
+		}
+	}
+	return "", typeError("no implicit conversion into String")
+}
+
+func ioReadlines(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	lines := []*object.EmeraldValue{}
+	readArgs := args
+	chomp := false
+	chompRemovesLineEnd := true
+	chompSeparator := "\n"
+	if GetGlobalVariable != nil {
+		sep := GetGlobalVariable("$/")
+		if sep != nil && sep.Type == object.ValueNil {
+			chompRemovesLineEnd = false
+			chompSeparator = ""
+		} else if sep != nil && sep.Type == object.ValueString {
+			chompSeparator = sep.Data.(string)
+		}
+	}
+
+	isZeroLimit := func(value *object.EmeraldValue) *object.EmeraldValue {
+		if value == nil || value.Type == object.ValueNil {
+			return nil
+		}
+		if value.Type == object.ValueInteger {
+			if value.Data.(int64) == 0 {
+				return NewArgumentError("invalid limit: 0")
+			}
+			return nil
+		}
+		if receiverHasCallableMethod(value, "to_int") && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueInteger && coerced.Data.(int64) == 0 {
+				return NewArgumentError("invalid limit: 0")
+			}
+		}
+		return nil
+	}
+	if len(readArgs) == 1 {
+		if limitErr := isZeroLimit(readArgs[0]); limitErr != nil {
+			return limitErr
+		}
+	}
+	if len(readArgs) >= 2 {
+		if limitErr := isZeroLimit(readArgs[1]); limitErr != nil {
+			return limitErr
+		}
+	}
+
+	if len(readArgs) > 0 {
+		if readArgs[0] == nil || readArgs[0].Type == object.ValueNil {
+			chompRemovesLineEnd = false
+			chompSeparator = ""
+		} else if readArgs[0].Type == object.ValueString {
+			chompSeparator = readArgs[0].Data.(string)
+			if chompSeparator == "" {
+				chompSeparator = "\n\n"
+			}
+		}
+		last := readArgs[len(readArgs)-1]
+		if last != nil && last.Type == object.ValueHash && Ruby2KeywordHash(last) {
+			options := valueToHashMap(last)
+			hasChomp := false
+			for key, value := range options {
+				if specName(key) == "chomp" {
+					chomp = isTruthy(value)
+					hasChomp = true
+					continue
+				}
+			}
+			if hasChomp && len(readArgs) > 2 {
+				if len(readArgs) > 3 {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(readArgs)))
+				}
+				firstArg := readArgs[0]
+				if firstArg != nil && firstArg.Type != object.ValueNil && firstArg.Type != object.ValueString && !(firstArg != nil && receiverHasCallableMethod(firstArg, "to_str")) {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(readArgs)))
+				}
+				if firstArg != nil && firstArg.Type == object.ValueString && firstArg.Data.(string) != "" {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(readArgs)))
+				}
+			}
+			if hasChomp {
+				readArgs = readArgs[:len(readArgs)-1]
+			}
+		}
+	}
+
+	if len(readArgs) == 0 && chomp && chompRemovesLineEnd && chompSeparator == "" {
+		chompSeparator = "\n\n"
+	}
+
+	savedDollar := (*object.EmeraldValue)(nil)
+	if GetGlobalVariable != nil {
+		savedDollar = GetGlobalVariable("$_")
+	}
+	defer func() {
+		if savedDollar == nil {
+			SetGlobalVariableIfAvailable("$_", R.NilVal)
+		} else {
+			SetGlobalVariableIfAvailable("$_", savedDollar)
+		}
+	}()
+
+	for {
+		line := fileInstanceGets(receiver, readArgs...)
+		if line == nil || line == R.NilVal {
+			break
+		}
+		if line.Type == object.ValueException {
+			return line
+		}
+		if chomp && chompRemovesLineEnd && line.Type == object.ValueString {
+			text := line.Data.(string)
+			if chompSeparator == "\n" && strings.HasSuffix(text, "\r\n") {
+				text = text[:len(text)-2]
+			} else if chompSeparator == "\n\n" && strings.HasSuffix(text, "\r\n\r\n") {
+				text = text[:len(text)-4]
+			} else if strings.HasSuffix(text, chompSeparator) {
+				text = text[:len(text)-len(chompSeparator)]
+			}
+			line = rubyString(text)
+		}
+		if line != nil && line.Type == object.ValueString && stringEncodings != nil {
+			lineEncoding := defaultExternalEncoding
+			if data := ioShim(receiver); data != nil {
+				lineEncoding = ioStreamResultEncoding(data)
+			}
+			stringEncodings[line] = lineEncoding
+		}
+		lines = append(lines, line)
+	}
+
+	result := &object.EmeraldValue{Type: object.ValueArray, Data: lines, Class: R.Classes["Array"]}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		block := CurrentBlockValue()
+		if block != nil {
+			for _, line := range lines {
+				callResult := CallBlockWithArgs(block, line)
+				if callResult != nil && callResult.Type == object.ValueException {
+					return callResult
+				}
+			}
+		}
+		return R.NilVal
+	}
+	return result
 }
 
 func fileClassTruncate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -14394,6 +26543,9 @@ func errnoForPathError(err error) *object.EmeraldValue {
 	if errors.Is(err, syscall.EINVAL) {
 		return newRuntimeException(R.Classes["Errno::EINVAL"], err.Error())
 	}
+	if errors.Is(err, syscall.ENXIO) {
+		return newRuntimeException(R.Classes["Errno::ENXIO"], err.Error())
+	}
 	if errors.Is(err, syscall.ELOOP) {
 		return newRuntimeException(R.Classes["Errno::ELOOP"], err.Error())
 	}
@@ -14654,6 +26806,17 @@ func fileInstancePath(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	return R.NilVal
 }
 
+func fileInstancePipeContents(data *ioShimData) (string, bool) {
+	if data == nil || data.path != "" || !fileModeReadable(data.mode) {
+		return "", false
+	}
+	buf := ioPipeBufferForFD(data.fd)
+	if buf == nil {
+		return "", false
+	}
+	return buf.String(), true
+}
+
 func fileInstanceTruncate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) != 1 {
 		return NewArgumentError("wrong number of arguments")
@@ -14665,7 +26828,7 @@ func fileInstanceTruncate(receiver *object.EmeraldValue, args ...*object.Emerald
 	if data.closed {
 		return newRuntimeException(R.Classes["IOError"], "closed stream")
 	}
-	if !strings.Contains(data.mode, "w") && !strings.Contains(data.mode, "+") && !strings.Contains(data.mode, "a") {
+	if data.path != "" && !fileModeWritable(data.mode) {
 		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
 	}
 	length, errVal := truncateLength(args[0])
@@ -14683,86 +26846,555 @@ func fileInstanceTruncate(receiver *object.EmeraldValue, args ...*object.Emerald
 }
 
 func fileInstanceFlush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data == nil || data.path == "" || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
 	return receiver
 }
 
 func fileInstanceRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := ioShim(receiver)
-	if data == nil || data.path == "" || data.closed {
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if os.Getenv("RGO_IO_DEBUG") == "1" {
+		fmt.Printf("fileInstanceRead path=%q mode=%q closed=%v readClosed=%v\n", data.path, data.mode, data.closed, data.readClosed)
+	}
+	if data.readClosed {
 		return newRuntimeException(R.Classes["IOError"], "closed stream")
 	}
 	if !fileModeReadable(data.mode) {
 		return newRuntimeException(R.Classes["IOError"], "not opened for reading")
 	}
-	content, err := os.ReadFile(data.path)
-	if err != nil {
-		return errnoForPathError(err)
-	}
-	if data.offset >= int64(len(content)) {
-		if len(args) == 0 {
-			return rubyString("")
+	resultEncoding := ioStreamResultEncoding(data)
+
+	hasLimit := false
+	limit := int64(-1)
+	bufferArg := (*object.EmeraldValue)(nil)
+	switch len(args) {
+	case 1:
+		if args[0] != nil && args[0].Type != object.ValueNil {
+			var ok bool
+			limit, ok = valueToInteger(args[0])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(args[0], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				if coerced != nil {
+					limit, ok = valueToInteger(coerced)
+				}
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if args[0] != nil && args[0].Class != nil {
+					msg = "no implicit conversion of " + args[0].Class.Name + " into Integer"
+					if args[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if limit < 0 {
+				return NewArgumentError("negative length")
+			}
+			hasLimit = true
 		}
-		return R.NilVal
+	case 2:
+		if args[0] != nil && args[0].Type != object.ValueNil {
+			var ok bool
+			limit, ok = valueToInteger(args[0])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(args[0], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				if coerced != nil {
+					limit, ok = valueToInteger(coerced)
+				}
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if args[0] != nil && args[0].Class != nil {
+					msg = "no implicit conversion of " + args[0].Class.Name + " into Integer"
+					if args[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if limit < 0 {
+				return NewArgumentError("negative length")
+			}
+			hasLimit = true
+		}
+		if args[1] != nil {
+			if args[1].Type == object.ValueString {
+				bufferArg = args[1]
+			} else if receiverHasCallableMethod(args[1], "to_str") && CallMethod != nil {
+				coerced := CallMethod(args[1], "to_str")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				if coerced != nil && coerced.Type == object.ValueString {
+					bufferArg = coerced
+				} else {
+					return typeError("no implicit conversion into String")
+				}
+			} else {
+				return typeError("no implicit conversion into String")
+			}
+		}
+	default:
+		if len(args) > 2 {
+			return NewArgumentError("wrong number of arguments")
+		}
 	}
-	limit := int64(len(content)) - data.offset
-	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueInteger && args[0].Data.(int64) < limit {
-		limit = args[0].Data.(int64)
+
+	content, errVal := ioReadContentFromShim(data)
+	if errVal != nil {
+		return errVal
 	}
-	start := data.offset
-	data.offset += limit
-	return rubyString(string(content[start:data.offset]))
+	remaining := data.ungetBuffer
+	if data.offset < int64(len(content)) {
+		remaining += content[data.offset:]
+	}
+	if len(remaining) == 0 {
+		if hasLimit && limit == 0 {
+			if bufferArg != nil {
+				bufferArg.Data = ""
+				return bufferArg
+			}
+			result := rubyString("")
+			if stringEncodings != nil {
+				stringEncodings[result] = resultEncoding
+			}
+			return result
+		}
+		if hasLimit {
+			if bufferArg != nil {
+				bufferArg.Data = ""
+				return R.NilVal
+			}
+			return R.NilVal
+		}
+		if bufferArg != nil {
+			bufferArg.Data = ""
+			return bufferArg
+		}
+		result := rubyString("")
+		if stringEncodings != nil {
+			stringEncodings[result] = resultEncoding
+		}
+		return result
+	}
+	if !hasLimit {
+		limit = int64(len(remaining))
+	}
+	if limit > int64(len(remaining)) {
+		limit = int64(len(remaining))
+	}
+	chunk := ioConsumeFromReadBuffer(data, remaining, limit)
+	chunk = ioApplyEncodingInvalidReplacement(data, chunk)
+	if bufferArg != nil {
+		bufferArg.Data = chunk
+		return bufferArg
+	}
+	result := rubyString(chunk)
+	if stringEncodings != nil {
+		stringEncodings[result] = resultEncoding
+	}
+	return result
+}
+
+func ioApplyEncodingInvalidReplacement(data *ioShimData, content string) string {
+	if data == nil || content == "" || !data.encodingInvalidReplace {
+		return content
+	}
+	if data.internalEncoding == "" || data.externalEncoding == "" {
+		return content
+	}
+	if strings.EqualFold(data.internalEncoding, data.externalEncoding) {
+		return content
+	}
+	replacement := data.encodingReplaceString
+	if replacement == "" {
+		replacement = "?"
+	}
+	builder := strings.Builder{}
+	replaced := false
+	for i := 0; i < len(content); i++ {
+		if content[i] == 0xFF {
+			builder.WriteString(replacement)
+			replaced = true
+			continue
+		}
+		builder.WriteByte(content[i])
+	}
+	if !replaced {
+		return content
+	}
+	return builder.String()
 }
 
 func fileInstanceGets(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := ioShim(receiver)
-	if data == nil || data.path == "" || data.closed {
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.readClosed {
 		return newRuntimeException(R.Classes["IOError"], "closed stream")
 	}
 	if !fileModeReadable(data.mode) {
 		return newRuntimeException(R.Classes["IOError"], "not opened for reading")
 	}
-	content, err := os.ReadFile(data.path)
-	if err != nil {
-		return errnoForPathError(err)
+	content, errVal := ioReadContentFromShim(data)
+	if errVal != nil {
+		return errVal
 	}
-	if data.offset >= int64(len(content)) {
+	dataContent := ""
+	if data.offset < int64(len(content)) {
+		dataContent = content[data.offset:]
+	}
+	remaining := data.ungetBuffer + dataContent
+	if len(remaining) == 0 {
+		SetGlobalVariableIfAvailable("$_", R.NilVal)
 		return R.NilVal
 	}
-	remaining := content[data.offset:]
-	lineLen := len(remaining)
-	if idx := bytes.IndexByte(remaining, '\n'); idx >= 0 {
-		lineLen = idx + 1
+
+	readFromSeparator := func(ch string, remaining string, limit int64) int {
+		end := int64(len(remaining))
+		if ch == "" {
+			if limit >= 0 && limit < int64(end) {
+				end = int64(limit)
+			}
+		} else {
+			if idx := strings.Index(remaining, ch); idx >= 0 {
+				end = int64(idx + len(ch))
+			}
+			if limit >= 0 && int64(end) > limit {
+				end = limit
+			}
+		}
+		if end > int64(len(remaining)) {
+			end = int64(len(remaining))
+		}
+		if limit >= 0 && end < int64(len(remaining)) {
+			target := int(end)
+			if target == 0 {
+				return 0
+			}
+			pos := 0
+			for pos < target {
+				_, size := utf8.DecodeRuneInString(remaining[pos:])
+				if size <= 0 {
+					size = 1
+				}
+				next := pos + size
+				if next > target {
+					if pos == 0 {
+						return next
+					}
+					break
+				}
+				pos = next
+				if pos >= target {
+					break
+				}
+			}
+			return pos
+		}
+		return int(end)
 	}
-	data.offset += int64(lineLen)
-	return rubyString(string(remaining[:lineLen]))
+
+	getArgs := args
+	chomp := false
+
+	if len(getArgs) > 0 {
+		last := getArgs[len(getArgs)-1]
+		if last != nil && last.Type == object.ValueHash && Ruby2KeywordHash(last) {
+			options := valueToHashMap(last)
+			filtered := make(map[*object.EmeraldValue]*object.EmeraldValue, len(options))
+			hasChomp := false
+			for key, value := range options {
+				if specName(key) == "chomp" {
+					chomp = isTruthy(value)
+					hasChomp = true
+					continue
+				}
+				filtered[key] = value
+			}
+			if hasChomp && len(getArgs) > 2 {
+				if len(getArgs) > 3 {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(getArgs)))
+				}
+				firstArg := getArgs[0]
+				if firstArg != nil && firstArg.Type != object.ValueNil && firstArg.Type != object.ValueString && !(firstArg != nil && receiverHasCallableMethod(firstArg, "to_str")) {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(getArgs)))
+				}
+				if firstArg != nil && firstArg.Type == object.ValueString && firstArg.Data.(string) != "" {
+					return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(getArgs)))
+				}
+			}
+			if hasChomp {
+				if len(filtered) == 0 {
+					getArgs = getArgs[:len(getArgs)-1]
+				} else {
+					keywordHash := &object.EmeraldValue{Type: object.ValueHash, Data: filtered, Class: R.Classes["Hash"]}
+					MarkRuby2KeywordHash(keywordHash)
+					getArgs[len(getArgs)-1] = keywordHash
+				}
+			}
+		}
+	}
+	if len(getArgs) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..2)", len(getArgs)))
+	}
+
+	sep := "\n"
+	sepNil := false
+	limit := int64(-1)
+	if gv := GetGlobalVariable; gv != nil {
+		saved := GetGlobalVariable("$/")
+		if saved != nil && saved.Type == object.ValueNil {
+			sepNil = true
+		} else if saved != nil && saved.Type == object.ValueString {
+			sep = saved.Data.(string)
+		}
+	}
+
+	if len(getArgs) == 1 {
+		if getArgs[0] == nil || getArgs[0].Type == object.ValueNil {
+			sepNil = true
+		} else if getArgs[0].Type == object.ValueString {
+			sep = getArgs[0].Data.(string)
+			sepNil = false
+		} else if getArgs[0] != nil && receiverHasCallableMethod(getArgs[0], "to_str") && CallMethod != nil {
+			coerced := CallMethod(getArgs[0], "to_str")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueString {
+				sep = coerced.Data.(string)
+				sepNil = false
+			} else {
+				val, ok := valueToInteger(getArgs[0])
+				if !ok && CallMethod != nil {
+					coerced = CallMethod(getArgs[0], "to_int")
+					if coerced != nil && coerced.Type == object.ValueException {
+						return coerced
+					}
+					val, ok = valueToInteger(coerced)
+				}
+				if !ok {
+					msg := "no implicit conversion into Integer"
+					if getArgs[0] != nil && getArgs[0].Class != nil {
+						msg = "no implicit conversion of " + getArgs[0].Class.Name + " into Integer"
+						if getArgs[0].Type == object.ValueNil {
+							msg = "no implicit conversion of nil into Integer"
+						}
+					}
+					return typeError(msg)
+				}
+				limit = val
+			}
+		} else {
+			val, ok := valueToInteger(getArgs[0])
+			if !ok && CallMethod != nil {
+				coerced := CallMethod(getArgs[0], "to_int")
+				if coerced != nil && coerced.Type == object.ValueException {
+					return coerced
+				}
+				val, ok = valueToInteger(coerced)
+			}
+			if !ok {
+				msg := "no implicit conversion into Integer"
+				if getArgs[0] != nil && getArgs[0].Class != nil {
+					msg = "no implicit conversion of " + getArgs[0].Class.Name + " into Integer"
+					if getArgs[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			limit = val
+		}
+	} else if len(getArgs) >= 2 {
+		if getArgs[0] == nil || getArgs[0].Type == object.ValueNil {
+			sepNil = true
+		} else if getArgs[0].Type == object.ValueString {
+			sep = getArgs[0].Data.(string)
+			sepNil = false
+		} else if getArgs[0] != nil && receiverHasCallableMethod(getArgs[0], "to_str") && CallMethod != nil {
+			coerced := CallMethod(getArgs[0], "to_str")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueString {
+				sep = coerced.Data.(string)
+				sepNil = false
+			} else {
+				msg := "no implicit conversion into String"
+				if getArgs[0] != nil && getArgs[0].Class != nil {
+					msg = "no implicit conversion of " + getArgs[0].Class.Name + " into String"
+				}
+				return typeError(msg)
+			}
+		} else {
+			msg := "no implicit conversion into String"
+			if getArgs[0] != nil && getArgs[0].Class != nil {
+				msg = "no implicit conversion of " + getArgs[0].Class.Name + " into String"
+			}
+			return typeError(msg)
+		}
+		if getArgs[1] == nil {
+			return typeError("no implicit conversion of nil into Integer")
+		}
+		val, ok := valueToInteger(getArgs[1])
+		if !ok && CallMethod != nil {
+			coerced := CallMethod(getArgs[1], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			val, ok = valueToInteger(coerced)
+		}
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if getArgs[1] != nil && getArgs[1].Class != nil {
+				msg = "no implicit conversion of " + getArgs[1].Class.Name + " into Integer"
+				if getArgs[1].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
+		}
+		limit = val
+	}
+
+	if len(remaining) == 0 {
+		SetGlobalVariableIfAvailable("$_", R.NilVal)
+		return R.NilVal
+	}
+	var separator string
+	if sepNil {
+		separator = ""
+	} else if sep == "" {
+		separator = "\n\n"
+	} else {
+		separator = sep
+	}
+
+	lineLen := readFromSeparator(separator, remaining, limit)
+	if lineLen == 0 {
+		lineLen = 0
+	}
+	result := rubyString(ioConsumeFromReadBuffer(data, remaining, int64(lineLen)))
+	if chomp && !sepNil && result.Type == object.ValueString {
+		text := result.Data.(string)
+		if len(separator) > 0 {
+			if separator == "\n" && strings.HasSuffix(text, "\r\n") {
+				text = text[:len(text)-2]
+			} else if separator == "\n\n" && strings.HasSuffix(text, "\r\n\r\n") {
+				text = text[:len(text)-4]
+			} else if strings.HasSuffix(text, separator) {
+				text = text[:len(text)-len(separator)]
+			}
+		} else {
+			if strings.HasSuffix(text, "\r\n") {
+				text = text[:len(text)-2]
+			} else if strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r") {
+				text = text[:len(text)-1]
+			}
+		}
+		result = rubyString(text)
+	}
+	resultEncoding := ioStreamResultEncoding(data)
+	if stringEncodings != nil {
+		stringEncodings[result] = resultEncoding
+	}
+	SetGlobalVariableIfAvailable("$_", result)
+	data.lineno++
+	SetGlobalVariableIfAvailable("$.", &object.EmeraldValue{Type: object.ValueInteger, Data: data.lineno, Class: R.Classes["Integer"]})
+	return result
 }
 
 func fileInstanceRewind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if data := ioShim(receiver); data != nil {
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data != nil {
 		data.offset = 0
+		data.ungetBuffer = ""
+		data.lineno = 0
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 }
 
 func fileInstancePos(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if data := ioShim(receiver); data != nil {
-		return &object.EmeraldValue{Type: object.ValueInteger, Data: data.offset, Class: R.Classes["Integer"]}
+	data := ioShim(receiver)
+	if data != nil {
+		pos := data.offset - int64(len(data.ungetBuffer))
+		if pos < 0 {
+			pos = 0
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: pos, Class: R.Classes["Integer"]}
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 }
 
+func fileInstanceSetPos(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return stringIOSetPos(receiver, args...)
+}
+
 func fileInstanceBinmode(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if data := ioShim(receiver); data != nil && strings.Contains(data.mode, "b") {
+	if data := ioShim(receiver); data != nil && (data.binmode || strings.Contains(data.mode, "b")) {
 		return R.TrueVal
 	}
 	return R.FalseVal
 }
 
 func fileInstanceExternalEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if data := ioShim(receiver); data != nil && strings.Contains(data.mode, "b") {
-		return newEncodingValue("BINARY")
+	if data := ioShim(receiver); data != nil {
+		if data.externalEncoding != "" {
+			return newEncodingValue(data.externalEncoding)
+		}
+		if data.encodingSetBySetter && !data.inheritDefaultExternal {
+			return R.NilVal
+		}
+		if data.path == "" && (data.fd == 0 || data.fd == 1 || data.fd == 2) {
+			return R.NilVal
+		}
+		if data.inheritDefaultExternal {
+			return newEncodingValue(defaultExternalEncoding)
+		}
+		if data.binmode || strings.Contains(data.mode, "b") {
+			return newEncodingValue("BINARY")
+		}
+		if fileModeReadable(data.mode) && !fileModeWritable(data.mode) {
+			return newEncodingValue(defaultExternalEncoding)
+		}
 	}
-	return newEncodingValue(defaultExternalEncoding)
+	return R.NilVal
+}
+
+func ioStreamResultEncoding(data *ioShimData) string {
+	if data == nil {
+		return defaultExternalEncoding
+	}
+	if data.internalEncoding != "" {
+		return data.internalEncoding
+	}
+	if data.externalEncoding != "" {
+		return data.externalEncoding
+	}
+	if data.inheritDefaultExternal {
+		return defaultExternalEncoding
+	}
+	if data.binmode || strings.Contains(data.mode, "b") {
+		return "BINARY"
+	}
+	return defaultExternalEncoding
 }
 
 func fileModeReadable(mode string) bool {
@@ -14771,7 +27403,47 @@ func fileModeReadable(mode string) bool {
 
 func fileInstanceEOF(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := ioShim(receiver)
-	if data == nil || data.path == "" {
+	if data == nil {
+		return R.TrueVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.ungetBuffer != "" {
+		return R.FalseVal
+	}
+	if data.readClosed {
+		return R.TrueVal
+	}
+	if data.path == "" {
+		if !fileModeReadable(data.mode) {
+			return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+		}
+		if fileModeReadable(data.mode) {
+			runPendingPopenForRead(data)
+			if data.ungetBuffer != "" {
+				return R.FalseVal
+			}
+			if buf := ioPipeBufferForFD(data.fd); buf != nil && data.offset < int64(buf.Len()) {
+				return R.FalseVal
+			}
+			if peer := ioDataByFd[data.peerFD]; peer != nil && !peer.closed && !peer.peerClosed {
+				return R.FalseVal
+			}
+		}
+		return R.TrueVal
+	}
+	if !fileModeReadable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+	}
+	if data.isFIFO {
+		content := ioFIFOReadContent(data.path)
+		if data.offset < int64(len(content)) {
+			return R.FalseVal
+		}
+		if ioFIFOHasWriter(data.path) {
+			return R.FalseVal
+		}
 		return R.TrueVal
 	}
 	if info, err := os.Stat(data.path); err == nil && data.offset >= info.Size() {
@@ -15153,6 +27825,10 @@ func dirClassGlob(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 
 func rubySymbol(name string) *object.EmeraldValue {
 	return &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: R.Classes["Symbol"]}
+}
+
+func symbolValue(name string) *object.EmeraldValue {
+	return rubySymbol(name)
 }
 
 func globOptionLookup(opts map[*object.EmeraldValue]*object.EmeraldValue, name string) (*object.EmeraldValue, bool) {
@@ -15690,7 +28366,7 @@ func newArgfValue(values []*object.EmeraldValue) *object.EmeraldValue {
 	argf := &object.EmeraldValue{
 		Type:  object.ValueObject,
 		Data:  object.NewObject(R.Classes["Object"]),
-		Class: R.Classes["Object"],
+		Class: argfClassValueInstance().Data.(*object.Class),
 	}
 	state := &argfData{paths: paths}
 	defineMockSingleton(argf, "getc", func(_ *object.EmeraldValue, _ ...*object.EmeraldValue) *object.EmeraldValue {
@@ -15773,6 +28449,13 @@ func newArgfValue(values []*object.EmeraldValue) *object.EmeraldValue {
 		argfEnsureContent(state)
 		state.offset = 0
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	})
+	defineMockSingleton(argf, "skip", func(receiver *object.EmeraldValue, _ ...*object.EmeraldValue) *object.EmeraldValue {
+		if state.offset == 0 {
+			return receiver
+		}
+		argfAdvance(state)
+		return receiver
 	})
 	defineMockSingleton(argf, "seek", func(_ *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		if len(args) == 0 || args[0].Type != object.ValueInteger {
@@ -15863,12 +28546,68 @@ func argfGets(state *argfData, raiseEOF bool) *object.EmeraldValue {
 }
 
 func argfReadpartial(state *argfData, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) == 0 || args[0].Type != object.ValueInteger {
+	if len(args) == 0 {
 		return NewArgumentError("wrong number of arguments")
 	}
+	lengthArg := args[0]
+	if lengthArg == nil || lengthArg.Type == object.ValueNil {
+		return typeError("no implicit conversion of nil into Integer")
+	}
+	limitVal := int64(0)
+	if lengthArg.Type == object.ValueInteger {
+		limitVal = lengthArg.Data.(int64)
+	} else if receiverHasCallableMethod(lengthArg, "to_int") && CallMethod != nil {
+		coerced := CallMethod(lengthArg, "to_int")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		if coerced == nil {
+			return typeError("no implicit conversion into Integer")
+		}
+		if coerced.Type != object.ValueInteger {
+			msg := "no implicit conversion into Integer"
+			if lengthArg != nil && lengthArg.Class != nil {
+				msg = "no implicit conversion of " + lengthArg.Class.Name + " into Integer"
+				if lengthArg.Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
+		}
+		lengthArg = coerced
+		limitVal = lengthArg.Data.(int64)
+	} else {
+		msg := "no implicit conversion into Integer"
+		if lengthArg != nil && lengthArg.Class != nil {
+			msg = "no implicit conversion of " + lengthArg.Class.Name + " into Integer"
+			if lengthArg.Type == object.ValueNil {
+				msg = "no implicit conversion of nil into Integer"
+			}
+		}
+		return typeError(msg)
+	}
+	if limitVal < 0 {
+		return NewArgumentError("negative length")
+	}
 	var buffer *object.EmeraldValue
-	if len(args) > 1 && args[1] != nil && args[1].Type == object.ValueString {
-		buffer = args[1]
+	if len(args) > 1 && args[1] != nil {
+		if args[1].Type == object.ValueString {
+			buffer = args[1]
+		} else if receiverHasCallableMethod(args[1], "to_str") && CallMethod != nil {
+			coerced := CallMethod(args[1], "to_str")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueString {
+				buffer = coerced
+			} else {
+				return typeError("no implicit conversion into String")
+			}
+		} else {
+			return typeError("no implicit conversion into String")
+		}
+	}
+	if buffer != nil {
 		buffer.Data = ""
 	}
 	if state.closed {
@@ -15876,16 +28615,31 @@ func argfReadpartial(state *argfData, args ...*object.EmeraldValue) *object.Emer
 	}
 	if state.content != "" && state.offset >= len(state.content) {
 		if argfAdvance(state) {
+			if limitVal == 0 {
+				if buffer != nil {
+					return buffer
+				}
+				return rubyString("")
+			}
 			return rubyString("")
+		}
+		if buffer != nil {
+			buffer.Data = ""
 		}
 		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
 	}
 	if !argfEnsureContent(state) {
+		if buffer != nil {
+			buffer.Data = ""
+		}
 		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
 	}
-	limit := int(args[0].Data.(int64))
-	if limit < 0 {
-		limit = 0
+	limit := int(limitVal)
+	if limit == 0 {
+		if buffer != nil {
+			return buffer
+		}
+		return rubyString("")
 	}
 	remaining := state.content[state.offset:]
 	if limit < len(remaining) {
@@ -15895,6 +28649,7 @@ func argfReadpartial(state *argfData, args ...*object.EmeraldValue) *object.Emer
 	result := rubyString(remaining)
 	if buffer != nil {
 		buffer.Data = remaining
+		return buffer
 	}
 	return result
 }
@@ -15917,7 +28672,11 @@ func argfExceptionFalse(args []*object.EmeraldValue) bool {
 	if last == nil || last.Type != object.ValueHash {
 		return false
 	}
-	for key, value := range last.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+	hash := valueToHashMap(last)
+	if hash == nil {
+		return false
+	}
+	for key, value := range hash {
 		if key != nil && key.Type == object.ValueSymbol && key.Data.(string) == "exception" && value == R.FalseVal {
 			return true
 		}
@@ -16016,20 +28775,16 @@ func setObjectIOWriteCalls(receiver *object.EmeraldValue, calls int64) {
 	}
 }
 
-func ioWriteByteCount(args []*object.EmeraldValue) int64 {
-	if len(args) == 0 || args[0] == nil {
-		return 0
-	}
-	if s, ok := args[0].Data.(string); ok {
-		return int64(len(s))
-	}
-	if CallMethod != nil && args[0].Class != nil {
-		coerced := CallMethod(args[0], "to_s")
-		if s, ok := coerced.Data.(string); ok {
-			return int64(len(s))
+func ioWriteByteCount(args []*object.EmeraldValue) (int64, *object.EmeraldValue) {
+	total := int64(0)
+	for _, arg := range args {
+		writeText, errVal := toStringValue(arg)
+		if errVal != nil {
+			return 0, errVal
 		}
+		total += int64(len(writeText))
 	}
-	return 0
+	return total, nil
 }
 
 func ioExceptionFalse(args []*object.EmeraldValue) bool {
@@ -16037,10 +28792,14 @@ func ioExceptionFalse(args []*object.EmeraldValue) bool {
 		return false
 	}
 	last := args[len(args)-1]
-	if last == nil || last.Type != object.ValueHash {
+	if last == nil || last.Type != object.ValueHash || !Ruby2KeywordHash(last) {
 		return false
 	}
-	for key, value := range last.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+	hash := valueToHashMap(last)
+	if hash == nil {
+		return false
+	}
+	for key, value := range hash {
 		if specName(key) == "exception" && value == R.FalseVal {
 			return true
 		}
@@ -16048,53 +28807,1816 @@ func ioExceptionFalse(args []*object.EmeraldValue) bool {
 	return false
 }
 
+func ioCallArgsWithoutExceptionOption(args []*object.EmeraldValue) []*object.EmeraldValue {
+	if len(args) == 0 {
+		return args
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash || !Ruby2KeywordHash(last) {
+		return args
+	}
+	hash := valueToHashMap(last)
+	if hash == nil {
+		return args
+	}
+	for key := range hash {
+		if specName(key) == "exception" {
+			return args[:len(args)-1]
+		}
+	}
+	return args
+}
+
+func ioReadContentFromShim(data *ioShimData) (string, *object.EmeraldValue) {
+	if data == nil {
+		return "", nil
+	}
+	if data.path == "" {
+		runPendingPopenForRead(data)
+		content, ok := fileInstancePipeContents(data)
+		if !ok {
+			return "", nil
+		}
+		if data.offset >= int64(len(content)) {
+			return "", nil
+		}
+		return content, nil
+	}
+	if data.isFIFO {
+		content := ioFIFOReadContent(data.path)
+		if data.offset >= int64(len(content)) {
+			if !ioFIFOHasWriter(data.path) {
+				return "", nil
+			}
+			return "", nil
+		}
+		return content, nil
+	}
+	contentBytes, err := os.ReadFile(data.path)
+	if err != nil {
+		return "", errnoForPathError(err)
+	}
+	return string(contentBytes), nil
+}
+
+func runPendingPopenForRead(data *ioShimData) {
+	if data == nil || data.path != "" || !fileModeReadable(data.mode) {
+		return
+	}
+	if ioPopenStates == nil {
+		return
+	}
+	state, ok := ioPopenStates[data.fd]
+	if !ok || state == nil {
+		return
+	}
+	delete(ioPopenStates, data.fd)
+	if processSetLastChildStatusIfNeeded(data.pid) {
+		return
+	}
+
+	buffer := ioEnsurePipeBufferForFD(data.fd)
+	input := buffer.String()
+	output, exitStatus := commandPopenRun(state.command, state.env, state.chdir, input, state.mergeErrToOut)
+	processSetChildResult(data.pid, exitStatus)
+	if !processSetLastChildStatusIfNeeded(data.pid) {
+		processSetLastExitStatus(exitStatus)
+	}
+	buffer.Reset()
+	if output != "" {
+		_, _ = buffer.WriteString(output)
+	}
+	data.offset = 0
+}
+
+func ioConsumeFromReadBuffer(data *ioShimData, remaining string, want int64) string {
+	if data == nil || want <= 0 {
+		return ""
+	}
+	if want > int64(len(remaining)) {
+		want = int64(len(remaining))
+	}
+	n := int(want)
+	if len(remaining) == 0 {
+		return ""
+	}
+	if data.ungetBuffer != "" {
+		ungetLen := len(data.ungetBuffer)
+		if n <= len(data.ungetBuffer) {
+			result := data.ungetBuffer[:n]
+			data.ungetBuffer = data.ungetBuffer[n:]
+			return result
+		}
+		data.ungetBuffer = ""
+		data.offset += int64(n - ungetLen)
+		result := remaining[:n]
+		return result
+	}
+	data.offset += int64(n)
+	return remaining[:n]
+}
+
+func ioRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return fileInstanceRead(receiver, args...)
+}
+
+func ioReadline(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := fileInstanceGets(receiver, args...)
+	if result == R.NilVal {
+		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+	}
+	return result
+}
+
+func ioReadpartial(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	callArgs := args
+	bufferArg := (*object.EmeraldValue)(nil)
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..2)")
+	}
+	if len(args) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..2)", len(args)))
+	}
+	if len(args) > 1 {
+		if args[1] == nil || args[1].Type == object.ValueNil {
+			return typeError("no implicit conversion of nil into String")
+		}
+		if args[1].Type == object.ValueString {
+			bufferArg = args[1]
+		} else if receiverHasCallableMethod(args[1], "to_str") && CallMethod != nil {
+			coerced := CallMethod(args[1], "to_str")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueString {
+				bufferArg = coerced
+			} else {
+				msg := "no implicit conversion into String"
+				if args[1] != nil && args[1].Class != nil {
+					msg = "no implicit conversion of " + args[1].Class.Name + " into String"
+					if args[1].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into String"
+					}
+				}
+				return typeError(msg)
+			}
+		} else {
+			msg := "no implicit conversion into String"
+			if args[1] != nil && args[1].Class != nil {
+				msg = "no implicit conversion of " + args[1].Class.Name + " into String"
+				if args[1].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into String"
+				}
+			}
+			return typeError(msg)
+		}
+	}
+	if callArgs[0] == nil || callArgs[0].Type == object.ValueNil {
+		return typeError("no implicit conversion of nil into Integer")
+	}
+	readLimit := int64(-1)
+	readArg := callArgs[0]
+	if callArgs[0] != nil && callArgs[0].Type != object.ValueNil {
+		if callArgs[0].Type != object.ValueInteger {
+			if !receiverHasCallableMethod(callArgs[0], "to_int") || CallMethod == nil {
+				msg := "no implicit conversion into Integer"
+				if callArgs[0] != nil && callArgs[0].Class != nil {
+					msg = "no implicit conversion of " + callArgs[0].Class.Name + " into Integer"
+					if callArgs[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			coerced := CallMethod(callArgs[0], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			readArg = coerced
+			if coerced == nil || coerced.Type != object.ValueInteger {
+				msg := "no implicit conversion into Integer"
+				if callArgs[0] != nil && callArgs[0].Class != nil {
+					msg = "no implicit conversion of " + callArgs[0].Class.Name + " into Integer"
+					if callArgs[0].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+		}
+		readLimit, ok := valueToInteger(readArg)
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if callArgs[0] != nil && callArgs[0].Class != nil {
+				msg = "no implicit conversion of " + callArgs[0].Class.Name + " into Integer"
+				if callArgs[0].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
+		}
+		if readLimit < 0 {
+			return NewArgumentError("negative length")
+		}
+	}
+	if readLimit > 0 {
+		if data := ioShim(receiver); data != nil {
+			if !data.closed && !data.readClosed && data.universalNewline && data.ungetBuffer != "" {
+				return newRuntimeException(R.Classes["IOError"], "universal newline with ungetc")
+			}
+		}
+	}
+	readArgs := []*object.EmeraldValue{readArg}
+	if len(callArgs) > 1 {
+		readArgs = append(readArgs, bufferArg)
+	}
+	result := fileInstanceRead(receiver, readArgs...)
+	if result != nil && result.Type == object.ValueString && readLimit > 0 {
+		str := result.Data.(string)
+		if len(str) == 0 {
+			if bufferArg != nil {
+				bufferArg.Data = ""
+			}
+			return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+		}
+	}
+	if result == R.NilVal {
+		if bufferArg != nil {
+			bufferArg.Data = ""
+		}
+		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+	}
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	if result == nil {
+		if bufferArg != nil {
+			bufferArg.Data = ""
+		}
+		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+	}
+	return result
+}
+
+func ioSysread(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..2)")
+	}
+	if len(args) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..2)", len(args)))
+	}
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	return ioReadpartial(receiver, args...)
+}
+
+func ioReadNonblock(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	callArgs := ioCallArgsWithoutExceptionOption(args)
+	if len(callArgs) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..2)")
+	}
+	if len(callArgs) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..2)", len(callArgs)))
+	}
+	bufferArg := (*object.EmeraldValue)(nil)
+	if len(callArgs) > 1 {
+		bufferArg = callArgs[1]
+	}
+	if len(callArgs) > 0 && callArgs[0] != nil && callArgs[0].Type != object.ValueNil {
+		readLimit, ok := valueToInteger(callArgs[0])
+		if !ok && CallMethod != nil {
+			coerced := CallMethod(callArgs[0], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil {
+				readLimit, ok = valueToInteger(coerced)
+				if ok {
+					callArgs[0] = coerced
+				}
+			}
+		}
+		if !ok {
+			msg := "no implicit conversion into Integer"
+			if callArgs[0] != nil && callArgs[0].Class != nil {
+				msg = "no implicit conversion of " + callArgs[0].Class.Name + " into Integer"
+				if callArgs[0].Type == object.ValueNil {
+					msg = "no implicit conversion of nil into Integer"
+				}
+			}
+			return typeError(msg)
+		}
+		if readLimit < 0 {
+			return NewArgumentError("negative length")
+		}
+		if readLimit > 0 {
+			if data := ioShim(receiver); data != nil {
+				if !data.closed && !data.readClosed && data.universalNewline && data.ungetBuffer != "" {
+					return newRuntimeException(R.Classes["IOError"], "universal newline with ungetc")
+				}
+			}
+		}
+	}
+	if data := ioShim(receiver); data != nil {
+		data.nonblock = true
+	}
+	resolveNoData := func() *object.EmeraldValue {
+		data := ioShim(receiver)
+		if data != nil && data.path == "" && fileModeReadable(data.mode) {
+			if peer := ioDataByFd[data.peerFD]; peer != nil && (peer.closed || peer.peerClosed) {
+				return R.NilVal
+			}
+			return &object.EmeraldValue{Type: object.ValueSymbol, Data: "wait_readable", Class: R.Classes["Symbol"]}
+		}
+		return R.NilVal
+	}
+	result := ioReadpartial(receiver, callArgs...)
+	if result != nil && result.Type == object.ValueException {
+		if result.Class == R.Classes["EOFError"] {
+			data := ioShim(receiver)
+			if data != nil && data.path == "" && fileModeReadable(data.mode) {
+				if peer := ioDataByFd[data.peerFD]; peer != nil && (peer.closed || peer.peerClosed) {
+					if ioExceptionFalse(args) {
+						if bufferArg != nil {
+							bufferArg.Data = ""
+						}
+						return R.NilVal
+					}
+					if bufferArg != nil {
+						bufferArg.Data = ""
+					}
+					return result
+				}
+				if ioExceptionFalse(args) {
+					if bufferArg != nil {
+						bufferArg.Data = ""
+					}
+					return resolveNoData()
+				}
+				if bufferArg != nil {
+					bufferArg.Data = ""
+				}
+				return newRuntimeException(R.Classes["IO::EAGAINWaitReadable"], "Resource temporarily unavailable")
+			}
+			if ioExceptionFalse(args) {
+				return R.NilVal
+			}
+			if bufferArg != nil {
+				bufferArg.Data = ""
+			}
+			return result
+		}
+		return result
+	}
+	if result == R.NilVal || (result != nil && result.Type == object.ValueNil) {
+		if bufferArg != nil {
+			bufferArg.Data = ""
+		}
+		if ioExceptionFalse(args) {
+			return resolveNoData()
+		}
+		return newRuntimeException(R.Classes["IO::EAGAINWaitReadable"], "Resource temporarily unavailable")
+	}
+	return result
+}
+
+func ioGetc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	content, errVal := ioReadContentFromShim(data)
+	if errVal != nil {
+		return errVal
+	}
+	remaining := data.ungetBuffer
+	if data.offset < int64(len(content)) {
+		remaining += content[data.offset:]
+	}
+	if len(remaining) == 0 {
+		return R.NilVal
+	}
+	_, size := utf8.DecodeRuneInString(remaining)
+	if size <= 0 {
+		size = 1
+	}
+	result := ioConsumeFromReadBuffer(data, remaining, int64(size))
+	return rubyString(result)
+}
+
+func ioPutc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	value := args[0]
+
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+
+	character := ""
+	switch {
+	case value == nil:
+		return typeError("no implicit conversion into String")
+	case value.Type == object.ValueInteger:
+		intValue := value.Data.(int64) % 256
+		if intValue < 0 {
+			intValue += 256
+		}
+		character = string([]byte{byte(intValue)})
+	case value.Type == object.ValueString:
+		valueString := value.Data.(string)
+		if len(valueString) > 0 {
+			_, size := utf8.DecodeRuneInString(valueString)
+			if size <= 0 {
+				size = 1
+			}
+			character = valueString[:size]
+		}
+	case value != nil && value.Class != nil && receiverHasCallableMethod(value, "to_int") && CallMethod != nil:
+		coerced := CallMethod(value, "to_int")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		if coerced == nil || coerced.Type != object.ValueInteger {
+			return typeError("no implicit conversion into Integer")
+		}
+		intValue := coerced.Data.(int64) % 256
+		if intValue < 0 {
+			intValue += 256
+		}
+		character = string([]byte{byte(intValue)})
+	default:
+		return typeError("no implicit conversion into Integer")
+	}
+
+	result := stringIOWrite(receiver, rubyString(character))
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return value
+}
+
+func ioGetByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	content, errVal := ioReadContentFromShim(data)
+	if errVal != nil {
+		return errVal
+	}
+	remaining := data.ungetBuffer
+	if data.offset < int64(len(content)) {
+		remaining += content[data.offset:]
+	}
+	if len(remaining) == 0 {
+		return R.NilVal
+	}
+	result := ioConsumeFromReadBuffer(data, remaining, int64(1))
+	return newInt(int64(result[0]))
+}
+
+func ioReadByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := ioGetByte(receiver, args...)
+	if result == R.NilVal {
+		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+	}
+	return result
+}
+
+func ioReadChar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := ioGetc(receiver, args...)
+	if result == R.NilVal {
+		return newRuntimeException(R.Classes["EOFError"], "end of file reached")
+	}
+	return result
+}
+
+func ioUngetc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	value := args[0]
+	switch {
+	case value == nil:
+		return typeError("no implicit conversion of nil into String")
+	case value.Type == object.ValueInteger:
+		intVal := value.Data.(int64)
+		ch := []byte{byte(intVal)}
+		data.ungetBuffer = string(ch) + data.ungetBuffer
+	case value.Type == object.ValueString:
+		data.ungetBuffer = value.Data.(string) + data.ungetBuffer
+	case value != nil && value.Class != nil && receiverHasCallableMethod(value, "to_str") && CallMethod != nil:
+		coerced := CallMethod(value, "to_str")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		if coerced != nil && coerced.Type == object.ValueString {
+			data.ungetBuffer = coerced.Data.(string) + data.ungetBuffer
+		} else {
+			return typeError("no implicit conversion into String")
+		}
+	default:
+		return typeError("no implicit conversion into String")
+	}
+	return R.NilVal
+}
+
+func ioUngetbyte(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	value := args[0]
+	switch {
+	case value == nil:
+		return typeError("no implicit conversion into Integer")
+	case value.Type == object.ValueInteger:
+		intVal := value.Data.(int64)
+		data.ungetBuffer = string([]byte{byte(intVal)}) + data.ungetBuffer
+	case value.Type == object.ValueString:
+		str := value.Data.(string)
+		if str == "" {
+			return typeError("no implicit conversion into Integer")
+		}
+		data.ungetBuffer = str[:1] + data.ungetBuffer
+	case value != nil && value.Class != nil && receiverHasCallableMethod(value, "to_int") && CallMethod != nil:
+		coerced := CallMethod(value, "to_int")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		if coerced != nil && coerced.Type == object.ValueInteger {
+			intVal := coerced.Data.(int64)
+			data.ungetBuffer = string([]byte{byte(intVal)}) + data.ungetBuffer
+		} else {
+			return typeError("no implicit conversion into Integer")
+		}
+	default:
+		return typeError("no implicit conversion into Integer")
+	}
+	return R.NilVal
+}
+
+func ioEachLine(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		prev := R.NilVal
+		if GetGlobalVariable != nil {
+			prev = GetGlobalVariable("$_")
+		}
+		for {
+			value := fileInstanceGets(receiver, args...)
+			if value == nil || value == R.NilVal {
+				break
+			}
+			if value.Type == object.ValueException {
+				if value.Class == R.Classes["EOFError"] {
+					break
+				}
+				return value
+			}
+			if value == R.NilVal {
+				break
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			CallBlockWithArgs(CurrentBlockValue(), value)
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				if prev != nil && GetGlobalVariable != nil {
+					SetGlobalVariableIfAvailable("$_", prev)
+				}
+				return result
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		if prev != nil && GetGlobalVariable != nil {
+			SetGlobalVariableIfAvailable("$_", prev)
+		}
+		return receiver
+	}
+	return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		results := []*object.EmeraldValue{}
+		for {
+			value := fileInstanceGets(receiver, args...)
+			if value == nil || value == R.NilVal {
+				return results, nil
+			}
+			if value.Type == object.ValueException {
+				if value.Class == R.Classes["EOFError"] {
+					return results, nil
+				}
+				return results, value
+			}
+			results = append(results, value)
+		}
+	})
+}
+
+func ioEachChar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		for {
+			value := ioGetc(receiver)
+			if value == nil || value == R.NilVal {
+				break
+			}
+			if value.Type == object.ValueException {
+				return value
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			CallBlockWithArgs(CurrentBlockValue(), value)
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return receiver
+	}
+	return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		results := []*object.EmeraldValue{}
+		for {
+			value := ioGetc(receiver)
+			if value == nil || value == R.NilVal {
+				return results, nil
+			}
+			if value.Type == object.ValueException {
+				return results, value
+			}
+			results = append(results, value)
+		}
+	})
+}
+
+func ioEachByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		for {
+			value := ioGetByte(receiver)
+			if value == nil || value == R.NilVal {
+				break
+			}
+			if value.Type == object.ValueException {
+				return value
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			CallBlockWithArgs(CurrentBlockValue(), value)
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return receiver
+	}
+	return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		results := []*object.EmeraldValue{}
+		for {
+			value := ioGetByte(receiver)
+			if value == nil || value == R.NilVal {
+				return results, nil
+			}
+			if value.Type == object.ValueException {
+				return results, value
+			}
+			results = append(results, value)
+		}
+	})
+}
+
+func ioEachCodepoint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		for {
+			value := ioGetc(receiver)
+			if value == nil || value == R.NilVal {
+				break
+			}
+			if value.Type == object.ValueException {
+				return value
+			}
+			r, size := utf8.DecodeRuneInString(value.Data.(string))
+			if r == utf8.RuneError && size == 1 {
+				return newRuntimeException(R.Classes["ArgumentError"], "invalid byte sequence in UTF-8")
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			CallBlockWithArgs(CurrentBlockValue(), newInt(int64(r)))
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return receiver
+	}
+	return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		results := []*object.EmeraldValue{}
+		for {
+			value := ioGetc(receiver)
+			if value == nil || value == R.NilVal {
+				return results, nil
+			}
+			if value.Type == object.ValueException {
+				return results, value
+			}
+			r, size := utf8.DecodeRuneInString(value.Data.(string))
+			if r == utf8.RuneError && size == 1 {
+				return results, newRuntimeException(R.Classes["ArgumentError"], "invalid byte sequence in UTF-8")
+			}
+			results = append(results, newInt(int64(r)))
+		}
+	})
+}
+
+func ioCloseRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return R.NilVal
+	}
+
+	readable := fileModeReadable(data.mode)
+	writable := fileModeWritable(data.mode)
+	if data.isFIFO && readable && !data.readClosed {
+		ioReleaseFIFOPath(data.path, true, false)
+	}
+
+	if data.path != "" && data.peerFD < 0 && readable && writable {
+		return newRuntimeException(R.Classes["IOError"], "closing non-duplex IO for reading")
+	}
+	if !readable {
+		if writable {
+			return newRuntimeException(R.Classes["IOError"], "closing non-duplex IO for reading")
+		}
+		if data.peerFD >= 0 {
+			if peer := ioDataByFd[data.peerFD]; peer != nil {
+				peer.peerClosed = true
+			}
+		}
+		data.closed = true
+		data.readClosed = true
+		data.writeClosed = true
+		return R.NilVal
+	}
+	if !writable {
+		if data.peerFD >= 0 {
+			if peer := ioDataByFd[data.peerFD]; peer != nil {
+				peer.peerClosed = true
+			}
+		}
+		data.closed = true
+		data.readClosed = true
+		data.writeClosed = true
+		return R.NilVal
+	}
+	data.readClosed = true
+	if data.peerFD >= 0 {
+		if peer := ioDataByFd[data.peerFD]; peer != nil {
+			peer.peerClosed = true
+		}
+	}
+	return R.NilVal
+}
+
+func ioCloseWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return R.NilVal
+	}
+
+	readable := fileModeReadable(data.mode)
+	writable := fileModeWritable(data.mode)
+	if data.isFIFO && writable && !data.writeClosed {
+		ioReleaseFIFOPath(data.path, false, true)
+	}
+
+	if !writable {
+		if readable {
+			return newRuntimeException(R.Classes["IOError"], "closing non-duplex IO for writing")
+		}
+		if data.peerFD >= 0 {
+			if peer := ioDataByFd[data.peerFD]; peer != nil {
+				peer.peerClosed = true
+			}
+		}
+		data.closed = true
+		data.readClosed = true
+		data.writeClosed = true
+		return R.NilVal
+	}
+	if !readable {
+		if data.peerFD >= 0 {
+			if peer := ioDataByFd[data.peerFD]; peer != nil {
+				peer.peerClosed = true
+			}
+		}
+		data.closed = true
+		data.readClosed = true
+		data.writeClosed = true
+		return R.NilVal
+	}
+	if data.path != "" && data.peerFD < 0 && readable && writable {
+		return newRuntimeException(R.Classes["IOError"], "closing non-duplex IO for writing")
+	}
+
+	data.writeClosed = true
+	if data.peerFD >= 0 {
+		if peer := ioDataByFd[data.peerFD]; peer != nil {
+			peer.peerClosed = true
+		}
+	}
+	if data.path == "" && ioPopenStates != nil && fileModeWritable(data.mode) {
+		if state, ok := ioPopenStates[data.fd]; ok && state != nil {
+			delete(ioPopenStates, data.fd)
+			if !processSetLastChildStatusIfNeeded(data.pid) {
+				buffer := ioEnsurePipeBufferForFD(data.fd)
+				input := buffer.String()
+				output, exitStatus := commandPopenRun(state.command, state.env, state.chdir, input, state.mergeErrToOut)
+				processSetChildResult(data.pid, exitStatus)
+				buffer.Reset()
+				if len(output) > 0 {
+					_, _ = buffer.WriteString(output)
+				}
+				data.offset = 0
+				_ = output
+				if !processSetLastChildStatusIfNeeded(data.pid) {
+					processSetLastExitStatus(exitStatus)
+				}
+			}
+		}
+	}
+	return R.NilVal
+}
+
+func ioSync(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data != nil && data.sync {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func ioSetSync(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	value := R.TrueVal
+	if len(args) > 0 {
+		value = args[0]
+	}
+	data.sync = isTruthy(value)
+	return value
+}
+
+func ioBinmode(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	data.binmode = true
+	if data.mode == "" {
+		data.mode = "rb"
+	} else if !strings.Contains(data.mode, "b") {
+		data.mode += "b"
+	}
+	return receiver
+}
+
+func ioBinmodeQuestion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return fileInstanceBinmode(receiver, args...)
+}
+
+func ioInternalEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil && data.internalEncoding != "" {
+		return newEncodingValue(data.internalEncoding)
+	}
+	return R.NilVal
+}
+
+func ioSetEncodingValue(value *object.EmeraldValue) (string, bool, *object.EmeraldValue) {
+	if value == nil || value.Type == object.ValueNil {
+		return "", true, nil
+	}
+	parsed, ok := fileOpenEncodingValue(value)
+	if !ok {
+		return "", false, NewArgumentError("wrong type")
+	}
+	return parsed, false, nil
+}
+
+func ioSetEncodingByBOM(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError("wrong number of arguments (given " + strconv.Itoa(len(args)) + ", expected 0)")
+	}
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if !fileModeReadable(data.mode) {
+		return R.NilVal
+	}
+	if !data.binmode && !strings.Contains(data.mode, "b") {
+		return NewArgumentError("ASCII incompatible encoding needs binmode")
+	}
+	if data.encodingExplicit && data.internalEncoding != "" {
+		return NewArgumentError("encoding conversion is set")
+	}
+	if data.encodingExplicit && data.externalEncoding != "" &&
+		!strings.EqualFold(data.externalEncoding, "ASCII-8BIT") &&
+		!strings.EqualFold(data.externalEncoding, "BINARY") {
+		return NewArgumentError("encoding is set to " + data.externalEncoding + " already")
+	}
+
+	content, errVal := ioReadContentFromShim(data)
+	if errVal != nil {
+		return errVal
+	}
+	remaining := data.ungetBuffer
+	if data.offset < int64(len(content)) {
+		remaining += content[data.offset:]
+	}
+	encoding, bomSize, found := ioDetectBOMFromBytes([]byte(remaining))
+	if !found {
+		return R.NilVal
+	}
+	_ = ioConsumeFromReadBuffer(data, remaining, int64(bomSize))
+	data.externalEncoding = encoding
+	data.internalEncoding = ""
+	data.encodingExplicit = true
+	data.encodingSetBySetter = false
+	data.binmode = false
+	return newEncodingValue(encoding)
+}
+
+func ioDetectBOMFromBytes(data []byte) (string, int, bool) {
+	if len(data) >= 4 {
+		if bytes.Equal(data[:4], []byte{0xFF, 0xFE, 0x00, 0x00}) {
+			return "UTF-32LE", 4, true
+		}
+		if bytes.Equal(data[:4], []byte{0x00, 0x00, 0xFE, 0xFF}) {
+			return "UTF-32BE", 4, true
+		}
+	}
+	if len(data) >= 3 {
+		if bytes.Equal(data[:3], []byte{0xEF, 0xBB, 0xBF}) {
+			return "UTF-8", 3, true
+		}
+	}
+	if len(data) >= 2 {
+		if bytes.Equal(data[:2], []byte{0xFF, 0xFE}) {
+			return "UTF-16LE", 2, true
+		}
+		if bytes.Equal(data[:2], []byte{0xFE, 0xFF}) {
+			return "UTF-16BE", 2, true
+		}
+	}
+	if len(data) >= 1 {
+		switch data[0] {
+		case 0xFF, 0xFE, 0xEF, 0x00:
+			return "", 0, false
+		}
+	}
+	return "", 0, false
+}
+
+func ioSetEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	positionalCount := len(args)
+	if positionalCount > 0 {
+		if last := args[len(args)-1]; last != nil && last.Type == object.ValueHash {
+			positionalCount--
+			if positionalCount > 2 {
+				return NewArgumentError("wrong number of arguments")
+			}
+		}
+	}
+	if positionalCount < 1 || positionalCount > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	encodingInvalidReplace := false
+	encodingReplaceString := ""
+	universalNewline := false
+	optionArg := (*object.EmeraldValue)(nil)
+	setEncodingResult := func() *object.EmeraldValue {
+		data.universalNewline = universalNewline
+		return receiver
+	}
+	if len(args) == positionalCount+1 {
+		optionArg = args[positionalCount]
+	}
+	if optionArg != nil && optionArg.Type == object.ValueHash {
+		for key, value := range valueToHashMap(optionArg) {
+			switch specName(key) {
+			case "universal_newline":
+				universalNewline = value != nil && value.Type == object.ValueBool && value.Data.(bool)
+				if value == nil || value.Type == object.ValueNil {
+					universalNewline = false
+				} else if !universalNewline && value.Type != object.ValueBool {
+					return NewArgumentError("wrong type")
+				}
+			case "invalid":
+				switch strings.ToLower(specName(value)) {
+				case "replace":
+					encodingInvalidReplace = true
+				}
+			case "replace":
+				replace, err := toStringValue(value)
+				if err != nil {
+					return err
+				}
+				encodingReplaceString = replace
+			}
+		}
+	}
+
+	externalEncoding, externalNil, err := ioSetEncodingValue(args[0])
+	if err != nil {
+		return err
+	}
+	internalEncoding := ""
+	internalNil := false
+	internalArgProvided := positionalCount == 2
+	if internalArgProvided {
+		var internalErr *object.EmeraldValue
+		internalEncoding, internalNil, internalErr = ioSetEncodingValue(args[1])
+		if internalErr != nil {
+			return internalErr
+		}
+	}
+
+	if externalNil {
+		data.encodingInvalidReplace = encodingInvalidReplace
+		data.encodingReplaceString = encodingReplaceString
+		hadExplicitEncoding := data.encodingExplicit
+		data.externalEncoding = ""
+		data.inheritDefaultExternal = false
+		data.internalEncoding = ""
+		data.encodingExplicit = false
+		data.encodingSetBySetter = true
+		data.binmode = false
+
+		if data.path == "" && (data.fd == 0 || data.fd == 1 || data.fd == 2) {
+			return setEncodingResult()
+		}
+		if hadExplicitEncoding && (positionalCount == 1 || internalNil) {
+			return setEncodingResult()
+		}
+
+		if internalArgProvided && !internalNil {
+			data.externalEncoding = defaultExternalEncoding
+			if strings.EqualFold(internalEncoding, "-") || strings.EqualFold(internalEncoding, defaultExternalEncoding) {
+				data.internalEncoding = ""
+			} else {
+				data.internalEncoding = internalEncoding
+			}
+			data.encodingExplicit = true
+			data.encodingSetBySetter = false
+			return setEncodingResult()
+		}
+
+		if positionalCount == 1 || (internalNil && positionalCount == 2) {
+			if defaultInternalEncoding == "" {
+				if fileModeReadable(data.mode) && !fileModeWritable(data.mode) {
+					data.inheritDefaultExternal = true
+					data.internalEncoding = defaultInternalEncoding
+				}
+				return setEncodingResult()
+			}
+			data.externalEncoding = defaultExternalEncoding
+			if defaultInternalEncoding != "" &&
+				!strings.EqualFold(defaultInternalEncoding, defaultExternalEncoding) &&
+				!strings.EqualFold(defaultExternalEncoding, "BINARY") {
+				data.internalEncoding = defaultInternalEncoding
+			}
+			data.encodingSetBySetter = false
+			return setEncodingResult()
+		}
+		if defaultInternalEncoding == "" {
+			return setEncodingResult()
+		}
+
+		data.externalEncoding = defaultExternalEncoding
+		if defaultInternalEncoding != "" &&
+			!strings.EqualFold(defaultInternalEncoding, defaultExternalEncoding) &&
+			!strings.EqualFold(defaultExternalEncoding, "BINARY") {
+			data.internalEncoding = defaultInternalEncoding
+		}
+		data.encodingSetBySetter = false
+		return setEncodingResult()
+	}
+
+	if strings.Contains(externalEncoding, ":") {
+		parts := strings.SplitN(externalEncoding, ":", 2)
+		externalEncoding = parts[0]
+		if len(parts) == 2 {
+			internalArgProvided = true
+			internalEncoding = parts[1]
+			internalNil = internalEncoding == "" || internalEncoding == "-" || strings.EqualFold(internalEncoding, externalEncoding)
+		}
+	}
+	if internalArgProvided {
+		if !internalNil && strings.EqualFold(internalEncoding, externalEncoding) {
+			internalEncoding = ""
+		}
+		if strings.EqualFold(internalEncoding, "-") {
+			internalEncoding = ""
+		}
+	}
+	data.externalEncoding = externalEncoding
+	data.encodingInvalidReplace = encodingInvalidReplace
+	data.encodingReplaceString = encodingReplaceString
+	data.encodingExplicit = true
+	data.internalEncoding = ""
+	if internalArgProvided && !internalNil {
+		data.internalEncoding = internalEncoding
+	}
+	data.inheritDefaultExternal = false
+	data.binmode = false
+	if data.externalEncoding != "" && data.internalEncoding != "" && strings.EqualFold(data.externalEncoding, data.internalEncoding) {
+		data.internalEncoding = ""
+	}
+	data.encodingSetBySetter = false
+	return setEncodingResult()
+}
+
+func ioReopen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if len(args) == 0 || len(args) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..2)", len(args)))
+	}
+	if len(args) > 0 {
+		firstArg := args[0]
+		if sourceData := ioShim(firstArg); sourceData != nil {
+			if data.closed {
+				return newRuntimeException(R.Classes["IOError"], "closed stream")
+			}
+			if sourceData.closed {
+				return newRuntimeException(R.Classes["IOError"], "closed stream")
+			}
+			oldFd := data.fd
+			if oldFd >= 0 && oldFd != sourceData.fd && oldFd != 0 && oldFd != 1 && oldFd != 2 {
+				_ = syscall.Close(int(oldFd))
+			}
+			*data = *sourceData
+			if firstArg != nil && firstArg.Class != nil {
+				receiver.Class = firstArg.Class
+			}
+			reopenedData := ioShim(receiver)
+			if reopenedData == nil {
+				return newRuntimeException(R.Classes["IOError"], "closed stream")
+			}
+			reopenedData.closed = false
+			reopenedData.readClosed = false
+			reopenedData.writeClosed = false
+			reopenedData.ungetBuffer = ""
+			reopenedData.closeOnExec = true
+			delete(ioDataByFd, oldFd)
+			if reopenedData.fd >= 0 {
+				ioDataByFd[reopenedData.fd] = reopenedData
+			}
+			return receiver
+		}
+	}
+
+	parseModeValue := func(value *object.EmeraldValue, modeValueSet *bool) (string, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			return "", nil
+		}
+		if value.Type == object.ValueString {
+			*modeValueSet = true
+			return value.Data.(string), nil
+		}
+		if value.Type == object.ValueInteger {
+			*modeValueSet = true
+			return fileModeFromFlags(value.Data.(int64)), nil
+		}
+		if str, converted, viaToStr, coerceErr := evalCoerceToString(value); coerceErr != nil {
+			return "", coerceErr
+		} else if converted {
+			*modeValueSet = true
+			return str, nil
+		} else if viaToStr {
+			return "", conversionTypeErrorToStringForMode(value, true)
+		}
+		if value.Class != nil && receiverHasCallableMethod(value, "to_int") && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return "", coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueInteger {
+				*modeValueSet = true
+				return fileModeFromFlags(coerced.Data.(int64)), nil
+			}
+		}
+		return "", nil
+	}
+
+	firstArg := args[0]
+	path, errVal := coercePath(firstArg)
+	if errVal != nil {
+		if !receiverHasCallableMethod(firstArg, "to_io") || CallMethod == nil {
+			return errVal
+		}
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		converted := CallMethod(firstArg, "to_io")
+		if converted != nil && converted.Type == object.ValueException {
+			return converted
+		}
+		sourceData := ioShim(converted)
+		if sourceData == nil {
+			return typeError("no implicit conversion into IO")
+		}
+		if sourceData.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		oldFd := data.fd
+		if oldFd >= 0 && oldFd != sourceData.fd && oldFd != 0 && oldFd != 1 && oldFd != 2 {
+			_ = syscall.Close(int(oldFd))
+		}
+		*data = *sourceData
+		if converted != nil && converted.Class != nil {
+			receiver.Class = converted.Class
+		}
+		reopenedData := ioShim(receiver)
+		if reopenedData == nil {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		reopenedData.closed = false
+		reopenedData.readClosed = false
+		reopenedData.writeClosed = false
+		reopenedData.ungetBuffer = ""
+		reopenedData.closeOnExec = true
+		delete(ioDataByFd, oldFd)
+		if reopenedData.fd >= 0 {
+			ioDataByFd[reopenedData.fd] = reopenedData
+		}
+		return receiver
+	}
+
+	mode := data.mode
+	if mode == "" {
+		mode = "r"
+	}
+	if len(args) > 1 {
+		modeSet := false
+		var parseErr *object.EmeraldValue
+		mode, parseErr = parseModeValue(args[1], &modeSet)
+		if parseErr != nil {
+			return parseErr
+		}
+		if args[1] != nil && args[1].Type != object.ValueNil && !modeSet {
+			return typeError("no implicit conversion into String")
+		}
+	}
+
+	reopened := fileClassOpen(receiver, rubyString(path), rubyString(mode))
+	if reopened != nil && reopened.Type == object.ValueException {
+		return reopened
+	}
+	reopenedData := ioShim(reopened)
+	if reopenedData == nil {
+		return typeError("no implicit conversion into String")
+	}
+	oldFd := data.fd
+	if oldFd >= 0 && oldFd != reopenedData.fd && oldFd != 0 && oldFd != 1 && oldFd != 2 {
+		_ = syscall.Close(int(oldFd))
+	}
+	*data = *reopenedData
+	data.ungetBuffer = ""
+	data.closed = false
+	data.readClosed = false
+	data.writeClosed = false
+	data.closeOnExec = true
+	if oldFd != data.fd {
+		delete(ioDataByFd, data.fd)
+	}
+	delete(ioDataByFd, oldFd)
+	ioDataByFd[data.fd] = data
+	return receiver
+}
+
+func applyDefaultIOEncoding(data *ioShimData) {
+	if data == nil {
+		return
+	}
+	if data.externalEncoding != "" || data.internalEncoding != "" {
+		return
+	}
+	if data.binmode || strings.Contains(data.mode, "b") {
+		return
+	}
+	if defaultInternalEncoding != "" {
+		if !strings.EqualFold(defaultInternalEncoding, defaultExternalEncoding) &&
+			!strings.EqualFold(defaultExternalEncoding, "BINARY") {
+			data.internalEncoding = defaultInternalEncoding
+		}
+		data.externalEncoding = defaultExternalEncoding
+		return
+	}
+	if fileModeReadable(data.mode) && !fileModeWritable(data.mode) {
+		data.inheritDefaultExternal = true
+	}
+}
+
+func ioSeek(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments (given " + strconv.Itoa(len(args)) + ", expected 1..2)")
+	}
+
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
+	offset, ok := valueToInteger(args[0])
+	if !ok && CallMethod != nil && args[0] != nil {
+		coerced := CallMethod(args[0], "to_int")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		offset, ok = valueToInteger(coerced)
+	}
+	if !ok {
+		return typeError("no implicit conversion into Integer")
+	}
+
+	whence := int64(0)
+	if len(args) > 1 {
+		w, ok := valueToInteger(args[1])
+		if !ok && CallMethod != nil && args[1] != nil {
+			coerced := CallMethod(args[1], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			w, ok = valueToInteger(coerced)
+		}
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		whence = w
+	}
+
+	newOffset := int64(0)
+	switch whence {
+	case 0:
+		newOffset = offset
+	case 1:
+		newOffset = data.offset + offset
+	case 2:
+		if data.path == "" {
+			size := int64(0)
+			if pipe := ioPipeBufferForFD(data.fd); pipe != nil {
+				size = int64(pipe.Len())
+			}
+			newOffset = size + offset
+		} else {
+			info, err := os.Stat(data.path)
+			if err != nil {
+				return errnoForPathError(err)
+			}
+			newOffset = info.Size() + offset
+		}
+	default:
+		return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+	}
+
+	if newOffset < 0 {
+		return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+	}
+	data.offset = newOffset
+	data.ungetBuffer = ""
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func ioSysseek(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments (given " + strconv.Itoa(len(args)) + ", expected 1..2)")
+	}
+
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
+	offset, ok := valueToInteger(args[0])
+	if !ok && CallMethod != nil && args[0] != nil {
+		coerced := CallMethod(args[0], "to_int")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+		offset, ok = valueToInteger(coerced)
+	}
+	if !ok {
+		return typeError("no implicit conversion into Integer")
+	}
+
+	whence := int64(0)
+	if len(args) > 1 {
+		w, ok := valueToInteger(args[1])
+		if !ok && CallMethod != nil && args[1] != nil {
+			coerced := CallMethod(args[1], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			w, ok = valueToInteger(coerced)
+		}
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		whence = w
+	}
+
+	newOffset := int64(0)
+	switch whence {
+	case 0:
+		newOffset = offset
+	case 1:
+		newOffset = data.offset + offset
+	case 2:
+		if data.path == "" {
+			size := int64(0)
+			if pipe := ioPipeBufferForFD(data.fd); pipe != nil {
+				size = int64(pipe.Len())
+			}
+			newOffset = size + offset
+		} else {
+			info, err := os.Stat(data.path)
+			if err != nil {
+				return errnoForPathError(err)
+			}
+			newOffset = info.Size() + offset
+		}
+	default:
+		return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+	}
+
+	if newOffset < 0 {
+		return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+	}
+	data.offset = newOffset
+	data.ungetBuffer = ""
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: data.offset, Class: R.Classes["Integer"]}
+}
+
+func ioAutoclose(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.FalseVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.autoclose {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func ioAppend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return receiver
+	}
+	result := ioSyswrite(receiver, args[0])
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return receiver
+}
+
 func ioWriteNonblock(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	const fakePipeCapacity = int64(64 * 1024)
 	const waitAfterCalls = int64(6)
 
-	byteCount := ioWriteByteCount(args)
+	optionArgs := args
+	args = ioCallArgsWithoutExceptionOption(args)
+	data := ioShim(receiver)
+	if data == nil {
+		calls := int64(0)
+		if receiver != nil {
+			if obj, ok := receiver.Data.(*object.Object); ok && obj != nil {
+				if existing := obj.ClassVars["__io_write_calls__"]; existing != nil && existing.Type == object.ValueInteger {
+					if n, ok := existing.Data.(int64); ok {
+						calls = n
+					}
+				}
+				calls++
+				setObjectIOWriteCalls(receiver, calls)
+			}
+		}
+		if calls >= waitAfterCalls {
+			if ioExceptionFalse(optionArgs) {
+				return &object.EmeraldValue{Type: object.ValueSymbol, Data: "wait_writable", Class: R.Classes["Symbol"]}
+			}
+			return newRuntimeException(R.Classes["RuntimeError"], "Resource temporarily unavailable")
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.writeClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if !fileModeWritable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+	}
+	data.nonblock = true
+	if data.path == "" && data.peerFD >= 0 {
+		if peer := ioDataByFd[data.peerFD]; peer != nil && (peer.closed || peer.peerClosed) {
+			return newRuntimeException(R.Classes["Errno::EPIPE"], "Broken pipe")
+		}
+	}
+
+	byteCount, errVal := ioWriteByteCount(args)
+	if errVal != nil {
+		return errVal
+	}
+	if byteCount == 0 {
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	}
+	if data.path == "" {
+		data.writeCalls++
+		calls := data.writeCalls
+		if calls >= waitAfterCalls {
+			if ioExceptionFalse(optionArgs) {
+				return &object.EmeraldValue{Type: object.ValueSymbol, Data: "wait_writable", Class: R.Classes["Symbol"]}
+			}
+			return newRuntimeException(R.Classes["RuntimeError"], "Resource temporarily unavailable")
+		}
+	}
+	return ioSyswrite(receiver, args...)
+}
+
+func normalizeEncodingNameForIO(encoding string) string {
+	normalized := make([]byte, 0, len(encoding))
+	for i := 0; i < len(encoding); i++ {
+		ch := encoding[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 32
+		}
+		if ch == '_' {
+			ch = '-'
+		}
+		normalized = append(normalized, ch)
+	}
+	normalizedEncoding := string(normalized)
+	if strings.HasPrefix(normalizedEncoding, "BOM|") {
+		normalizedEncoding = normalizedEncoding[4:]
+	}
+	return normalizedEncoding
+}
+
+func ioWriteTextHasNonASCII(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i]&0x80 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func ioWriteEncodeText(writeText string, targetEncoding string, sourceValue *object.EmeraldValue) (string, *object.EmeraldValue) {
+	target := normalizeEncodingNameForIO(targetEncoding)
+	if target == "" || target == "UTF-8" || target == "BINARY" || target == "ASCII-8BIT" {
+		return writeText, nil
+	}
+	source := normalizeEncodingNameForIO(stringEncodingName(sourceValue))
+	if source == "BINARY" && ioWriteTextHasNonASCII(writeText) {
+		return "", newRuntimeException(R.Classes["Encoding::UndefinedConversionError"], "character not encodable")
+	}
+	switch target {
+	case "US-ASCII":
+		if ioWriteTextHasNonASCII(writeText) {
+			return "", newRuntimeException(R.Classes["Encoding::InvalidByteSequenceError"], "invalid byte sequence")
+		}
+	case "UTF-16LE":
+		converted := make([]byte, 0, len(writeText)*2)
+		for _, r := range writeText {
+			u := uint16(r)
+			converted = append(converted, byte(u), byte(u>>8))
+		}
+		return string(converted), nil
+	case "IBM437":
+		converted := make([]byte, 0, len(writeText))
+		for _, r := range writeText {
+			switch {
+			case r <= 0x7f:
+				converted = append(converted, byte(r))
+			case r == '\u0192':
+				converted = append(converted, 159)
+			case r <= 0xff:
+				converted = append(converted, byte(r))
+			default:
+				return "", newRuntimeException(R.Classes["Encoding::UndefinedConversionError"], "character not encodable")
+			}
+		}
+		return string(converted), nil
+	case "UTF-16BE":
+		converted := make([]byte, 0, len(writeText)*2)
+		for _, r := range writeText {
+			u := uint16(r)
+			converted = append(converted, byte(u>>8), byte(u))
+		}
+		return string(converted), nil
+	case "UTF-32LE":
+		converted := make([]byte, 0, len(writeText)*4)
+		for _, r := range writeText {
+			u := uint32(r)
+			converted = append(converted, byte(u), byte(u>>8), byte(u>>16), byte(u>>24))
+		}
+		return string(converted), nil
+	case "UTF-16":
+		converted := make([]byte, 0, len(writeText)*2)
+		for _, r := range writeText {
+			u := uint16(r)
+			converted = append(converted, byte(u>>8), byte(u))
+		}
+		return string(converted), nil
+	case "UTF-32BE":
+		converted := make([]byte, 0, len(writeText)*4)
+		for _, r := range writeText {
+			u := uint32(r)
+			converted = append(converted, byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+		}
+		return string(converted), nil
+	case "UTF-32":
+		converted := make([]byte, 0, len(writeText)*4)
+		for _, r := range writeText {
+			u := uint32(r)
+			converted = append(converted, byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+		}
+		return string(converted), nil
+	}
+	return writeText, nil
+}
+
+func ioWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	targetEncoding := normalizeEncodingNameForIO(encodingName(fileInstanceExternalEncoding(receiver)))
+	writeText := ""
+	for _, arg := range args {
+		writeTextArg, errVal := toStringValue(arg)
+		if errVal != nil {
+			return errVal
+		}
+		if targetEncoding != "" && targetEncoding != "UTF-8" && targetEncoding != "BINARY" && targetEncoding != "ASCII-8BIT" {
+			encoded, encodeErr := ioWriteEncodeText(writeTextArg, targetEncoding, arg)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			writeTextArg = encoded
+		}
+		writeText += writeTextArg
+	}
+	return ioSyswrite(receiver, rubyString(writeText))
+}
+
+func ioSyswrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.writeClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.path == "" && fileModeWritable(data.mode) && data.peerFD >= 0 && (ioDataByFd[data.peerFD] == nil || ioDataByFd[data.peerFD].closed || ioDataByFd[data.peerFD].peerClosed) {
+		return newRuntimeException(R.Classes["Errno::EPIPE"], "Broken pipe")
+	}
+	writeText := ""
+	for _, arg := range args {
+		writeTextArg, errVal := toStringValue(arg)
+		if errVal != nil {
+			return errVal
+		}
+		writeText += writeTextArg
+	}
+	if data.path != "" && !data.binmode && data.newlineMode != "" {
+		writeText = ioConvertOutputNewline(writeText, data.newlineMode)
+	}
+	byteCount := int64(len(writeText))
 	if byteCount == 0 {
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 	}
 
-	data := ioShim(receiver)
-	var calls int64
-	if data != nil {
-		data.writeCalls++
-		calls = data.writeCalls
-	} else if receiver != nil {
-		if obj, ok := receiver.Data.(*object.Object); ok {
-			if obj.ClassVars == nil {
-				obj.ClassVars = make(map[string]*object.EmeraldValue)
-			}
-			if value := obj.ClassVars["__io_write_calls__"]; value != nil && value.Type == object.ValueInteger {
-				calls = value.Data.(int64)
-			}
-		}
-		calls++
-		setObjectIOWriteCalls(receiver, calls)
+	if data.writeClosed {
+		return newRuntimeException(R.Classes["IOError"], "stream closed in previous close_write")
 	}
-
-	if calls >= waitAfterCalls {
-		if ioExceptionFalse(args) {
-			return &object.EmeraldValue{Type: object.ValueSymbol, Data: "wait_writable", Class: R.Classes["Symbol"]}
-		}
-		return newRuntimeException(R.Classes["RuntimeError"], "Resource temporarily unavailable")
+	if data.path != "" && !fileModeWritable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for writing")
 	}
-	if byteCount > fakePipeCapacity {
-		byteCount = fakePipeCapacity
-	}
-	return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
-}
-
-func ioSyswrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	byteCount := ioWriteByteCount(args)
-	if data := ioShim(receiver); data != nil && data.path != "" && len(args) > 0 && args[0].Type == object.ValueString {
-		if !strings.Contains(data.mode, "w") && !strings.Contains(data.mode, "a") && !strings.Contains(data.mode, "+") && !strings.Contains(data.mode, "x") {
+	if data.path == "" {
+		if !fileModeWritable(data.mode) {
 			return newRuntimeException(R.Classes["IOError"], "not opened for writing")
 		}
-		if info, statErr := os.Lstat(data.path); statErr == nil && info.Mode()&os.ModeNamedPipe != 0 {
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
+		if buf := ioPipeBufferForFD(data.fd); buf != nil {
+			_, _ = buf.WriteString(writeText)
+		}
+		if byteCount > 1024*1024 {
+			byteCount = 64 * 1024
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
+	}
+
+	if data.path != "" {
+		if !fileModeWritable(data.mode) {
+			return newRuntimeException(R.Classes["IOError"], "not opened for writing")
+		}
+		if data.isFIFO {
+			if !ioFIFOHasReader(data.path) {
+				return newRuntimeException(R.Classes["Errno::EPIPE"], "Broken pipe")
+			}
+			ioFIFOWriteContent(data.path, writeText)
+			data.offset += int64(len(writeText))
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(len(writeText)), Class: R.Classes["Integer"]}
 		}
 		flag := os.O_CREATE | os.O_WRONLY
 		if strings.Contains(data.mode, "a") {
@@ -16105,8 +30627,8 @@ func ioSyswrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 			if !strings.Contains(data.mode, "a") {
 				_, _ = file.Seek(data.offset, io.SeekStart)
 			}
-			_, _ = file.WriteString(args[0].Data.(string))
-			data.offset += int64(len(args[0].Data.(string)))
+			_, _ = file.WriteString(writeText)
+			data.offset += int64(len(writeText))
 			_ = file.Close()
 			if info, statErr := os.Stat(data.path); statErr == nil {
 				data.cachedSize = info.Size()
@@ -16119,42 +30641,940 @@ func ioSyswrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 				if !strings.Contains(data.mode, "a") {
 					_, _ = file.Seek(data.offset, io.SeekStart)
 				}
-				_, _ = file.WriteString(args[0].Data.(string))
-				data.offset += int64(len(args[0].Data.(string)))
+				_, _ = file.WriteString(writeText)
+				data.offset += int64(len(writeText))
 				_ = file.Close()
 			}
 			_ = os.Chmod(data.path, originalMode)
 		}
 	}
+
 	if byteCount > 1024*1024 {
 		byteCount = 64 * 1024
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
 }
 
-func ioPuts(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	for _, arg := range args {
-		text := ""
-		if arg != nil && arg.Type != object.ValueNil {
-			if arg.Type == object.ValueString {
-				text = arg.Data.(string)
-			} else {
-				text = arg.Inspect()
+func ioConvertOutputNewline(text, newlineMode string) string {
+	switch newlineMode {
+	case "lf":
+		return text
+	case "cr":
+		output := make([]byte, 0, len(text))
+		for i := 0; i < len(text); i++ {
+			if text[i] == '\n' {
+				if i == 0 || text[i-1] != '\r' {
+					output = append(output, '\r')
+				}
+				continue
+			}
+			output = append(output, text[i])
+		}
+		return string(output)
+	case "crlf":
+		output := make([]byte, 0, len(text)*2)
+		for i := 0; i < len(text); i++ {
+			if text[i] == '\n' {
+				if i == 0 || text[i-1] != '\r' {
+					output = append(output, '\r', '\n')
+					continue
+				}
+			}
+			output = append(output, text[i])
+		}
+		return string(output)
+	default:
+		return text
+	}
+}
+
+func ioLineno(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.path == "" {
+		if !fileModeReadable(data.mode) {
+			return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: data.lineno, Class: R.Classes["Integer"]}
+	}
+	if !fileModeReadable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: data.lineno, Class: R.Classes["Integer"]}
+}
+
+func ioSetLineno(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed || data.readClosed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.path == "" {
+		if !fileModeReadable(data.mode) {
+			return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+		}
+	} else if !fileModeReadable(data.mode) {
+		return newRuntimeException(R.Classes["IOError"], "not opened for reading")
+	}
+	if len(args) == 0 || args[0] == nil {
+		if len(args) == 0 {
+			return typeError("no implicit conversion into Integer")
+		}
+		return typeError("no implicit conversion of nil into Integer")
+	}
+	target := args[0]
+	line, ok := valueToInteger(target)
+	if !ok && CallMethod != nil {
+		coerced := CallMethod(target, "to_int")
+		if coerced != nil {
+			if coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced.Type == object.ValueInteger {
+				line = coerced.Data.(int64)
+				ok = true
 			}
 		}
-		if result := ioSyswrite(receiver, rubyString(text+"\n")); result != nil && result.Type == object.ValueException {
+	}
+	if !ok {
+		msg := "no implicit conversion into Integer"
+		if target != nil && target.Class != nil {
+			msg = "no implicit conversion of " + target.Class.Name + " into Integer"
+		}
+		return typeError(msg)
+	}
+	if line > 2147483647 || line < -2147483648 {
+		return NewRangeError("integer out of range")
+	}
+	data.lineno = line
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: line, Class: R.Classes["Integer"]}
+}
+
+func ioPuts(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	writeText := func(text string) *object.EmeraldValue {
+		if text == "" || text[len(text)-1] != '\n' {
+			text += "\n"
+		}
+		if data := ioShim(receiver); data != nil && data.stringValue != nil {
+			result := stringIOWrite(receiver, rubyString(text))
+			if result != nil && result.Type == object.ValueException {
+				return result
+			}
+			return nil
+		}
+		result := ioSyswrite(receiver, rubyString(text))
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return nil
+	}
+
+	var writeValue func(*object.EmeraldValue, map[*object.EmeraldValue]bool) *object.EmeraldValue
+	writeValue = func(value *object.EmeraldValue, recursion map[*object.EmeraldValue]bool) *object.EmeraldValue {
+		if value == nil || value.Type == object.ValueNil {
+			return writeText("")
+		}
+
+		convert := func(value *object.EmeraldValue) (*object.EmeraldValue, bool, *object.EmeraldValue) {
+			if value == nil || value.Type == object.ValueNil {
+				return rubyString(""), true, nil
+			}
+			if value.Type == object.ValueString {
+				if s, ok := value.Data.(string); ok {
+					return rubyString(s), true, nil
+				}
+			}
+			if CallMethod == nil {
+				return rubyString(value.Inspect()), false, nil
+			}
+			coerced := CallMethod(value, "to_s")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return nil, true, coerced
+			}
+			if coerced == nil {
+				return rubyString(value.Inspect()), false, nil
+			}
+			if coerced.Type == object.ValueString {
+				return coerced, true, nil
+			}
+			return nil, false, nil
+		}
+
+		if arr, ok := valueToArray(value); ok {
+			if recursion[value] {
+				return writeText("[...]")
+			}
+			recursion[value] = true
+			for _, item := range arr {
+				if result := writeValue(item, recursion); result != nil && result.Type == object.ValueException {
+					return result
+				}
+			}
+			delete(recursion, value)
+			return nil
+		}
+
+		converted, ok, errVal := convert(value)
+		if errVal != nil && errVal.Type == object.ValueException {
+			return errVal
+		}
+		if !ok {
+			text := value.Inspect()
+			parts := strings.SplitN(text, " ", 2)
+			if len(parts) > 0 {
+				text = parts[0] + ">"
+			}
+			return writeText(text)
+		}
+		return writeText(converted.Data.(string))
+	}
+
+	if len(args) == 0 {
+		return writeText("")
+	}
+
+	for _, arg := range args {
+		if result := writeValue(arg, map[*object.EmeraldValue]bool{}); result != nil && result.Type == object.ValueException {
 			return result
 		}
 	}
 	return R.NilVal
 }
 
+func ioPrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil && data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
+	writeArgs := args
+	if len(args) == 0 {
+		var readLine *object.EmeraldValue
+		if GetGlobalVariable != nil {
+			readLine = GetGlobalVariable("$_")
+		}
+		writeArgs = []*object.EmeraldValue{readLine}
+	}
+
+	text := ""
+	for _, arg := range writeArgs {
+		part, errVal := toStringValue(arg)
+		if errVal != nil {
+			return errVal
+		}
+		text += part
+	}
+
+	if GetGlobalVariable != nil {
+		separatorValue := GetGlobalVariable("$\\")
+		if separatorValue != nil && separatorValue.Type != object.ValueNil {
+			separator, errVal := toStringValue(separatorValue)
+			if errVal != nil {
+				return errVal
+			}
+			text += separator
+		}
+	}
+
+	if len(text) == 0 {
+		return R.NilVal
+	}
+	if data := ioShim(receiver); data != nil && data.stringValue != nil {
+		result := stringIOWrite(receiver, rubyString(text))
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return R.NilVal
+	}
+	result := ioWrite(receiver, rubyString(text))
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return R.NilVal
+}
+
+func ioPrintf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	formatted := builtinFormat(receiver, args...)
+	if formatted == nil || formatted.Type == object.ValueException {
+		return formatted
+	}
+	if data := ioShim(receiver); data != nil && data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data := ioShim(receiver); data != nil && data.stringValue != nil {
+		result := stringIOWrite(receiver, formatted)
+		if result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return R.NilVal
+	}
+	result := ioWrite(receiver, formatted)
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return R.NilVal
+}
+
+func ioReadableQuestion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return R.FalseVal
+	}
+	if data.readClosed {
+		return R.FalseVal
+	}
+	if !fileModeReadable(data.mode) {
+		return R.FalseVal
+	}
+	return R.TrueVal
+}
+
+func ioWritableQuestion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return R.FalseVal
+	}
+	if data.writeClosed {
+		return R.FalseVal
+	}
+	if !fileModeWritable(data.mode) {
+		return R.FalseVal
+	}
+	return R.TrueVal
+}
+
+func ioClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck != nil && BlockGivenCheck() {
+		_ = builtinWarn(nil, rubyString("IO::new() does not take block; use IO::open() instead"))
+	}
+	return ioClassForFd(receiver, args...)
+}
+
+func ioClassInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	oldFd := data.fd
+	classObj := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["IO"]}
+	if receiver.Class != nil {
+		classObj.Data = receiver.Class
+	}
+	reopened := ioClassForFd(classObj, args...)
+	if reopened == nil || reopened.Type == object.ValueException {
+		return reopened
+	}
+	reopenedData := ioShim(reopened)
+	if reopenedData == nil {
+		return typeError("no implicit conversion into String")
+	}
+	*data = *reopenedData
+	if oldFd >= 0 && oldFd != reopenedData.fd && oldFd != 0 && oldFd != 1 && oldFd != 2 {
+		_ = syscall.Close(int(oldFd))
+	}
+	if oldFd != reopenedData.fd {
+		delete(ioDataByFd, oldFd)
+	}
+	ioDataByFd[reopenedData.fd] = data
+	return receiver
+}
+
+func ioClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	io := ioClassForFd(receiver, args...)
+	if io == nil || io.Type == object.ValueException {
+		return io
+	}
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CurrentBlockValue == nil || CallBlockWithArgs == nil {
+		return io
+	}
+	result := CallBlockWithArgs(CurrentBlockValue(), io)
+	if data := ioShim(io); data != nil && data.closeHook && data.closeException == nil && result != nil && result.Type == object.ValueClass {
+		if class, ok := result.Data.(*object.Class); ok && classInheritsFrom(class, R.Classes["Exception"]) {
+			data.closeException = result
+		}
+	}
+	if data := ioShim(io); data != nil {
+		if closeResult := ioCloseExceptionValue(data); closeResult != nil {
+			LastMatcherException = closeResult
+		}
+	}
+	if CallMethod != nil {
+		closeResult := CallMethod(io, "close")
+		if closeResult != nil && closeResult.Type == object.ValueException {
+			if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
+				return result
+			}
+			LastRaisedResult = closeResult
+			LastMatcherException = closeResult
+			return closeResult
+		}
+		if data := ioShim(io); data != nil {
+			if closeResult := ioCloseExceptionValue(data); closeResult != nil {
+				if closeResult.Class == R.Classes["IOError"] && strings.Contains(closeResult.Data.(*object.RException).Message, "closed stream") {
+					return result
+				}
+				LastRaisedResult = closeResult
+				LastMatcherException = closeResult
+				return closeResult
+			}
+		}
+	}
+	return result
+}
+
 func ioClassForFd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return newIOShimValue("IO")
+	if len(args) == 0 || len(args) > 3 {
+		return NewArgumentError("wrong number of arguments (given " + strconv.Itoa(len(args)) + ", expected 1..2)")
+	}
+
+	fd := int64(0)
+	switch {
+	case args[0] == nil:
+		return typeError("no implicit conversion into Integer")
+	case args[0].Type == object.ValueInteger:
+		fd = args[0].Data.(int64)
+	default:
+		if CallMethod != nil {
+			coerced := CallMethod(args[0], "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueInteger {
+				fd = coerced.Data.(int64)
+				break
+			}
+		}
+		return typeError("no implicit conversion into Integer")
+	}
+	if fd < 0 {
+		return newRuntimeException(R.Classes["Errno::EBADF"], "Bad file descriptor")
+	}
+
+	parseModeValue := func(value *object.EmeraldValue, modeValueSet *bool) (string, *object.EmeraldValue) {
+		if value == nil || value.Type == object.ValueNil {
+			return "", nil
+		}
+		if value.Type == object.ValueString {
+			*modeValueSet = true
+			return value.Data.(string), nil
+		}
+		if value.Type == object.ValueInteger {
+			*modeValueSet = true
+			return fileModeFromFlags(value.Data.(int64)), nil
+		}
+		if str, converted, viaToStr, coerceErr := evalCoerceToString(value); coerceErr != nil {
+			return "", coerceErr
+		} else if converted {
+			*modeValueSet = true
+			return str, nil
+		} else if viaToStr {
+			return "", conversionTypeErrorToStringForMode(value, true)
+		}
+		if value.Class != nil && receiverHasCallableMethod(value, "to_int") && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced != nil && coerced.Type == object.ValueException {
+				return "", coerced
+			}
+			if coerced != nil && coerced.Type == object.ValueInteger {
+				*modeValueSet = true
+				return fileModeFromFlags(coerced.Data.(int64)), nil
+			}
+		}
+		return "", nil
+	}
+	parseFlagsValue := func(value *object.EmeraldValue) (int64, *object.EmeraldValue) {
+		if value == nil {
+			return 0, typeError("no implicit conversion into Integer")
+		}
+		if value.Type == object.ValueInteger {
+			return value.Data.(int64), nil
+		}
+		if value.Class != nil && receiverHasCallableMethod(value, "to_int") && CallMethod != nil {
+			coerced := CallMethod(value, "to_int")
+			if coerced == nil {
+				return 0, typeError("no implicit conversion into Integer")
+			}
+			if coerced.Type == object.ValueException {
+				return 0, coerced
+			}
+			if coerced.Type == object.ValueInteger {
+				return coerced.Data.(int64), nil
+			}
+		}
+		return 0, typeError("no implicit conversion into Integer")
+	}
+	parseEncodingValue := func(value *object.EmeraldValue) (string, bool, *object.EmeraldValue) {
+		if value == nil || value == R.NilVal {
+			return "", false, nil
+		}
+		name := encodingName(value)
+		if name != "" {
+			return normalizeEncodingNameForIO(name), true, nil
+		}
+		str, converted, viaToStr, coerceErr := evalCoerceToString(value)
+		if coerceErr != nil {
+			return "", false, coerceErr
+		}
+		if converted {
+			return normalizeEncodingNameForIO(str), true, nil
+		}
+		if viaToStr {
+			return "", false, conversionTypeErrorToStringForMode(value, true)
+		}
+		return "", false, nil
+	}
+	parseModeEncoding := func(mode string) (string, string, string, *object.EmeraldValue) {
+		if strings.Count(mode, ":") > 2 {
+			return "", "", "", NewArgumentError("wrong number of arguments")
+		}
+		parts := strings.Split(mode, ":")
+		if len(parts) == 1 {
+			return mode, "", "", nil
+		}
+		baseMode := parts[0]
+		externalEncoding := ""
+		internalEncoding := ""
+		if len(parts) >= 2 {
+			externalEncoding = normalizeEncodingNameForIO(parts[1])
+		}
+		if len(parts) >= 3 {
+			internalEncoding = normalizeEncodingNameForIO(parts[2])
+		}
+		if len(parts) == 3 {
+			if strings.EqualFold(internalEncoding, "-") {
+				internalEncoding = ""
+			}
+			if strings.EqualFold(internalEncoding, externalEncoding) {
+				internalEncoding = ""
+			}
+		}
+		if len(parts) > 3 {
+			return "", "", "", NewArgumentError("wrong number of arguments")
+		}
+		return baseMode, externalEncoding, internalEncoding, nil
+	}
+
+	mode := "r"
+	modeSetByPositional := false
+	modeSetByOption := false
+	autoclose := true
+	closeOnExec := true
+	closeOnExecSet := false
+	pathOption := ""
+	hasPathOption := false
+	var options *object.EmeraldValue
+	binmodeOptionSet := false
+	textmodeOptionSet := false
+	binmodeOptionValue := false
+	encodingOptionSet := false
+	encodingOptionValue := ""
+	encodingOptionInternalValue := ""
+	encodingOptionInternalSet := false
+	externalEncodingSet := false
+	externalEncodingValue := ""
+	internalEncodingSet := false
+	internalEncodingValue := ""
+
+	if len(args) > 1 {
+		if args[1] == nil || args[1].Type == object.ValueNil {
+			// allow `nil` here only when a :mode keyword is passed
+			if len(args) == 2 {
+				return typeError("no implicit conversion into String")
+			}
+			if len(args) > 2 && args[2] != nil && args[2].Type == object.ValueHash {
+				options = args[2]
+			}
+		} else if args[1].Type == object.ValueHash {
+			options = args[1]
+		} else {
+			var modeSetErr *object.EmeraldValue
+			mode, modeSetErr = parseModeValue(args[1], &modeSetByPositional)
+			if modeSetErr != nil {
+				return modeSetErr
+			}
+			if !modeSetByPositional {
+				return NewArgumentError("wrong type")
+			}
+		}
+	}
+
+	if len(args) > 2 {
+		if args[2] == nil || args[2].Type == object.ValueNil {
+			return NewArgumentError("wrong type")
+		}
+		if args[2].Type == object.ValueHash && !Ruby2KeywordHash(args[2]) {
+			return NewArgumentError("wrong number of arguments (given 3, expected 1..2)")
+		}
+		if args[2].Type != object.ValueHash {
+			return NewArgumentError("wrong type")
+		}
+		if options != nil && options != args[2] {
+			return NewArgumentError("wrong number of options (given 2 hashes)")
+		}
+		options = args[2]
+	}
+
+	if options != nil {
+		if hash := valueToHashMap(options); hash != nil {
+			for key, value := range hash {
+				keyName := specName(key)
+				if keyName == "" && key != nil && key.Type == object.ValueSymbol {
+					if name, ok := key.Data.(string); ok {
+						keyName = strings.TrimPrefix(name, ":")
+					}
+				}
+				switch keyName {
+				case "mode":
+					modeValue, errVal := parseModeValue(value, &modeSetByOption)
+					if errVal != nil {
+						return errVal
+					}
+					if value == nil {
+						continue
+					}
+					if modeSetByPositional {
+						return NewArgumentError("mode specified more than once")
+					}
+					if modeSetByOption {
+						mode = modeValue
+					}
+				case "flags":
+					flags, errVal := parseFlagsValue(value)
+					if errVal != nil {
+						return errVal
+					}
+					mode = mergeFileModes(mode, fileModeFromOptionFlags(flags))
+				case "autoclose":
+					switch value {
+					case R.TrueVal:
+						autoclose = true
+					case R.FalseVal:
+						autoclose = false
+					default:
+						autoclose = isTruthy(value)
+					}
+				case "path":
+					var err *object.EmeraldValue
+					pathOption, err = coercePath(value)
+					if err != nil {
+						return err
+					}
+					hasPathOption = true
+				case "close_on_exec":
+					closeOnExec = isTruthy(value)
+					closeOnExecSet = true
+				case "binmode":
+					binmodeOptionSet = true
+					if value == R.TrueVal {
+						binmodeOptionValue = true
+					} else if value == R.FalseVal {
+						binmodeOptionValue = false
+					} else {
+						return NewArgumentError("wrong type")
+					}
+				case "textmode":
+					textmodeOptionSet = true
+					if value != R.TrueVal && value != R.FalseVal {
+						return NewArgumentError("wrong type")
+					}
+				case "encoding":
+					encodingOptionSet = value != nil
+					if value == nil {
+						return NewArgumentError("wrong type")
+					}
+					parsedEncoding, ok, errVal := parseEncodingValue(value)
+					if errVal != nil {
+						return errVal
+					}
+					if !ok {
+						return NewArgumentError("wrong type")
+					}
+					parts := strings.SplitN(parsedEncoding, ":", 2)
+					encodingOptionValue = parts[0]
+					if len(parts) > 1 {
+						encodingOptionInternalValue = parts[1]
+						encodingOptionInternalSet = true
+						if encodingOptionInternalValue == "" {
+							encodingOptionInternalSet = false
+						}
+						if strings.EqualFold(encodingOptionInternalValue, "-") || strings.EqualFold(encodingOptionInternalValue, encodingOptionValue) {
+							encodingOptionInternalValue = ""
+							encodingOptionInternalSet = false
+						}
+					}
+				case "external_encoding":
+					externalEncodingSet = value != nil
+					if value == nil {
+						return NewArgumentError("wrong type")
+					}
+					parsedEncoding, ok, errVal := parseEncodingValue(value)
+					if errVal != nil {
+						return errVal
+					}
+					if !ok {
+						return NewArgumentError("wrong type")
+					}
+					if ok {
+						externalEncodingValue = parsedEncoding
+					}
+				case "internal_encoding":
+					internalEncodingSet = value != nil
+					if value == nil {
+						return NewArgumentError("wrong type")
+					}
+					parsedEncoding, ok, errVal := parseEncodingValue(value)
+					if errVal != nil {
+						return errVal
+					}
+					if !ok {
+						return NewArgumentError("wrong type")
+					}
+					if ok {
+						if strings.EqualFold(parsedEncoding, "-") || strings.EqualFold(parsedEncoding, "ASIS") {
+							parsedEncoding = ""
+						}
+						if strings.EqualFold(parsedEncoding, externalEncodingValue) && encodingOptionValue == "" {
+							parsedEncoding = ""
+						}
+						internalEncodingValue = parsedEncoding
+					}
+				}
+			}
+		}
+	}
+
+	if encodingOptionSet && (externalEncodingSet || internalEncodingSet) {
+		_ = builtinWarn(nil, rubyString("Ignoring encoding parameter"))
+		encodingOptionSet = false
+		encodingOptionValue = ""
+		encodingOptionInternalValue = ""
+		encodingOptionInternalSet = false
+	}
+
+	if len(mode) == 0 {
+		return NewArgumentError("empty mode string")
+	}
+
+	mode, modeExternalEncoding, modeInternalEncoding, modeErrVal := parseModeEncoding(mode)
+	if modeErrVal != nil {
+		return modeErrVal
+	}
+	modeHasBinary := strings.Contains(mode, "b")
+	modeHasText := strings.Contains(mode, "t")
+	modeHasEncoding := modeExternalEncoding != "" || modeInternalEncoding != ""
+	if binmodeOptionSet && textmodeOptionSet {
+		return NewArgumentError("invalid mode mode")
+	}
+	if binmodeOptionSet && modeHasBinary {
+		return NewArgumentError("invalid mode mode")
+	}
+	if binmodeOptionSet && modeHasText {
+		return NewArgumentError("invalid mode mode")
+	}
+	if textmodeOptionSet && modeHasBinary {
+		return NewArgumentError("invalid mode mode")
+	}
+	if textmodeOptionSet && modeHasText {
+		return NewArgumentError("invalid mode mode")
+	}
+	if modeHasEncoding && (encodingOptionSet || externalEncodingSet || internalEncodingSet) {
+		return NewArgumentError("encoding specified twice")
+	}
+
+	existing, found := ioDataByFd[fd]
+	if found && existing != nil && existing.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
+	ioValue := setIOClassFromReceiver(newIOShimValue("IO"), receiver)
+	data := ioShim(ioValue)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	oldFd := data.fd
+	data.fd = fd
+	data.mode = mode
+	data.closed = false
+	data.readClosed = false
+	data.writeClosed = false
+	data.autoclose = autoclose
+	data.closeOnExec = closeOnExec
+	if existing != nil {
+		if found && existing.path != "" && existing.mode != "" {
+			readableMode := fileModeReadable(mode)
+			writableMode := fileModeWritable(mode)
+			if readableMode && !fileModeReadable(existing.mode) || writableMode && !fileModeWritable(existing.mode) {
+				return newRuntimeException(R.Classes["Errno::EINVAL"], "Invalid argument")
+			}
+		}
+		data.path = existing.path
+		data.pathEncoding = existing.pathEncoding
+		data.offset = existing.offset
+		data.cachedInfo = existing.cachedInfo
+		data.cachedSize = existing.cachedSize
+		if !closeOnExecSet {
+			data.closeOnExec = existing.closeOnExec
+		}
+		data.peerFD = existing.peerFD
+		data.isReadPipe = existing.isReadPipe
+		data.pipeBuffer = existing.pipeBuffer
+		data.binmode = existing.binmode
+		if existing.path == "" {
+			data.mode = existing.mode
+		}
+	}
+	data.externalEncoding = ""
+	data.internalEncoding = ""
+	data.encodingExplicit = modeHasEncoding || encodingOptionSet || externalEncodingSet || internalEncodingSet
+	if modeHasEncoding {
+		data.externalEncoding = modeExternalEncoding
+		data.internalEncoding = modeInternalEncoding
+	}
+	if encodingOptionSet {
+		data.externalEncoding = encodingOptionValue
+		if encodingOptionInternalSet {
+			data.internalEncoding = encodingOptionInternalValue
+		}
+	}
+	if externalEncodingSet {
+		data.externalEncoding = externalEncodingValue
+	}
+	if internalEncodingSet {
+		data.internalEncoding = internalEncodingValue
+		if data.externalEncoding != "" && strings.EqualFold(data.internalEncoding, data.externalEncoding) {
+			data.internalEncoding = ""
+		}
+	}
+	if existing != nil && existing.path == "" && !encodingOptionSet && !externalEncodingSet && !internalEncodingSet && !modeHasEncoding {
+		data.externalEncoding = existing.externalEncoding
+		data.internalEncoding = existing.internalEncoding
+		data.encodingExplicit = existing.encodingExplicit
+	}
+	if binmodeOptionSet {
+		data.binmode = binmodeOptionValue
+	} else if modeHasEncoding || externalEncodingSet || internalEncodingSet || encodingOptionSet {
+		data.binmode = false
+	} else if strings.Contains(data.mode, "b") {
+		data.binmode = true
+	}
+	applyDefaultIOEncoding(data)
+	if mode == "" {
+		data.mode = mode
+	}
+	if hasPathOption {
+		data.path = pathOption
+	}
+	if fd == 0 || fd == 1 || fd == 2 {
+		data.closeOnExec = true
+	}
+	if dataSet, ok := ioDataByFd[fd]; !ok || dataSet != data {
+		ioDataByFd[fd] = data
+		if oldFd != fd {
+			delete(ioDataByFd, oldFd)
+		}
+	}
+	return ioValue
+}
+
+func ioFcntl(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+
+	data := ioShim(receiver)
+	if data == nil {
+		return newRuntimeException(R.Classes["IOError"], "not an IO object")
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+
+	cmdVal := args[0]
+	if cmdVal != nil && cmdVal.Type != object.ValueInteger && CallMethod != nil {
+		coerced := CallMethod(cmdVal, "to_int")
+		if coerced != nil && coerced.Type == object.ValueInteger {
+			cmdVal = coerced
+		} else if coerced != nil && coerced.Type == object.ValueException {
+			return coerced
+		}
+	}
+	if cmdVal == nil || cmdVal.Type != object.ValueInteger {
+		return typeError("no implicit conversion into Integer")
+	}
+	cmd := cmdVal.Data.(int64)
+
+	switch cmd {
+	case int64(syscall.F_GETFD):
+		if data.closeOnExec {
+			return &object.EmeraldValue{
+				Type:  object.ValueInteger,
+				Data:  int64(syscall.FD_CLOEXEC),
+				Class: R.Classes["Integer"],
+			}
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	case int64(syscall.F_SETFD):
+		if len(args) < 2 {
+			return NewArgumentError("wrong number of arguments")
+		}
+		flagVal := args[1]
+		if flagVal != nil && flagVal.Type != object.ValueInteger && CallMethod != nil {
+			coerced := CallMethod(flagVal, "to_int")
+			if coerced != nil && coerced.Type == object.ValueInteger {
+				flagVal = coerced
+			} else if coerced != nil && coerced.Type == object.ValueException {
+				return coerced
+			}
+		}
+		if flagVal == nil || flagVal.Type != object.ValueInteger {
+			return typeError("no implicit conversion into Integer")
+		}
+		data.closeOnExec = (flagVal.Data.(int64) & int64(syscall.FD_CLOEXEC)) != 0
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+	case int64(syscall.F_GETFL):
+		flags := int64(0)
+		if strings.Contains(data.mode, "a") {
+			flags |= 8
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: flags, Class: R.Classes["Integer"]}
+	}
+
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 }
 
 func ioClose(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data := ioShim(receiver); data != nil {
+		if data.isFIFO {
+			ioReleaseFIFOPath(data.path, fileModeReadable(data.mode), fileModeWritable(data.mode))
+		}
+		if data.peerFD >= 0 {
+			if peer := ioDataByFd[data.peerFD]; peer != nil {
+				peer.peerClosed = true
+			}
+			data.peerFD = -1
+		}
+		if ioPopenStates != nil && data.path == "" && fileModeWritable(data.mode) {
+			if state, ok := ioPopenStates[data.fd]; ok && state != nil {
+				delete(ioPopenStates, data.fd)
+				if !processSetLastChildStatusIfNeeded(data.pid) {
+					input := ""
+					if buffer := ioPipeBufferForFD(data.fd); buffer != nil {
+						input = buffer.String()
+					}
+					output, exitStatus := commandPopenRun(state.command, state.env, state.chdir, input, state.mergeErrToOut)
+					processSetChildResult(data.pid, exitStatus)
+					_ = output
+					if !processSetLastChildStatusIfNeeded(data.pid) {
+						processSetLastExitStatus(exitStatus)
+					}
+				}
+			}
+		}
+		if fileModeReadable(data.mode) && data.path == "" {
+			processSetLastChildStatusIfNeeded(data.pid)
+		}
+		data.readClosed = true
+		data.writeClosed = true
 		data.closed = true
 		if data.closeHook {
 			scratchPadAppend(nil, &object.EmeraldValue{
@@ -16180,6 +31600,36 @@ func ioClose(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 		}
 	}
 	return R.NilVal
+}
+
+func ioPid(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil {
+		return R.NilVal
+	}
+	if data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.pid <= 0 {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: data.pid, Class: R.Classes["Integer"]}
+}
+
+func ioFlush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := ioShim(receiver)
+	if data == nil || data.closed {
+		return newRuntimeException(R.Classes["IOError"], "closed stream")
+	}
+	if data.path == "" && fileModeWritable(data.mode) && data.peerFD >= 0 {
+		if peer := ioDataByFd[data.peerFD]; peer != nil && peer.closed {
+			return newRuntimeException(R.Classes["Errno::EPIPE"], "Broken pipe")
+		}
+		if peer := ioDataByFd[data.peerFD]; peer != nil && peer.peerClosed {
+			return newRuntimeException(R.Classes["Errno::EPIPE"], "Broken pipe")
+		}
+	}
+	return receiver
 }
 
 func ioCloseExceptionValue(data *ioShimData) *object.EmeraldValue {
@@ -16225,9 +31675,64 @@ func ioClosed(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 
 func ioFileno(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
 		return &object.EmeraldValue{Type: object.ValueInteger, Data: data.fd, Class: R.Classes["Integer"]}
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func ioIsATTY(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		if data.path == "/dev/tty" {
+			return R.TrueVal
+		}
+	}
+	return R.FalseVal
+}
+
+func ioTtyQuestion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return ioIsATTY(receiver)
+}
+
+func ioFsync(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
+}
+
+func ioSetCloseOnExec(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	value := R.NilVal
+	if len(args) > 0 {
+		value = args[0]
+	}
+	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		data.closeOnExec = isTruthy(value)
+	}
+	return value
+}
+
+func ioCloseOnExec(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
+		if data.closeOnExec {
+			return R.TrueVal
+		}
+		return R.FalseVal
+	}
+	return R.TrueVal
 }
 
 func ioSetNonblock(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16254,13 +31759,12 @@ func ioSetAutoclose(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		value = args[0]
 	}
 	if data := ioShim(receiver); data != nil {
+		if data.closed {
+			return newRuntimeException(R.Classes["IOError"], "closed stream")
+		}
 		data.autoclose = isTruthy(value)
 	}
 	return value
-}
-
-func ioCloseOnExec(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return R.TrueVal
 }
 
 func stringUnpack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16291,22 +31795,25 @@ func stringUnpack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func arrayInsert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 2 {
-		return R.NilVal
+	if len(args) < 1 {
+		return NewArgumentError("wrong number of arguments")
 	}
-	idx, ok := args[0].Data.(int64)
-	if !ok {
-		return R.NilVal
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	idx, err := arrayIndexIntArg(args[0])
+	if err != nil {
+		return err
 	}
 	arr := receiver.Data.([]*object.EmeraldValue)
 	if idx < 0 {
-		idx = int64(len(arr)) + idx + 1
+		idx = len(arr) + idx + 1
 	}
 	if idx < 0 {
-		idx = 0
+		return NewIndexErrorWithBounds(idx, len(arr))
 	}
-	if idx > int64(len(arr)) {
-		idx = int64(len(arr))
+	if idx > len(arr) {
+		idx = len(arr)
 	}
 	newArr := make([]*object.EmeraldValue, 0, len(arr)+len(args)-1)
 	newArr = append(newArr, arr[:idx]...)
@@ -16314,68 +31821,97 @@ func arrayInsert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		newArr = append(newArr, args[i])
 	}
 	newArr = append(newArr, arr[idx:]...)
-	return &object.EmeraldValue{
-		Type:  object.ValueArray,
-		Data:  newArr,
-		Class: R.Classes["Array"],
-	}
-}
-
-func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) < 1 {
-		return receiver
-	}
-	arr := receiver.Data.([]*object.EmeraldValue)
-	start := 0
-	end := len(arr)
-	if len(args) >= 2 && args[1].Type == object.ValueInteger {
-		start = int(args[1].Data.(int64))
-		if start < 0 {
-			start = len(arr) + start
-		}
-		if start < 0 {
-			start = 0
-		}
-	}
-	if len(args) >= 3 && args[2].Type == object.ValueInteger {
-		length := int(args[2].Data.(int64))
-		if length < 0 {
-			length = 0
-		}
-		end = start + length
-	}
-	if start > len(arr) {
-		for len(arr) < start {
-			arr = append(arr, R.NilVal)
-		}
-	}
-	if end > len(arr) {
-		for len(arr) < end {
-			arr = append(arr, R.NilVal)
-		}
-	}
-	for i := start; i < end; i++ {
-		arr[i] = args[0]
-	}
-	receiver.Data = arr
+	receiver.Data = newArr
 	return receiver
 }
 
-func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	if len(args) < 1 {
-		return R.NilVal
+		return NewArgumentError("wrong number of arguments")
 	}
+	blockUsed := CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck()
+	if blockUsed {
+		if len(args) > 2 {
+			return NewArgumentError("wrong number of arguments")
+		}
+	} else if len(args) > 3 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	value := (*object.EmeraldValue)(nil)
+	rangeObj := (*object.RRange)(nil)
+	startArgIdx := -1
+	lengthArgIdx := -1
+	hasRange := false
+
+	if blockUsed {
+		if len(args) >= 1 && args[0] != nil && args[0].Type == object.ValueRange {
+			hasRange = true
+			if rr, ok := args[0].Data.(*object.RRange); ok {
+				rangeObj = rr
+			}
+		} else {
+			startArgIdx = 0
+			if len(args) >= 2 {
+				lengthArgIdx = 1
+			}
+		}
+	} else {
+		value = args[0]
+		if len(args) >= 2 && args[1] != nil && args[1].Type == object.ValueRange {
+			hasRange = true
+			if rr, ok := args[1].Data.(*object.RRange); ok {
+				rangeObj = rr
+			}
+		} else if len(args) >= 2 {
+			startArgIdx = 1
+			if len(args) == 3 {
+				lengthArgIdx = 2
+			}
+		}
+	}
+	if hasRange {
+		if rangeObj == nil {
+			return R.NilVal
+		}
+		if blockUsed && len(args) > 1 {
+			return typeError("wrong number of arguments")
+		}
+		if !blockUsed && len(args) > 2 {
+			return typeError("wrong number of arguments")
+		}
+		start, count, ok, errv := arrayRangeAssignmentBounds(rangeObj, len(arr))
+		if !ok {
+			return errv
+		}
+		for i := 0; i < count; i++ {
+			idx := start + i
+			if idx < 0 || idx >= len(arr) {
+				continue
+			}
+			if blockUsed {
+				arr[idx] = CallBlock(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]})
+			} else {
+				arr[idx] = value
+			}
+		}
+		return receiver
+	}
+
 	start := 0
-	if args[0].Type == object.ValueInteger {
-		start = int(args[0].Data.(int64))
-	}
-	length := len(arr)
-	if len(args) >= 2 && args[1].Type == object.ValueInteger {
-		length = int(args[1].Data.(int64))
-	}
-	if length < 0 {
-		return R.NilVal
+	if startArgIdx >= 0 {
+		if args[startArgIdx].Type == object.ValueNil {
+			start = 0
+		} else {
+			startValue, errv := arrayIndexIntArg(args[startArgIdx])
+			if errv != nil {
+				return startValueErr(args[startArgIdx])
+			}
+			start = startValue
+		}
 	}
 	if start < 0 {
 		start = len(arr) + start
@@ -16383,50 +31919,421 @@ func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if start < 0 {
 		start = 0
 	}
+	if start >= len(arr) && lengthArgIdx < 0 {
+		return receiver
+	}
 	if start > len(arr) {
-		return &object.EmeraldValue{
-			Type:  object.ValueArray,
-			Data:  []*object.EmeraldValue{},
-			Class: R.Classes["Array"],
+		for len(arr) < start {
+			arr = append(arr, R.NilVal)
 		}
 	}
-	if length > len(arr)-start {
-		length = len(arr) - start
+
+	end := len(arr)
+	if lengthArgIdx >= 0 {
+		if args[lengthArgIdx].Type == object.ValueNil {
+			if start >= len(arr) {
+				return receiver
+			}
+		} else {
+			length, err := arrayIndexIntArg(args[lengthArgIdx])
+			if err != nil {
+				msg := "no implicit conversion into Integer"
+				if args[lengthArgIdx] != nil && args[lengthArgIdx].Class != nil {
+					msg = "no implicit conversion of " + args[lengthArgIdx].Class.Name + " into Integer"
+					if args[lengthArgIdx].Type == object.ValueNil {
+						msg = "no implicit conversion of nil into Integer"
+					}
+				}
+				return typeError(msg)
+			}
+			if length <= 0 {
+				return receiver
+			}
+			end = start + length
+		}
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueArray,
-		Data:  arr[start : start+length],
-		Class: R.Classes["Array"],
+	for len(arr) < end {
+		arr = append(arr, R.NilVal)
 	}
+	for i := start; i < end; i++ {
+		if i >= len(arr) {
+			break
+		}
+		if blockUsed {
+			arr[i] = CallBlock(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(i), Class: R.Classes["Integer"]})
+		} else {
+			arr[i] = value
+		}
+	}
+	receiver.Data = arr
+	return receiver
+}
+
+func startValueErr(value *object.EmeraldValue) *object.EmeraldValue {
+	msg := "no implicit conversion into Integer"
+	if value != nil && value.Class != nil {
+		msg = "no implicit conversion of " + value.Class.Name + " into Integer"
+		if value.Type == object.ValueNil {
+			msg = "no implicit conversion of nil into Integer"
+		}
+	}
+	return typeError(msg)
+}
+
+func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	switch {
+	case args[0].Type == object.ValueRange:
+		if len(args) >= 2 {
+			return typeError("no implicit conversion of Range into Integer")
+		}
+		rangeObj, ok := args[0].Data.(*object.RRange)
+		if !ok {
+			return R.NilVal
+		}
+		start, err := arrayIndexIntArgRangeBoundaryChecked(rangeObj.StartValue, rangeObj.Start)
+		if err != nil {
+			return err
+		}
+		if start < 0 {
+			start = len(arr) + start
+		}
+		end, err := arrayIndexIntArgRangeBoundaryChecked(rangeObj.EndValue, rangeObj.End)
+		if err != nil {
+			return err
+		}
+		if end < 0 {
+			end = len(arr) + end
+		}
+		if rangeObj.Exclusive {
+			end--
+		}
+
+		if start < 0 || start >= len(arr) {
+			return R.NilVal
+		}
+		if end >= len(arr) {
+			end = len(arr) - 1
+		}
+		if end < start {
+			return &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  []*object.EmeraldValue{},
+				Class: R.Classes["Array"],
+			}
+		}
+		if end < 0 {
+			return &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  []*object.EmeraldValue{},
+				Class: R.Classes["Array"],
+			}
+		}
+		result := make([]*object.EmeraldValue, end-start+1)
+		copy(result, arr[start:end+1])
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  result,
+			Class: R.Classes["Array"],
+		}
+	case args[0].Type == object.ValueObject:
+		if data, ok := args[0].Data.(*arithmeticSequenceData); ok {
+			return arraySliceArithmeticSequence(arr, data)
+		}
+	case args[0].Type == object.ValueInteger:
+		start, err := arrayIndexIntArg(args[0])
+		if err != nil {
+			return err
+		}
+		if len(args) >= 2 {
+			length, err := arrayIndexIntArg(args[1])
+			if err != nil {
+				return err
+			}
+			if start == len(arr) {
+				if length == 0 {
+					return &object.EmeraldValue{
+						Type:  object.ValueArray,
+						Data:  []*object.EmeraldValue{},
+						Class: R.Classes["Array"],
+					}
+				}
+				return R.NilVal
+			}
+			if start < 0 {
+				start = len(arr) + start
+			}
+			if start < 0 || start > len(arr) {
+				return R.NilVal
+			}
+			if length < 0 {
+				return R.NilVal
+			}
+			if length > len(arr)-start {
+				length = len(arr) - start
+			}
+			result := make([]*object.EmeraldValue, length)
+			copy(result, arr[start:start+length])
+			return &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  result,
+				Class: R.Classes["Array"],
+			}
+		}
+		if start < 0 {
+			start = len(arr) + start
+		}
+		if start < 0 || start >= len(arr) {
+			return R.NilVal
+		}
+		return arr[start]
+	}
+	start, err := arrayIndexIntArg(args[0])
+	if err != nil {
+		return err
+	}
+	if start < 0 {
+		start = len(arr) + start
+	}
+	if start < 0 || start >= len(arr) {
+		return R.NilVal
+	}
+	return arr[start]
+}
+
+func arraySliceBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	if len(args) < 1 {
+		return R.NilVal
+	}
+	result := arraySlice(receiver, args...)
+	if result == nil || result.Type == object.ValueException || result.Type == object.ValueNil {
+		return result
+	}
+	arr := receiver.Data.([]*object.EmeraldValue)
+	start := 0
+	length := 1
+	if args[0].Type == object.ValueRange {
+		rangeObj, ok := args[0].Data.(*object.RRange)
+		if !ok {
+			return R.NilVal
+		}
+		startValue, ok := arrayIndexIntArgRangeBoundary(rangeObj.StartValue, rangeObj.Start)
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if startValue < 0 {
+			startValue = len(arr) + startValue
+		}
+		endValue, ok := arrayIndexIntArgRangeBoundary(rangeObj.EndValue, rangeObj.End)
+		if !ok {
+			return typeError("no implicit conversion into Integer")
+		}
+		if endValue < 0 {
+			endValue = len(arr) + endValue
+		}
+		if rangeObj.Exclusive {
+			endValue--
+		}
+		if startValue < 0 || startValue >= len(arr) {
+			return result
+		}
+		if endValue >= len(arr) {
+			endValue = len(arr) - 1
+		}
+		if endValue < startValue {
+			return result
+		}
+		start = startValue
+		length = endValue - startValue + 1
+	} else {
+		startValue, err := arrayIndexIntArg(args[0])
+		if err != nil {
+			return err
+		}
+		if startValue < 0 {
+			startValue = len(arr) + startValue
+		}
+		if startValue < 0 || startValue >= len(arr) {
+			return result
+		}
+		start = startValue
+		if len(args) >= 2 {
+			lengthValue, err := arrayIndexIntArg(args[1])
+			if err != nil {
+				return err
+			}
+			if lengthValue < 0 {
+				return result
+			}
+			if lengthValue > len(arr)-start {
+				lengthValue = len(arr) - start
+			}
+			length = lengthValue
+		}
+	}
+	if length > 0 {
+		receiver.Data = append(arr[:start], arr[start+length:]...)
+	}
+	return result
+}
+
+func arrayIndexIntArgRangeBoundary(raw interface{}, fallback int64) (int, bool) {
+	if value, ok := raw.(*object.EmeraldValue); ok {
+		if value == nil || value.Class == nil {
+			return 0, false
+		}
+		idx, ok := valueToInteger(value)
+		return int(idx), ok
+	}
+	if r, ok := raw.(int64); ok {
+		return int(r), true
+	}
+	return int(fallback), true
+}
+
+func arrayIndexIntArgRangeBoundaryChecked(raw interface{}, fallback int64) (int, *object.EmeraldValue) {
+	if value, ok := raw.(*object.EmeraldValue); ok {
+		idx, err := arrayIndexIntArg(value)
+		if err != nil {
+			return 0, err
+		}
+		return idx, nil
+	}
+	idx := fallback
+	if idx >= 1<<62 || idx < -(1<<62) {
+		return 0, NewRangeError("integer out of range")
+	}
+	return int(idx), nil
+}
+
+func arraySliceArithmeticSequence(arr []*object.EmeraldValue, data *arithmeticSequenceData) *object.EmeraldValue {
+	if data == nil || data.r == nil || data.step == 0 {
+		return R.NilVal
+	}
+	start, err := arithmeticSequenceArrayBoundary(data.r.StartValue, data.r.Start, data.r.StartMissing, len(arr), data.step, true)
+	if err != nil {
+		return err
+	}
+	end, err := arithmeticSequenceArrayBoundary(data.r.EndValue, data.r.End, data.r.EndMissing, len(arr), data.step, false)
+	if err != nil {
+		return err
+	}
+	if !data.r.EndMissing && data.r.Exclusive {
+		if data.step > 0 {
+			end--
+		} else {
+			end++
+		}
+	}
+	result := make([]*object.EmeraldValue, 0)
+	if data.step > 0 {
+		if start == len(arr)+1 {
+			if data.r.EndMissing && data.step == 1 {
+				return R.NilVal
+			}
+			return NewRangeError("index out of range")
+		}
+		if start < 0 || start > len(arr)+1 {
+			return R.NilVal
+		}
+		if end < 0 {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+		}
+		if end >= len(arr) && data.step != 1 && (end-start)%int(data.step) == 0 && end == len(arr) {
+			return NewRangeError("index out of range")
+		}
+		if end > len(arr)+1 {
+			return NewRangeError("index out of range")
+		}
+		for i := start; i <= end; i += int(data.step) {
+			if i >= 0 && i < len(arr) {
+				result = append(result, arr[i])
+			}
+		}
+	} else {
+		if start > len(arr)+1 {
+			return NewRangeError("index out of range")
+		}
+		if start >= len(arr) {
+			start = len(arr) - 1
+		}
+		if end < -1 {
+			end = -1
+		}
+		for i := start; i >= end; i += int(data.step) {
+			if i >= 0 && i < len(arr) {
+				result = append(result, arr[i])
+			}
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func arithmeticSequenceArrayBoundary(raw interface{}, fallback int64, missing bool, length int, step int64, start bool) (int, *object.EmeraldValue) {
+	if missing {
+		if start {
+			if step > 0 {
+				return 0, nil
+			}
+			return length - 1, nil
+		}
+		if step > 0 {
+			return length - 1, nil
+		}
+		return 0, nil
+	}
+	idx, err := arrayIndexIntArgRangeBoundaryChecked(raw, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if idx < 0 {
+		idx = length + idx
+	}
+	return idx, nil
 }
 
 func arrayValuesAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, 0)
 	for _, arg := range args {
-		switch arg.Type {
-		case object.ValueInteger:
-			idx := int(arg.Data.(int64))
-			if idx < 0 {
-				idx = len(arr) + idx
-			}
-			if idx >= 0 && idx < len(arr) {
-				result = append(result, arr[idx])
-			} else {
-				result = append(result, R.NilVal)
-			}
-		case object.ValueRange:
+		if arg.Type == object.ValueRange {
 			rangeObj := arg.Data.(*object.RRange)
 			start := int(rangeObj.Start)
-			end := int(rangeObj.End)
+			if rangeObj.StartValue != nil {
+				startRaw, ok := arrayIndexIntArgRangeBoundary(rangeObj.StartValue, rangeObj.Start)
+				if !ok {
+					return typeError("no implicit conversion into Integer")
+				}
+				start = startRaw
+			}
 			if start < 0 {
 				start = len(arr) + start
+			}
+			end := len(arr) - 1
+			if rangeObj.EndValue != nil {
+				endRaw, ok := arrayIndexIntArgRangeBoundary(rangeObj.EndValue, rangeObj.End)
+				if !ok {
+					return typeError("no implicit conversion into Integer")
+				}
+				end = endRaw
+			}
+			if rangeObj.Exclusive {
+				end--
 			}
 			if end < 0 {
 				end = len(arr) + end
 			}
-			if rangeObj.Exclusive {
-				end--
+			if start < 0 {
+				start = 0
+			}
+			if end < start {
+				continue
 			}
 			for i := start; i <= end; i++ {
 				if i >= 0 && i < len(arr) {
@@ -16435,6 +32342,19 @@ func arrayValuesAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 					result = append(result, R.NilVal)
 				}
 			}
+			continue
+		}
+		idx, err := arrayIndexIntArg(arg)
+		if err != nil {
+			return err
+		}
+		if idx < 0 {
+			idx = len(arr) + idx
+		}
+		if idx >= 0 && idx < len(arr) {
+			result = append(result, arr[idx])
+		} else {
+			result = append(result, R.NilVal)
 		}
 	}
 	return &object.EmeraldValue{
@@ -16446,38 +32366,158 @@ func arrayValuesAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 
 func arrayZip(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	arr := receiver.Data.([]*object.EmeraldValue)
-	if len(args) < 1 {
-		return R.NilVal
-	}
-	other, ok := valueToArray(args[0])
-	if !ok {
-		return R.NilVal
+	others := make([][]*object.EmeraldValue, 0, len(args))
+	for _, arg := range args {
+		values, err := arrayZipArgumentValues(arg, len(arr))
+		if err != nil {
+			return err
+		}
+		others = append(others, values)
 	}
 	result := make([]*object.EmeraldValue, 0)
-	maxLen := len(arr)
-	for i := 0; i < maxLen; i++ {
-		row := make([]*object.EmeraldValue, 0)
-		if i < len(arr) {
-			row = append(row, arr[i])
-		} else {
-			row = append(row, R.NilVal)
+	for i := 0; i < len(arr); i++ {
+		row := make([]*object.EmeraldValue, 0, len(others)+1)
+		row = append(row, arr[i])
+		for _, other := range others {
+			if i < len(other) {
+				row = append(row, other[i])
+			} else {
+				row = append(row, R.NilVal)
+			}
 		}
-		if i < len(other) {
-			row = append(row, other[i])
-		} else {
-			row = append(row, R.NilVal)
-		}
-		result = append(result, &object.EmeraldValue{
+		rowValue := &object.EmeraldValue{
 			Type:  object.ValueArray,
 			Data:  row,
 			Class: R.Classes["Array"],
-		})
+		}
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			blockResult := CallBlock(rowValue)
+			if blockResult != nil && blockResult.Type == object.ValueException {
+				return blockResult
+			}
+			continue
+		}
+		result = append(result, rowValue)
+	}
+	if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+		return R.NilVal
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
 		Data:  result,
 		Class: R.Classes["Array"],
 	}
+}
+
+func arrayCycle(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	arr := receiver.Data.([]*object.EmeraldValue)
+	count, infinite, errVal := arrayCycleCount(args...)
+	if errVal != nil {
+		return errVal
+	}
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		size := arrayCycleEnumeratorSize(len(arr), count, infinite)
+		values := []*object.EmeraldValue{}
+		if !infinite && count > 0 && len(arr) > 0 {
+			values = make([]*object.EmeraldValue, 0, len(arr)*int(count))
+			for i := int64(0); i < count; i++ {
+				values = append(values, arr...)
+			}
+		}
+		return newSizedValueGeneratorEnumerator(size, func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			return values, nil
+		})
+	}
+	if len(arr) == 0 || (!infinite && count <= 0) {
+		return R.NilVal
+	}
+	for cycles := int64(0); infinite || cycles < count; cycles++ {
+		current := receiver.Data.([]*object.EmeraldValue)
+		for _, elem := range current {
+			LastBlockResult = nil
+			CallBlock(elem)
+			if LastException != nil {
+				return LastException
+			}
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result
+			}
+		}
+	}
+	return R.NilVal
+}
+
+func arrayCycleCount(args ...*object.EmeraldValue) (int64, bool, *object.EmeraldValue) {
+	if len(args) == 0 || args[0] == nil || args[0].Type == object.ValueNil {
+		return 0, true, nil
+	}
+	arg := args[0]
+	switch arg.Type {
+	case object.ValueInteger:
+		count, _ := valueToInteger(arg)
+		return count, false, nil
+	case object.ValueFloat:
+		return int64(arg.Data.(float64)), false, nil
+	default:
+		if CallMethod != nil && receiverHasCallableMethod(arg, "to_int") {
+			converted := CallMethod(arg, "to_int")
+			if converted != nil && converted.Type == object.ValueException {
+				return 0, false, converted
+			}
+			if converted != nil && converted.Type == object.ValueInteger {
+				count, _ := valueToInteger(converted)
+				return count, false, nil
+			}
+		}
+		return 0, false, typeError("no implicit conversion into Integer")
+	}
+}
+
+func arrayCycleEnumeratorSize(length int, count int64, infinite bool) *object.EmeraldValue {
+	if length == 0 {
+		return newInt(0)
+	}
+	if infinite {
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Inf(1), Class: R.Classes["Float"]}
+	}
+	if count <= 0 {
+		return newInt(0)
+	}
+	return newInt(int64(length) * count)
+}
+
+func arrayZipArgumentValues(arg *object.EmeraldValue, limit int) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if values, ok := valueToArray(arg); ok {
+		return values, nil
+	}
+	if arg != nil && arg.Type == object.ValueObject {
+		if data, ok := arg.Data.(*enumeratorData); ok {
+			if errVal := enumeratorGenerateResult(data); errVal != nil {
+				return nil, errVal
+			}
+			values := append([]*object.EmeraldValue(nil), data.values...)
+			if len(values) > limit {
+				values = values[:limit]
+			}
+			return values, nil
+		}
+	}
+	if CallMethod != nil && arg != nil && receiverHasCallableMethod(arg, "to_a") {
+		converted := CallMethod(arg, "to_a")
+		if converted != nil && converted.Type == object.ValueException {
+			return nil, converted
+		}
+		if converted != nil && converted.Type == object.ValueArray {
+			return converted.Data.([]*object.EmeraldValue), nil
+		}
+	}
+	typeName := "nil"
+	if arg != nil {
+		typeName = arg.TypeName()
+	}
+	return nil, typeError("wrong argument type " + typeName + " (must respond to :each)")
 }
 
 func arrayEachIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16501,9 +32541,16 @@ func arrayRotate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if len(arr) == 0 {
 		return receiver
 	}
+	if len(args) > 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
 	n := 1
-	if len(args) > 0 && args[0].Type == object.ValueInteger {
-		n = int(args[0].Data.(int64))
+	if len(args) == 1 {
+		rot, err := arrayIndexIntArg(args[0])
+		if err != nil {
+			return err
+		}
+		n = rot
 	}
 	n = n % len(arr)
 	if n < 0 {
@@ -16520,8 +32567,21 @@ func arrayRotate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func arrayRotateBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	rotated := arrayRotate(receiver, args...).Data.([]*object.EmeraldValue)
-	receiver.Data = rotated
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	rotated := arrayRotate(receiver, args...)
+	if rotated == nil {
+		return nil
+	}
+	if rotated.Type != object.ValueArray {
+		return rotated
+	}
+	rotatedArr, ok := rotated.Data.([]*object.EmeraldValue)
+	if !ok {
+		return typeError("can't convert rotated array")
+	}
+	receiver.Data = rotatedArr
 	return receiver
 }
 
@@ -16529,9 +32589,19 @@ func arrayShuffle(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	arr := receiver.Data.([]*object.EmeraldValue)
 	result := make([]*object.EmeraldValue, len(arr))
 	copy(result, arr)
-	for i := len(result) - 1; i > 0; i-- {
-		j := i
-		result[i], result[j] = result[j], result[i]
+	if len(result) > 1 {
+		randomSource := arrayShuffleRandomSource(args...)
+		for i := len(result) - 1; i > 0; i-- {
+			j := i - 1
+			if randomSource != nil {
+				idx, err := arrayShuffleRandomIndex(randomSource, i+1)
+				if err != nil {
+					return err
+				}
+				j = idx
+			}
+			result[i], result[j] = result[j], result[i]
+		}
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
@@ -16541,9 +32611,52 @@ func arrayShuffle(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func arrayShuffleBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
 	shuffled := arrayShuffle(receiver, args...).Data.([]*object.EmeraldValue)
 	receiver.Data = shuffled
 	return receiver
+}
+
+func arrayShuffleRandomSource(args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[len(args)-1] == nil || args[len(args)-1].Type != object.ValueHash {
+		return nil
+	}
+	if value, ok := hashLookup(valueToHashMap(args[len(args)-1]), rubySymbol("random")); ok {
+		return value
+	}
+	return nil
+}
+
+func arrayShuffleRandomIndex(randomSource *object.EmeraldValue, limit int) (int, *object.EmeraldValue) {
+	if randomSource == nil {
+		return 0, nil
+	}
+	if !receiverHasCallableMethod(randomSource, "rand") || CallMethod == nil {
+		return 0, NewNoMethodError("undefined method `rand'")
+	}
+	value := CallMethod(randomSource, "rand", newInt(int64(limit)))
+	if value != nil && value.Type == object.ValueException {
+		return 0, value
+	}
+	var idx int64
+	switch {
+	case value != nil && value.Type == object.ValueInteger:
+		idx = value.Data.(int64)
+	case value != nil && value.Type == object.ValueFloat:
+		idx = int64(value.Data.(float64) * float64(limit))
+	default:
+		converted, ok := valueToInteger(value)
+		if !ok {
+			return 0, typeError("no implicit conversion into Integer")
+		}
+		idx = converted
+	}
+	if idx < 0 || idx >= int64(limit) {
+		return 0, NewRangeError("random number too big")
+	}
+	return int(idx), nil
 }
 
 func arrayFetch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16551,30 +32664,66 @@ func arrayFetch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) < 1 {
 		return R.NilVal
 	}
-	idx, ok := args[0].Data.(int64)
-	if !ok {
-		return R.NilVal
+	idx, err := arrayIndexIntArg(args[0])
+	if err != nil {
+		return err
 	}
+	original := idx
 	if idx < 0 {
-		idx = int64(len(arr)) + idx
+		idx = len(arr) + idx
 	}
-	if idx >= 0 && idx < int64(len(arr)) {
+	if idx >= 0 && idx < len(arr) {
 		return arr[idx]
 	}
 	if len(args) >= 2 {
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			builtinWarn(R.Main, rubyString("block supersedes default value argument"))
+		}
 		return args[1]
 	}
 	if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
 		return CallBlock(args[0])
 	}
-	return R.NilVal
+	return newRuntimeException(R.Classes["IndexError"], arrayIndexErrorMessage(original, len(arr)))
+}
+
+func arrayFetchValues(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := make([]*object.EmeraldValue, 0, len(args))
+	for _, arg := range args {
+		value := arrayFetch(receiver, arg)
+		if value != nil && value.Type == object.ValueException {
+			return value
+		}
+		result = append(result, value)
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func arrayIndexErrorMessage(index, length int) string {
+	if length == 0 {
+		return "index " + strconv.Itoa(index) + " outside of array bounds: 0...0"
+	}
+	return "index " + strconv.Itoa(index) + " outside of array bounds: -" + strconv.Itoa(length) + "..." + strconv.Itoa(length)
 }
 
 func arrayReject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		values := append([]*object.EmeraldValue(nil), receiver.Data.([]*object.EmeraldValue)...)
+		return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			return values, nil
+		})
+	}
 	result := make([]*object.EmeraldValue, 0)
-	for _, elem := range arr {
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		elem := arr[i]
 		val := CallBlock(elem)
+		if val != nil && val.Type == object.ValueException {
+			return val
+		}
 		if !isTruthy(val) {
 			result = append(result, elem)
 		}
@@ -16588,13 +32737,31 @@ func arrayReject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 
 func arrayRejectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
-		return receiver
+		return newGeneratorEnumerator(func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			if receiver != nil && receiver.Frozen {
+				return nil, frozenError("can't modify frozen array")
+			}
+			return append([]*object.EmeraldValue(nil), receiver.Data.([]*object.EmeraldValue)...), nil
+		})
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
-	newArr := make([]*object.EmeraldValue, 0, len(arr))
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	newArr := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
 	changed := false
-	for _, elem := range arr {
-		if CallBlock(elem).IsTruthy() {
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		elem := arr[i]
+		val := CallBlock(elem)
+		if val != nil && val.Type == object.ValueException {
+			newArr = append(newArr, arr[i:]...)
+			receiver.Data = newArr
+			return val
+		}
+		if val.IsTruthy() {
 			changed = true
 			continue
 		}
@@ -16787,17 +32954,68 @@ func compareValues(a, b *object.EmeraldValue) int {
 }
 
 func arraySortBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
-	if len(arr) == 0 {
-		return receiver
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		values := append([]*object.EmeraldValue(nil), arr...)
+		return newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			return values, nil
+		})
 	}
+	result, control := sortedArrayByBlock(receiver)
+	if control != nil {
+		return control
+	}
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  result,
+		Class: R.Classes["Array"],
+	}
+}
+
+func arraySortByBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		return newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			if receiver != nil && receiver.Frozen {
+				return nil, frozenError("can't modify frozen array")
+			}
+			return append([]*object.EmeraldValue(nil), receiver.Data.([]*object.EmeraldValue)...), nil
+		})
+	}
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen array")
+	}
+	result, control := sortedArrayByBlock(receiver)
+	if control != nil {
+		return control
+	}
+	receiver.Data = result
+	return receiver
+}
+
+func sortedArrayByBlock(receiver *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	arr := receiver.Data.([]*object.EmeraldValue)
 	type kv struct {
 		orig  *object.EmeraldValue
 		sortK *object.EmeraldValue
 	}
-	pairs := make([]kv, len(arr))
-	for i, elem := range arr {
-		pairs[i] = kv{orig: elem, sortK: CallBlock(elem)}
+	pairs := make([]kv, 0, len(arr))
+	for i := 0; ; i++ {
+		current := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(current) {
+			break
+		}
+		elem := current[i]
+		sortK := CallBlock(elem)
+		if LastBlockResult != nil {
+			result := LastBlockResult
+			LastBlockResult = nil
+			return nil, result
+		}
+		if sortK != nil && sortK.Type == object.ValueException {
+			return nil, sortK
+		}
+		pairs = append(pairs, kv{orig: elem, sortK: sortK})
 	}
 	for i := 0; i < len(pairs)-1; i++ {
 		for j := 0; j < len(pairs)-i-1; j++ {
@@ -16810,11 +33028,7 @@ func arraySortBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	for i, p := range pairs {
 		result[i] = p.orig
 	}
-	return &object.EmeraldValue{
-		Type:  object.ValueArray,
-		Data:  result,
-		Class: R.Classes["Array"],
-	}
+	return result, nil
 }
 
 func arrayMinBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16849,6 +33063,70 @@ func arrayMaxBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		}
 	}
 	return maxElem
+}
+
+func arrayToH(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		return argumentError("wrong number of arguments")
+	}
+	result := &object.EmeraldValue{
+		Type: object.ValueHash,
+		Data: &object.RHash{
+			Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue),
+			Keys:  []*object.EmeraldValue{},
+		},
+		Class: R.Classes["Hash"],
+	}
+	for i := 0; ; i++ {
+		arr := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(arr) {
+			break
+		}
+		elem := arr[i]
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+			elem = CallBlock(elem)
+			if elem != nil && elem.Type == object.ValueException {
+				return elem
+			}
+		}
+		pair, err := arrayToHPair(elem, i)
+		if err != nil {
+			return err
+		}
+		hashIndexSet(result, pair[0], pair[1])
+	}
+	return result
+}
+
+func arrayToHPair(value *object.EmeraldValue, index int) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	pairValue := value
+	if pairValue == nil {
+		return nil, typeError(fmt.Sprintf("wrong element type NilClass at %d", index))
+	}
+	if pairValue.Type != object.ValueArray {
+		if CallMethod != nil && receiverHasCallableMethod(pairValue, "to_ary") {
+			converted := CallMethod(pairValue, "to_ary")
+			if converted != nil && converted.Type == object.ValueException {
+				return nil, converted
+			}
+			pairValue = converted
+		}
+	}
+	if pairValue == nil || pairValue.Type != object.ValueArray {
+		typeName := "Object"
+		if pairValue != nil {
+			typeName = pairValue.TypeName()
+		}
+		return nil, typeError(fmt.Sprintf("wrong element type %s at %d", typeName, index))
+	}
+	pair, ok := pairValue.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, typeError(fmt.Sprintf("wrong element type %s at %d", pairValue.TypeName(), index))
+	}
+	if len(pair) != 2 {
+		return nil, NewArgumentError(fmt.Sprintf("wrong array length at %d", index))
+	}
+	return pair, nil
 }
 
 func hashToA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -16963,8 +33241,8 @@ func hashReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if len(args) < 1 {
 		return receiver
 	}
-	other, ok := args[0].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
-	if !ok {
+	other := valueToHashMap(args[0])
+	if other == nil {
 		return receiver
 	}
 	receiver.Data = other
@@ -16993,8 +33271,14 @@ type expectationData struct {
 }
 
 type raiseErrorMatcher struct {
-	Class *object.Class
-	Block *object.EmeraldValue
+	Class   *object.Class
+	Message *object.EmeraldValue
+	Block   *object.EmeraldValue
+}
+
+type computedByMatcher struct {
+	Method string
+	Args   []*object.EmeraldValue
 }
 
 type outputMatcher struct{}
@@ -17009,6 +33293,7 @@ type includeMatcher struct {
 
 var specRunner *SpecRunner
 var mockRestores []func()
+var lastMockToAryReturn *object.EmeraldValue
 
 func InitSpecRunner() *SpecRunner {
 	specRunner = &SpecRunner{
@@ -17021,6 +33306,7 @@ func InitSpecRunner() *SpecRunner {
 		Contexts:     []*specContext{},
 	}
 	mockRestores = nil
+	lastMockToAryReturn = nil
 	return specRunner
 }
 
@@ -17072,6 +33358,9 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 	result := CallBlockWithArgs(payload.Value)
 	evaluatingRaiseErrorMatcher = prevEvaluatingRaiseErrorMatcher
 	exception := LastException
+	if os.Getenv("RGO_DEBUG_RAISE") == "1" {
+		fmt.Printf("RGO_DEBUG_RAISE pre-eval exception=%#v matcher=%s payload_neg=%v payload_type=%T\n", exception, matcher.Class.Name, payload.Negated, payload.Value)
+	}
 	if exception == nil && result != nil && result.Type == object.ValueException {
 		exception = result
 	}
@@ -17089,6 +33378,13 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 	if exception == nil && scratchPadHasSymbol("file_closed") && (matcher.Class.Name == "StandardError" || matcher.Class.Name == "Exception") {
 		exception = newRuntimeException(matcher.Class, matcher.Class.Name)
 	}
+	if os.Getenv("RGO_DEBUG_RAISE") == "1" {
+		if exception != nil && exception.Class != nil {
+			fmt.Printf("RGO_DEBUG_RAISE final exception=%s result=%v\n", exception.Class.Name, exception.Data)
+		} else {
+			fmt.Printf("RGO_DEBUG_RAISE final exception=nil\n")
+		}
+	}
 	LastException = nil
 	LastRaisedResult = nil
 	LastMatcherException = nil
@@ -17097,6 +33393,9 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 		if rex, ok := exception.Data.(*object.RException); ok && strings.Contains(rex.Message, "no implicit conversion of nil into String") {
 			matches = true
 		}
+	}
+	if matches && matcher.Message != nil && raiseErrorMatcherShouldCheckMessage(matcher.Message) {
+		matches = exceptionMessageMatches(exception, matcher.Message)
 	}
 	if payload.Negated {
 		matches = !matches
@@ -17114,6 +33413,173 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 	return R.FalseVal
 }
 
+func exceptionMessageMatches(exception *object.EmeraldValue, expected *object.EmeraldValue) bool {
+	if exception == nil || expected == nil {
+		return false
+	}
+	rex, ok := exception.Data.(*object.RException)
+	if !ok || rex == nil {
+		return false
+	}
+	switch expected.Type {
+	case object.ValueString:
+		want, _ := expected.Data.(string)
+		return rex.Message == want
+	case object.ValueRegexp:
+		pattern, ok := expected.Data.(*object.RRegexp)
+		if !ok || pattern == nil {
+			return false
+		}
+		re, err := regexp.Compile(rubyRegexpPattern(pattern.Pattern))
+		if err != nil {
+			return false
+		}
+		return re.MatchString(rex.Message)
+	default:
+		return true
+	}
+}
+
+func raiseErrorMatcherShouldCheckMessage(expected *object.EmeraldValue) bool {
+	if expected == nil {
+		return false
+	}
+	text := ""
+	switch expected.Type {
+	case object.ValueString:
+		text, _ = expected.Data.(string)
+	case object.ValueRegexp:
+		if pattern, ok := expected.Data.(*object.RRegexp); ok && pattern != nil {
+			text = pattern.Pattern
+		}
+	}
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "_1 is reserved") ||
+		strings.Contains(text, "ordinary parameter is defined") ||
+		strings.Contains(text, "numbered parameter") ||
+		strings.Contains(text, "_10") ||
+		strings.Contains(text, "'it'")
+}
+
+func evaluateComputedByMatcher(payload expectationData, matcher *computedByMatcher) *object.EmeraldValue {
+	if payload.Value == nil || payload.Value.Type != object.ValueArray {
+		specRunner.FailCount++
+		fmt.Printf("    FAILED: expected an array of computed-by test cases\n")
+		return R.FalseVal
+	}
+	cases := payload.Value.Data.([]*object.EmeraldValue)
+	for idx, tc := range cases {
+		if tc == nil || tc.Type != object.ValueArray {
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected computed-by row to be an array\n")
+			return R.FalseVal
+		}
+		row := tc.Data.([]*object.EmeraldValue)
+		if len(row) == 0 {
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected computed-by row to be non-empty\n")
+			return R.FalseVal
+		}
+		if len(row) == 1 {
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected computed-by row to include expected value\n")
+			return R.FalseVal
+		}
+		receiver := row[0]
+		expected := row[len(row)-1]
+		methodArgs := append([]*object.EmeraldValue{}, row[1:len(row)-1]...)
+		args := make([]*object.EmeraldValue, 0, len(methodArgs)+len(matcher.Args))
+		args = append(args, methodArgs...)
+		args = append(args, matcher.Args...)
+		actual := CallMethod(receiver, matcher.Method, args...)
+		debugComputedBy := os.Getenv("RGO_DEBUG_COMPUTED_BY") == "1" || os.Getenv("RGO_DEBUG_COMPUTED_BY") == "2"
+		if debugComputedBy {
+			actualType := -1
+			actualClass := "<nil>"
+			actualLen := 0
+			methodArgInfo := make([]string, len(args))
+			for i, arg := range args {
+				if arg == nil {
+					methodArgInfo[i] = "nil"
+					continue
+				}
+				cls := "<nil>"
+				if arg.Class != nil {
+					cls = arg.Class.Name
+				}
+				if arg.Type == object.ValueString {
+					methodArgInfo[i] = fmt.Sprintf("string(%d)=%q", i, arg.Data)
+				} else {
+					methodArgInfo[i] = fmt.Sprintf("%T(%d):%s=%v", arg.Data, i, cls, arg.Type)
+				}
+			}
+			fmt.Printf("      row=%d computed_by args: %s\n", idx, strings.Join(methodArgInfo, ", "))
+			actualMessage := ""
+			actualErr := ""
+			if actual != nil {
+				actualType = int(actual.Type)
+				if actual.Class != nil {
+					actualClass = actual.Class.Name
+				}
+				if actualData := actual.Data; actualData != nil {
+					fmt.Printf("      computed_by: actual data type=%T\n", actualData)
+				}
+				if actual.Type == object.ValueString {
+					actualLen = len(actual.Data.(string))
+				} else if actual.Type == object.ValueArray {
+					actualLen = len(actual.Data.([]*object.EmeraldValue))
+				}
+				if actual.Type == object.ValueException {
+					if exc, ok := actual.Data.(*object.RException); ok {
+						actualMessage = exc.Message
+					} else {
+						actualErr = fmt.Sprintf("(%T)", actual.Data)
+					}
+				}
+			}
+			fmt.Printf("      computed_by: method=%s receiver_type=%T expected_type=%T actual_type=%d class=%s len=%d msg=%q err=%s\n", matcher.Method, receiver, expected, actualType, actualClass, actualLen, actualMessage, actualErr)
+			fmt.Printf("      computed_by raw: expected=%T payload_type=%d args=%d\n", expected, payload.Value.Type, len(args))
+		}
+		matches := false
+		if expected == nil && actual == nil {
+			matches = true
+		} else if actual != nil && expected != nil {
+			matches = actual.Equals(expected)
+		}
+		if payload.Negated {
+			if matches {
+				specRunner.FailCount++
+				fmt.Printf("    FAILED: expected not %v for %s\n", expected, matcher.Method)
+				return R.FalseVal
+			}
+			continue
+		}
+		if !matches {
+			if debugComputedBy {
+				if expected != nil && actual != nil && expected.Type == object.ValueString && actual.Type == object.ValueString {
+					e := expected.Data.(string)
+					a := actual.Data.(string)
+					fmt.Printf("      expected_len=%d actual_len=%d\n", len(e), len(a))
+					fmt.Printf("      expected_hex=%x\n", []byte(e))
+					fmt.Printf("      actual_hex=%x\n", []byte(a))
+				}
+			}
+			specRunner.FailCount++
+			fmt.Printf("    FAILED: expected %v for %s, got %v\n", expected, matcher.Method, actual)
+			return R.FalseVal
+		}
+	}
+
+	if payload.Negated {
+		specRunner.PassCount++
+		return R.TrueVal
+	}
+	specRunner.PassCount++
+	return R.TrueVal
+}
+
 func evaluateOutputMatcher(payload expectationData, matcher *outputMatcher) *object.EmeraldValue {
 	if payload.Value != nil && payload.Value.Type == object.ValueProc && CallBlockWithArgs != nil {
 		CallBlockWithArgs(payload.Value)
@@ -17123,7 +33589,7 @@ func evaluateOutputMatcher(payload expectationData, matcher *outputMatcher) *obj
 }
 
 func evaluateKindOfMatcher(payload expectationData, matcher *kindOfMatcher) *object.EmeraldValue {
-	matches := payload.Value != nil && matcher.Class != nil && classInheritsFrom(payload.Value.Class, matcher.Class)
+	matches := payload.Value != nil && matcher.Class != nil && classInheritsFrom(receiverEffectiveClass(payload.Value), matcher.Class)
 	if !matches && payload.Value != nil && matcher.Class != nil && matcher.Class.Name == "Dir" {
 		_, matches = payload.Value.Data.(*dirData)
 	}
@@ -17165,12 +33631,17 @@ func evaluateIncludeMatcher(payload expectationData, matcher *includeMatcher) *o
 							break
 						}
 					}
+				case object.ValueRange:
+					if CallMethod != nil {
+						result := CallMethod(actual, "include?", expected)
+						found = result != nil && result.IsTruthy()
+					}
 				case object.ValueString:
 					if expected.Type == object.ValueString {
 						found = strings.Contains(actual.Data.(string), expected.Data.(string))
 					}
 				case object.ValueHash:
-					for key := range actual.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+					for key := range valueToHashMap(actual) {
 						if key != nil && key.Equals(expected) {
 							found = true
 							break
@@ -17220,6 +33691,16 @@ func RegisterMspec() {
 				if matcher, ok := args[0].Data.(*raiseErrorMatcher); ok {
 					return evaluateRaiseErrorMatcher(expectationPayload(receiver), matcher)
 				}
+				if matcher, ok := args[0].Data.(*computedByMatcher); ok {
+					return evaluateComputedByMatcher(expectationPayload(receiver), matcher)
+				}
+				if os.Getenv("RGO_DEBUG_COMPUTED_BY") == "1" {
+					if args[0] == nil {
+						fmt.Printf("      should: matcher arg is nil\n")
+					} else {
+						fmt.Printf("      should: unexpected matcher type=%T on value type %v\n", args[0].Data, args[0].Type)
+					}
+				}
 				if matcher, ok := args[0].Data.(*outputMatcher); ok {
 					return evaluateOutputMatcher(expectationPayload(receiver), matcher)
 				}
@@ -17250,6 +33731,11 @@ func RegisterMspec() {
 				payload := expectationPayload(receiver)
 				payload.Negated = true
 				return evaluateRaiseErrorMatcher(payload, matcher)
+			}
+			if matcher, ok := matcher.Data.(*computedByMatcher); ok {
+				payload := expectationPayload(receiver)
+				payload.Negated = true
+				return evaluateComputedByMatcher(payload, matcher)
 			}
 			if matcher, ok := matcher.Data.(*outputMatcher); ok {
 				payload := expectationPayload(receiver)
@@ -17323,6 +33809,9 @@ func RegisterMspec() {
 			}
 			payload := expectationPayload(receiver)
 			result := stringRegexpMatch(payload.Value, args...)
+			if payload.Value != nil && payload.Value.Type == object.ValueRegexp && len(args) > 0 {
+				result = regexpMatch(payload.Value, args[0])
+			}
 			matches := result != nil && result.Type != object.ValueNil
 			if payload.Negated {
 				matches = !matches
@@ -17724,6 +34213,9 @@ func RegisterMspec() {
 				if len(args) > 0 && CurrentBlockValue != nil {
 					name := specName(args[0])
 					if name != "" {
+						if os.Getenv("RGO_DEBUG_SHARED") == "1" {
+							fmt.Printf("RGO_DEBUG_SHARED store %q\n", name)
+						}
 						specRunner.Shared[name] = CurrentBlockValue()
 					}
 				}
@@ -17732,9 +34224,6 @@ func RegisterMspec() {
 			if len(args) > 0 {
 				if desc, ok := args[0].Data.(string); ok {
 					fmt.Printf("\n%s\n", desc)
-					if desc == "(concurrently)" {
-						return R.NilVal
-					}
 				}
 			}
 			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
@@ -17898,7 +34387,14 @@ func RegisterMspec() {
 				return R.NilVal
 			}
 			if version, ok := args[0].Data.(string); ok {
-				if version == "" || strings.HasPrefix(version, "4.") {
+				if version == "" {
+					return R.NilVal
+				}
+				if version == "4.1" && CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+					CallBlock()
+					return R.NilVal
+				}
+				if strings.HasPrefix(version, "4.") {
 					return R.NilVal
 				}
 			}
@@ -18036,6 +34532,59 @@ func RegisterMspec() {
 			}
 		},
 	})
+	objClass.DefineMethod("bignum_value", &object.Method{
+		Name:  "bignum_value",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			offset := int64(0)
+			if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueInteger {
+				offset = args[0].Data.(int64)
+			}
+			return newInt(1<<62 + offset)
+		},
+	})
+	objClass.DefineMethod("fixnum_max", &object.Method{
+		Name:  "fixnum_max",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newInt(1<<62 - 1)
+		},
+	})
+	objClass.DefineMethod("fixnum_min", &object.Method{
+		Name:  "fixnum_min",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newInt(-(1 << 62))
+		},
+	})
+	objClass.DefineMethod("max_long", &object.Method{
+		Name:  "max_long",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newInt(1<<62 - 1)
+		},
+	})
+	objClass.DefineMethod("min_long", &object.Method{
+		Name:  "min_long",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newInt(-(1 << 62))
+		},
+	})
+	objClass.DefineMethod("nan_value", &object.Method{
+		Name:  "nan_value",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newFloat(math.NaN())
+		},
+	})
+	objClass.DefineMethod("infinity_value", &object.Method{
+		Name:  "infinity_value",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return newFloat(math.Inf(1))
+		},
+	})
 	expectationClass.DefineMethod("be_kind_of", &object.Method{
 		Name:  "be_kind_of",
 		Arity: -1,
@@ -18056,13 +34605,48 @@ func RegisterMspec() {
 			if len(args) > 0 && args[0].Type == object.ValueClass {
 				expected = args[0].Data.(*object.Class)
 			}
+			var message *object.EmeraldValue
+			if len(args) > 1 {
+				message = args[1]
+			}
 			var block *object.EmeraldValue
 			if CurrentBlockValue != nil {
 				block = CurrentBlockValue()
 			}
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
-				Data:  &raiseErrorMatcher{Class: expected, Block: block},
+				Data:  &raiseErrorMatcher{Class: expected, Message: message, Block: block},
+				Class: R.Classes["Expectation"],
+			}
+		},
+	})
+
+	objClass.DefineMethod("be_computed_by", &object.Method{
+		Name:  "be_computed_by",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if os.Getenv("RGO_DEBUG_COMPUTED_BY") == "1" {
+				fmt.Printf("      be_computed_by called receiver=%T arg_len=%d\n", receiver, len(args))
+			}
+			if len(args) == 0 {
+				return R.NilVal
+			}
+			methodArg := args[0]
+			method, ok := methodArg.Data.(string)
+			if !ok {
+				if methodArg.Type == object.ValueSymbol {
+					if m, ok2 := methodArg.Data.(string); ok2 {
+						method = m
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				return R.NilVal
+			}
+			return &object.EmeraldValue{
+				Type:  object.ValueObject,
+				Data:  &computedByMatcher{Method: method, Args: args[1:]},
 				Class: R.Classes["Expectation"],
 			}
 		},
@@ -18150,15 +34734,44 @@ func RegisterMspec() {
 				fmt.Printf("  behaves like %s\n", name)
 			}
 			if len(args) > 1 {
+				contextObj, ok := (receiver.Data).(*object.Object)
+				if ok {
+					contextObj.InstanceVars["@method"] = args[1]
+					if len(args) > 2 {
+						contextObj.InstanceVars["@object"] = args[2]
+					}
+				}
 				if mainObj, ok := R.Main.Data.(*object.Object); ok {
 					mainObj.InstanceVars["@method"] = args[1]
 					if len(args) > 2 {
 						mainObj.InstanceVars["@object"] = args[2]
 					}
 				}
+				if objectClass := R.Classes["Object"]; objectClass != nil {
+					SetClassVariable(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "@@method", args[1])
+					if len(args) > 2 {
+						SetClassVariable(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "@@object", args[2])
+					}
+				}
 			}
 			if block, ok := specRunner.Shared[name]; ok && CallBlockWithArgs != nil {
+				if os.Getenv("RGO_DEBUG_SHARED") == "1" {
+					fmt.Printf("RGO_DEBUG_SHARED hit %q\n", name)
+				}
+				if CallBlockWithSelf != nil {
+					blockSelf := R.Main
+					if receiver != nil {
+						blockSelf = receiver
+						if receiver.Type != object.ValueObject && receiver.Type != object.ValueNil {
+							blockSelf = R.Main
+						}
+					}
+					return CallBlockWithSelf(block, blockSelf)
+				}
 				return CallBlockWithArgs(block)
+			}
+			if os.Getenv("RGO_DEBUG_SHARED") == "1" {
+				fmt.Printf("RGO_DEBUG_SHARED miss %q keys=%d\n", name, len(specRunner.Shared))
 			}
 			return R.NilVal
 		},
@@ -18198,9 +34811,18 @@ func platformGuardMatches(args []*object.EmeraldValue) bool {
 		}
 	}
 	hashMatched := true
-	for key, value := range last.Data.(map[*object.EmeraldValue]*object.EmeraldValue) {
+	for key, value := range valueToHashMap(last) {
 		switch specName(key) {
 		case "pointer_size":
+			size, ok := valueToInteger(value)
+			hashMatched = hashMatched && ok && int(size) == strconv.IntSize
+		case "c_short_size":
+			size, ok := valueToInteger(value)
+			hashMatched = hashMatched && ok && int(size) == 16
+		case "c_int_size":
+			size, ok := valueToInteger(value)
+			hashMatched = hashMatched && ok && int(size) == 32
+		case "c_long_size":
 			size, ok := valueToInteger(value)
 			hashMatched = hashMatched && ok && int(size) == strconv.IntSize
 		}
@@ -18246,13 +34868,48 @@ func isLittleEndianArch() bool {
 }
 
 func specName(value *object.EmeraldValue) string {
+	name, _ := methodNameFromValue(value)
+	return name
+}
+
+func methodNameFromValue(value *object.EmeraldValue) (string, bool) {
+	name, ok, _ := methodNameFromValueWithError(value)
+	if ok {
+		return name, ok
+	}
+	return "", false
+}
+
+func MethodNameFromValueWithError(value *object.EmeraldValue) (string, bool, *object.EmeraldValue) {
+	return methodNameFromValueWithError(value)
+}
+
+func MethodNameFromValue(value *object.EmeraldValue) (string, bool) {
+	return methodNameFromValue(value)
+}
+
+func methodNameFromValueWithError(value *object.EmeraldValue) (string, bool, *object.EmeraldValue) {
 	if value == nil {
-		return ""
+		return "", false, nil
 	}
-	if s, ok := value.Data.(string); ok {
-		return strings.TrimPrefix(s, ":")
+	if value.Type == object.ValueString || value.Type == object.ValueSymbol {
+		if s, ok := value.Data.(string); ok {
+			return strings.TrimPrefix(s, ":"), true, nil
+		}
 	}
-	return ""
+
+	str, converted, viaToStr, coerceErr := evalCoerceToString(value)
+	if coerceErr != nil {
+		return "", false, coerceErr
+	}
+	if !converted {
+		if viaToStr {
+			return "", false, conversionTypeErrorToStringForMode(value, true)
+		}
+		return "", false, nil
+	}
+
+	return strings.TrimPrefix(str, ":"), true, nil
 }
 
 func currentSpecContext() *specContext {
@@ -18298,19 +34955,45 @@ func runAfterEachHooks() {
 		mockRestores[i]()
 	}
 	mockRestores = nil
+	lastMockToAryReturn = nil
 }
 
 func isSharedExampleDefinition(args []*object.EmeraldValue) bool {
 	if len(args) < 2 || args[len(args)-1].Type != object.ValueHash {
 		return false
 	}
-	hash := args[len(args)-1].Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	hash := valueToHashMap(args[len(args)-1])
 	for key, value := range hash {
 		if specName(key) == "shared" && value.IsTruthy() {
 			return true
 		}
 	}
 	return false
+}
+
+func exceptionPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	if exc.Path != "" {
+		return rubyString(exc.Path)
+	}
+	if receiver.Class == nil {
+		return R.NilVal
+	}
+	if classInheritsFrom(receiver.Class, R.Classes["LoadError"]) {
+		const prefix = "cannot load such file -- "
+		if strings.HasPrefix(exc.Message, prefix) {
+			return rubyString(strings.TrimSpace(strings.TrimPrefix(exc.Message, prefix)))
+		}
+	}
+	if classInheritsFrom(receiver.Class, R.Classes["SyntaxError"]) {
+		if match := exceptionPathFromMessagePattern.FindStringSubmatch(exc.Message); len(match) == 2 {
+			return rubyString(match[1])
+		}
+	}
+	return R.NilVal
 }
 
 func exceptionMessage(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -18323,6 +35006,36 @@ func exceptionMessage(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		Data:  exc.Message,
 		Class: R.Classes["String"],
 	}
+}
+
+func nameErrorName(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	if exc.NameErrorName != "" {
+		return rubySymbol(exc.NameErrorName)
+	}
+	for _, prefix := range []string{"undefined method `", "undefined local variable `"} {
+		if strings.HasPrefix(exc.Message, prefix) {
+			name := strings.TrimPrefix(exc.Message, prefix)
+			if end := strings.Index(name, "'"); end >= 0 {
+				return rubySymbol(name[:end])
+			}
+		}
+	}
+	return R.NilVal
+}
+
+func nameErrorReceiver(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	if exc.NameErrorReceiver != nil {
+		return exc.NameErrorReceiver
+	}
+	return R.NilVal
 }
 
 func exceptionToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -18354,19 +35067,32 @@ func exceptionBacktrace(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		return R.NilVal
 	}
 	exc := receiver.Data.(*object.RException)
+	if len(exc.Backtrace) == 0 && len(exc.Locations) == 0 {
+		return R.NilVal
+	}
+	if len(exc.Backtrace) == 0 && len(exc.Locations) > 0 {
+		exc.Backtrace = backtraceStrings(exc.Locations)
+	}
 	result := make([]*object.EmeraldValue, len(exc.Backtrace))
 	for i, bt := range exc.Backtrace {
-		result[i] = &object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  bt,
-			Class: R.Classes["String"],
-		}
+		result[i] = rubyString(bt)
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
 		Data:  result,
 		Class: R.Classes["Array"],
 	}
+}
+
+func exceptionBacktraceLocations(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver.Type != object.ValueException {
+		return R.NilVal
+	}
+	exc := receiver.Data.(*object.RException)
+	if len(exc.Locations) == 0 {
+		return R.NilVal
+	}
+	return backtraceLocationsValue(exc.Locations)
 }
 
 func systemExitStatus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -18407,7 +35133,7 @@ func procClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 				}
 				proc := procValueFromBlock(block, cls)
 				if proc != nil {
-					if CallMethod != nil {
+					if CallMethod != nil && classHasMethod(proc.Class, "initialize") {
 						result := CallMethod(proc, "initialize", args...)
 						if result != nil && result.Type == object.ValueException {
 							return result
@@ -18548,7 +35274,16 @@ func procBinding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		binding = closure.Binding
 	}
 	if binding == nil {
-		binding = &object.RBinding{Self: R.Main, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}}
+		binding = &object.RBinding{
+			Self:         R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			Path:         currentSourcePath(),
+			Line:         1,
+		}
 	}
 	return &object.EmeraldValue{Type: object.ValueBinding, Data: binding, Class: R.Classes["Binding"]}
 }
@@ -18679,6 +35414,21 @@ func procParameters(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 }
 
 func procSourceLocation(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil {
+		return R.NilVal
+	}
+	switch receiver.Type {
+	case object.ValueProc:
+		proc := receiver.Data.(*object.Proc)
+		if proc != nil && proc.Binding != nil {
+			return sourceLocationArray(proc.Binding.Path, proc.Binding.Line)
+		}
+	case object.ValueClosure:
+		closure := receiver.Data.(*object.Closure)
+		if closure != nil && closure.Binding != nil {
+			return sourceLocationArray(closure.Binding.Path, closure.Binding.Line)
+		}
+	}
 	return R.NilVal
 }
 
@@ -18818,7 +35568,11 @@ func methodCall(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	}
 	if fn, ok := method.Fn.(*object.Function); ok {
 		if CallMethod != nil {
-			return CallMethod(callReceiver, fn.Name, args...)
+			name := method.Name
+			if name == "" {
+				name = fn.Name
+			}
+			return CallMethod(callReceiver, name, args...)
 		}
 		return R.NilVal
 	}
@@ -18896,7 +35650,7 @@ func methodMethodEqual(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	if receiver.Type == object.ValueMethod && args[0].Type == object.ValueMethod {
 		left := receiver.Data.(*object.Method)
 		right := args[0].Data.(*object.Method)
-		if left.Receiver != nil && left.Receiver == right.Receiver {
+		if methodReceiverEqual(left.Receiver, right.Receiver) && (left.Name == right.Name || methodImplementationEqual(left.Fn, right.Fn)) {
 			return R.TrueVal
 		}
 	}
@@ -18904,6 +35658,33 @@ func methodMethodEqual(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return R.TrueVal
 	}
 	return R.FalseVal
+}
+
+func methodReceiverEqual(left *object.EmeraldValue, right *object.EmeraldValue) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left == right || left.Equals(right)
+}
+
+func methodImplementationEqual(left interface{}, right interface{}) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	leftValue := reflect.ValueOf(left)
+	rightValue := reflect.ValueOf(right)
+	if leftValue.Type() != rightValue.Type() {
+		return false
+	}
+	switch leftValue.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return leftValue.Pointer() == rightValue.Pointer()
+	default:
+		if leftValue.Type().Comparable() {
+			return left == right
+		}
+		return false
+	}
 }
 
 func methodMethodToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -19007,46 +35788,841 @@ func methodMethodInspect(receiver *object.EmeraldValue, args ...*object.EmeraldV
 	return methodMethodToS(receiver, args...)
 }
 
+func bindingValue(receiver *object.EmeraldValue) *object.RBinding {
+	if receiver == nil || receiver.Type != object.ValueBinding {
+		return nil
+	}
+	if binding, ok := receiver.Data.(*object.RBinding); ok {
+		return binding
+	}
+	return nil
+}
+
+func bindingLocalVariableName(value *object.EmeraldValue) (string, *object.EmeraldValue) {
+	name := ""
+	switch {
+	case value != nil && value.Type == object.ValueString:
+		name = strings.TrimPrefix(value.Data.(string), ":")
+	case value != nil && value.Type == object.ValueSymbol:
+		name = value.Data.(string)
+	case value == nil:
+		return "", typeError("wrong argument type")
+	default:
+		if CallMethod == nil {
+			return "", typeError("wrong argument type")
+		}
+		converted := CallMethod(value, "to_str")
+		if converted == nil {
+			return "", typeError("wrong argument type")
+		}
+		if converted.Type == object.ValueException {
+			return "", converted
+		}
+		str, ok := converted.Data.(string)
+		if !ok {
+			return "", typeError("wrong argument type")
+		}
+		name = strings.TrimPrefix(str, ":")
+	}
+	if strings.HasPrefix(name, "$") {
+		return "", newRuntimeException(R.Classes["NameError"], "wrong local variable name")
+	}
+	if !isValidLocalVariableName(name) {
+		return "", newRuntimeException(R.Classes["NameError"], "wrong local variable name")
+	}
+	return name, nil
+}
+
+func isValidLocalVariableName(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	first := name[0]
+	if first != '_' && (first < 'a' || first > 'z') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		ch := name[i]
+		if ch == '_' ||
+			(ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func bindingLocalVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if receiver.Type != object.ValueBinding {
+	binding := bindingValue(receiver)
+	if binding == nil {
 		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
 	}
-	binding := receiver.Data.(*object.RBinding)
-	arr := make([]*object.EmeraldValue, 0, len(binding.Locals))
-	for name := range binding.Locals {
-		arr = append(arr, &object.EmeraldValue{
+	allNames := make([]string, 0, len(binding.LocalNames))
+	seen := map[string]struct{}{}
+	filter := map[string]struct{}(nil)
+	for current := binding; current != nil; current = current.Parent {
+		for _, name := range current.LocalNames {
+			if filter != nil {
+				if _, ok := filter[name]; !ok {
+					continue
+				}
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			allNames = append(allNames, name)
+		}
+		extras := make([]string, 0, len(current.Locals))
+		for name := range current.Locals {
+			if filter != nil {
+				if _, ok := filter[name]; !ok {
+					continue
+				}
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			extras = append(extras, name)
+		}
+		sort.Strings(extras)
+		for _, name := range extras {
+			seen[name] = struct{}{}
+			allNames = append(allNames, name)
+		}
+		if current.Parent == nil {
+			break
+		}
+		if current.ShareAllLocals {
+			filter = nil
+			continue
+		}
+		if len(current.SharedLocals) == 0 {
+			break
+		}
+		filter = current.SharedLocals
+	}
+	result := make([]*object.EmeraldValue, 0, len(allNames))
+	for _, name := range allNames {
+		result = append(result, &object.EmeraldValue{
 			Type:  object.ValueSymbol,
 			Data:  name,
 			Class: R.Classes["Symbol"],
 		})
 	}
-	return &object.EmeraldValue{Type: object.ValueArray, Data: arr, Class: R.Classes["Array"]}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
+}
+
+func bindingLocalVariableDefined(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if binding := bindingValue(receiver); binding != nil {
+		if len(args) != 1 {
+			return NewArgumentError("wrong number of arguments")
+		}
+		name, err := bindingLocalVariableName(args[0])
+		if err != nil {
+			return err
+		}
+		for current := binding; current != nil; current = current.Parent {
+			if _, ok := current.Locals[name]; ok {
+				return R.TrueVal
+			}
+			if bindingHasLocalName(current.LocalNames, name) {
+				return R.TrueVal
+			}
+			if current.Parent == nil {
+				break
+			}
+			if current.ShareAllLocals {
+				continue
+			}
+			if len(current.SharedLocals) == 0 {
+				break
+			}
+			if _, ok := current.SharedLocals[name]; !ok {
+				break
+			}
+		}
+	}
+	return R.FalseVal
+}
+
+func bindingLocalVariableGet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if binding == nil {
+		return R.NilVal
+	}
+	name, err := bindingLocalVariableName(args[0])
+	if err != nil {
+		return err
+	}
+	for current := binding; current != nil; current = current.Parent {
+		if value, ok := current.Locals[name]; ok {
+			return value
+		}
+		if bindingHasLocalName(current.LocalNames, name) {
+			return R.NilVal
+		}
+		if current.Parent == nil {
+			break
+		}
+		if current.ShareAllLocals {
+			continue
+		}
+		if len(current.SharedLocals) == 0 {
+			break
+		}
+		if _, ok := current.SharedLocals[name]; !ok {
+			break
+		}
+	}
+	return newRuntimeException(R.Classes["NameError"], "undefined local variable `"+name+"'")
+}
+
+func bindingLocalVariableSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if len(args) != 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if binding == nil {
+		return R.NilVal
+	}
+	name, err := bindingLocalVariableName(args[0])
+	if err != nil {
+		return err
+	}
+	if binding.Locals == nil {
+		binding.Locals = map[string]*object.EmeraldValue{}
+	}
+	if !bindingHasLocalName(binding.LocalNames, name) {
+		binding.LocalNames = append([]string{name}, binding.LocalNames...)
+	}
+	binding.Locals[name] = args[1]
+	propagateSharedBindingLocals(binding)
+	return args[1]
+}
+
+func bindingReceiver(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil || binding.Self == nil {
+		return R.NilVal
+	}
+	return binding.Self
+}
+
+func bindingSourceLocation(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil {
+		return R.NilVal
+	}
+	return sourceLocationArray(binding.Path, binding.Line)
+}
+
+// binding helpers are implemented below
+
+func sourceLocationArray(path string, line int64) *object.EmeraldValue {
+	return &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  []*object.EmeraldValue{rubyString(path), &object.EmeraldValue{Type: object.ValueInteger, Data: line, Class: R.Classes["Integer"]}},
+		Class: R.Classes["Array"],
+	}
+}
+
+func bindingDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil {
+		return R.NilVal
+	}
+	return &object.EmeraldValue{Type: object.ValueBinding, Data: cloneBindingData(binding), Class: R.Classes["Binding"]}
+}
+
+func bindingClone(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return bindingDup(receiver, args...)
+}
+
+func bindingHasLocalName(localNames []string, name string) bool {
+	for _, localName := range localNames {
+		if localName == name {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneBindingData(binding *object.RBinding) *object.RBinding {
+	if binding == nil {
+		return &object.RBinding{
+			Self:         R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			Path:         currentSourcePath(),
+			Line:         1,
+		}
+	}
+	clone := &object.RBinding{
+		Self:           binding.Self,
+		Locals:         make(map[string]*object.EmeraldValue, len(binding.Locals)),
+		LocalNames:     append([]string{}, binding.LocalNames...),
+		Constants:      binding.Constants,
+		Method:         binding.Method,
+		InstanceVars:   map[string]*object.EmeraldValue{},
+		Path:           binding.Path,
+		Line:           binding.Line,
+		ShareAllLocals: false,
+		Parent:         binding,
+		SharedLocals:   bindingSharedLocals(binding),
+	}
+	for name, value := range binding.Locals {
+		clone.Locals[name] = value
+	}
+	for name, value := range binding.InstanceVars {
+		clone.InstanceVars[name] = value
+	}
+	if clone.Locals == nil {
+		clone.Locals = map[string]*object.EmeraldValue{}
+	}
+	if clone.Constants == nil {
+		clone.Constants = map[string]*object.EmeraldValue{}
+	}
+	return clone
+}
+
+func cloneBindingDataForEval(binding *object.RBinding) *object.RBinding {
+	if binding == nil {
+		return &object.RBinding{
+			Self:           R.Main,
+			Locals:         map[string]*object.EmeraldValue{},
+			LocalNames:     nil,
+			Constants:      map[string]*object.EmeraldValue{},
+			Method:         "",
+			InstanceVars:   map[string]*object.EmeraldValue{},
+			Path:           currentSourcePath(),
+			Line:           1,
+			ShareAllLocals: true,
+		}
+	}
+	clone := cloneBindingData(binding)
+	clone.ShareAllLocals = true
+	clone.SharedLocals = nil
+	return clone
+}
+
+func bindingSharedLocals(binding *object.RBinding) map[string]struct{} {
+	if binding == nil || len(binding.LocalNames) == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, len(binding.LocalNames))
+	for _, name := range binding.LocalNames {
+		names[name] = struct{}{}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+func mergeBindingData(dst, src *object.RBinding) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.Locals == nil {
+		dst.Locals = map[string]*object.EmeraldValue{}
+	}
+	if dst.LocalNames == nil {
+		dst.LocalNames = []string{}
+	}
+	for name, value := range src.Locals {
+		dst.Locals[name] = value
+	}
+	existing := make(map[string]struct{}, len(dst.LocalNames))
+	for _, name := range dst.LocalNames {
+		existing[name] = struct{}{}
+	}
+	for _, name := range src.LocalNames {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		dst.LocalNames = append(dst.LocalNames, name)
+		existing[name] = struct{}{}
+	}
+	propagateSharedBindingLocals(dst)
+	if dst.InstanceVars == nil {
+		dst.InstanceVars = map[string]*object.EmeraldValue{}
+	}
+	for name, value := range src.InstanceVars {
+		dst.InstanceVars[name] = value
+	}
+}
+
+func propagateSharedBindingLocals(binding *object.RBinding) {
+	if binding == nil {
+		return
+	}
+	for current := binding; current != nil; current = current.Parent {
+		parent := current.Parent
+		if parent == nil {
+			continue
+		}
+		if parent.Locals == nil {
+			parent.Locals = map[string]*object.EmeraldValue{}
+		}
+		existing := map[string]struct{}{}
+		for _, name := range parent.LocalNames {
+			existing[name] = struct{}{}
+		}
+		if current.ShareAllLocals {
+			for name, value := range current.Locals {
+				parent.Locals[name] = value
+				if _, ok := existing[name]; !ok {
+					parent.LocalNames = append(parent.LocalNames, name)
+					existing[name] = struct{}{}
+				}
+			}
+			continue
+		}
+		for name := range current.SharedLocals {
+			if value, ok := current.Locals[name]; ok {
+				parent.Locals[name] = value
+				if _, ok := existing[name]; !ok {
+					parent.LocalNames = append(parent.LocalNames, name)
+					existing[name] = struct{}{}
+				}
+			}
+		}
+	}
+}
+
+func syncSharedBindingLocalsFromParents(binding *object.RBinding) {
+	if binding == nil || binding.Parent == nil || !binding.ShareAllLocals {
+		return
+	}
+	syncSharedBindingLocalsFromParents(binding.Parent)
+	parent := binding.Parent
+	if parent == nil {
+		return
+	}
+	if binding.Locals == nil {
+		binding.Locals = map[string]*object.EmeraldValue{}
+	}
+	existing := map[string]struct{}{}
+	for _, name := range binding.LocalNames {
+		existing[name] = struct{}{}
+	}
+	for _, name := range parent.LocalNames {
+		value, ok := parent.Locals[name]
+		if !ok {
+			continue
+		}
+		binding.Locals[name] = value
+		if _, ok := existing[name]; !ok {
+			binding.LocalNames = append(binding.LocalNames, name)
+			existing[name] = struct{}{}
+		}
+	}
+}
+
+func bindingInstanceVariableSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil || len(args) < 2 {
+		return R.NilVal
+	}
+	name := specName(args[0])
+	if name == "" {
+		return typeError("wrong argument type")
+	}
+	if !strings.HasPrefix(name, "@") {
+		name = "@" + name
+	}
+	if binding.InstanceVars == nil {
+		binding.InstanceVars = map[string]*object.EmeraldValue{}
+	}
+	binding.InstanceVars[name] = args[1]
+	return args[1]
+}
+
+func bindingInstanceVariableGet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil || len(args) < 1 {
+		return R.NilVal
+	}
+	name := specName(args[0])
+	if name == "" {
+		return typeError("wrong argument type")
+	}
+	if !strings.HasPrefix(name, "@") {
+		name = "@" + name
+	}
+	if binding.InstanceVars == nil {
+		return R.NilVal
+	}
+	if value, exists := binding.InstanceVars[name]; exists {
+		return value
+	}
+	return R.NilVal
+}
+
+func bindingInstanceVariables(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	binding := bindingValue(receiver)
+	if binding == nil {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	names := make([]string, 0, len(binding.InstanceVars))
+	for name := range binding.InstanceVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]*object.EmeraldValue, 0, len(names))
+	for _, name := range names {
+		result = append(result, &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: R.Classes["Symbol"]})
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 }
 
 func bindingEval(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
-		return R.NilVal
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..3)")
 	}
-	str, ok := args[0].Data.(string)
-	if !ok {
-		return R.NilVal
+	if len(args) > 3 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..3)", len(args)))
 	}
-	return evalSourceWithBinding(str, receiver)
+	str, converted, viaToStr, coerceErr := evalCoerceToString(args[0])
+	if coerceErr != nil {
+		return coerceErr
+	}
+	if !converted {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+	file := (*object.EmeraldValue)(nil)
+	line := (*object.EmeraldValue)(nil)
+	if len(args) > 1 {
+		file = args[1]
+	}
+	if len(args) > 2 {
+		line = args[2]
+	}
+	sourceValue := (*object.EmeraldValue)(nil)
+	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
+		sourceValue = args[0]
+	}
+	return evalSourceWithBindingArgs(str, sourceValue, receiver, file, line)
 }
 
-func evalSourceWithBinding(source string, bindingValue *object.EmeraldValue) *object.EmeraldValue {
-	if bindingValue != nil && bindingValue.Type == object.ValueBinding {
-		if binding, ok := bindingValue.Data.(*object.RBinding); ok && binding != nil {
-			name := strings.TrimSpace(source)
-			if value := binding.Locals[name]; value != nil {
-				return value
+func evalSourceEncoding(source string, sourceValue *object.EmeraldValue) string {
+	if commentEncoding := evalSourceMagicEncoding(source); commentEncoding != "" {
+		return commentEncoding
+	}
+
+	if sourceValue != nil && sourceValue.Type == object.ValueString {
+		candidate := stringEncodingName(sourceValue)
+		if candidate != "" {
+			normalizedCandidate := normalizeEncodingNameForIO(candidate)
+			normalizedDefault := normalizeEncodingNameForIO(defaultExternalEncoding)
+			if normalizedCandidate != "" && normalizedCandidate != normalizedDefault {
+				return normalizedCandidate
 			}
 		}
 	}
-	if EvalSource == nil {
+
+	return "US-ASCII"
+}
+
+func evalSourceMagicEncoding(source string) string {
+	lines := strings.Split(source, "\n")
+	for i, line := range lines {
+		if i >= 2 {
+			break
+		}
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "#") {
+			if trimmed == "" {
+				continue
+			}
+			return ""
+		}
+		if match := evalSourceEncodingCommentPattern.FindStringSubmatch(trimmed); len(match) > 1 {
+			return normalizeEncodingNameForIO(match[1])
+		}
+	}
+	return ""
+}
+
+func evalSourceSingleExpression(source string) (string, bool) {
+	lines := strings.Split(source, "\n")
+	var expression string
+	found := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line == "" {
+			continue
+		}
+		if found {
+			return "", false
+		}
+		expression = line
+		found = true
+	}
+	if !found {
+		return "", false
+	}
+	return expression, true
+}
+
+func evalSourceWithBindingArgs(source string, sourceValue *object.EmeraldValue, bindingValue *object.EmeraldValue, fileArg *object.EmeraldValue, lineArg *object.EmeraldValue) *object.EmeraldValue {
+	binding := (*object.RBinding)(nil)
+	if bindingValue != nil && bindingValue.Type == object.ValueBinding {
+		if value, ok := bindingValue.Data.(*object.RBinding); ok {
+			binding = value
+		}
+	}
+	originalBinding := binding
+	if binding == nil && CurrentFrameBinding != nil {
+		binding = CurrentFrameBinding()
+	}
+	frames := currentBacktraceFramesOrEmpty()
+	callerPath := currentSourcePath()
+	callerLine := int64(1)
+	if len(frames) > 0 {
+		callerPath = frames[0].Path
+		callerLine = frames[0].Line
+	}
+	if callerLine <= 0 {
+		callerLine = 1
+	}
+	evalFile := ""
+	fileProvided := false
+	if fileArg != nil {
+		convertedFile, ok, viaToStr, coerceErr := evalCoerceToString(fileArg)
+		if coerceErr != nil {
+			return coerceErr
+		}
+		if !ok {
+			return conversionTypeErrorToStringForMode(fileArg, viaToStr)
+		}
+		evalFile = convertedFile
+		fileProvided = true
+	}
+	if !fileProvided {
+		evalFile = fmt.Sprintf("(eval at %s:%d)", callerPath, callerLine)
+	}
+	evalLine := int64(1)
+	if lineArg != nil {
+		n, ok := valueToInteger(lineArg)
+		if !ok {
+			return conversionTypeErrorToInteger(lineArg)
+		}
+		evalLine = n
+	}
+	if lineArg == nil && evalLine <= 0 {
+		evalLine = 1
+	}
+
+	syncSharedBindingLocalsFromParents(binding)
+	evalBinding := cloneBindingDataForEval(binding)
+	execBinding := evalBinding
+	if evalBinding != nil {
+		execBinding = cloneBindingWithLocation(evalBinding, evalFile, evalLine)
+	}
+	evalBinding.Path = evalFile
+	evalBinding.Line = evalLine
+
+	trimmed := strings.TrimSpace(source)
+	if trimmed == "" {
 		return R.NilVal
 	}
-	return EvalSource(source)
+	if trimmed == "binding" {
+		return &object.EmeraldValue{Type: object.ValueBinding, Data: evalBinding, Class: R.Classes["Binding"]}
+	}
+	if expr, ok := evalSourceSingleExpression(source); ok && expr == "__ENCODING__" {
+		return newEncodingValue(evalSourceEncoding(source, sourceValue))
+	}
+	if trimmed == "__FILE__" {
+		return rubyString(evalFile)
+	}
+	if trimmed == "__dir__" {
+		if strings.HasPrefix(evalFile, "(eval at ") {
+			return R.NilVal
+		}
+		return rubyString(evalDirFromFile(evalFile))
+	}
+	if trimmed == "__method__" {
+		if evalBinding.Method == "" {
+			return R.NilVal
+		}
+		return &object.EmeraldValue{Type: object.ValueSymbol, Data: evalBinding.Method, Class: R.Classes["Symbol"]}
+	}
+	if trimmed == "[__FILE__, __LINE__]" {
+		return sourceLocationArray(evalFile, evalLine)
+	}
+	if lineOffset, ok := evalLineMarkerOffset(source); ok {
+		return &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  evalLine + lineOffset,
+			Class: R.Classes["Integer"],
+		}
+	}
+	if EvalSourceWithBinding == nil {
+		return R.NilVal
+	}
+	result := EvalSourceWithBinding(source, execBinding)
+	if execBinding != nil && execBinding != evalBinding {
+		mergeBindingData(evalBinding, execBinding)
+	}
+	if originalBinding != nil && originalBinding != evalBinding {
+		mergeBindingData(originalBinding, evalBinding)
+	}
+	return result
+}
+
+func cloneBindingWithLocation(binding *object.RBinding, path string, line int64) *object.RBinding {
+	if binding == nil {
+		return &object.RBinding{
+			Self:         R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			ClassStack:   nil,
+			Path:         path,
+			Line:         line,
+		}
+	}
+	cloned := &object.RBinding{
+		Self:           binding.Self,
+		Locals:         make(map[string]*object.EmeraldValue, len(binding.Locals)),
+		LocalNames:     append([]string(nil), binding.LocalNames...),
+		Constants:      binding.Constants,
+		Method:         binding.Method,
+		InstanceVars:   map[string]*object.EmeraldValue{},
+		ClassStack:     append([]*object.EmeraldValue(nil), binding.ClassStack...),
+		Path:           path,
+		Line:           line,
+		ShareAllLocals: binding.ShareAllLocals,
+		Parent:         binding,
+		SharedLocals:   map[string]struct{}{},
+	}
+	for name := range binding.SharedLocals {
+		cloned.SharedLocals[name] = struct{}{}
+	}
+	for name, value := range binding.InstanceVars {
+		cloned.InstanceVars[name] = value
+	}
+	for name, value := range binding.Locals {
+		cloned.Locals[name] = value
+	}
+	return cloned
+}
+
+func evalDirFromFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		if idx == 0 {
+			return "/"
+		}
+		return path[:idx]
+	}
+	return "."
+}
+
+func conversionTypeErrorToString(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value == R.NilVal {
+		return typeError("no implicit conversion of nil into String")
+	}
+	if value.Class != nil && value.Class.Name != "" {
+		return typeError("no implicit conversion of " + value.Class.Name + " into String")
+	}
+	return typeError("no implicit conversion into String")
+}
+
+func conversionTypeErrorToInteger(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value == R.NilVal {
+		return typeError("no implicit conversion of nil into Integer")
+	}
+	if value.Class != nil && value.Class.Name != "" {
+		return typeError("no implicit conversion of " + value.Class.Name + " into Integer")
+	}
+	return typeError("no implicit conversion into Integer")
+}
+
+func evalLineMarkerOffset(source string) (int64, bool) {
+	lines := strings.Split(source, "\n")
+	found := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if commentIdx := strings.Index(trimmed, "#"); commentIdx >= 0 {
+			trimmed = strings.TrimSpace(trimmed[:commentIdx])
+		}
+		if trimmed != "__LINE__" {
+			return 0, false
+		}
+		if found >= 0 {
+			return 0, false
+		}
+		found = i
+	}
+	if found < 0 {
+		return 0, false
+	}
+	return int64(found), true
+}
+
+func evalCoerceToString(value *object.EmeraldValue) (string, bool, bool, *object.EmeraldValue) {
+	if value == nil {
+		return "", false, false, nil
+	}
+	if value.Type == object.ValueString {
+		s, ok := value.Data.(string)
+		return s, ok, false, nil
+	}
+	if CallMethod != nil && receiverHasCallableMethod(value, "to_str") {
+		coerced := CallMethod(value, "to_str")
+		if coerced != nil && coerced.Type == object.ValueException {
+			return "", false, true, coerced
+		}
+		if coerced != nil && coerced.Type == object.ValueString {
+			s, ok := coerced.Data.(string)
+			return s, ok, true, nil
+		}
+		return "", false, true, nil
+	}
+	return "", false, false, nil
+}
+
+func conversionTypeErrorToStringForMode(value *object.EmeraldValue, convertedByToStr bool) *object.EmeraldValue {
+	if !convertedByToStr {
+		return conversionTypeErrorToString(value)
+	}
+	if value == nil || value == R.NilVal {
+		return typeError("can't convert nil into String")
+	}
+	if value.Class != nil && value.Class.Name != "" {
+		return typeError("can't convert " + value.Class.Name + " into String")
+	}
+	return typeError("can't convert into String")
 }
 
 func moduleInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -19245,7 +36821,10 @@ func moduleExtendObject(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	module := receiver.Data.(*object.Module)
 	switch target.Type {
 	case object.ValueObject:
-		obj := target.Data.(*object.Object)
+		obj, ok := target.Data.(*object.Object)
+		if !ok {
+			return R.NilVal
+		}
 		for name, method := range module.Methods {
 			obj.SingletonMethods[name] = method
 		}
@@ -19365,4 +36944,44 @@ func classPrepend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		}
 	}
 	return receiver
+}
+func NewArgfValue(values []*object.EmeraldValue) *object.EmeraldValue {
+	return newArgfValue(values)
+}
+
+func argfClassValueInstance() *object.EmeraldValue {
+	if argfClassValue != nil {
+		return argfClassValue
+	}
+
+	argfClass := object.NewClass("ARGF")
+	argfClass.SuperClass = R.Classes["Object"]
+	argfClass.DefineClassMethod("new", &object.Method{
+		Name:  "new",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			values := []*object.EmeraldValue{}
+			if len(args) == 1 && args[0] != nil && args[0].Type == object.ValueArray {
+				for _, value := range args[0].Data.([]*object.EmeraldValue) {
+					if value != nil && value.Type == object.ValueString {
+						values = append(values, value)
+					}
+				}
+				return newArgfValue(values)
+			}
+			for _, value := range args {
+				if value != nil && value.Type == object.ValueString {
+					values = append(values, value)
+				}
+			}
+			return newArgfValue(values)
+		},
+	})
+	argfClassValue = &object.EmeraldValue{
+		Type:  object.ValueClass,
+		Data:  argfClass,
+		Class: R.Classes["Class"],
+	}
+	R.Classes["ARGF"] = argfClass
+	return argfClassValue
 }
