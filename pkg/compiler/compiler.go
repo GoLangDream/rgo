@@ -1336,6 +1336,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			KeywordParams:   kwParams,
 			RejectKeywords:  node.RejectKeywords,
 			KeywordRestOnly: node.KeywordRestOnly,
+			RejectBlock:     node.RejectBlock,
 			FreeVarNames:    freeVarNames(free),
 		}
 		if node.KeywordRestParam != nil {
@@ -2083,6 +2084,7 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 		RejectKeywords:       block.RejectKeywords,
 		SingleDestructure:    block.SingleDestructure,
 		KeywordRestOnly:      block.KeywordRestOnly,
+		RejectBlock:          block.RejectBlock,
 		FreeVarNames:         freeVarNames(free),
 		TrailingCommaParam:   block.TrailingComma,
 		ForLoopCollectAsPair: forLoopCollectAsPair,
@@ -2361,6 +2363,10 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		c.Emit(OpPop)
 	}
 
+	endRescueStart := len(c.currentInstructions())
+	if hasRescue {
+		c.Emit(OpEndRescue)
+	}
 	endStart := len(c.currentInstructions())
 
 	if hasElse {
@@ -2377,7 +2383,7 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 		if hasEnsure {
 			c.changeOperand(jump, ensureStart)
 		} else {
-			c.changeOperand(jump, endStart)
+			c.changeOperand(jump, endRescueStart)
 		}
 	}
 	c.changeOperandAt(beginPos, 0, rescueStart)
@@ -3623,6 +3629,7 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		NumLocals:      numLocals,
 		LocalNames:     localNames,
 		RejectKeywords: node.RejectKeywords,
+		RejectBlock:    node.RejectBlock,
 		FreeVarNames:   freeVarNames(free),
 	}
 	if node.RestParam != nil {

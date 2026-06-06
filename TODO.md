@@ -4,7 +4,7 @@
 
 - [x] `rescue A, *[B]` 这类 rescue splat 数组字面量 parser 边界问题已修复；新增 parser/vm 回归测试覆盖数组字面量 splat rescue。
 - [x] `vendor/ruby/spec/core/array/fixtures/classes.rb` 通过 `require_relative` 动态加载时，正常 `begin ... rescue NameError ... end` 被动态语法校验误判为 `SyntaxError: unexpected rescue modifier`，导致 `ArraySpecs.frozen_array` fixture 未加载并连带影响 `append_spec` 等 frozen array 场景。已改为逐行校验 rescue 子句，并保留 `VM.New` 前设置的 `CurrentSpecFile`；已验证 `append_spec.rb` / `at_spec.rb`。
-- [ ] 2026-06-07 刷新 `vendor/ruby/spec/language` 后发现当前真实状态为 78 pass / 3 nonzero_failures / 2871 examples / 7 failures，失败文件为 `block_spec.rb`、`method_spec.rb`、`predefined_spec.rb`。日志已临时写到 `/tmp/rgo-language-fail-logs/`；按项目规则先记录，后续单独处理。
+- [x] 2026-06-07 刷新 `vendor/ruby/spec/language` 后暴露的 3 个当前 spec 回归已解除：`block_spec.rb` / `method_spec.rb` 的 `&nil` block 拒收语义，以及 `predefined_spec.rb` 的 `$@` 赋值校验和 rescue `$!` 生命周期。已刷新 `reports/spec-status/language-current.csv`：81 pass / 2871 examples / 0 failures。
 
 ## 阶段 0：补测试（已完成）
 
@@ -57,7 +57,7 @@
 - [x] `vendor/ruby/spec/language/def_spec.rb` 已解除（2026-06-04）：已补 frozen 对象/类/singleton class 定义方法时的 `FrozenError`、`FrozenError#receiver`、重复 rest 参数 `SyntaxError`，以及 eval 中 class method 定义不污染实例方法表。已验证：73 examples / 0 failures。
 - [x] `vendor/ruby/spec/language/pattern_matching_spec.rb` 已解除（2026-06-04）：已补 eval 中非法 pattern 的 `SyntaxError` 预检，并为 `Object[]` / `Object[a: ...]` pattern 增加 `deconstruct` / `deconstruct_keys` 返回类型校验。已验证：113 examples / 0 failures。
 - [x] `vendor/ruby/spec/language/method_spec.rb` 已解除（2026-06-04）：已补 method call splat 的 `to_a` 语义、空格方法调用参数列表动态 `SyntaxError`、匿名/命名 keyword rest、`**nil` 与空 keyword splat、裸 hash rocket / `**` keyword send 标记，以及普通位置 Hash 不应满足 keyword 方法 arity 的边界。已验证：168 examples / 0 failures。
-- [x] Language 历史刷新记录（2026-06-04）：当时已解除 `def_spec.rb`、`pattern_matching_spec.rb`、`method_spec.rb`、`class_spec.rb`、`predefined_spec.rb`、`regexp/back-references_spec.rb`、`rescue_spec.rb`、`block_spec.rb` 等收尾项，并刷新 `reports/spec-status/language-current.csv` 为 81 files pass / 0 failures。2026-06-07 重新刷新后见顶部调试记录，当前 dashboard 存在 3 个待处理回归。
+- [x] Language 历史刷新记录（2026-06-04）：当时已解除 `def_spec.rb`、`pattern_matching_spec.rb`、`method_spec.rb`、`class_spec.rb`、`predefined_spec.rb`、`regexp/back-references_spec.rb`、`rescue_spec.rb`、`block_spec.rb` 等收尾项，并刷新 `reports/spec-status/language-current.csv` 为 81 files pass / 0 failures。2026-06-07 已重新解除当前 spec 回归并刷新为 81 pass / 0 failures。
 
 ### Ruby Spec（`vendor/ruby/spec`）
 - 已新增并验证 `scripts/full_spec_gate.sh` 可稳定跑通所有 ruby spec 文件，报告写到 `reports/spec-status/ruby-spec-full.csv`。

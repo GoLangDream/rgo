@@ -906,7 +906,10 @@ func (p *Parser) parseBlockParams(block *ast.BlockExpression) {
 			if p.curTokenIs(lexer.BIT_AND) {
 				paramTok := p.curToken
 				p.nextToken()
-				if p.curTokenIs(lexer.IDENT) {
+				if p.curTokenIs(lexer.NIL) {
+					block.RejectBlock = true
+					p.nextToken()
+				} else if p.curTokenIs(lexer.IDENT) {
 					name := p.curToken.Literal
 					if name != "_" {
 						if _, ok := seen[name]; ok {
@@ -4135,7 +4138,9 @@ func (p *Parser) parseOneDefParam(exp *ast.DefExpression) {
 			return
 		}
 		p.nextToken()
-		if p.curTokenIs(lexer.IDENT) {
+		if p.curTokenIs(lexer.NIL) {
+			exp.RejectBlock = true
+		} else if p.curTokenIs(lexer.IDENT) {
 			exp.BlockParam = &ast.Identifier{
 				Token: p.curToken,
 				Value: p.curToken.Literal,
@@ -4392,7 +4397,9 @@ func (p *Parser) parseLambdaParam(lit *ast.ProcLiteral, seen map[string]struct{}
 	if p.curTokenIs(lexer.BIT_AND) {
 		blockToken := p.curToken
 		p.nextToken()
-		if p.curTokenIs(lexer.IDENT) {
+		if p.curTokenIs(lexer.NIL) {
+			lit.RejectBlock = true
+		} else if p.curTokenIs(lexer.IDENT) {
 			record(p.curToken.Literal)
 			lit.BlockParam = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 		} else {

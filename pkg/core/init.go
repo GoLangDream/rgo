@@ -60,6 +60,7 @@ var RequirePath func(path string) (string, *object.EmeraldValue)
 var ResolveRequirePath func(path string) string
 
 var InMethodScope func() bool
+var InRescue func() bool
 
 var LastBlockResult *object.EmeraldValue
 var forEachContextStack []struct {
@@ -33352,12 +33353,19 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 		specRunner.FailCount++
 		return R.FalseVal
 	}
-	LastException = nil
+	previousException := LastException
+	preservePreviousException := InRescue != nil && InRescue()
+	if !preservePreviousException {
+		LastException = nil
+	}
 	prevEvaluatingRaiseErrorMatcher := evaluatingRaiseErrorMatcher
 	evaluatingRaiseErrorMatcher = true
 	result := CallBlockWithArgs(payload.Value)
 	evaluatingRaiseErrorMatcher = prevEvaluatingRaiseErrorMatcher
 	exception := LastException
+	if exception == previousException {
+		exception = nil
+	}
 	if os.Getenv("RGO_DEBUG_RAISE") == "1" {
 		fmt.Printf("RGO_DEBUG_RAISE pre-eval exception=%#v matcher=%s payload_neg=%v payload_type=%T\n", exception, matcher.Class.Name, payload.Negated, payload.Value)
 	}
@@ -33385,7 +33393,11 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 			fmt.Printf("RGO_DEBUG_RAISE final exception=nil\n")
 		}
 	}
-	LastException = nil
+	if preservePreviousException {
+		LastException = previousException
+	} else {
+		LastException = nil
+	}
 	LastRaisedResult = nil
 	LastMatcherException = nil
 	matches := exception != nil && classInheritsFrom(exception.Class, matcher.Class)
@@ -33404,7 +33416,11 @@ func evaluateRaiseErrorMatcher(payload expectationData, matcher *raiseErrorMatch
 		specRunner.PassCount++
 		if !payload.Negated && exception != nil && matcher.Block != nil && CallBlockWithArgs != nil {
 			if result := CallBlockWithArgs(matcher.Block, exception); result != nil && result.Type == object.ValueException {
-				LastException = nil
+				if preservePreviousException {
+					LastException = previousException
+				} else {
+					LastException = nil
+				}
 			}
 		}
 		return R.TrueVal

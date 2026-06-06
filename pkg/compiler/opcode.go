@@ -143,6 +143,7 @@ const (
 	OpReraise
 	OpThrow
 	OpBeginRescue
+	OpEndRescue
 	OpEnsure
 	OpCatch
 
@@ -321,6 +322,7 @@ var definitions = map[Opcode]Definition{
 	OpReraise:     {"OpReraise", []int{}},
 	OpThrow:       {"OpThrow", []int{}},
 	OpBeginRescue: {"OpBeginRescue", []int{2, 2, 2}},
+	OpEndRescue:   {"OpEndRescue", []int{}},
 	OpEnsure:      {"OpEnsure", []int{}},
 	OpCatch:       {"OpCatch", []int{2}},
 

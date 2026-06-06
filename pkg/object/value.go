@@ -507,6 +507,7 @@ type Function struct {
 	KeywordRestParam      string
 	HasBlockParam         bool
 	BlockParamIndex       int
+	RejectBlock           bool
 	TrailingCommaParam    bool
 	DefinedByDefineMethod bool
 	ForLoopCollectAsPair  bool

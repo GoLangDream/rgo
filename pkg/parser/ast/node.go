@@ -239,6 +239,7 @@ type BlockExpression struct {
 	KeywordRestOnly   bool
 	KeywordParams     []*KeywordParam
 	BlockParam        *Identifier
+	RejectBlock       bool
 	Statements        []Statement
 }
 
@@ -415,6 +416,7 @@ type DefExpression struct {
 	KeywordRestOnly  bool
 	KeywordRestParam *Identifier
 	BlockParam       *Identifier // &block parameter, nil if none
+	RejectBlock      bool
 	KeywordParams    []*KeywordParam
 	Body             *BlockExpression
 	Receiver         Expression
@@ -988,6 +990,7 @@ type ProcLiteral struct {
 	RestParamIndex int
 	RejectKeywords bool
 	BlockParam     *Identifier
+	RejectBlock    bool
 	Body           *BlockExpression
 }
 

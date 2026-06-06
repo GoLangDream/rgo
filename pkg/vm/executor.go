@@ -74,6 +74,12 @@ type RescueHandler struct {
 	Frame        *Frame
 }
 
+type ActiveRescue struct {
+	EndOffset         int
+	Frame             *Frame
+	PreviousException *object.EmeraldValue
+}
+
 type CatchHandler struct {
 	Label     *object.EmeraldValue
 	EndOffset int
@@ -106,8 +112,9 @@ type VM struct {
 	procCallDepth    int
 	nextFrameID      int
 
-	rescueStack  []*RescueHandler
-	ensureActive bool
+	rescueStack   []*RescueHandler
+	activeRescues []*ActiveRescue
+	ensureActive  bool
 
 	catchStack []*CatchHandler
 }
@@ -202,6 +209,9 @@ func (vm *VM) installCoreHooks() {
 	core.CurrentFrameBinding = vm.currentFrameBinding
 	core.CurrentBacktraceFrames = vm.currentBacktraceFrames
 	core.GlobalVariableNames = vm.globalVariableNames
+	core.InRescue = func() bool {
+		return len(vm.activeRescues) > 0
+	}
 	core.CallBlockWithArgs = func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.callBlock(block, args...)
 	}
@@ -407,6 +417,10 @@ func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *o
 		if core.LastException == nil || core.LastException.Type == object.ValueNil {
 			return nil, core.NewArgumentError("$! not set")
 		}
+		if errVal := validateBacktraceGlobalValue(value); errVal != nil {
+			return nil, errVal
+		}
+		updateLastExceptionBacktrace(value)
 	case "$~":
 		if value == nil || value.Type == object.ValueNil || value.Type == object.ValueMatchData {
 			return value, nil
@@ -438,6 +452,66 @@ func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *o
 		return nil, core.NewNameError(rawName + " is a read-only variable")
 	}
 	return value, nil
+}
+
+func validateBacktraceGlobalValue(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value.Type == object.ValueNil || value.Type == object.ValueString {
+		return nil
+	}
+	if value.Type != object.ValueArray {
+		return core.NewTypeError("backtrace must be Array of String")
+	}
+	for _, elem := range value.Data.([]*object.EmeraldValue) {
+		if elem == nil || elem.Type == object.ValueNil || elem.Type == object.ValueArray {
+			return core.NewTypeError("backtrace must be Array of String")
+		}
+		if elem.Type == object.ValueString {
+			continue
+		}
+		if elem.Class != nil && elem.Class.Name == "Location" && classInheritsFrom(elem.Class, core.R.Classes["Thread::Backtrace::Location"]) {
+			continue
+		}
+		return core.NewTypeError("backtrace must be Array of String")
+	}
+	return nil
+}
+
+func updateLastExceptionBacktrace(value *object.EmeraldValue) {
+	if core.LastException == nil || core.LastException.Type != object.ValueException {
+		return
+	}
+	exc, ok := core.LastException.Data.(*object.RException)
+	if !ok || exc == nil {
+		return
+	}
+	if value == nil || value.Type == object.ValueNil {
+		exc.Backtrace = nil
+		exc.Locations = nil
+		return
+	}
+	if value.Type == object.ValueString {
+		exc.Backtrace = []string{value.Data.(string)}
+		exc.Locations = nil
+		return
+	}
+	if value.Type != object.ValueArray {
+		return
+	}
+	backtrace := []string{}
+	locations := []object.RBacktraceLocation{}
+	for _, elem := range value.Data.([]*object.EmeraldValue) {
+		if elem.Type == object.ValueString {
+			backtrace = append(backtrace, elem.Data.(string))
+			continue
+		}
+		if frame, ok := elem.Data.(object.RBacktraceLocation); ok {
+			locations = append(locations, frame)
+		} else if frame, ok := elem.Data.(*object.RBacktraceLocation); ok && frame != nil {
+			locations = append(locations, *frame)
+		}
+	}
+	exc.Backtrace = backtrace
+	exc.Locations = locations
 }
 
 func (vm *VM) coerceGlobalLineNumber(value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
@@ -571,6 +645,27 @@ func (vm *VM) Run() error {
 	}
 
 	return nil
+}
+
+func (vm *VM) endActiveRescue(frame *Frame) {
+	for len(vm.activeRescues) > 0 {
+		active := vm.activeRescues[len(vm.activeRescues)-1]
+		vm.activeRescues = vm.activeRescues[:len(vm.activeRescues)-1]
+		if active.Frame == frame {
+			core.LastException = active.PreviousException
+			return
+		}
+	}
+}
+
+func (vm *VM) endActiveRescuesForFrame(frame *Frame) {
+	for i := len(vm.activeRescues) - 1; i >= 0; i-- {
+		if vm.activeRescues[i].Frame != frame {
+			continue
+		}
+		core.LastException = vm.activeRescues[i].PreviousException
+		vm.activeRescues = append(vm.activeRescues[:i], vm.activeRescues[i+1:]...)
+	}
 }
 
 func (vm *VM) evalSource(source string) *object.EmeraldValue {
@@ -3743,6 +3838,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			defer func() {
 				vm.currentBlock = prevBlock
 			}()
+			if errVal := rejectBlockArgument(fn, vm.currentBlock); errVal != nil {
+				if vm.raiseException(frame, errVal) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, errVal)
+				return nil
+			}
 			bp := vm.sp
 			vm.stack[vm.sp] = self
 			vm.sp++
@@ -3821,6 +3923,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				result = vm.stack[vm.sp-1]
 			}
 			vm.sp = bp
+			vm.endActiveRescuesForFrame(curFrame)
 			vm.frames = vm.frames[:vm.fp]
 			vm.fp--
 			vm.frames[vm.fp] = oldFrame
@@ -3921,6 +4024,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Frame:        frame,
 		}
 		vm.rescueStack = append(vm.rescueStack, handler)
+
+	case compiler.OpEndRescue:
+		vm.endActiveRescue(frame)
 
 	case compiler.OpEnsure:
 		vm.ensureActive = true
@@ -5103,6 +5209,9 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 	}
 
 	if fn, ok := methodObj.Fn.(*object.Function); ok {
+		if errVal := rejectBlockArgument(fn, vm.currentBlock); errVal != nil {
+			return errVal
+		}
 		args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
 		if err := methodArityError(fn, positionalArityArgCount(fn, args)); err != nil {
 			return err
@@ -5327,6 +5436,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		}
 		vm.sp = bp
 
+		vm.endActiveRescuesForFrame(frame)
 		vm.frames = vm.frames[:vm.fp]
 		vm.fp--
 		vm.frames[vm.fp] = oldFrame
@@ -6080,6 +6190,7 @@ func inheritsFrom(cls *object.Class, name string) bool {
 }
 
 func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool {
+	previousException := core.LastException
 	core.LastException = exception
 	if len(vm.rescueStack) == 0 {
 		return false
@@ -6093,6 +6204,11 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 	}
 	vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
 	if handler.RescueOffset > 0 {
+		vm.activeRescues = append(vm.activeRescues, &ActiveRescue{
+			EndOffset:         handler.EndOffset,
+			Frame:             handler.Frame,
+			PreviousException: previousException,
+		})
 		handler.Frame.Ip = handler.RescueOffset - 1
 	} else if handler.EnsureOffset > 0 {
 		handler.Frame.Ip = handler.EnsureOffset - 1
@@ -6565,6 +6681,13 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 	return bp
 }
 
+func rejectBlockArgument(fn *object.Function, block *object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil || !fn.RejectBlock || block == nil || block.Type == object.ValueNil {
+		return nil
+	}
+	return core.NewArgumentError("no block accepted")
+}
+
 func (vm *VM) bindRestParameterSlots(fn *object.Function, args []*object.EmeraldValue, bp int, markRuby2Keywords bool) {
 	preCount := fn.RestParamIndex
 	if preCount < 0 {
@@ -6941,6 +7064,9 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	vm.currentBlock = nil
 	prevClassStack := vm.classStack
 	prevCatchStack := vm.catchStack
+	if errVal := rejectBlockArgument(fn, prevBlock); errVal != nil {
+		return errVal
+	}
 	if isThreadBlock {
 		vm.catchStack = nil
 	}
@@ -7008,6 +7134,7 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		core.LastBlockResult = nil
 	}
 
+	vm.endActiveRescuesForFrame(frame)
 	vm.frames = vm.frames[:vm.fp]
 	vm.fp--
 

@@ -5508,8 +5508,82 @@ def call_proc(p)
   p.call(21)
 end
 
-wrapper { |x| x + 1 }`)
+	wrapper { |x| x + 1 }`)
 	assertIntResult(t, result, 22)
+}
+
+func TestNilBlockParameterRejectsPassedBlock(t *testing.T) {
+	result, _ := runRuby(t, `def no_method_block(a, &nil)
+  a
+end
+no_proc_block = eval("proc { |a, &nil| a }")
+[no_method_block(:method), no_proc_block.call(:proc)]`)
+	assertArrayOfSymbols(t, result, []string{"method", "proc"})
+
+	for name, source := range map[string]string{
+		"method": `def no_method_block(a, &nil)
+  a
+end
+no_method_block(:method) { :block }`,
+		"proc": `no_proc_block = eval("proc { |a, &nil| a }")
+no_proc_block.call(:proc) { :block }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := runRubyExpectError(t, source)
+			if err == nil || !strings.Contains(err.Error(), "ArgumentError") || !strings.Contains(err.Error(), "no block accepted") {
+				t.Fatalf("expected ArgumentError no block accepted, got %v", err)
+			}
+		})
+	}
+}
+
+func TestGlobalBacktraceAssignmentValidatesEntries(t *testing.T) {
+	result, _ := runRuby(t, `begin
+  raise
+rescue
+  $@ = ["one", "two"]
+  $@
+end`)
+	assertArrayOfStrings(t, result, []string{"one", "two"})
+
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "$@" do
+  it "validates bad backtrace entries inside raise_error matchers" do
+    begin
+      raise
+    rescue
+      -> { $@ = :bad }.should raise_error(TypeError)
+      -> { $@ = [:bad] }.should raise_error(TypeError)
+      -> { $@ = [nil] }.should raise_error(TypeError)
+      -> { $@ = [["nested"]] }.should raise_error(TypeError)
+    end
+    -> { $@ = [] }.should raise_error(ArgumentError, "$! not set")
+  end
+
+  it "clears the current exception after nested backtrace setters" do
+    setter = -> backtrace {
+      exception = nil
+      begin
+        raise
+      rescue
+        $@ = backtrace
+        exception = $!
+      end
+      exception
+    }
+
+    setter.call([])
+    -> { setter.call(:bad) }.should raise_error(TypeError)
+    -> { setter.call([:bad]) }.should raise_error(TypeError)
+    -> { setter.call([nil]) }.should raise_error(TypeError)
+    -> { setter.call([[]]) }.should raise_error(TypeError)
+    -> { $@ = [] }.should raise_error(ArgumentError, "$! not set")
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected $@ assignment matcher examples to pass, got %d failures", runner.FailCount)
+	}
 }
 
 func TestSingletonMethodSuperStartsAfterReceiverClass(t *testing.T) {
