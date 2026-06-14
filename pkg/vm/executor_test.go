@@ -82,6 +82,38 @@ func runRubyWithCurrentSpecFile(t *testing.T, source, specFile string) (*object.
 	return runRuby(t, source)
 }
 
+func TestRequiredEnumerableEachDefinerYieldsAllElements(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRubyWithCurrentSpecFile(t, `
+require_relative 'fixtures/classes'
+e = EnumerableSpecs::EachDefiner.new(11, "22")
+count = 0
+seen = []
+e.each do |value|
+  seen << value
+  count += 1
+end
+[e.instance_variable_get(:@arr), seen, count]
+`, filepath.Join(wd, "..", "..", "vendor", "ruby", "spec", "core", "enumerable", "min_spec.rb"))
+
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected result array, got %#v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if got := values[0].Data.([]*object.EmeraldValue); len(got) != 2 {
+		t.Fatalf("expected fixture constructor to keep 2 elements, got %d", len(got))
+	}
+	if got := values[1].Data.([]*object.EmeraldValue); len(got) != 2 {
+		t.Fatalf("expected each to yield 2 elements, got %d", len(got))
+	}
+	if got := values[2].Data.(int64); got != 2 {
+		t.Fatalf("expected block count 2, got %d", got)
+	}
+}
+
 // runRubyExpectError compiles and executes Ruby source code, expects an error
 func runRubyExpectError(t *testing.T, source string) error {
 	t.Helper()
@@ -595,6 +627,11 @@ func TestArrayLiteral(t *testing.T) {
 	assertIntResult(t, arr[0], 1)
 	assertIntResult(t, arr[1], 2)
 	assertIntResult(t, arr[2], 3)
+}
+
+func TestArrayEqualityUsesRubyElementEqualityForTimeValues(t *testing.T) {
+	result, _ := runRuby(t, `[Time.utc(1970)] == [Time.utc(1970)]`)
+	assertBoolResult(t, result, true)
 }
 
 func TestArrayPlusNonArrayRaisesTypeError(t *testing.T) {
@@ -1898,6 +1935,199 @@ func TestArrayRejectReturnsEnumeratorWithoutBlock(t *testing.T) {
 	assertStringResult(t, result, "Enumerator")
 }
 
+func TestEnumerableSelectOnIncludedClass(t *testing.T) {
+	result, _ := runRuby(t, `
+class RGOEnumerableSelectSpec
+  include Enumerable
+  def initialize(*values)
+    @values = values
+  end
+  def each
+    @values.each { |value| yield value }
+  end
+end
+
+obj = RGOEnumerableSelectSpec.new(1, 2, 3, 4)
+[obj.select { |value| value > 2 }, obj.select.class.to_s]
+`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected 2 result elements, got %d", len(values))
+	}
+	selected := values[0]
+	if selected.Type != object.ValueArray {
+		t.Fatalf("expected select result Array, got %s", selected.TypeName())
+	}
+	selectedValues := selected.Data.([]*object.EmeraldValue)
+	if len(selectedValues) != 2 {
+		t.Fatalf("expected 2 selected values, got %d", len(selectedValues))
+	}
+	assertIntResult(t, selectedValues[0], 3)
+	assertIntResult(t, selectedValues[1], 4)
+	assertStringResult(t, values[1], "Enumerator")
+}
+
+func TestStructSelectReturnsArrayOrEnumeratorAndPreservesAccessor(t *testing.T) {
+	result, _ := runRuby(t, `
+car = Struct.new(:make, :model, :year).new("Ford", "Escort", "1995")
+field = Struct.new(:select).new(42)
+[car.select { |value| value == "1995" }, car.select.class.to_s, car.select.size, field.select]
+`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 4 {
+		t.Fatalf("expected 4 result elements, got %d", len(values))
+	}
+	selected := values[0]
+	if selected.Type != object.ValueArray {
+		t.Fatalf("expected select result Array, got %s", selected.TypeName())
+	}
+	selectedValues := selected.Data.([]*object.EmeraldValue)
+	if len(selectedValues) != 1 {
+		t.Fatalf("expected 1 selected value, got %d", len(selectedValues))
+	}
+	assertStringResult(t, selectedValues[0], "1995")
+	assertStringResult(t, values[1], "Enumerator")
+	assertIntResult(t, values[2], 3)
+	assertIntResult(t, values[3], 42)
+}
+
+func TestEnumeratorLazySelectFirstFiltersValues(t *testing.T) {
+	result, _ := runRuby(t, `[1, 2, 3, 4].lazy.select { |value| value.even? }.first(2)`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+	assertIntResult(t, values[0], 2)
+	assertIntResult(t, values[1], 4)
+}
+
+func TestEnumeratorLazySelectSizeIsNil(t *testing.T) {
+	result, _ := runRuby(t, `Enumerator::Lazy.new(Object.new, 100) {}.send(:select) { true }.size`)
+	if result.Type != object.ValueNil {
+		t.Fatalf("expected nil, got %s", result.Inspect())
+	}
+}
+
+func TestEnumeratorLazySelectForceGathersMultiYields(t *testing.T) {
+	result, _ := runRuby(t, `
+require_relative "vendor/ruby/spec/core/enumerator/lazy/fixtures/classes"
+yields = []
+EnumeratorLazySpecs::YieldsMixed.new.to_enum.lazy.send(:select) { |value| yields << value }.force
+yields.should == EnumeratorLazySpecs::YieldsMixed.gathered_yields
+`)
+	if result.Type == object.ValueException {
+		t.Fatalf("expected fixture matcher to pass, got %s", result.Inspect())
+	}
+}
+
+func TestEnumeratorLazySelectForceGathersLocallyDefinedMultiYields(t *testing.T) {
+	result, _ := runRuby(t, `
+class RGOLazyYieldsMixed
+  def each(arg=:default_arg, *args)
+    yield
+    yield 0
+    yield 0, 1
+    yield 0, 1, 2
+    yield(*[0, 1, 2])
+    yield nil
+    yield arg
+    yield args
+    yield []
+    yield [0]
+    yield [0, 1]
+    yield [0, 1, 2]
+  end
+end
+yields = []
+RGOLazyYieldsMixed.new.to_enum.lazy.send(:select) { |value| yields << value }.force
+yields.should == [nil, 0, [0, 1], [0, 1, 2], [0, 1, 2], nil, :default_arg, [], [], [0], [0, 1], [0, 1, 2]]
+`)
+	if result.Type == object.ValueException {
+		t.Fatalf("expected matcher to pass, got %s", result.Inspect())
+	}
+}
+
+func TestEnumeratorLazySelectWithoutBlockRaises(t *testing.T) {
+	result, _ := runRuby(t, `-> { [1, 2, 3].lazy.send(:select) }.should raise_error(ArgumentError)`)
+	if result.Type == object.ValueException {
+		t.Fatalf("expected matcher to handle ArgumentError, got %s", result.Inspect())
+	}
+}
+
+func TestEnumeratorLazySelectOnInfiniteRangeIsBoundedByFirst(t *testing.T) {
+	result, _ := runRuby(t, `(0..Float::INFINITY).lazy.send(:select) { |n| n > 5 }.send(:select) { |n| n.even? }.first(3)`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(values))
+	}
+	assertIntResult(t, values[0], 6)
+	assertIntResult(t, values[1], 8)
+	assertIntResult(t, values[2], 10)
+}
+
+func TestEnumeratorLazySelectAcceptsSymbolToProcBlock(t *testing.T) {
+	result, _ := runRuby(t, `(0..Float::INFINITY).lazy.send(:select) { |n| n > 5 }.send(:select, &:even?).first(3)`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(values))
+	}
+	assertIntResult(t, values[0], 6)
+	assertIntResult(t, values[1], 8)
+	assertIntResult(t, values[2], 10)
+}
+
+func TestEnumeratorLazySelectFirstStopsMethodEnumerator(t *testing.T) {
+	result, _ := runRuby(t, `
+class RGOLazyEventsMixed
+  def each
+    ScratchPad << :before_yield
+    yield 0
+    ScratchPad << :after_yield
+    raise "unreachable"
+  end
+end
+ScratchPad.record []
+RGOLazyEventsMixed.new.to_enum.lazy.send(:select) { true }.send(:select) { true }.first(1)
+ScratchPad.recorded
+`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s", result.TypeName())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 1 {
+		t.Fatalf("expected 1 event, got %d (%s)", len(values), result.Inspect())
+	}
+	assertSymbolResult(t, values[0], "before_yield")
+}
+
+func TestEnumeratorLazyTakeSelectSizeIsNil(t *testing.T) {
+	result, _ := runRuby(t, `Enumerator::Lazy.new(Object.new, 100) {}.take(50) {}.send(:select) { true }.size`)
+	assertNilResult(t, result)
+}
+
+func TestEnumeratorLazySelectComparesWithRangeFirstSelect(t *testing.T) {
+	result, _ := runRuby(t, `
+s = 0..Float::INFINITY
+s.lazy.send(:select) { |n| true }.first(100) == s.first(100).send(:select) { |n| true }
+`)
+	assertBoolResult(t, result, true)
+}
+
 func TestArrayRejectBangRaisesOnFrozenReceiverWithBlock(t *testing.T) {
 	err := runRubyExpectError(t, `[1, 2, 3].freeze.reject! { |x| x > 1 }`)
 	if err == nil || !strings.Contains(err.Error(), "FrozenError") {
@@ -2946,6 +3176,22 @@ func TestUndefinedGlobalVariableReadsAsNil(t *testing.T) {
 	assertBoolResult(t, result, true)
 }
 
+func TestEvalGlobalAssignmentAppearsInGlobalVariables(t *testing.T) {
+	result, _ := runRuby(t, `before = global_variables.size
+eval("$rgo_eval_global_assignment = 1")
+[global_variables.size == before + 1, global_variables.include?(:$rgo_eval_global_assignment)]`)
+	values := result.Data.([]*object.EmeraldValue)
+	assertBoolResult(t, values[0], true)
+	assertBoolResult(t, values[1], true)
+}
+
+func TestArrayUsesEnumerableGrep(t *testing.T) {
+	result, _ := runRuby(t, `global_variables.grep(/std/).include?(:$stderr) &&
+global_variables.grep(/std/).include?(:$stdin) &&
+global_variables.grep(/std/).include?(:$stdout)`)
+	assertBoolResult(t, result, true)
+}
+
 func TestConstantAssignmentAndRead(t *testing.T) {
 	result, _ := runRuby(t, "RGO_TEST_CONST = 42\nRGO_TEST_CONST")
 	assertIntResult(t, result, 42)
@@ -3065,6 +3311,212 @@ func TestRangeToA(t *testing.T) {
 	}
 	assertIntResult(t, arr[0], 1)
 	assertIntResult(t, arr[3], 4)
+}
+
+func TestRangeToAUsesSingletonSuccOnTimeValues(t *testing.T) {
+	result, _ := runRuby(t, `t = Time.utc(1970)
+def t.succ
+  self + 1
+end
+(t..t.succ).to_a.size`)
+	assertIntResult(t, result, 2)
+}
+
+func TestRangeFirstWithToIntExpectationDoesNotRecordSpecFailure(t *testing.T) {
+	_, _ = runRuby(t, `obj = mock("to_int")
+obj.should_receive(:to_int).and_return(2)
+(3..7).first(obj).should == [3, 4]`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeFirstRaisesRangeErrorForBeginlessRange(t *testing.T) {
+	_, _ = runRuby(t, `-> { (..1).first }.should raise_error(RangeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeLastSupportsCountAndRaisesForInvalidArguments(t *testing.T) {
+	_, _ = runRuby(t, `(1..5).last(3).should == [3, 4, 5]
+(0...0).last(2).should == []
+(2..4).last(5).should == [2, 3, 4]
+(2..9).last(2.8).should == [8, 9]
+obj = mock("to_int")
+obj.should_receive(:to_int).and_return("1")
+-> { (2..3).last(obj) }.should raise_error(TypeError)
+-> { (0..2).last(-1) }.should raise_error(ArgumentError)
+-> { (2..3).last(nil) }.should raise_error(TypeError)
+-> { (2..3).last("1") }.should raise_error(TypeError)
+-> { eval("(1..)").last }.should raise_error(RangeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeMinRaisesRangeErrorForInvalidOpenRanges(t *testing.T) {
+	_, _ = runRuby(t, `-> { (..1).min }.should raise_error(RangeError)
+-> { eval("(1..)").min { |a, b| a } }.should raise_error(RangeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeMaxHandlesOpenAndExclusiveRangeErrors(t *testing.T) {
+	_, _ = runRuby(t, `-> { (303.20...908.1111).max }.should raise_error(TypeError)
+time_start = Time.now
+time_end = Time.now + 1.0
+-> { (time_start...time_end).max }.should raise_error(TypeError)
+-> { eval("(1..)").max }.should raise_error(RangeError)
+-> { (...1.0).max }.should raise_error(TypeError)
+-> { (..1).max { |a, b| a } }.should raise_error(RangeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeMinmaxHandlesOpenAndExclusiveRangeErrors(t *testing.T) {
+	_, _ = runRuby(t, `x = mock("x")
+y = mock("y")
+x.should_receive(:<=>).with(y).any_number_of_times.and_return(-1)
+x.should_receive(:<=>).with(x).any_number_of_times.and_return(0)
+y.should_receive(:<=>).with(x).any_number_of_times.and_return(1)
+y.should_receive(:<=>).with(y).any_number_of_times.and_return(0)
+
+-> { (x..).minmax }.should raise_error(RangeError)
+-> { (..x).minmax }.should raise_error(StandardError)
+-> { (x...).minmax }.should raise_error(RangeError)
+-> { (...x).minmax }.should raise_error(RangeError)
+-> { (0...Float::INFINITY).minmax }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeNewValidatesComparableEndpointsAndPropagatesComparisonErrors(t *testing.T) {
+	_, _ = runRuby(t, `-> { Range.new(1, mock("x")) }.should raise_error(ArgumentError)
+-> { Range.new(mock("x"), mock("y")) }.should raise_error(ArgumentError)
+b = mock("x")
+(a = mock("nil")).should_receive(:<=>).with(b).and_return(nil)
+-> { Range.new(a, b) }.should raise_error(ArgumentError)
+
+class RangeNewComparisonError < StandardError; end
+b = mock("a")
+a = mock("b")
+a.should_receive(:<=>).with(b).and_raise(RangeNewComparisonError)
+-> { Range.new(a, b) }.should raise_error(RangeNewComparisonError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeInitializeInitializesAllocatedRangeAndRejectsFrozenRanges(t *testing.T) {
+	_, _ = runRuby(t, `range = Range.allocate
+-> { range.send(:initialize, 0, 1) }.should_not raise_error
+range.to_a.should == [0, 1]
+
+range = Range.allocate
+-> { range.send(:initialize, 0, 1, true) }.should_not raise_error
+range.to_a.should == [0]
+
+-> { Range.allocate.send(:initialize) }.should raise_error(ArgumentError)
+-> { Range.allocate.send(:initialize, 1) }.should raise_error(ArgumentError)
+-> { (0..1).send(:initialize, 1, 3) }.should raise_error(FrozenError)
+-> { (0..1).send(:initialize, 1, 3, true) }.should raise_error(FrozenError)
+-> { Range.allocate.send(:initialize, Object.new, Object.new) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeOverlapRaisesTypeErrorForNonRangeAndChecksOpenRanges(t *testing.T) {
+	_, _ = runRuby(t, `(0..2).overlap?(1..3).should == true
+(0...2).overlap?(2..4).should == false
+(0..2).overlap?(..-1).should == false
+(0..2).overlap?(1..).should == true
+-> { (0..2).overlap?(1) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeSizeRaisesTypeErrorForNonIterableRanges(t *testing.T) {
+	_, _ = runRuby(t, `(1..16).size.should == 16
+eval("(1..)").size.should == Float::INFINITY
+eval("('z'..)").size.should == nil
+(:a..:z).size.should be_nil
+-> { (1.0..16.0).size }.should raise_error(TypeError)
+-> { (16.0..0.0).size }.should raise_error(TypeError)
+-> { (..1).size }.should raise_error(TypeError)
+-> { (...0.5).size }.should raise_error(TypeError)
+-> { (..nil).size }.should raise_error(TypeError)
+-> { eval("(0.5...)").size }.should raise_error(TypeError)
+-> { eval("([]...)").size }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeToSetRaisesForBeginlessRangeAndPositionalArguments(t *testing.T) {
+	_, _ = runRuby(t, `(1..3).to_set
+-> { (..0).to_set }.should raise_error(TypeError, "can't iterate from NilClass")
+-> { (1..3).to_set(Object) }.should raise_error(ArgumentError, "wrong number of arguments (given 1, expected 0)")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeEachRaisesTypeErrorWhenStartCannotSucc(t *testing.T) {
+	result, _ := runRuby(t, `beginless_raised = false
+begin
+  (..2).each { |i| i }
+rescue TypeError
+  beginless_raised = true
+end
+
+float_raised = false
+begin
+  (0.5..2.4).each { |i| i }
+rescue TypeError
+  float_raised = true
+end
+
+class RangeNoSuccCompare
+  def <=>(other)
+    1
+  end
+end
+
+object_raised = false
+begin
+  (RangeNoSuccCompare.new..RangeNoSuccCompare.new).each { |i| i }
+rescue TypeError
+  object_raised = true
+end
+
+[beginless_raised, float_raised, object_raised]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 3 {
+		t.Fatalf("expected three values, got %d", len(values))
+	}
+	assertBoolResult(t, values[0], true)
+	assertBoolResult(t, values[1], true)
+	assertBoolResult(t, values[2], true)
 }
 
 func TestForLoop(t *testing.T) {
@@ -4503,6 +4955,354 @@ end`)
 	}
 }
 
+func TestCatchWithoutBlockRaisesLocalJumpError(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { catch :blah }.should raise_error(LocalJumpError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestCatchStringLabelsMatchByIdentity(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+key = "exit"
+catch(key) { throw key }.should == nil
+-> { catch("exit".dup) { throw "exit".dup } }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestUnmatchedThrowRaisesUncaughtThrowError(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { throw :blah }.should raise_error(UncaughtThrowError)
+-> { throw :blah }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelProcWithoutBlockRaisesArgumentError(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { proc }.should raise_error(ArgumentError, "tried to create Proc object without a block")
+def rgo_proc_without_block_method
+  proc
+end
+-> { rgo_proc_without_block_method { "hello" } }.should raise_error(ArgumentError, "tried to create Proc object without a block")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestPublicSendArgumentErrorsIncludePublicSendBacktraceFrame(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { public_send }.should raise_error(ArgumentError) { |e| e.backtrace[0].should =~ /public_send/ }
+-> { public_send(Object.new) }.should raise_error(TypeError) { |e| e.backtrace[0].should =~ /public_send/ }`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRemoveInstanceVariableValidatesNameBeforeFrozenReceiver(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `object = Object.new.freeze
+-> { object.remove_instance_variable(:@foo) }.should raise_error(FrozenError)
+-> { object.remove_instance_variable(:foo) }.should raise_error(NameError)
+-> { nil.remove_instance_variable(:@foo) }.should raise_error(FrozenError)
+-> { nil.remove_instance_variable(:foo) }.should raise_error(NameError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestAtExitWithoutBlockAndDoEndFixtureLifecycle(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { at_exit }.should raise_error(ArgumentError, "called without a block")
+script = fixture("vendor/ruby/spec/core/kernel/at_exit_spec.rb", "at_exit.rb")
+result = ruby_exe("{", options: "-r#{script}", args: "2>&1", exit_status: 1)
+$?.should_not.success?
+result.should.include?("handler ran\n")
+result.should.include?("SyntaxError")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelSleepValidatesDurationAndReturnsInteger(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `Kernel.should have_private_instance_method(:sleep)
+sleep(0.001).should be_kind_of(Integer)
+sleep(0).should >= 0
+sleep(Rational(1, 999)).should >= 0
+duration = Object.new
+def duration.divmod(*)
+  [0, 0.001]
+end
+sleep(duration).should >= 0
+-> { sleep(-0.1) }.should raise_error(ArgumentError)
+-> { sleep(-1) }.should raise_error(ArgumentError)
+-> { sleep("2") }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelTypePredicatesValidateClassOrModuleArgument(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `object = Object.new
+[:kind_of?, :is_a?, :instance_of?].each do |name|
+  -> { object.send(name, 1) }.should raise_error(TypeError)
+  -> { object.send(name, "Object") }.should raise_error(TypeError)
+  -> { object.send(name, :Object) }.should raise_error(TypeError)
+  -> { object.send(name, Object.new) }.should raise_error(TypeError)
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelInitializeCopyValidatesReceiverAndSource(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `obj = Object.new
+obj.send(:initialize_copy, obj).should.equal?(obj)
+frozen = Object.new.freeze
+frozen.send(:initialize_copy, frozen).should.equal?(frozen)
+1.send(:initialize_copy, 1).should.equal?(1)
+
+-> { Object.new.freeze.send(:initialize_copy, Object.new) }.should raise_error(FrozenError)
+-> { 1.send(:initialize_copy, Object.new) }.should raise_error(FrozenError)
+
+klass = Class.new
+sub = Class.new(klass)
+a = klass.new
+b = sub.new
+message = "initialize_copy should take same class object"
+-> { a.send(:initialize_copy, b) }.should raise_error(TypeError, message)
+-> { b.send(:initialize_copy, a) }.should raise_error(TypeError, message)
+-> { a.send(:initialize_copy, 1) }.should raise_error(TypeError, message)
+-> { a.send(:initialize_copy, 1.0) }.should raise_error(TypeError, message)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelCloneFreezeKeywordAndInitializeClone(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `class RGOCloneFreeze
+  def initialize_clone(other, **kwargs)
+    ScratchPad.record([other, kwargs])
+  end
+end
+
+obj = RGOCloneFreeze.new
+obj.clone(freeze: true).frozen?.should == true
+ScratchPad.recorded.should == [obj, { freeze: true }]
+
+obj.clone(freeze: false).frozen?.should == false
+ScratchPad.recorded.should == [obj, { freeze: false }]
+
+obj.freeze
+obj.clone(freeze: nil).frozen?.should == true
+obj.clone(freeze: false).frozen?.should == false
+
+class RGOCloneOneArg
+  def initialize_clone(other)
+    ScratchPad.record(other)
+  end
+end
+
+-> { RGOCloneOneArg.new.clone(freeze: true) }.should raise_error(ArgumentError, "wrong number of arguments (given 2, expected 1)")
+-> { RGOCloneFreeze.new.clone(freeze: 1) }.should raise_error(ArgumentError, /unexpected value for freeze: Integer/)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringUnaryMinusReturnsFrozenDedupedStringAndRejectsSingletonClass(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `value = -"string"
+value.should == "string"
+value.frozen?.should == true
+-> { value.singleton_class }.should raise_error(TypeError, "can't define singleton")
+
+dynamic = "string"
+-> { (-dynamic).singleton_class }.should raise_error(TypeError, "can't define singleton")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelDefineSingletonMethodValidatesArgumentsAndDefinesPerReceiver(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `obj = Object.new
+obj.define_singleton_method(:test) { "world!" }.should == :test
+obj.test.should == "world!"
+-> { Object.new.test }.should raise_error(NoMethodError)
+
+-> { obj.define_singleton_method(:missing) }.should raise_error(ArgumentError)
+-> { obj.define_singleton_method(:bad, "self") }.should raise_error(TypeError)
+-> { Object.new.freeze.define_singleton_method(:foo) { 1 } }.should raise_error(FrozenError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelExtendValidatesArgumentsAndFrozenReceiver(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `obj = Object.new
+-> { obj.extend }.should raise_error(ArgumentError)
+-> { obj.extend(Class.new) }.should raise_error(TypeError)
+-> { Object.new.freeze.extend(Module.new) }.should raise_error(FrozenError)
+-> { Object.new.freeze.extend }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelInstanceVariableGetValidatesName(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `obj = Object.new
+obj.instance_variable_set("@test", :test)
+obj.instance_variable_get("@test").should == :test
+obj.instance_variable_get(:@test).should == :test
+obj.instance_variable_get(:@missing).should == nil
+nil.instance_variable_get(:@missing).should == nil
+:foo.instance_variable_get(:@missing).should == nil
+
+-> { obj.instance_variable_get("test") }.should raise_error(NameError)
+-> { obj.instance_variable_get(:test) }.should raise_error(NameError)
+-> { obj.instance_variable_get("@") }.should raise_error(NameError)
+-> { obj.instance_variable_get(:"@") }.should raise_error(NameError)
+-> { obj.instance_variable_get("@0") }.should raise_error(NameError)
+-> { obj.instance_variable_get(:"@0") }.should raise_error(NameError)
+-> { nil.instance_variable_get(:foo) }.should raise_error(NameError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestSpecStubBangInstallsStubbedReturnValue(t *testing.T) {
+	core.RegisterMspec()
+	result, _ := runRuby(t, `obj = Object.new
+obj.stub!(:to_str).and_return("@test")
+obj.to_str.should == "@test"
+
+target = Object.new
+target.instance_variable_set("@test", :test)
+target.instance_variable_get(obj).should == :test
+obj.to_str`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+	if result == nil || result.Type != object.ValueString || result.Data.(string) != "@test" {
+		t.Fatalf("expected stubbed to_str to return @test, got %#v", result)
+	}
+}
+
+func TestKernelInstanceVariableSetValidatesNameBeforeFrozenWrite(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `obj = Object.new
+obj.instance_variable_set(:@test, :test).should == :test
+obj.instance_variable_get(:@test).should == :test
+
+class RGOIvarSetName
+  def initialize(value)
+    @value = value
+  end
+
+  def to_str
+    @value
+  end
+end
+
+obj.instance_variable_set(RGOIvarSetName.new("@coerced"), :coerced).should == :coerced
+obj.instance_variable_get(:@coerced).should == :coerced
+
+-> { obj.instance_variable_set(:test, 1) }.should raise_error(NameError)
+-> { obj.instance_variable_set(:"@0", 1) }.should raise_error(NameError)
+-> { obj.instance_variable_set(:"@", 1) }.should raise_error(NameError)
+-> { obj.instance_variable_set(RGOIvarSetName.new("test"), 1) }.should raise_error(NameError)
+-> { nil.instance_variable_set(:foo, 1) }.should raise_error(NameError)
+-> { nil.instance_variable_set(:@foo, 1) }.should raise_error(FrozenError)
+-> { :foo.instance_variable_set(:@foo, 1) }.should raise_error(FrozenError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelAbortValidatesStringArgumentAndWritesToIOStubStderr(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { abort 123 }.should raise_error(TypeError)
+
+old_stderr = $stderr
+begin
+  $stderr = IOStub.new
+  -> { abort "a message" }.should raise_error(SystemExit)
+  $stderr.should =~ /a message/
+ensure
+  $stderr = old_stderr
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestMultiAssignSetsGlobalVariableTargets(t *testing.T) {
+	result, _ := runRuby(t, `$rgo_multi_assign_global = :old
+@rgo_multi_assign_ivar, $rgo_multi_assign_global = $rgo_multi_assign_global, :new
+[$rgo_multi_assign_global, @rgo_multi_assign_ivar]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected array result, got %#v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 || values[0].Type != object.ValueSymbol || values[0].Data.(string) != "new" || values[1].Type != object.ValueSymbol || values[1].Data.(string) != "old" {
+		t.Fatalf("expected [:new, :old], got %#v", values)
+	}
+}
+
+func TestKernelSystemRunsCommandsAndSetsProcessStatus(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `system("true").should == true
+$?.should be_an_instance_of(Process::Status)
+$?.success?.should == true
+$?.exitstatus.should == 0
+
+system("false").should == false
+$?.should be_an_instance_of(Process::Status)
+$?.success?.should == false
+$?.exitstatus.should == 1
+
+system("rgo-command-does-not-exist").should == nil
+$?.should be_an_instance_of(Process::Status)
+$?.success?.should == false
+
+-> { system("false", exception: true) }.should raise_error(RuntimeError)
+-> { system("rgo-command-does-not-exist", exception: true) }.should raise_error(Errno::ENOENT)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestMethodDefaultArgumentUsesDefaultWhenOmitted(t *testing.T) {
 	result, _ := runRuby(t, `def foo(a = 1)
   a
@@ -4943,6 +5743,207 @@ second = Process.wait
 	assertNilResult(t, values[0])
 	if values[1].Type != object.ValueInteger || values[1].Data != int64(10_000) {
 		t.Fatalf("expected waited pid 10000, got %v", values[1].Inspect())
+	}
+}
+
+func TestRubyExeInThreadCanBeSignaledBeforeJoin(t *testing.T) {
+	result, _ := runRuby(t, `script = tmp("ruby-exe-thread-signal.rb")
+pid_file = tmp("ruby-exe-thread-signal.pid")
+rm_r pid_file
+File.write(script, "Signal.trap('TERM') { puts 'signaled'; exit }\nFile.write(ARGV[0], Process.pid)\nsleep\n")
+thread = Thread.new { ruby_exe(script, args: [pid_file]) }
+Thread.pass while thread.status && !File.exist?(pid_file)
+pid = IO.read(pid_file).to_i
+Process.kill(:TERM, pid)
+output = thread.value
+rm_r script
+rm_r pid_file
+output`)
+	assertStringResult(t, result, "signaled\n")
+}
+
+func TestIOEachLineHugeLimitRaisesRangeError(t *testing.T) {
+	_, _ = runRuby(t, `path = tmp("io-each-line-huge-limit.txt")
+File.write(path, "hello\n")
+file = File.open(path)
+begin
+  -> { file.each_line(2**128) {} }.should raise_error(RangeError)
+ensure
+  file.close
+  rm_r path
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestIOEachLineHashArgumentRaisesTypeError(t *testing.T) {
+	_, _ = runRuby(t, `path = tmp("io-each-line-hash-argument.txt")
+File.write(path, "hello\n")
+file = File.open(path)
+begin
+  -> { file.each_line({ chomp: true }) {} }.should raise_error(TypeError)
+ensure
+  file.close
+  rm_r path
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableGreaterThanRaisesWhenCompareReturnsNil(t *testing.T) {
+	_, _ = runRuby(t, `class ComparableGreaterThanNil
+  def <=>(other)
+    nil
+  end
+end
+
+-> { ComparableGreaterThanNil.new > ComparableGreaterThanNil.new }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableLessThanRaisesWhenCompareReturnsNil(t *testing.T) {
+	_, _ = runRuby(t, `class ComparableLessThanNil
+  def <=>(other)
+    nil
+  end
+end
+
+-> { ComparableLessThanNil.new < ComparableLessThanNil.new }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableLessThanOrEqualRaisesWhenCompareReturnsNil(t *testing.T) {
+	_, _ = runRuby(t, `class ComparableLessThanOrEqualNil
+  def <=>(other)
+    nil
+  end
+end
+
+-> { ComparableLessThanOrEqualNil.new <= ComparableLessThanOrEqualNil.new }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableEqualRaisesWhenCompareReturnsNonNumeric(t *testing.T) {
+	_, _ = runRuby(t, `class ComparableEqualString
+  def <=>(other)
+    "abc"
+  end
+end
+
+-> { ComparableEqualString.new == ComparableEqualString.new }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableEqualPropagatesCompareException(t *testing.T) {
+	_, _ = runRuby(t, `class ComparableEqualRaises
+  def <=>(other)
+    raise TypeError
+  end
+end
+
+-> { ComparableEqualRaises.new == ComparableEqualRaises.new }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestComparableClampBoundsValue(t *testing.T) {
+	result, _ := runRuby(t, `[2.clamp(1, 3), 0.clamp(1, 3), 4.clamp(1, 3)]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(values))
+	}
+	assertIntResult(t, values[0], 2)
+	assertIntResult(t, values[1], 1)
+	assertIntResult(t, values[2], 3)
+}
+
+func TestComparableClampExclusiveRangeRaisesArgumentError(t *testing.T) {
+	_, _ = runRuby(t, `-> { 2.clamp(1...3) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestClassAllocateSuperclassRaisesTypeError(t *testing.T) {
+	_, _ = runRuby(t, `-> { Class.allocate.superclass }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestClassAllocateNewRaisesException(t *testing.T) {
+	_, _ = runRuby(t, `-> { Class.allocate.new }.should raise_error(Exception)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestBasicObjectDupRaisesTypeError(t *testing.T) {
+	_, _ = runRuby(t, `-> { BasicObject.dup }.should raise_error(TypeError, "can't copy the root class")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestClassInitializeSendRaisesTypeError(t *testing.T) {
+	_, _ = runRuby(t, `Class.should have_private_method(:initialize)
+-> { Integer.send :initialize }.should raise_error(TypeError)
+-> { Object.send :initialize }.should raise_error(TypeError)
+-> { BasicObject.send :initialize }.should raise_error(TypeError)
+-> { Class.allocate.send(:initialize, Class) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestClassNewRejectsInvalidSuperclass(t *testing.T) {
+	_, _ = runRuby(t, `obj = mock("Class.new metaclass")
+meta = obj.singleton_class
+-> { Class.new(meta) }.should raise_error(TypeError)
+-> { Class.new("") }.should raise_error(TypeError, /superclass must be a.*Class/)
+-> { Class.new(Module.new) }.should raise_error(TypeError, /superclass must be a.*Class/)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestClassAttachedObjectReturnsSingletonOwnerAndRejectsRegularClasses(t *testing.T) {
+	_, _ = runRuby(t, `klass = Class.new
+obj = klass.new
+obj.singleton_class.attached_object.should equal obj
+(class << klass; self; end).attached_object.should equal klass
+-> { klass.attached_object }.should raise_error(TypeError, /is not a singleton class/)
+-> { nil.singleton_class.attached_object }.should raise_error(TypeError, /NilClass.*is not a singleton class/)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
 }
 
@@ -7311,6 +8312,17 @@ func TestIntegerDivisionByZeroRaisesZeroDivisionError(t *testing.T) {
 	result, _ := runRuby(t, `raised = false
 begin
   1/0
+rescue ZeroDivisionError
+  raised = true
+end
+raised`)
+	assertBoolResult(t, result, true)
+}
+
+func TestIntegerZeroToNegativePowerRaisesZeroDivisionError(t *testing.T) {
+	result, _ := runRuby(t, `raised = false
+begin
+  0 ** -1
 rescue ZeroDivisionError
   raised = true
 end
@@ -11445,6 +12457,12 @@ func TestIOCopyStreamClassMethodIsDiscoverable(t *testing.T) {
 	}
 }
 
+func TestStringIONewWithoutArgumentsUsesEmptyString(t *testing.T) {
+	result, _ := runRuby(t, `io = StringIO.new
+io.string`)
+	assertStringResult(t, result, "")
+}
+
 func TestIOCopyStreamCopiesAndRespectsLengthAndOffset(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "copy_stream_src.txt")
@@ -11570,6 +12588,438 @@ end`, dst))
 	if result.Data.(string) != "espipe" {
 		t.Fatalf("expected :espipe, got %v", result)
 	}
+}
+
+func TestIOSelectInfiniteTimeoutRunsPendingThread(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+main = Thread.current
+Thread.new do
+  Thread.pass until main.status == "sleep"
+  wr.write "ready"
+end
+selected = IO.select([rd], nil, nil, nil)
+rd.read(5)`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertStringResult(t, result, "ready")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IO.select with infinite timeout did not run pending thread")
+	}
+}
+
+func TestIOSelectResultComparesToExpectedNestedArrays(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+main = Thread.current
+t = Thread.new do
+  Thread.pass until main.status == "sleep"
+  wr.write "ready"
+end
+result = IO.select([rd], nil, nil, nil)
+matched = result == [[rd], [], []]
+t.join
+matched`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertBoolResult(t, result, true)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IO.select result comparison did not finish")
+	}
+}
+
+func TestIOSelectResultShouldMatcherFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+main = Thread.current
+t = Thread.new do
+  Thread.pass until main.status == "sleep"
+  wr.write "ready"
+end
+result = IO.select([rd], nil, nil, nil)
+result.should == [[rd], [], []]
+t.join
+:done`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertSymbolResult(t, result, "done")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IO.select result should matcher did not finish")
+	}
+}
+
+func TestIOSelectSpecStyleExampleFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `describe "IO.select regression" do
+  before :each do
+    @rd, @wr = IO.pipe
+  end
+
+  after :each do
+    @rd.close unless @rd.closed?
+    @wr.close unless @wr.closed?
+  end
+
+  it "returns supplied objects when ready" do
+    main = Thread.current
+    t = Thread.new {
+      Thread.pass until main.status == "sleep"
+      @wr.write "be ready"
+    }
+    result = IO.select [@rd], nil, nil, nil
+    result.should == [[@rd], [], []]
+    t.join
+  end
+end`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertNilResult(t, result)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("spec-style IO.select example did not finish")
+	}
+}
+
+func TestIOSelectFirstFourSpecExamplesFinishTogether(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `describe "IO.select regression" do
+  before :each do
+    @rd, @wr = IO.pipe
+  end
+
+  after :each do
+    @rd.close unless @rd.closed?
+    @wr.close unless @wr.closed?
+  end
+
+  it "one" do
+    IO.select([@rd], nil, nil, 0.001).should == nil
+  end
+
+  it "two" do
+    @wr.syswrite("be ready")
+    IO.pipe do |_, wr|
+      result = IO.select [@rd], [wr], nil, 0
+      result.should == [[@rd], [wr], []]
+    end
+  end
+
+  it "three" do
+    result = IO.select [@rd], nil, nil, 0
+    result.should == nil
+  end
+
+  it "four" do
+    main = Thread.current
+    t = Thread.new {
+      Thread.pass until main.status == "sleep"
+      @wr.write "be ready"
+    }
+    result = IO.select [@rd], nil, nil, nil
+    result.should == [[@rd], [], []]
+    t.join
+  end
+end`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertNilResult(t, result)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first four IO.select examples did not finish together")
+	}
+}
+
+func TestIOSelectPipeBlockThenInfiniteSelectFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+wr.syswrite("be ready")
+IO.pipe do |_, block_wr|
+  IO.select([rd], [block_wr], nil, 0)
+end
+rd.close
+wr.close
+
+rd, wr = IO.pipe
+main = Thread.current
+t = Thread.new {
+  Thread.pass until main.status == "sleep"
+  wr.write "be ready"
+}
+IO.select([rd], nil, nil, nil)
+t.join
+:done`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertSymbolResult(t, result, "done")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IO.pipe block followed by infinite IO.select did not finish")
+	}
+}
+
+func TestIOSelectFirstTwoThenInfiniteSpecExamplesFinish(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `describe "IO.select regression" do
+  before :each do
+    @rd, @wr = IO.pipe
+  end
+
+  after :each do
+    @rd.close unless @rd.closed?
+    @wr.close unless @wr.closed?
+  end
+
+  it "one" do
+    IO.select([@rd], nil, nil, 0.001).should == nil
+  end
+
+  it "two" do
+    @wr.syswrite("be ready")
+    IO.pipe do |_, wr|
+      result = IO.select [@rd], [wr], nil, 0
+      result.should == [[@rd], [wr], []]
+    end
+  end
+
+  it "four" do
+    main = Thread.current
+    t = Thread.new {
+      Thread.pass until main.status == "sleep"
+      @wr.write "be ready"
+    }
+    result = IO.select [@rd], nil, nil, nil
+    result.should == [[@rd], [], []]
+    t.join
+  end
+end`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertNilResult(t, result)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first two plus infinite IO.select examples did not finish")
+	}
+}
+
+func TestIOSelectZeroTimeoutThenInfiniteSpecExampleFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `describe "IO.select regression" do
+  before :each do
+    @rd, @wr = IO.pipe
+  end
+
+  after :each do
+    @rd.close unless @rd.closed?
+    @wr.close unless @wr.closed?
+  end
+
+  it "three" do
+    result = IO.select [@rd], nil, nil, 0
+    result.should == nil
+  end
+
+  it "four" do
+    main = Thread.current
+    t = Thread.new {
+      Thread.pass until main.status == "sleep"
+      @wr.write "be ready"
+    }
+    result = IO.select [@rd], nil, nil, nil
+    result.should == [[@rd], [], []]
+    t.join
+  end
+end`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertNilResult(t, result)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("zero-timeout then infinite IO.select examples did not finish")
+	}
+}
+
+func TestIOSelectZeroTimeoutSpecExampleAfterHookFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `describe "IO.select regression" do
+  before :each do
+    @rd, @wr = IO.pipe
+  end
+
+  after :each do
+    @rd.close unless @rd.closed?
+    @wr.close unless @wr.closed?
+  end
+
+  it "three" do
+    result = IO.select [@rd], nil, nil, 0
+    result.should == nil
+  end
+end`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertNilResult(t, result)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("zero-timeout IO.select spec example after hook did not finish")
+	}
+}
+
+func TestIOSelectZeroTimeoutThenCloseReadEndFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+IO.select([rd], nil, nil, 0)
+rd.close
+wr.close
+:done`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertSymbolResult(t, result, "done")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("zero-timeout IO.select followed by pipe close did not finish")
+	}
+}
+
+func TestIOSelectZeroTimeoutDoesNotLeaveCurrentThreadSleeping(t *testing.T) {
+	result, _ := runRuby(t, `rd, wr = IO.pipe
+IO.select([rd], nil, nil, 0)
+Thread.current.status`)
+	assertStringResult(t, result, "run")
+}
+
+func TestIOSelectPlainZeroTimeoutThenInfiniteSelectFinishes(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `rd, wr = IO.pipe
+IO.select([rd], nil, nil, 0)
+rd.close
+wr.close
+
+rd, wr = IO.pipe
+main = Thread.current
+t = Thread.new {
+  Thread.pass until main.status == "sleep"
+  wr.write "be ready"
+}
+IO.select([rd], nil, nil, nil)
+t.join
+:done`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertSymbolResult(t, result, "done")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("plain zero-timeout then infinite IO.select did not finish")
+	}
+}
+
+func TestIOSelectInfiniteTimeoutInThreadLeavesThreadSleeping(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		result, _ := runRuby(t, `t = Thread.new do
+  IO.select(nil, nil, nil, nil)
+end
+Thread.pass while t.status && t.status != "sleep"
+status = t.status
+t.kill
+t.join
+status`)
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		assertStringResult(t, result, "sleep")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IO.select infinite timeout in thread did not yield sleeping thread")
+	}
+}
+
+func TestIOSelectInfiniteTimeoutSharedSpecSnippetPasses(t *testing.T) {
+	result, _ := runRuby(t, `describe "IO.select with infinite timeout" do
+  it "sleeps forever and sets the thread status to sleep" do
+    t = Thread.new do
+      IO.select(nil, nil, nil, nil)
+    end
+
+    Thread.pass while t.status && t.status != "sleep"
+    t.join unless t.status
+    t.status.should == "sleep"
+    t.kill
+    t.join
+  end
+end`)
+	assertNilResult(t, result)
+}
+
+func TestIOSelectInfiniteTimeoutItBehavesLikeSnippetPasses(t *testing.T) {
+	result, _ := runRuby(t, `describe "IO.select with infinite timeout" do
+  describe :io_select_infinite_timeout, shared: true do
+    it "sleeps forever and sets the thread status to 'sleep'" do
+      t = Thread.new do
+        IO.select(nil, nil, nil, @method)
+      end
+
+      Thread.pass while t.status && t.status != "sleep"
+      t.join unless t.status
+      t.status.should == "sleep"
+      t.kill
+      t.join
+    end
+  end
+
+  describe "IO.select when passed nil for timeout" do
+    it_behaves_like :io_select_infinite_timeout, nil
+  end
+end`)
+	assertNilResult(t, result)
+}
+
+func TestIOSelectObjectTimeoutRaisesTypeErrorMatcher(t *testing.T) {
+	result, _ := runRuby(t, `rd, wr = IO.pipe
+-> { IO.select([rd], nil, nil, Object.new) }.should raise_error(TypeError)`)
+	assertBoolResult(t, result, true)
+}
+
+func TestIOSelectFloatNANTimeoutRaisesRangeErrorMatcher(t *testing.T) {
+	result, _ := runRuby(t, `rd, wr = IO.pipe
+-> { IO.select(nil, nil, nil, Float::NAN) }.should raise_error(RangeError)`)
+	assertBoolResult(t, result, true)
 }
 
 func TestIOCopyStreamSupportsCustomReadObjectAndWriteObject(t *testing.T) {
@@ -14807,6 +16257,567 @@ func TestArrayJoinRaisesForUtf8AndBinaryNonAsciiStrings(t *testing.T) {
 	err := runRubyExpectError(t, `["báz", [255].pack("C").force_encoding("BINARY")].join`)
 	if err == nil || !strings.Contains(err.Error(), "Encoding::CompatibilityError") {
 		t.Fatalf("expected Encoding::CompatibilityError, got %v", err)
+	}
+}
+
+func TestRangeReverseEachHandlesEnumeratorAndErrorCases(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+(1..3).reverse_each.to_a.should == [3, 2, 1]
+(1...3).reverse_each.to_a.should == [2, 1]
+
+a = []
+(1..3).reverse_each { |i| a << i }.should == 1..3
+a.should == [3, 2, 1]
+
+(..5).reverse_each.take(3).should == [5, 4, 3]
+-> { (1..).reverse_each.take(3) }.should raise_error(TypeError, "can't iterate from NilClass")
+-> { (Time.now..Time.now).reverse_each { |x| x } }.should raise_error(TypeError, /can't iterate from Time/)
+
+(1..3).reverse_each.size.should == 3
+(1...3).reverse_each.size.should == 2
+(1..3.3).reverse_each.size.should == 3
+(1...3.3).reverse_each.size.should == 3
+-> { (1.1..3).reverse_each.size }.should raise_error(TypeError, /can't iterate from Integer/)
+-> { (1.1..3.3).reverse_each.size }.should raise_error(TypeError, /can't iterate from Float/)
+('a'..'z').reverse_each.size.should == nil`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeBsearchHandlesNumericRangesAndTypeErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+(0..1).bsearch.should be_an_instance_of(Enumerator)
+(0..1).bsearch.size.should == nil
+
+-> { (0..1).bsearch { Object.new } }.should raise_error(TypeError, "wrong argument type Object (must be numeric, true, false or nil)")
+-> { (0..1).bsearch { "1" } }.should raise_error(TypeError, "wrong argument type String (must be numeric, true, false or nil)")
+value = mock("range bsearch")
+-> { Range.new(value, value).bsearch { true } }.should raise_error(TypeError, "can't do binary search for MockObject")
+-> { ("a".."e").bsearch { true } }.should raise_error(TypeError, "can't do binary search for String")
+-> { ("a".."e").bsearch }.should raise_error(TypeError, "can't do binary search for String")
+
+(0..4).bsearch { |x| x >= 2 }.should == 2
+(0...4).bsearch { |x| x >= 3 }.should == 3
+(0..3).bsearch { |x| nil }.should be_nil
+(0..4).bsearch { |x| x < 1 ? 1 : x > 3 ? -1 : 0 }.should >= 1
+eval("(0..)").bsearch { |x| x >= 2 }.should == 2
+(..10).bsearch { |x| x >= 2 }.should == 2
+(0.1...2.3).bsearch { |x| x > 3 }.should be_nil
+(-0.2..4.8).bsearch { |x| x < 5 }.should == -0.2`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestRangeStepHandlesBeginlessAndDeferredNoBlockErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+-> { (..10).step(1) { break } }.should raise_error(ArgumentError, "#step iteration for beginless ranges is meaningless")
+-> { ("A".."G").step(2.0) { } }.should raise_error(TypeError)
+-> { ("A"..).step(2.0) { } }.should raise_error(TypeError)
+
+obj = mock("Range#step non-integer")
+-> { (1..2).step(obj) }.should_not raise_error
+
+obj = mock("Range#step non-comparable")
+obj.should_receive(:<=>).with(obj).and_return(1)
+enum = (obj..obj).step(obj)
+-> { enum.size }.should_not raise_error
+enum.size.should == nil
+
+-> { Range.new(nil, nil).step(1) }.should raise_error(ArgumentError, "#step for non-numeric beginless ranges is meaningless")
+-> { (..10).step("a") }.should raise_error(ArgumentError, "#step for non-numeric beginless ranges is meaningless")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestSingletonValueClassesCannotBeAllocatedOrConstructed(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+[FalseClass, TrueClass, NilClass].each do |klass|
+  -> { klass.allocate }.should raise_error(TypeError)
+  -> { klass.new }.should raise_error(NoMethodError)
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableGrepRequiresPatternArgument(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def each
+    yield 1
+  end
+end
+
+-> { klass.new.grep { |value| value } }.should raise_error(ArgumentError)
+-> { klass.new.grep_v { |value| value } }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerablePredicateMethodsPropagateArgumentAndRuntimeErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def each
+    yield 1
+  end
+end
+
+throwing_each = Class.new do
+  include Enumerable
+  def each
+    raise "from each"
+  end
+end
+
+pattern = Object.new
+def pattern.===(value)
+  raise "from pattern"
+end
+
+[:all?, :any?, :none?, :one?].each do |name|
+  -> { klass.new.send(name, 1, 2) }.should raise_error(ArgumentError)
+  -> { [1].send(name, 1, 2) }.should raise_error(ArgumentError)
+  -> { { :a => 1 }.send(name, 1, 2) }.should raise_error(ArgumentError)
+  -> { throwing_each.new.send(name) }.should raise_error(RuntimeError)
+  -> { klass.new.send(name) { raise "from block" } }.should raise_error(RuntimeError)
+  -> { klass.new.send(name, pattern) }.should raise_error(RuntimeError)
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestMethodLookupWithHashBackedValuesDoesNotPanic(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+({ :a => 1 }).should == { :a => 1 }
+{ 1 => "a", 2 => "b" }.map { |key, value| [key, value] }.should == [[1, "a"], [2, "b"]]`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestHashMapWithMethodProcHonorsMethodArity(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  def register(a, b, c)
+  end
+end
+method = klass.new.method(:register)
+-> { method.call(1, 2) }.should raise_error(ArgumentError)
+-> { { 1 => "a" }.map(&method) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableFlatMapUsesToAryForOneLevelFlattening(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+coercible = Object.new
+def coercible.to_ary
+  [3, 4]
+end
+
+invalid = Object.new
+def invalid.to_ary
+  "not an array"
+end
+
+[1, coercible, 2].flat_map { |value| value }.should == [1, 3, 4, 2]
+begin
+  [invalid].flat_map { |value| value }
+rescue => error
+  error.class
+end.should == TypeError`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableFirstTakeDropCountValidationAndConversion(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+obj = Object.new
+def obj.to_int
+  2
+end
+
+enum = klass.new(3, 2, 1, :go)
+enum.take(2.3).should == [3, 2]
+enum.drop(2.3).should == [1, :go]
+enum.first(obj).should == [3, 2]
+-> { enum.take }.should raise_error(ArgumentError)
+-> { enum.drop }.should raise_error(ArgumentError)
+-> { enum.drop(1, 2) }.should raise_error(ArgumentError)
+-> { enum.take(-1) }.should raise_error(ArgumentError)
+-> { enum.drop(-1) }.should raise_error(ArgumentError)
+-> { enum.first(-1) }.should raise_error(ArgumentError)
+-> { enum.take(nil) }.should raise_error(TypeError)
+-> { enum.drop(nil) }.should raise_error(TypeError)
+-> { enum.first(bignum_value) }.should raise_error(RangeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableEntryConsSliceArgumentValidation(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  attr_reader :arguments
+  def initialize(*list)
+    @list = list
+  end
+  def each(*args)
+    @arguments = args
+    @list.each { |value| yield value }
+  end
+end
+
+strict_each = Class.new do
+  include Enumerable
+  def each
+    yield 1
+  end
+end
+
+enum = klass.new(1, 2, 3)
+enum.each_entry(:foo, "bar").to_a.should == [1, 2, 3]
+enum.arguments.should == [:foo, "bar"]
+
+-> { strict_each.new.each_entry(:foo).to_a }.should raise_error(ArgumentError)
+-> { enum.each_cons }.should raise_error(ArgumentError)
+-> { enum.each_cons(0) }.should raise_error(ArgumentError)
+-> { enum.each_cons(-1) }.should raise_error(ArgumentError)
+-> { enum.each_cons(1, 2) }.should raise_error(ArgumentError)
+-> { enum.each_slice }.should raise_error(ArgumentError)
+-> { enum.each_slice(0) }.should raise_error(ArgumentError)
+-> { enum.each_slice(-1) }.should raise_error(ArgumentError)
+-> { enum.each_slice(1, 2) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableCycleArgumentValidation(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def each
+    yield 1
+  end
+end
+
+enum = klass.new
+-> { enum.cycle("cat") {} }.should raise_error(TypeError)
+-> { enum.cycle(1, 2) {} }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableZipSupportsGenericReceiversAndBadArgumentErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new(1, 2, 3)
+enum.zip([4, 5], [6, 7, 8]).should == [[1, 4, 6], [2, 5, 7], [3, nil, 8]]
+-> { enum.zip(Object.new) }.should raise_error(TypeError, "wrong argument type Object (must respond to :each)")
+-> { enum.zip(1) }.should raise_error(TypeError, "wrong argument type Integer (must respond to :each)")
+-> { enum.zip(true) }.should raise_error(TypeError, "wrong argument type TrueClass (must respond to :each)")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableTallyValidatesDestinationHash(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new("foo", "bar", "foo")
+hash = { "foo" => 1 }
+enum.tally(hash).should equal(hash)
+hash.should == { "foo" => 3, "bar" => 1 }
+
+frozen = { "foo" => 1 }.freeze
+-> { enum.tally(frozen) }.should raise_error(FrozenError)
+frozen.should == { "foo" => 1 }
+-> { klass.new.tally(frozen) }.should raise_error(FrozenError)
+-> { enum.tally({ "foo" => "bar" }) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableToHSupportsGenericReceiversAndErrorCases(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each(*args)
+    args.each { |value| yield value }
+    @list.each { |value| yield value }
+  end
+end
+
+klass.new([:a, 1], [:b, 2], [:a, 3]).to_h.should == { :a => 3, :b => 2 }
+klass.new([:b, 2]).to_h(:a, 1).should == { :a => 1, :b => 2 }
+klass.new(:a, :b).to_h { |key| [key, key.to_s] }.should == { :a => "a", :b => "b" }
+klass.new([:a, 1]).to_h { |*args| [args[0], args.length] }.should == { [:a, 1] => 1 }
+-> { klass.new(:x).to_h }.should raise_error(TypeError)
+-> { klass.new([:x]).to_h }.should raise_error(ArgumentError)
+-> { klass.new(:x).to_h { |key| "not-array" } }.should raise_error(TypeError)
+-> { klass.new(:x).to_h { |key| [key] } }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableAdjacentGroupingMethods(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new(10, 9, 7, 6, 4, 3, 2, 1)
+enum.chunk_while { |left, right| left - 1 == right }.to_a.should == [[10, 9], [7, 6], [4, 3, 2, 1]]
+enum.slice_when { |left, right| left - 1 != right }.to_a.should == [[10, 9], [7, 6], [4, 3, 2, 1]]
+klass.new(42).chunk_while { raise }.to_a.should == [[42]]
+klass.new.slice_when { raise }.to_a.should == []
+-> { enum.chunk_while }.should raise_error(ArgumentError)
+-> { enum.slice_when }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableSliceBeforeAfterMethods(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new(7, 6, 5, 4, 3, 2, 1)
+enum.slice_before { |value| value == 6 || value == 2 }.to_a.should == [[7], [6, 5, 4, 3], [2, 1]]
+enum.slice_after { |value| value == 6 || value == 2 }.to_a.should == [[7, 6], [5, 4, 3, 2], [1]]
+enum.slice_before(6).to_a.should == [[7], [6, 5, 4, 3, 2, 1]]
+enum.slice_after(6).to_a.should == [[7, 6], [5, 4, 3, 2, 1]]
+-> { enum.slice_before }.should raise_error(ArgumentError)
+-> { enum.slice_before(1) {} }.should raise_error(ArgumentError)
+-> { enum.slice_before(1, 2) }.should raise_error(ArgumentError)
+-> { enum.slice_after }.should raise_error(ArgumentError)
+-> { enum.slice_after(1) {} }.should raise_error(ArgumentError)
+-> { enum.slice_after(1, 2) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableChunkValidationAndEnumeratorWithIndex(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new(1, 2, 3, 1, 2)
+enum.chunk { |value| value < 3 && 1 || 0 }.to_a.should == [[1, [1, 2]], [0, [3]], [1, [1, 2]]]
+enum.chunk.with_index { |value, index| value - index }.to_a.should == [[1, [1, 2, 3]], [-2, [1, 2]]]
+klass.new(1, 2, 1).chunk { |value| value == 2 ? :_separator : 1 }.to_a.should == [[1, [1]], [1, [1]]]
+klass.new(1, 2, 1).chunk { |value| value < 2 && :_alone }.to_a.should == [[:_alone, [1]], [false, [2]], [:_alone, [1]]]
+-> { enum.chunk(1) {} }.should raise_error(ArgumentError)
+-> { enum.chunk { :_invalid }.to_a }.should raise_error(RuntimeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableMinMaxSortComparisonErrorsAndCounts(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+enum = klass.new(333, 22, 666666, 55555, 1010101010)
+enum.min.should == 22
+enum.max.should == 1010101010
+enum.min(2).should == [22, 333]
+enum.max(2).should == [1010101010, 666666]
+enum.sort.should == [22, 333, 55555, 666666, 1010101010]
+enum.sort { |left, right| right <=> left }.should == [1010101010, 666666, 55555, 333, 22]
+
+-> { klass.new(BasicObject.new, BasicObject.new).min }.should raise_error(NoMethodError)
+-> { klass.new(BasicObject.new, BasicObject.new).max }.should raise_error(NoMethodError)
+-> { klass.new(BasicObject.new, BasicObject.new).sort }.should raise_error(NoMethodError)
+-> { klass.new(11, "22").min }.should raise_error(ArgumentError)
+-> { klass.new(11, "22").max }.should raise_error(ArgumentError)
+-> { klass.new(1, 2).sort { |left, right| "bad" } }.should raise_error(ArgumentError)
+-> { enum.min(-1) }.should raise_error(ArgumentError)
+-> { enum.max(-1) }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableInjectReduceNativeArgumentValidation(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def each
+    yield 1
+    yield 2
+    yield 3
+  end
+end
+
+enum = klass.new
+enum.inject(10, :-).should == 4
+enum.reduce(10, "-").should == 4
+name = Object.new
+def name.to_str; "-"; end
+enum.inject(10, name).should == 4
+enum.reduce(name).should == -4
+enum.inject(0) { |memo, value| memo + value }.should == 6
+enum.reduce { |memo, value| memo + value }.should == 6
+-> { enum.inject(10, Object.new) }.should raise_error(TypeError, /is not a symbol nor a string/)
+-> { enum.reduce(Object.new) }.should raise_error(TypeError, /is not a symbol nor a string/)
+-> { enum.inject }.should raise_error(ArgumentError)
+-> { enum.reduce }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestArrayAndHashInjectReduceArgumentValidation(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+-> { [1, 2, 3].inject(10, Object.new) }.should raise_error(TypeError, /is not a symbol nor a string/)
+-> { [1, 2, 3].reduce(Object.new) }.should raise_error(TypeError, /is not a symbol nor a string/)
+-> { [1, 2].inject }.should raise_error(ArgumentError)
+-> { { one: 1, two: 2 }.inject }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEnumerableMinmaxNativeComparisonErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+klass = Class.new do
+  include Enumerable
+  def initialize(*list)
+    @list = list
+  end
+  def each
+    @list.each { |value| yield value }
+  end
+end
+
+klass.new(6, 4, 5, 10, 8).minmax.should == [4, 10]
+klass.new("333", "2", "60").minmax { |left, right| left.length <=> right.length }.should == ["2", "333"]
+klass.new.minmax.should == [nil, nil]
+-> { klass.new(BasicObject.new, BasicObject.new).minmax }.should raise_error(NoMethodError)
+-> { klass.new(11, "22").minmax }.should raise_error(ArgumentError)
+-> { klass.new(11, 12, 22, 33).minmax { |left, right| nil } }.should raise_error(ArgumentError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
 }
 

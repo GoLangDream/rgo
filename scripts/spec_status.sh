@@ -83,18 +83,18 @@ for spec in "${FILES[@]}"; do
   elif [ "$code" -eq 137 ] || [ "$code" -eq 143 ]; then
     status=oom_or_killed
     error_kind=oom_or_killed
-  elif grep -q '^Parse Error:' "$tmp"; then
+  elif grep -a -q '^Parse Error:' "$tmp"; then
     status=parse_error
     error_kind=parse_error
-  elif grep -q '^Compile Error:' "$tmp"; then
+  elif grep -a -q '^Compile Error:' "$tmp"; then
     status=compile_error
     error_kind=compile_error
-  elif grep -q '^Runtime Error:' "$tmp"; then
+  elif grep -a -q '^Runtime Error:' "$tmp"; then
     status=runtime_error
     error_kind=runtime_error
   else
-    summary=$(grep -E '^[0-9]+ examples, [0-9]+ failures$' "$tmp" | tail -n 1 || true)
-  if [ -n "$summary" ]; then
+    summary=$(grep -a -E '^[0-9]+ examples, [0-9]+ failures$' "$tmp" | tail -n 1 || true)
+    if [ -n "$summary" ]; then
       examples=${summary%% examples,*}
       failures=${summary#*, }
       failures=${failures%% failures}
@@ -104,11 +104,11 @@ for spec in "${FILES[@]}"; do
       elif [ "$failures" = "0" ] && [ "$code" -eq 0 ]; then
         status=pass
         error_kind=
-      else
-        status=nonzero_failures
-        error_kind=nonzero_failures
-      fi
-    elif grep -q '^Runtime Error:' "$tmp"; then
+    else
+      status=nonzero_failures
+      error_kind=nonzero_failures
+    fi
+    elif grep -a -q '^Runtime Error:' "$tmp"; then
       status=runtime_error
       error_kind=runtime_error
     fi

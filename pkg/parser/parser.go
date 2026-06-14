@@ -961,10 +961,12 @@ func (p *Parser) parseCatchExpression() ast.Expression {
 	}
 
 	if p.curTokenIs(lexer.DO) {
+		exp.HasBlock = true
 		p.nextToken()
 		exp.Body = &ast.BlockExpression{Token: p.curToken}
 		p.parseBlockParams(exp.Body)
 	} else if p.curTokenIs(lexer.LBRACE) {
+		exp.HasBlock = true
 		endToken = lexer.RBRACE
 		p.nextToken()
 		exp.Body = &ast.BlockExpression{Token: p.curToken}
@@ -976,6 +978,7 @@ func (p *Parser) parseCatchExpression() ast.Expression {
 				endToken = lexer.RBRACE
 			}
 			if p.curTokenIs(lexer.DO) || p.curTokenIs(lexer.LBRACE) {
+				exp.HasBlock = true
 				p.nextToken()
 			}
 			exp.Body = &ast.BlockExpression{Token: p.curToken}
@@ -2421,6 +2424,12 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 		p.nextToken()
 		if arg := p.parseArrayLiteral(); arg != nil {
 			call.Args = append(call.Args, arg)
+		}
+		for p.peekTokenIs(lexer.COMMA) {
+			p.nextToken()
+			p.skipPeekNewlines()
+			p.nextToken()
+			p.parseOneCallArgStoppingAtRParen(call)
 		}
 		return call
 	}

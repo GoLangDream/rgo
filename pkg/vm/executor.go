@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -117,6 +118,8 @@ type VM struct {
 	ensureActive  bool
 
 	catchStack []*CatchHandler
+
+	nativeSingletonMethods map[interface{}]map[string]*object.Method
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
@@ -133,6 +136,7 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		LineMap:      bytecode.LineMap,
 		Constants:    bytecode.Constants,
 		NumLocals:    bytecode.NumLocals,
+		GlobalNames:  bytecode.GlobalNames,
 		LocalNames:   bytecode.LocalNames,
 	}
 
@@ -147,33 +151,95 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	}
 
 	vm := &VM{
-		constants:           bytecode.Constants,
-		globals:             make([]*object.EmeraldValue, 100),
-		globalNames:         bytecode.GlobalNames,
-		bytecodeGlobalNames: bytecode.GlobalNames,
-		rubyConsts:          make(map[string]*object.EmeraldValue),
-		stack:               make([]*object.EmeraldValue, StackSize),
-		sp:                  1 + bytecode.NumLocals,
-		frames:              []*Frame{mainFrame},
-		fp:                  0,
-		nextFrameID:         2,
-		instructions:        bytecode.Instructions,
-		autoloading:         make(map[string]bool),
-		isRoot:              parent == nil,
+		constants:              bytecode.Constants,
+		globals:                make([]*object.EmeraldValue, 100),
+		globalNames:            bytecode.GlobalNames,
+		bytecodeGlobalNames:    bytecode.GlobalNames,
+		rubyConsts:             make(map[string]*object.EmeraldValue),
+		stack:                  make([]*object.EmeraldValue, StackSize),
+		sp:                     1 + bytecode.NumLocals,
+		frames:                 []*Frame{mainFrame},
+		fp:                     0,
+		nextFrameID:            2,
+		instructions:           bytecode.Instructions,
+		autoloading:            make(map[string]bool),
+		nativeSingletonMethods: make(map[interface{}]map[string]*object.Method),
+		isRoot:                 parent == nil,
 	}
 	vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
-	vm.rubyConsts["Enumerable"] = &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule("Enumerable"), Class: core.R.Classes["Module"]}
+	enumerableModule := object.NewModule("Enumerable")
+	enumerableModule.DefineMethod("select", &object.Method{Name: "select", Fn: core.EnumerableSelect, Arity: 0})
+	enumerableModule.DefineMethod("find_all", &object.Method{Name: "find_all", Fn: core.EnumerableSelect, Arity: 0})
+	enumerableModule.DefineMethod("filter", &object.Method{Name: "filter", Fn: core.EnumerableSelect, Arity: 0})
+	enumerableModule.DefineMethod("map", &object.Method{Name: "map", Fn: core.EnumerableMap, Arity: -1})
+	enumerableModule.DefineMethod("collect", &object.Method{Name: "collect", Fn: core.EnumerableMap, Arity: -1})
+	enumerableModule.DefineMethod("first", &object.Method{Name: "first", Fn: core.EnumerableFirst, Arity: -1})
+	enumerableModule.DefineMethod("take", &object.Method{Name: "take", Fn: core.EnumerableTake, Arity: -1})
+	enumerableModule.DefineMethod("drop", &object.Method{Name: "drop", Fn: core.EnumerableDrop, Arity: -1})
+	enumerableModule.DefineMethod("each_entry", &object.Method{Name: "each_entry", Fn: core.EnumerableEachEntry, Arity: -1})
+	enumerableModule.DefineMethod("each_cons", &object.Method{Name: "each_cons", Fn: core.EnumerableEachCons, Arity: -1})
+	enumerableModule.DefineMethod("each_slice", &object.Method{Name: "each_slice", Fn: core.EnumerableEachSlice, Arity: -1})
+	enumerableModule.DefineMethod("cycle", &object.Method{Name: "cycle", Fn: core.EnumerableCycle, Arity: -1})
+	enumerableModule.DefineMethod("all?", &object.Method{Name: "all?", Fn: core.EnumerableAll, Arity: -1})
+	enumerableModule.DefineMethod("any?", &object.Method{Name: "any?", Fn: core.EnumerableAny, Arity: -1})
+	enumerableModule.DefineMethod("none?", &object.Method{Name: "none?", Fn: core.EnumerableNone, Arity: -1})
+	enumerableModule.DefineMethod("one?", &object.Method{Name: "one?", Fn: core.EnumerableOne, Arity: -1})
+	enumerableModule.DefineMethod("min_by", &object.Method{Name: "min_by", Fn: core.EnumerableMinBy, Arity: -1})
+	enumerableModule.DefineMethod("max_by", &object.Method{Name: "max_by", Fn: core.EnumerableMaxBy, Arity: -1})
+	enumerableModule.DefineMethod("min", &object.Method{Name: "min", Fn: core.EnumerableMin, Arity: -1})
+	enumerableModule.DefineMethod("max", &object.Method{Name: "max", Fn: core.EnumerableMax, Arity: -1})
+	enumerableModule.DefineMethod("minmax", &object.Method{Name: "minmax", Fn: core.EnumerableMinmax, Arity: -1})
+	enumerableModule.DefineMethod("sort", &object.Method{Name: "sort", Fn: core.EnumerableSort, Arity: -1})
+	enumerableModule.DefineMethod("inject", &object.Method{Name: "inject", Fn: core.EnumerableInject, Arity: -1})
+	enumerableModule.DefineMethod("reduce", &object.Method{Name: "reduce", Fn: core.EnumerableInject, Arity: -1})
+	enumerableModule.DefineMethod("grep", &object.Method{Name: "grep", Fn: core.EnumerableGrep, Arity: -1})
+	enumerableModule.DefineMethod("grep_v", &object.Method{Name: "grep_v", Fn: core.EnumerableGrepV, Arity: -1})
+	enumerableModule.DefineMethod("zip", &object.Method{Name: "zip", Fn: core.EnumerableZip, Arity: -1})
+	enumerableModule.DefineMethod("tally", &object.Method{Name: "tally", Fn: core.EnumerableTally, Arity: -1})
+	enumerableModule.DefineMethod("to_h", &object.Method{Name: "to_h", Fn: core.EnumerableToH, Arity: -1})
+	enumerableModule.DefineMethod("chunk_while", &object.Method{Name: "chunk_while", Fn: core.EnumerableChunkWhile, Arity: -1})
+	enumerableModule.DefineMethod("slice_when", &object.Method{Name: "slice_when", Fn: core.EnumerableSliceWhen, Arity: -1})
+	enumerableModule.DefineMethod("slice_before", &object.Method{Name: "slice_before", Fn: core.EnumerableSliceBefore, Arity: -1})
+	enumerableModule.DefineMethod("slice_after", &object.Method{Name: "slice_after", Fn: core.EnumerableSliceAfter, Arity: -1})
+	enumerableModule.DefineMethod("chunk", &object.Method{Name: "chunk", Fn: core.EnumerableChunk, Arity: -1})
+	vm.rubyConsts["Enumerable"] = &object.EmeraldValue{Type: object.ValueModule, Data: enumerableModule, Class: core.R.Classes["Module"]}
 	if parent != nil {
 		vm.globals = parent.globals
 		vm.globalNames = parent.globalNames
 		vm.rubyConsts = parent.rubyConsts
 		vm.autoloading = parent.autoloading
+		vm.nativeSingletonMethods = parent.nativeSingletonMethods
 	}
+	vm.includeEnumerableInCoreClasses()
 
 	vm.stack[0] = core.R.Main
 	vm.installCoreHooks()
 
 	return vm
+}
+
+func (vm *VM) includeEnumerableInCoreClasses() {
+	moduleVal := vm.rubyConsts["Enumerable"]
+	if moduleVal == nil || moduleVal.Type != object.ValueModule {
+		return
+	}
+	enumerable := moduleVal.Data.(*object.Module)
+	for _, name := range []string{"Array", "Hash", "Range"} {
+		class := core.R.Classes[name]
+		if class == nil {
+			continue
+		}
+		alreadyIncluded := false
+		for _, included := range class.IncludedModules {
+			if included == enumerable || (included != nil && included.Name == enumerable.Name) {
+				alreadyIncluded = true
+				break
+			}
+		}
+		if !alreadyIncluded {
+			class.Include(enumerable)
+		}
+	}
 }
 
 func (vm *VM) allocateFrameID() int {
@@ -190,6 +256,13 @@ func (vm *VM) installCoreHooks() {
 	core.CallBlock = CallBlock
 	core.CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.send(receiver, method, args)
+	}
+	core.CallMethodWithBlock = func(receiver *object.EmeraldValue, method string, block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		prevBlock := vm.currentBlock
+		vm.currentBlock = block
+		result := vm.send(receiver, method, args)
+		vm.currentBlock = prevBlock
+		return result
 	}
 	core.SetGlobalVariable = func(name string, value *object.EmeraldValue) {
 		vm.setGlobalByName(name, value)
@@ -231,6 +304,9 @@ func (vm *VM) installCoreHooks() {
 		if vm.threadDepth > 0 {
 			vm.threadDepth--
 		}
+	}
+	core.InThreadBlock = func() bool {
+		return vm.threadDepth > 0
 	}
 	core.BlockGivenCheck = func() bool {
 		return vm.currentBlock != nil
@@ -299,6 +375,10 @@ func (vm *VM) getGlobalByName(name string) *object.EmeraldValue {
 }
 
 func (vm *VM) resolveGlobalIndex(index int) int {
+	return vm.resolveGlobalIndexForFrame(nil, index)
+}
+
+func (vm *VM) resolveGlobalIndexForFrame(frame *Frame, index int) int {
 	if vm.globalNames == nil {
 		return index
 	}
@@ -306,7 +386,7 @@ func (vm *VM) resolveGlobalIndex(index int) int {
 		return index
 	}
 
-	name := vm.rawGlobalNameForIndex(index)
+	name := vm.rawGlobalNameForFrameIndex(frame, index)
 	if name == "" {
 		return index
 	}
@@ -323,6 +403,17 @@ func (vm *VM) resolveGlobalIndex(index int) int {
 		}
 	}
 	return vm.ensureGlobalIndexForName(name)
+}
+
+func (vm *VM) rawGlobalNameForFrameIndex(frame *Frame, index int) string {
+	if frame != nil && frame.Fn != nil && frame.Fn.GlobalNames != nil {
+		for name, idx := range frame.Fn.GlobalNames {
+			if idx == index {
+				return name
+			}
+		}
+	}
+	return vm.rawGlobalNameForIndex(index)
 }
 
 func (vm *VM) rawGlobalNameForIndex(index int) string {
@@ -401,8 +492,8 @@ func (vm *VM) ensureGlobalIndexForName(name string) int {
 	return idx
 }
 
-func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
-	rawName := vm.rawGlobalNameForIndex(rawIndex)
+func (vm *VM) validateGlobalAssignmentForFrame(frame *Frame, rawIndex int, resolvedIndex int, value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+	rawName := vm.rawGlobalNameForFrameIndex(frame, rawIndex)
 	name := vm.globalNameForIndex(resolvedIndex)
 	switch rawName {
 	case "$&", "$`", "$'", "$+":
@@ -452,6 +543,10 @@ func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *o
 		return nil, core.NewNameError(rawName + " is a read-only variable")
 	}
 	return value, nil
+}
+
+func (vm *VM) validateGlobalAssignment(rawIndex int, resolvedIndex int, value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
+	return vm.validateGlobalAssignmentForFrame(nil, rawIndex, resolvedIndex, value)
 }
 
 func validateBacktraceGlobalValue(value *object.EmeraldValue) *object.EmeraldValue {
@@ -2365,11 +2460,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		right := vm.pop()
 		left := vm.pop()
 		result := vm.pow(left, right)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
 		vm.push(result)
 
 	case compiler.OpMinus, compiler.OpNeg:
 		val := vm.pop()
 		result := vm.negate(val)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
 		vm.push(result)
 
 	case compiler.OpBang:
@@ -2381,6 +2482,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		right := vm.pop()
 		left := vm.pop()
 		result := vm.equals(left, right)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
 		vm.push(result)
 
 	case compiler.OpNotEqual:
@@ -2441,6 +2545,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			break
 		}
 		lt := vm.lessThan(left, right)
+		if lt != nil && lt.Type == object.ValueException && vm.raiseException(frame, lt) {
+			return nil
+		}
 		eq := vm.equals(left, right)
 		if (lt.Type == object.ValueBool && lt.Data == true) ||
 			(eq.Type == object.ValueBool && eq.Data == true) {
@@ -2617,8 +2724,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(result)
 
 	case compiler.OpGetGlobal:
-		idx := vm.readUint16()
-		idx = vm.resolveGlobalIndex(idx)
+		rawIdx := vm.readUint16()
+		idx := vm.resolveGlobalIndexForFrame(frame, rawIdx)
 		val := vm.globals[idx]
 		if val == nil {
 			for name, globalIdx := range vm.globalNames {
@@ -2655,8 +2762,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpSetGlobal:
 		rawIdx := vm.readUint16()
-		idx := vm.resolveGlobalIndex(rawIdx)
-		value, errVal := vm.validateGlobalAssignment(rawIdx, idx, vm.peek(0))
+		idx := vm.resolveGlobalIndexForFrame(frame, rawIdx)
+		value, errVal := vm.validateGlobalAssignmentForFrame(frame, rawIdx, idx, vm.peek(0))
 		if errVal != nil {
 			if vm.raiseException(frame, errVal) {
 				return nil
@@ -2666,7 +2773,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.stack[vm.sp-1] = value
 		vm.globals[idx] = value
-		if name := vm.rawGlobalNameForIndex(rawIdx); name != "" {
+		if name := vm.rawGlobalNameForFrameIndex(frame, rawIdx); name != "" {
 			core.NotifyGlobalVariableSet(name, value)
 		}
 
@@ -3054,7 +3161,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		var block *object.EmeraldValue
 		switch blockArg {
 		case 1:
-			block = derefClosureValue(vm.pop())
+			block = vm.normalizeBlockPass(derefClosureValue(vm.pop()))
 		case 2:
 			block = prevBlock
 		}
@@ -3266,6 +3373,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Name:       name,
 			Fn:         closure.Fn,
 			Closure:    closure,
+			Arity:      functionArity(closure.Fn),
 			Visibility: vm.currentDefinitionVisibility(),
 		}
 
@@ -3339,8 +3447,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		if receiver != nil && receiver.Type == object.ValueObject {
-			obj := receiver.Data.(*object.Object)
-			obj.SingletonMethods[name] = method
+			if obj, ok := receiver.Data.(*object.Object); ok {
+				obj.SingletonMethods[name] = method
+			} else {
+				key := nativeSingletonKey(receiver)
+				methods := vm.nativeSingletonMethods[key]
+				if methods == nil {
+					methods = make(map[string]*object.Method)
+					vm.nativeSingletonMethods[key] = methods
+				}
+				methods[name] = method
+			}
 		} else if receiver != nil && receiver.Type == object.ValueClass {
 			cls := receiver.Data.(*object.Class)
 			cls.DefineClassMethod(name, method)
@@ -3360,11 +3477,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Instructions: vm.pop().Data.([]byte),
 			Constants:    constants,
 			NumLocals:    0,
+			GlobalNames:  frame.Fn.GlobalNames,
 		}
 
 		method := &object.Method{
-			Name: name,
-			Fn:   fn,
+			Name:  name,
+			Fn:    fn,
+			Arity: functionArity(fn),
 		}
 
 		classVal := vm.stack[frame.Bp]
@@ -3687,6 +3806,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			left = nil
 			startMissing = true
 			start = 0
+		} else if left.Type == object.ValueNil {
+			left = nil
+			startMissing = true
+			start = 0
 		}
 		if right == nil {
 			right = nil
@@ -3732,9 +3855,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Exclusive:    exclusive == 1,
 		}
 		vm.push(&object.EmeraldValue{
-			Type:  object.ValueRange,
-			Data:  rangeObj,
-			Class: core.R.Classes["Range"],
+			Type:   object.ValueRange,
+			Data:   rangeObj,
+			Class:  core.R.Classes["Range"],
+			Frozen: true,
 		})
 
 	case compiler.OpRationalNew:
@@ -4151,11 +4275,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				return nil
 			}
 		}
-		className := "ArgumentError"
-		if vm.threadDepth > 0 {
-			className = "UncaughtThrowError"
-		}
-		exception := core.NewException(className, "uncaught throw")
+		exception := core.NewException("UncaughtThrowError", "uncaught throw")
 		if vm.raiseException(frame, exception) {
 			return nil
 		}
@@ -4387,7 +4507,14 @@ func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
 				return &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: core.R.Classes["Integer"]}
 			}
 			if r < 0 {
-				return &object.EmeraldValue{Type: object.ValueFloat, Data: 1.0 / vm.powInt(l, -int(r)), Class: core.R.Classes["Float"]}
+				if l == 0 {
+					return &object.EmeraldValue{
+						Type:  object.ValueException,
+						Data:  &object.RException{Message: "divided by 0"},
+						Class: core.R.Classes["ZeroDivisionError"],
+					}
+				}
+				return &object.EmeraldValue{Type: object.ValueFloat, Data: math.Pow(float64(l), float64(r)), Class: core.R.Classes["Float"]}
 			}
 			if integerPowOverflows(l, int(r)) {
 				result := int64(math.MaxInt64)
@@ -4465,6 +4592,9 @@ func (vm *VM) negate(val *object.EmeraldValue) *object.EmeraldValue {
 	case float64:
 		return &object.EmeraldValue{Type: object.ValueFloat, Data: -v, Class: core.R.Classes["Float"]}
 	}
+	if val != nil && core.ReceiverHasCallableMethod(val, "-@") {
+		return vm.send(val, "-@", nil)
+	}
 	return core.R.NilVal
 }
 
@@ -4487,7 +4617,7 @@ func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
 		return core.R.TrueVal
 	}
 	if left.Type == object.ValueArray || right.Type == object.ValueArray {
-		if left.Equals(right) {
+		if vm.arraysEqual(left, right) {
 			return core.R.TrueVal
 		}
 		return core.R.FalseVal
@@ -4547,7 +4677,48 @@ func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
 	if left == right {
 		return core.R.TrueVal
 	}
+	if core.CallMethod != nil && left != nil && core.ReceiverHasCallableMethod(left, "<=>") {
+		cmp := core.CallMethod(left, "<=>", right)
+		if cmp != nil && cmp.Type == object.ValueException {
+			return cmp
+		}
+		if cmp == nil || cmp.Type == object.ValueNil {
+			return core.R.FalseVal
+		}
+		switch value := cmp.Data.(type) {
+		case int64:
+			if value == 0 {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		case float64:
+			if value == 0 {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		default:
+			return core.NewArgumentError("comparison failed")
+		}
+	}
 	return core.R.FalseVal
+}
+
+func (vm *VM) arraysEqual(left, right *object.EmeraldValue) bool {
+	if left == nil || right == nil || left.Type != object.ValueArray || right.Type != object.ValueArray {
+		return false
+	}
+	leftValues := left.Data.([]*object.EmeraldValue)
+	rightValues := right.Data.([]*object.EmeraldValue)
+	if len(leftValues) != len(rightValues) {
+		return false
+	}
+	for i := range leftValues {
+		result := vm.equals(leftValues[i], rightValues[i])
+		if result == nil || result.Type != object.ValueBool || !result.Data.(bool) {
+			return false
+		}
+	}
+	return true
 }
 
 func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
@@ -4577,6 +4748,27 @@ func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
 			return core.R.FalseVal
 		case float64:
 			if l < r {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		}
+	}
+	if core.CallMethod != nil && left != nil && core.ReceiverHasCallableMethod(left, "<=>") {
+		cmp := core.CallMethod(left, "<=>", right)
+		if cmp != nil && cmp.Type == object.ValueException {
+			return cmp
+		}
+		if cmp == nil || cmp.Type == object.ValueNil {
+			return core.NewArgumentError(comparisonFailedMessage(left, right))
+		}
+		switch value := cmp.Data.(type) {
+		case int64:
+			if value < 0 {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		case float64:
+			if value < 0 {
 				return core.R.TrueVal
 			}
 			return core.R.FalseVal
@@ -4617,7 +4809,40 @@ func (vm *VM) greaterThan(left, right *object.EmeraldValue) *object.EmeraldValue
 			return core.R.FalseVal
 		}
 	}
+	if core.CallMethod != nil && left != nil && core.ReceiverHasCallableMethod(left, "<=>") {
+		cmp := core.CallMethod(left, "<=>", right)
+		if cmp != nil && cmp.Type == object.ValueException {
+			return cmp
+		}
+		if cmp == nil || cmp.Type == object.ValueNil {
+			return core.NewArgumentError("comparison failed")
+		}
+		switch value := cmp.Data.(type) {
+		case int64:
+			if value > 0 {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		case float64:
+			if value > 0 {
+				return core.R.TrueVal
+			}
+			return core.R.FalseVal
+		}
+	}
 	return core.R.NilVal
+}
+
+func comparisonFailedMessage(left, right *object.EmeraldValue) string {
+	leftName := "Object"
+	if left != nil {
+		leftName = left.TypeName()
+	}
+	rightInspect := "nil"
+	if right != nil {
+		rightInspect = right.Inspect()
+	}
+	return "comparison of " + leftName + " with " + rightInspect + " failed"
 }
 
 func (vm *VM) lessThanOrEqual(left, right *object.EmeraldValue) *object.EmeraldValue {
@@ -4901,13 +5126,25 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		receiver = core.R.NilVal
 	}
 	receiver = derefClosureValue(receiver)
+	if method == "public_send" && len(args) == 0 {
+		err := core.NewArgumentError("wrong number of arguments")
+		core.PrependExceptionBacktraceLabel(err, "public_send")
+		return err
+	}
 	if (method == "send" || method == "__send__" || method == "public_send") && len(args) > 0 {
 		methodName, ok, parseErr := core.MethodNameFromValueWithError(args[0])
 		if parseErr != nil {
+			if method == "public_send" {
+				core.PrependExceptionBacktraceLabel(parseErr, "public_send")
+			}
 			return parseErr
 		}
 		if !ok {
-			return core.NewTypeError("is not a symbol nor a string")
+			err := core.NewTypeError("is not a symbol nor a string")
+			if method == "public_send" {
+				core.PrependExceptionBacktraceLabel(err, "public_send")
+			}
+			return err
 		}
 		forwardArgs := args[1:]
 		if methodName != "initialize" && len(forwardArgs) == 1 && forwardArgs[0] != nil && forwardArgs[0].Type == object.ValueArray {
@@ -5006,6 +5243,50 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	return vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner)
 }
 
+func (vm *VM) normalizeBlockPass(block *object.EmeraldValue) *object.EmeraldValue {
+	if block == nil {
+		return nil
+	}
+	switch block.Type {
+	case object.ValueClosure, object.ValueProc:
+		return block
+	case object.ValueSymbol:
+		name, _ := block.Data.(string)
+		return &object.EmeraldValue{
+			Type: object.ValueProc,
+			Data: &object.Proc{
+				Native: func(args ...*object.EmeraldValue) *object.EmeraldValue {
+					if len(args) == 0 {
+						return core.R.NilVal
+					}
+					return vm.send(args[0], name, args[1:])
+				},
+			},
+			Class: core.R.Classes["Proc"],
+		}
+	case object.ValueMethod:
+		methodValue := block
+		return &object.EmeraldValue{
+			Type: object.ValueProc,
+			Data: &object.Proc{
+				Native: func(args ...*object.EmeraldValue) *object.EmeraldValue {
+					return core.CallMethod(methodValue, "call", args...)
+				},
+				NativeArity:    methodValue.Data.(*object.Method).Arity,
+				HasNativeArity: true,
+			},
+			Class: core.R.Classes["Proc"],
+		}
+	default:
+		if block.Class != nil && core.CallMethod != nil {
+			if method, ok := block.Class.GetMethod("to_proc"); ok && method != nil {
+				return core.CallMethod(block, "to_proc")
+			}
+		}
+		return block
+	}
+}
+
 func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, missingAsNameError bool) (*object.Method, *object.Class, *object.EmeraldValue) {
 	var methodObj *object.Method
 	var methodOwner *object.Class
@@ -5049,6 +5330,12 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 					methodOwner = owner
 					ok = true
 				}
+			}
+		} else if methods := vm.nativeSingletonMethods[nativeSingletonKey(receiver)]; methods != nil {
+			if m, found := methods[method]; found {
+				methodObj = m
+				methodOwner = nil
+				ok = true
 			}
 		}
 	}
@@ -5187,6 +5474,20 @@ afterInheritedClassMethodLookup:
 		return nil, nil, core.R.NilVal
 	}
 	return methodObj, methodOwner, nil
+}
+
+func nativeSingletonKey(receiver *object.EmeraldValue) interface{} {
+	if receiver == nil {
+		return nil
+	}
+	if receiver.Type == object.ValueObject {
+		if _, ok := receiver.Data.(*object.Object); !ok && receiver.Data != nil {
+			if reflect.TypeOf(receiver.Data).Comparable() {
+				return receiver.Data
+			}
+		}
+	}
+	return receiver
 }
 
 func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
@@ -5526,6 +5827,23 @@ func methodArityError(fn *object.Function, argc int) *object.EmeraldValue {
 		return core.NewArgumentError("wrong number of arguments")
 	}
 	return nil
+}
+
+func functionArity(fn *object.Function) int {
+	if fn == nil {
+		return 0
+	}
+	required := 0
+	for i := range fn.Params {
+		if i < len(fn.ParamDefaults) && fn.ParamDefaults[i] != nil {
+			continue
+		}
+		required++
+	}
+	if fn.HasRestParam {
+		return -required - 1
+	}
+	return len(fn.Params)
 }
 
 func positionalArityArgCount(fn *object.Function, args []*object.EmeraldValue) int {
@@ -6074,7 +6392,10 @@ func throwLabelsMatch(catchLabel, throwLabel *object.EmeraldValue) bool {
 	if catchLabel.Type != throwLabel.Type {
 		return false
 	}
-	return catchLabel.Equals(throwLabel)
+	if catchLabel.Type == object.ValueSymbol {
+		return catchLabel.Equals(throwLabel)
+	}
+	return catchLabel == throwLabel
 }
 
 func defineConstantOn(container *object.EmeraldValue, name string, value *object.EmeraldValue) {

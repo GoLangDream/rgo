@@ -32,9 +32,19 @@ test "runs" do
 end
 RUBY
 
+cat >"$WORK/specs/binary_output_spec.rb" <<'RUBY'
+describe "binary output" do
+  it "still parses the summary" do
+    print "\0"
+    1.should == 1
+  end
+end
+RUBY
+
 RGO_SPEC_TIMEOUT=1 "$ROOT/scripts/spec_status.sh" "$WORK/specs" "$OUT" >/dev/null
 
 grep -q '^file,status,examples,failures,error_kind,duration_ms$' "$OUT"
+grep -q "$WORK/specs/binary_output_spec.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/minitest_test.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/parse_error_spec.rb,parse_error,0,0,parse_error," "$OUT"
 grep -q "$WORK/specs/pass_spec.rb,pass,1,0,," "$OUT"

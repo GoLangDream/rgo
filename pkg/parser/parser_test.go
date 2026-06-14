@@ -3293,6 +3293,26 @@ func TestParseReceiverBareCallWithMultipleArguments(t *testing.T) {
 	parse(t, `Regexp.send @method, /hi/, Regexp::IGNORECASE`)
 }
 
+func TestParseReceiverBareCallWithArrayFirstArgumentAndMoreArguments(t *testing.T) {
+	expr := parseExpr(t, `IO.select [rd], nil, nil, 0`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "select" {
+		t.Fatalf("expected select method call, got %v", call.Method)
+	}
+	if len(call.Args) != 4 {
+		t.Fatalf("expected 4 args, got %d: %s", len(call.Args), call.String())
+	}
+	if _, ok := call.Args[0].(*ast.ArrayLiteral); !ok {
+		t.Fatalf("expected first arg ArrayLiteral, got %T", call.Args[0])
+	}
+	if _, ok := call.Args[3].(*ast.IntegerLiteral); !ok {
+		t.Fatalf("expected fourth arg IntegerLiteral, got %T", call.Args[3])
+	}
+}
+
 func TestParseBareCallArgumentStartingWithSelf(t *testing.T) {
 	parse(t, `assert_equal self, exc.receiver`)
 }

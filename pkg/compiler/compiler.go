@@ -988,8 +988,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				c.Emit(OpIndex)
 				name := node.Names[i]
 				if len(name.Value) > 0 && name.Value[0] == '$' {
-					sym, _ := c.symbolTable.Resolve(name.Value)
-					c.symbolTable.DefineGlobal(name.Value)
+					sym := c.symbolTable.DefineGlobal(name.Value)
 					c.emit(OpSetGlobal, sym.Index)
 				} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
 					c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
@@ -1044,8 +1043,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			for i := len(node.Names) - 1; i >= 0; i-- {
 				name := node.Names[i]
 				if len(name.Value) > 0 && name.Value[0] == '$' {
-					sym, _ := c.symbolTable.Resolve(name.Value)
-					c.symbolTable.DefineGlobal(name.Value)
+					sym := c.symbolTable.DefineGlobal(name.Value)
 					c.emit(OpSetGlobal, sym.Index)
 				} else if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
 					c.emit(OpSetClassVar, c.addConstant(&object.EmeraldValue{
@@ -1331,6 +1329,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Instructions:    instructions,
 			LineMap:         lineMap,
 			NumLocals:       numLocals,
+			GlobalNames:     c.globalNamesCopy(),
 			LocalNames:      localNames,
 			ParamDefaults:   paramDefaults,
 			KeywordParams:   kwParams,
@@ -1443,6 +1442,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				Instructions: instructions,
 				LineMap:      lineMap,
 				NumLocals:    numLocals,
+				GlobalNames:  c.globalNamesCopy(),
 				LocalNames:   localNames,
 				FreeVarNames: freeVarNames(c.symbolTable.FreeSymbols),
 			},
@@ -1489,6 +1489,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				Instructions: instructions,
 				LineMap:      lineMap,
 				NumLocals:    numLocals,
+				GlobalNames:  c.globalNamesCopy(),
 				LocalNames:   localNames,
 				FreeVarNames: freeVarNames(c.symbolTable.FreeSymbols),
 			},
@@ -1936,20 +1937,28 @@ func (c *Compiler) emitString(value string) {
 }
 
 func (c *Compiler) Bytecode() *Bytecode {
-	globalNames := make(map[string]int)
-	for name, symbol := range c.symbolTable.store {
-		if symbol.Scope == ScopeGlobal {
-			globalNames[name] = symbol.Index
-		}
-	}
 	return &Bytecode{
 		Instructions: c.currentInstructions(),
 		LineMap:      c.currentLineMapCopy(),
 		Constants:    c.constants,
 		NumLocals:    c.symbolTable.MaxSymbols,
-		GlobalNames:  globalNames,
+		GlobalNames:  c.globalNamesCopy(),
 		LocalNames:   c.localNames(),
 	}
+}
+
+func (c *Compiler) globalNamesCopy() map[string]int {
+	root := c.symbolTable
+	for root.Outer != nil {
+		root = root.Outer
+	}
+	globalNames := make(map[string]int)
+	for name, symbol := range root.store {
+		if symbol.Scope == ScopeGlobal {
+			globalNames[name] = symbol.Index
+		}
+	}
+	return globalNames
 }
 
 func (c *Compiler) localNames() map[string]int {
@@ -2079,6 +2088,7 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 		Instructions:         instructions,
 		LineMap:              lineMap,
 		NumLocals:            numLocals,
+		GlobalNames:          c.globalNamesCopy(),
 		LocalNames:           localNames,
 		KeywordParams:        kwParams,
 		RejectKeywords:       block.RejectKeywords,
@@ -2394,6 +2404,11 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 }
 
 func (c *Compiler) compileCatchExpression(node *ast.CatchExpression) error {
+	if !node.HasBlock {
+		c.EmitConstant(core.NewLocalJumpError("no block given"))
+		c.Emit(OpRaise)
+		return nil
+	}
 	if node.Label != nil {
 		if err := c.Compile(node.Label); err != nil {
 			return err
@@ -2603,6 +2618,12 @@ func (c *Compiler) compileDefaultValue(expr ast.Expression) *object.EmeraldValue
 			Type:  object.ValueString,
 			Data:  node.Value,
 			Class: core.R.Classes["String"],
+		}
+	case *ast.SymbolLiteral:
+		return &object.EmeraldValue{
+			Type:  object.ValueSymbol,
+			Data:  strings.TrimPrefix(node.Value, ":"),
+			Class: core.R.Classes["Symbol"],
 		}
 	case *ast.Boolean:
 		if node.Value {
@@ -2864,6 +2885,7 @@ func (c *Compiler) compileExpressionThunk(expr ast.Expression) error {
 			Instructions: instructions,
 			LineMap:      lineMap,
 			NumLocals:    numLocals,
+			GlobalNames:  c.globalNamesCopy(),
 			LocalNames:   localNames,
 			FreeVarNames: freeVarNames(free),
 		},
@@ -3627,6 +3649,7 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		Instructions:   instructions,
 		LineMap:        lineMap,
 		NumLocals:      numLocals,
+		GlobalNames:    c.globalNamesCopy(),
 		LocalNames:     localNames,
 		RejectKeywords: node.RejectKeywords,
 		RejectBlock:    node.RejectBlock,

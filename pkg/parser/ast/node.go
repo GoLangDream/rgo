@@ -900,9 +900,10 @@ func (r *RaiseExpression) String() string {
 }
 
 type CatchExpression struct {
-	Token lexer.Token
-	Label Expression
-	Body  *BlockExpression
+	Token    lexer.Token
+	Label    Expression
+	Body     *BlockExpression
+	HasBlock bool
 }
 
 func (c *CatchExpression) expressionNode()      {}

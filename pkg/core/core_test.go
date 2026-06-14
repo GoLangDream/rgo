@@ -2,6 +2,7 @@ package core
 
 import (
 	"testing"
+	"time"
 
 	"github.com/GoLangDream/rgo/pkg/object"
 )
@@ -524,4 +525,52 @@ func TestObjectToS(t *testing.T) {
 	if result.Type != object.ValueString {
 		t.Errorf("expected String, got %v", result.Type)
 	}
+}
+
+func TestStringLjustTruncatesRepeatedPad(t *testing.T) {
+	assertStr(t, callMethod(t, mkStr("hello"), "ljust", mkInt(20), mkStr("1234")), "hello123412341234123")
+}
+
+func TestStringRjustTruncatesRepeatedPad(t *testing.T) {
+	assertStr(t, callMethod(t, mkStr("hello"), "rjust", mkInt(20), mkStr("1234")), "123412341234123hello")
+}
+
+func TestStringLjustEmptyPadRaisesArgumentErrorWithoutHanging(t *testing.T) {
+	done := make(chan *object.EmeraldValue, 1)
+	go func() {
+		done <- callMethod(t, mkStr("hello"), "ljust", mkInt(10), mkStr(""))
+	}()
+
+	select {
+	case result := <-done:
+		assertExceptionType(t, result, R.Classes["ArgumentError"])
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("String#ljust with empty pad did not return")
+	}
+}
+
+func TestStringJustifyHandlesObjectBackedStringValues(t *testing.T) {
+	wrapped := &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  object.NewObject(R.Classes["String"]),
+		Class: R.Classes["String"],
+	}
+
+	result := callMethod(t, wrapped, "ljust", mkInt(2))
+	assertStr(t, result, "  ")
+}
+
+func TestStringMethodsHandleObjectBackedStringValues(t *testing.T) {
+	wrapped := &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  object.NewObject(R.Classes["String"]),
+		Class: R.Classes["String"],
+	}
+
+	assertStr(t, callMethod(t, wrapped, "+", mkStr("suffix")), "suffix")
+	assertStr(t, callMethod(t, wrapped, "chomp"), "")
+	assertStr(t, callMethod(t, wrapped, "upcase"), "")
+	assertStr(t, callMethod(t, wrapped, "<<", mkStr("suffix")), "suffix")
+	assertInt(t, callMethod(t, wrapped, "<=>", wrapped), 0)
+	assertExceptionType(t, callMethod(t, mkStr("abc"), "insert", mkInt(-5), mkStr("x")), R.Classes["IndexError"])
 }

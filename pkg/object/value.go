@@ -497,6 +497,7 @@ type Function struct {
 	LineMap               map[int]int
 	Constants             []*EmeraldValue
 	NumLocals             int
+	GlobalNames           map[string]int
 	LocalNames            map[string]int
 	FreeVarNames          []string
 	HasRestParam          bool
@@ -532,19 +533,21 @@ type Method struct {
 }
 
 type Proc struct {
-	Fn           *Function
-	Env          []*EmeraldValue
-	Block        *EmeraldValue
-	Binding      *RBinding
-	ClassStack   []*EmeraldValue
-	InstanceVars map[string]*EmeraldValue
-	Native       func(args ...*EmeraldValue) *EmeraldValue
-	AutoSplat    bool
-	IsLambda     bool
-	BreakOwnerID int
-	CurryTarget  *EmeraldValue
-	CurryArgs    []*EmeraldValue
-	CurryArity   int
+	Fn             *Function
+	Env            []*EmeraldValue
+	Block          *EmeraldValue
+	Binding        *RBinding
+	ClassStack     []*EmeraldValue
+	InstanceVars   map[string]*EmeraldValue
+	Native         func(args ...*EmeraldValue) *EmeraldValue
+	NativeArity    int
+	HasNativeArity bool
+	AutoSplat      bool
+	IsLambda       bool
+	BreakOwnerID   int
+	CurryTarget    *EmeraldValue
+	CurryArgs      []*EmeraldValue
+	CurryArity     int
 }
 
 type ControlFlow struct {

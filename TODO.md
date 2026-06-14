@@ -5,6 +5,10 @@
 - [x] `rescue A, *[B]` 这类 rescue splat 数组字面量 parser 边界问题已修复；新增 parser/vm 回归测试覆盖数组字面量 splat rescue。
 - [x] `vendor/ruby/spec/core/array/fixtures/classes.rb` 通过 `require_relative` 动态加载时，正常 `begin ... rescue NameError ... end` 被动态语法校验误判为 `SyntaxError: unexpected rescue modifier`，导致 `ArraySpecs.frozen_array` fixture 未加载并连带影响 `append_spec` 等 frozen array 场景。已改为逐行校验 rescue 子句，并保留 `VM.New` 前设置的 `CurrentSpecFile`；已验证 `append_spec.rb` / `at_spec.rb`。
 - [x] 2026-06-07 刷新 `vendor/ruby/spec/language` 后暴露的 3 个当前 spec 回归已解除：`block_spec.rb` / `method_spec.rb` 的 `&nil` block 拒收语义，以及 `predefined_spec.rb` 的 `$@` 赋值校验和 rescue `$!` 生命周期。已刷新 `reports/spec-status/language-current.csv`：81 pass / 2871 examples / 0 failures。
+- [x] 2026-06-07 全量 Ruby spec timeout 跟进：`vendor/ruby/spec/core/enumerator/lazy/select_spec.rb` 已解除 timeout。补齐 `Enumerator::Lazy#select/filter/take/first/force`、`Array#lazy`、`Range#lazy`、`Object#to_enum/enum_for` 的最小运行路径，并修复 `&:even?` block pass 与 `Range#first(n)`；已验证该 spec 11 examples / 0 failures。
+- [x] 2026-06-13 全量 Ruby spec timeout 跟进：`vendor/ruby/spec/core/enumerable/select_spec.rb`、`vendor/ruby/spec/core/struct/select_spec.rb`、`vendor/ruby/spec/core/string/{ljust,rjust,center}_spec.rb` 已解除 timeout。修复 `String#ljust/#rjust/#center` exact-width padding、empty pad `ArgumentError`、String subclass receiver/pad coercion panic、基础 encoding 传播；已验证对应 5 个 spec 文件均 pass。
+- [x] 2026-06-13 剩余 Ruby spec timeout 复测：`vendor/ruby/spec/core/io/select_spec.rb` 与 `vendor/ruby/spec/core/process/kill_spec.rb` 在 `RGO_SPEC_TIMEOUT=10` 下均已通过；根因由 `Kernel#loop` 误用 `currentThread != nil` 的一轮保护解除。
+- [x] 2026-06-13 `vendor/ruby/spec/core/kernel/{global_variables,catch,throw,proc,public_send,remove_instance_variable,at_exit,sleep,kind_of,is_a,instance_of,initialize_copy,clone,singleton_class,define_singleton_method,extend,instance_variable_get,instance_variable_set,abort,system}_spec.rb` 已解除。补齐内建 `Array`/`Hash`/`Range` 对 VM `Enumerable` module 的 include 关系，修复 `catch` 无 block 的 `LocalJumpError`、非 Symbol throw tag 的 identity 匹配、unmatched throw 使用 `UncaughtThrowError`，`Kernel#proc` 无 block 时抛出 `ArgumentError`，`public_send` 参数校验错误的 backtrace 顶层 frame，`remove_instance_variable` 在 frozen receiver 前先校验实例变量名，shared fixture fallback/absolute path 与 `at_exit` 无 block 的 `ArgumentError` 语义，`sleep` duration 校验、返回 Integer 和 stale `LastException` 传播问题，`kind_of?`/`is_a?`/`instance_of?` 参数校验与 module ancestry 判断，`initialize_copy` 的返回 self、frozen receiver 和 same-class 校验，`clone(freeze:)` keyword、frozen state 与 `initialize_clone` 调用语义，`String#-@` frozen deduped string 与 frozen String singleton class 拒收语义，`define_singleton_method` 参数校验、per-receiver singleton method、UnboundMethod owner 校验和 spec DSL `test` 不再污染所有 Object 实例，`extend` 的参数、类型和 frozen receiver 校验，`instance_variable_get` 名称校验与 spec DSL `stub!` 返回值安装，`instance_variable_set` 名称校验和 frozen receiver 前的校验顺序，`abort` 的 `$stderr` 捕获、非 String `TypeError`、`IOStub` 和 require-loaded closure global name 解析，以及 `system` 的同步命令执行、shell 选择、`exception:` 和 `$?` 状态。
 
 ## 阶段 0：补测试（已完成）
 
@@ -1490,3 +1494,21 @@ RGo 当前状态：
 
 - [ ] `puts (1..5).to_a.inspect` / `puts (1..5).include?(3)` 当前在 feature smoke 中会先输出 `1..5`，说明 command-call 参数后的 dot-chain 优先级仍与 Ruby 存在差异。
   - 当前 `Range#to_a` / `Range#include?` 本身可用；`scripts/feature_test.sh` 已改为显式 `puts((1..5).to_a.inspect)` 和 `puts((1..5).include?(3))`，避免该 parser follow-up 阻塞 array gate。
+
+### Rational exponent bignum follow-up（2026-06-13）
+
+- [ ] `vendor/ruby/spec/core/rational/exponent_spec.rb` 已解除 `0 ** -1` / `Rational(..., bignum_value) ** -4` 触发的 Go integer divide-by-zero panic，但完整 spec 继续进入 bignum exponent examples 后运行时间过长。
+  - 已补 `0 ** -1` 抛出 `ZeroDivisionError` 的 VM 回归，并让 `OpPow` 对 exception 结果走 `raiseException`。
+  - 后续需要补真正的 Rational/bignum 表示与指数语义；当前 `Rational()` 仍主要降级为 Integer/Float，无法通过该文件的精确 Rational 断言。
+
+### BasicObject instance_exec class variable scope（2026-06-13）
+
+- [ ] `vendor/ruby/spec/core/basicobject/instance_exec_spec.rb` 仍有 1 个 failure：`base.instance_exec { @@count = 2 }` 在 `def self.included(base)` 的 block 中应写入 block 定义处的模块 class variable scope（`BasicObjectSpecs::InstExec`），当前写到了 `instance_exec` receiver 的模块 scope。
+  - 最小复现：`module M; def self.run(base); base.instance_exec { @@x = 1 }; end; end; module N; end; M.run(N)` 后当前 `N.class_variables == [:@@x]`，但应为 `M.class_variables == [:@@x]`。
+  - 已确认普通 `module M; @@x = 1; end` class variable 存储可用；问题集中在 singleton method 内创建 block 时没有捕获方法的 lexical class variable scope。
+
+### Enumerable fixture loop follow-up（2026-06-13）
+
+- [x] `EnumerableSpecs::EachDefiner#each` 经 `require_relative` 加载后只 yield 首个元素的问题已解除。
+  - 根因：`require` 路径会调用 `Thread.current` 初始化 `currentThread`，而 `Kernel#loop` 用 `currentThread != nil` 作为线程内一轮执行保护，导致后续普通 loop 都只执行 1 轮。
+  - 已改为通过 VM 的 thread block depth 判断真实线程 block 执行上下文，并保留 fiber body 的一轮保护；已验证 `vendor/ruby/spec/core/enumerable` 61 files 全部 pass。
