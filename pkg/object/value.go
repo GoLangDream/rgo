@@ -87,7 +87,7 @@ func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
 		}
 		return s
 	case ValueString:
-		return v.Data.(string)
+		return inspectString(v.Data.(string))
 	case ValueArray:
 		if seen[v] {
 			return "[...]"
@@ -210,6 +210,38 @@ func inspectSymbol(name string) string {
 	return ":\"" + escapeSymbolInspectName(name) + "\""
 }
 
+func inspectString(value string) string {
+	var out strings.Builder
+	out.WriteByte('"')
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\a':
+			out.WriteString(`\a`)
+		case '\b':
+			out.WriteString(`\b`)
+		case '\t':
+			out.WriteString(`\t`)
+		case '\n':
+			out.WriteString(`\n`)
+		case '\v':
+			out.WriteString(`\v`)
+		case '\f':
+			out.WriteString(`\f`)
+		case '\r':
+			out.WriteString(`\r`)
+		case 0x1b:
+			out.WriteString(`\e`)
+		case '"', '\\':
+			out.WriteByte('\\')
+			out.WriteByte(value[i])
+		default:
+			out.WriteByte(value[i])
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
+}
+
 func isBareSymbolInspectName(name string) bool {
 	if name == "" {
 		return false
@@ -269,7 +301,7 @@ func (v *EmeraldValue) inspectElementWithSeen(seen map[*EmeraldValue]bool) strin
 		return "nil"
 	}
 	if v.Type == ValueString {
-		return fmt.Sprintf("%q", v.Data.(string))
+		return inspectString(v.Data.(string))
 	}
 	return v.inspectWithSeen(seen)
 }
@@ -581,8 +613,12 @@ type RArray struct {
 }
 
 type RHash struct {
-	Pairs map[*EmeraldValue]*EmeraldValue
-	Keys  []*EmeraldValue
+	Pairs             map[*EmeraldValue]*EmeraldValue
+	Keys              []*EmeraldValue
+	Default           *EmeraldValue
+	DefaultProc       *EmeraldValue
+	CompareByIdentity bool
+	InstanceVars      map[string]*EmeraldValue
 }
 
 type RSymbol struct {
@@ -617,10 +653,13 @@ type RException struct {
 	Path              string
 	Backtrace         []string
 	Locations         []RBacktraceLocation
+	Cause             *EmeraldValue
+	Raised            bool
 	Result            *EmeraldValue
 	Status            *int64
 	NameErrorName     string
 	NameErrorReceiver *EmeraldValue
+	KeyErrorKey       *EmeraldValue
 }
 
 type RBacktraceLocation struct {

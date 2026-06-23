@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/GoLangDream/rgo/pkg/compiler"
@@ -42,12 +43,18 @@ func main() {
 	core.Init()
 
 	switch command {
+	case "-e":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: rgo -e <code>\n")
+			os.Exit(1)
+		}
+		runRubySource(args[1], "-e", args[2:])
 	case "run":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "Usage: rgo run <file.rb>\n")
 			os.Exit(1)
 		}
-		runRubyFile(args[1])
+		runRubyFile(args[1], args[2:])
 	case "test":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "Usage: rgo test <file.rb>\n")
@@ -69,13 +76,58 @@ func printUsage() {
 Usage:
   rgo run <file.rb>    Run a Ruby file
   rgo test <file.rb>   Run a spec test file (supports mspec DSL)
+  rgo -e <code>        Run Ruby source passed on the command line
   rgo help            Show this help
 
 `)
 }
 
-func runRubyFile(filename string) {
+func runRubySource(source string, filename string, argv []string) {
 	_ = os.Setenv("MSPEC_RUNNER", "1")
+	_ = os.Setenv("RGO_REAL_SLEEP", "1")
+	stopSignals := forwardSignalsToRuby()
+	defer stopSignals()
+
+	oldSpecFile := core.CurrentSpecFile
+	core.CurrentSpecFile = filename
+	defer func() {
+		core.CurrentSpecFile = oldSpecFile
+	}()
+
+	l := lexer.New(source)
+	p := parser.New(l)
+	program := p.ParseProgram()
+
+	if len(p.Errors()) > 0 {
+		for _, err := range p.Errors() {
+			fmt.Fprintf(os.Stderr, "Parse Error: %s\n", err)
+		}
+		os.Exit(1)
+	}
+
+	c := compiler.New()
+	err := c.Compile(program)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Compile Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	bytecode := c.Bytecode()
+	v := vm.New(bytecode)
+	setARGV(v, argv)
+	err = v.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
+		os.Exit(1)
+	}
+	exitIfSystemExit()
+}
+
+func runRubyFile(filename string, argv []string) {
+	_ = os.Setenv("MSPEC_RUNNER", "1")
+	_ = os.Setenv("RGO_REAL_SLEEP", "1")
+	stopSignals := forwardSignalsToRuby()
+	defer stopSignals()
 	abs, err := filepath.Abs(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
@@ -114,15 +166,61 @@ func runRubyFile(filename string) {
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	setARGV(v, argv)
 	err = v.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
 		os.Exit(1)
 	}
+	exitIfSystemExit()
+}
 
-	result := v.LastPoppedStackElement()
-	if result != nil {
-		fmt.Println(formatValue(result))
+func exitIfSystemExit() {
+	exception := core.LastException
+	if exception == nil || exception.Type != object.ValueException || exception.Class == nil || exception.Class.Name != "SystemExit" {
+		return
+	}
+	if data, ok := exception.Data.(*object.RException); ok && data != nil && data.Status != nil {
+		os.Exit(int(*data.Status))
+	}
+	os.Exit(0)
+}
+
+func setARGV(v *vm.VM, argv []string) {
+	values := make([]*object.EmeraldValue, 0, len(argv))
+	for _, arg := range argv {
+		values = append(values, &object.EmeraldValue{Type: object.ValueString, Data: arg, Class: core.R.Classes["String"]})
+	}
+	v.SetTopLevelConstant("ARGV", &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: core.R.Classes["Array"]})
+}
+
+func forwardSignalsToRuby() func() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case sig := <-ch:
+				sysSig, ok := sig.(syscall.Signal)
+				if !ok {
+					continue
+				}
+				handled, exitStatus := core.DispatchSignal(int64(sysSig))
+				if exitStatus != nil {
+					os.Exit(int(*exitStatus))
+				}
+				if !handled {
+					os.Exit(128 + int(sysSig))
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(done)
 	}
 }
 
@@ -243,6 +341,9 @@ func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (stri
 	if err != nil {
 		return "", err
 	}
+	if err := invalidSourceEncodingError(bytes); err != nil {
+		return "", err
+	}
 
 	var out strings.Builder
 	baseDir := filepath.Dir(abs)
@@ -270,6 +371,15 @@ func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (stri
 		out.WriteString("\n")
 	}
 	return out.String(), nil
+}
+
+func invalidSourceEncodingError(data []byte) error {
+	if len(data) >= 2 {
+		if (data[0] == 0xff && data[1] == 0xfe) || (data[0] == 0xfe && data[1] == 0xff) {
+			return fmt.Errorf("invalid multibyte char")
+		}
+	}
+	return nil
 }
 
 func threadFixtureSubset() string {

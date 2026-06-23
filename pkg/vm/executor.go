@@ -79,6 +79,7 @@ type ActiveRescue struct {
 	EndOffset         int
 	Frame             *Frame
 	PreviousException *object.EmeraldValue
+	RescueStackDepth  int
 }
 
 type CatchHandler struct {
@@ -105,13 +106,14 @@ type VM struct {
 
 	poppedValues []*object.EmeraldValue
 
-	currentBlock     *object.EmeraldValue
-	visibilityBypass bool
-	classStack       []*object.EmeraldValue
-	autoloading      map[string]bool
-	threadDepth      int
-	procCallDepth    int
-	nextFrameID      int
+	currentBlock              *object.EmeraldValue
+	visibilityBypass          bool
+	classStack                []*object.EmeraldValue
+	instanceExecClassVarScope *object.EmeraldValue
+	autoloading               map[string]bool
+	threadDepth               int
+	procCallDepth             int
+	nextFrameID               int
 
 	rescueStack   []*RescueHandler
 	activeRescues []*ActiveRescue
@@ -120,6 +122,9 @@ type VM struct {
 	catchStack []*CatchHandler
 
 	nativeSingletonMethods map[interface{}]map[string]*object.Method
+
+	freezeStringLiterals bool
+	sourceEncoding       string
 }
 
 func New(bytecode *compiler.Bytecode) *VM {
@@ -167,6 +172,20 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		isRoot:                 parent == nil,
 	}
 	vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
+	vm.rubyConsts["TOPLEVEL_BINDING"] = &object.EmeraldValue{
+		Type: object.ValueBinding,
+		Data: &object.RBinding{
+			Self:         core.R.Main,
+			Locals:       map[string]*object.EmeraldValue{},
+			LocalNames:   nil,
+			Constants:    map[string]*object.EmeraldValue{},
+			Method:       "",
+			InstanceVars: map[string]*object.EmeraldValue{},
+			Path:         core.CurrentSpecFile,
+			Line:         1,
+		},
+		Class: core.R.Classes["Binding"],
+	}
 	enumerableModule := object.NewModule("Enumerable")
 	enumerableModule.DefineMethod("select", &object.Method{Name: "select", Fn: core.EnumerableSelect, Arity: 0})
 	enumerableModule.DefineMethod("find_all", &object.Method{Name: "find_all", Fn: core.EnumerableSelect, Arity: 0})
@@ -216,6 +235,15 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	vm.installCoreHooks()
 
 	return vm
+}
+
+func (vm *VM) SetTopLevelConstant(name string, value *object.EmeraldValue) {
+	vm.rubyConsts[name] = value
+	objectClass := core.R.Classes["Object"]
+	if objectClass != nil {
+		objectVal := &object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: core.R.Classes["Class"]}
+		defineConstantOn(objectVal, name, value)
+	}
 }
 
 func (vm *VM) includeEnumerableInCoreClasses() {
@@ -269,6 +297,14 @@ func (vm *VM) installCoreHooks() {
 	}
 	core.GetGlobalVariable = func(name string) *object.EmeraldValue {
 		return vm.getGlobalByName(name)
+	}
+	core.SetConstantName = func(container *object.EmeraldValue, name string, value *object.EmeraldValue) {
+		if container == nil || container.Type != object.ValueClass {
+			return
+		}
+		if class := container.Data.(*object.Class); class != nil && class.Name == "Object" {
+			vm.rubyConsts[name] = value
+		}
 	}
 	core.RemoveConstantName = func(container *object.EmeraldValue, name string) {
 		qualified := qualifiedConstantName(container, name)
@@ -703,6 +739,27 @@ func (vm *VM) programNameGlobal() *object.EmeraldValue {
 	return value
 }
 
+func (vm *VM) currentExceptionBacktraceGlobal() *object.EmeraldValue {
+	if core.LastException == nil || core.LastException.Type != object.ValueException {
+		return core.R.NilVal
+	}
+	exc, ok := core.LastException.Data.(*object.RException)
+	if !ok || exc == nil {
+		return core.R.NilVal
+	}
+	if len(exc.Backtrace) == 0 && len(exc.Locations) == 0 {
+		exc.Locations = vm.currentBacktraceFrames()
+	}
+	if len(exc.Backtrace) == 0 && len(exc.Locations) > 0 {
+		exc.Backtrace = vm.backtraceStrings(exc.Locations)
+	}
+	result := make([]*object.EmeraldValue, len(exc.Backtrace))
+	for i, line := range exc.Backtrace {
+		result[i] = &object.EmeraldValue{Type: object.ValueString, Data: line, Class: core.R.Classes["String"]}
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}
+}
+
 func (vm *VM) Run() error {
 	if vm.isRoot {
 		defer core.RunAtExitHooks()
@@ -954,6 +1011,8 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 
 	child := newVM(c.Bytecode(), vm)
 	child.classStack = childClassStack
+	child.freezeStringLiterals = evalSourceFreezesStringLiterals(source)
+	child.sourceEncoding = core.CurrentEvalSourceEncoding
 	localSlots := bindingLocalSlots(child)
 	child.stack[0] = childSelf
 	if binding != nil {
@@ -970,6 +1029,26 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 		result = core.R.NilVal
 	}
 	return result
+}
+
+func evalSourceFreezesStringLiterals(source string) bool {
+	lines := strings.Split(source, "\n")
+	for i, line := range lines {
+		if i >= 2 {
+			break
+		}
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "#") {
+			if trimmed == "" {
+				continue
+			}
+			return false
+		}
+		if match := evalFrozenStringLiteralPattern.FindStringSubmatch(trimmed); len(match) == 2 {
+			return strings.EqualFold(match[1], "true")
+		}
+	}
+	return false
 }
 
 type dynamicSyntaxContext struct {
@@ -1259,6 +1338,8 @@ func containsKeywordArgInIndex(content string) bool {
 
 func invalidNumberedParameterSyntax(source string) string {
 	code := maskRubyStringLiterals(source)
+	code = numberedParameterLabelPattern.ReplaceAllString(code, `${1}__numbered_label__:`)
+	code = specItDeclarationPattern.ReplaceAllString(code, `${1}__spec_it__ `)
 	if !numberedParameterPattern.MatchString(code) && !itParameterPattern.MatchString(code) {
 		return ""
 	}
@@ -1314,14 +1395,19 @@ func invalidPatternMatchingSyntax(source string) string {
 
 func invalidSpacedMethodCallArgumentListSyntax(source string) string {
 	code := maskRubyStringLiterals(source)
-	for _, match := range spacedMethodCallArgumentListPattern.FindAllStringSubmatch(code, -1) {
-		if len(match) < 2 {
+	for _, line := range strings.Split(code, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
 		}
-		if spacedCallKeywordExclusions[match[1]] {
-			continue
+		for _, match := range spacedMethodCallArgumentListPattern.FindAllStringSubmatch(line, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			if spacedCallKeywordExclusions[match[1]] {
+				continue
+			}
+			return "syntax error, unexpected ','"
 		}
-		return "syntax error, unexpected ','"
 	}
 	return ""
 }
@@ -1512,14 +1598,17 @@ var (
 	numberedParameterToken                 = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
 	numberedParameterUse                   = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
 	numberedParameterPattern               = regexp.MustCompile(numberedParameterToken)
+	numberedParameterLabelPattern          = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*:`)
 	numberedParameterAssignmentPattern     = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*=`)
 	numberedParameterNestedPattern         = regexp.MustCompile(numberedParameterUse + `[\s\S]*(->|proc\s*\{|\blambda\s*\{)[\s\S]*` + numberedParameterUse)
 	numberedParameterExplicitParamsPattern = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*` + numberedParameterUse + `|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `)`)
 	numberedParameterMethodNamePattern     = regexp.MustCompile(`^_[0-9]+$`)
 	itParameterPattern                     = regexp.MustCompile(`(^|[^A-Za-z0-9_])it([^A-Za-z0-9_?!]|$)`)
+	specItDeclarationPattern               = regexp.MustCompile(`(^|[^A-Za-z0-9_])it\s+`)
 	itParameterExplicitParamsPattern       = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*\bit\b|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b)`)
 	itBeforeNumberedParameterPattern       = regexp.MustCompile(`\bit\b[\s\S]*(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`)
 	numberedBeforeItParameterPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)[\s\S]*\bit\b`)
+	evalFrozenStringLiteralPattern         = regexp.MustCompile(`(?i)frozen_string_literal\s*:\s*(true|false)`)
 	patternWhenBeforeInPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bwhen\b[\s\S]*\bin\b`)
 	patternInBeforeWhenPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bin\b[\s\S]*\bwhen\b`)
 	patternCalculationPattern              = regexp.MustCompile(`(?m)^\s*in\s+[^\n]*\+`)
@@ -2279,6 +2368,19 @@ func (vm *VM) resolveRequirePath(path string) string {
 	currentDir, _ := os.Getwd()
 
 	requestPath := filepath.FromSlash(strings.ReplaceAll(path, "\\", "/"))
+	if requestPath == "~" || strings.HasPrefix(requestPath, "~"+string(filepath.Separator)) {
+		home, _ := core.EnvString("HOME")
+		if home == "" {
+			home = os.Getenv("HOME")
+		}
+		if home != "" {
+			if requestPath == "~" {
+				requestPath = home
+			} else {
+				requestPath = filepath.Join(home, strings.TrimPrefix(requestPath, "~"+string(filepath.Separator)))
+			}
+		}
+	}
 	isAbs := filepath.IsAbs(requestPath)
 	isBare := !strings.ContainsAny(requestPath, "/\\")
 	isExplicitRelative := strings.HasPrefix(requestPath, "."+string(filepath.Separator)) ||
@@ -2299,9 +2401,22 @@ func (vm *VM) resolveRequirePath(path string) string {
 		seen[clean] = struct{}{}
 		candidates = append(candidates, clean)
 	}
+	addRequireCandidates := func(c string) {
+		clean := filepath.Clean(c)
+		if !strings.HasSuffix(clean, ".rb") {
+			addCandidate(clean + ".rb")
+		}
+		addCandidate(clean)
+	}
 
-	if isExplicitRelative || isAbs || isDotOrDotDot {
-		addCandidate(cleanPath)
+	if isExplicitRelative && currentDir != "" {
+		addRequireCandidates(filepath.Join(currentDir, cleanPath))
+	}
+	if isDotOrDotDot && currentDir != "" {
+		addRequireCandidates(filepath.Join(currentDir, cleanPath))
+	}
+	if isAbs {
+		addRequireCandidates(cleanPath)
 	}
 	if isBare {
 		entries := core.GetGlobalVariable("$LOAD_PATH")
@@ -2311,28 +2426,12 @@ func (vm *VM) resolveRequirePath(path string) string {
 				if !ok {
 					continue
 				}
-				addCandidate(filepath.Join(epath, requestPath))
-				if !strings.HasSuffix(requestPath, ".rb") {
-					addCandidate(filepath.Join(epath, requestPath+".rb"))
-				}
+				addRequireCandidates(filepath.Join(epath, requestPath))
 			}
 		}
 	}
-	if !isBare {
-		addCandidate(cleanPath)
-	}
-	if !strings.HasSuffix(cleanPath, ".rb") {
-		addCandidate(cleanPath + ".rb")
-	}
-	if isExplicitRelative && currentDir != "" {
-		addCandidate(filepath.Join(currentDir, cleanPath))
-		if !strings.HasSuffix(cleanPath, ".rb") {
-			addCandidate(filepath.Join(currentDir, cleanPath+".rb"))
-		}
-	}
-
-	if isDotOrDotDot && currentDir != "" {
-		addCandidate(filepath.Join(currentDir, cleanPath))
+	if !isBare && !isExplicitRelative && !isDotOrDotDot {
+		addRequireCandidates(cleanPath)
 	}
 	for _, candidate := range candidates {
 		if info, err := os.Stat(candidate); err != nil || info.IsDir() {
@@ -2379,6 +2478,18 @@ func (vm *VM) requirePath(path string) (string, *object.EmeraldValue) {
 	return candidate, result
 }
 
+func (vm *VM) constantValue(value *object.EmeraldValue) *object.EmeraldValue {
+	if value != nil && value.Type == object.ValueString {
+		if vm.sourceEncoding != "" {
+			core.SetStringEncoding(value, vm.sourceEncoding)
+		}
+		if vm.freezeStringLiterals {
+			value.Frozen = true
+		}
+	}
+	return value
+}
+
 func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	constants := vm.frameConstants(frame)
 	switch op {
@@ -2387,7 +2498,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if idx < 0 || idx >= len(constants) {
 			return fmt.Errorf("invalid constant index %d (constants: %d) at ip=%d", idx, len(constants), vm.frames[vm.fp].Ip)
 		}
-		vm.push(constants[idx])
+		vm.push(vm.constantValue(constants[idx]))
 
 	case compiler.OpTrue:
 		vm.push(core.R.TrueVal)
@@ -2454,6 +2565,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		right := vm.pop()
 		left := vm.pop()
 		result := vm.mod(left, right)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
 		vm.push(result)
 
 	case compiler.OpPow:
@@ -2728,9 +2842,23 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		idx := vm.resolveGlobalIndexForFrame(frame, rawIdx)
 		val := vm.globals[idx]
 		if val == nil {
+			rawName := vm.rawGlobalNameForFrameIndex(frame, rawIdx)
+			resolvedName := core.ResolveGlobalAlias(rawName)
+			if resolvedName == "$!" {
+				val = core.LastException
+			} else if resolvedName == "$@" {
+				val = vm.currentExceptionBacktraceGlobal()
+			}
 			for name, globalIdx := range vm.globalNames {
+				if val != nil {
+					break
+				}
 				if globalIdx == idx && name == "$!" {
 					val = core.LastException
+					break
+				}
+				if globalIdx == idx && name == "$@" {
+					val = vm.currentExceptionBacktraceGlobal()
 					break
 				}
 				if globalIdx == idx && (name == "stdout" || name == "$stdout") {
@@ -2788,7 +2916,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				return nil
 			}
 			vm.push(val)
-		} else if val, ok := vm.rubyConsts[name]; ok {
+		} else if val, ok := vm.topLevelConstantValue(name); ok {
 			vm.push(val)
 		} else if name == "ENV" {
 			vm.push(core.EnvObject())
@@ -2834,6 +2962,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		container := vm.currentConstantContainer()
 		if container != nil && !strings.Contains(name, "::") {
 			defineConstantOn(container, name, value)
+			if vm.sourceEncoding != "" {
+				core.SetConstantNameEncoding(container, name, vm.sourceEncoding)
+			}
 		}
 		if _, _, scopedLocal := vm.scopedLocalConstantContainer(frame, name); !scopedLocal {
 			core.AssignConstantName(container, name, value)
@@ -3218,10 +3349,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		result := vm.send(receiver, methodName, args)
 		vm.currentBlock = prevBlock
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
-		if result != nil && result.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
+		if shouldPropagateExceptionValue(result) && core.EvaluatingRaiseErrorMatcher() {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -3511,23 +3642,39 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.returnUnhandledException(frame, errVal)
 			return nil
 		}
-		if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueClass {
-			class = existing.Data.(*object.Class)
-		} else if existing, ok := vm.rubyConsts[name]; ok && existing.Type != object.ValueClass {
-			exception := core.NewTypeError(name + " is not a class")
-			if vm.raiseException(frame, exception) {
-				return nil
-			}
-			vm.returnUnhandledException(frame, exception)
-			return nil
-		} else if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
-			if existing, found := vm.classValueFromContainer(container, constName); found {
+		localContainer := false
+		if container := vm.currentConstantContainer(); container != nil && !strings.Contains(name, "::") {
+			localContainer = true
+			if existing, found := vm.classValueFromContainer(container, name); found {
 				class = existing.Data.(*object.Class)
 			}
-		} else if existing, ok := vm.classValueForQualifiedName(name); ok {
-			class = existing.Data.(*object.Class)
-		} else if existing, ok := core.R.Classes[name]; ok {
-			class = existing
+		}
+		if class == nil && localContainer {
+			class = object.NewClass(name)
+			class.SuperClass = core.R.Classes["Object"]
+			class.SuperClassSet = !hasExplicitSuperclass
+		} else if class == nil {
+			if existing, ok := vm.rubyConsts[name]; ok && existing.Type == object.ValueClass {
+				class = existing.Data.(*object.Class)
+			} else if existing, ok := vm.rubyConsts[name]; ok && existing.Type != object.ValueClass {
+				exception := core.NewTypeError(name + " is not a class")
+				if vm.raiseException(frame, exception) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, exception)
+				return nil
+			}
+		}
+		if class == nil {
+			if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
+				if existing, found := vm.classValueFromContainer(container, constName); found {
+					class = existing.Data.(*object.Class)
+				}
+			} else if existing, ok := vm.classValueForQualifiedName(name); ok {
+				class = existing.Data.(*object.Class)
+			} else if existing, ok := core.R.Classes[name]; ok {
+				class = existing
+			}
 		}
 		if class == nil {
 			class = object.NewClass(name)
@@ -3594,6 +3741,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 
 		var module *object.Module
+		var existingModuleValue *object.EmeraldValue
 		useExisting := func(existing *object.EmeraldValue) bool {
 			if existing == nil {
 				return false
@@ -3607,6 +3755,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			if existing.Type == object.ValueModule {
 				module = existing.Data.(*object.Module)
+				existingModuleValue = existing
+				return false
+			}
+			if name == "Kernel" && existing.Type == object.ValueClass {
+				existingModuleValue = existing
 				return false
 			}
 			exception := core.NewTypeError(name + " is not a module")
@@ -3623,11 +3776,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.returnUnhandledException(frame, errVal)
 			return nil
 		}
-		if existing, ok := vm.rubyConsts[name]; ok {
-			if useExisting(existing) {
-				return nil
-			}
-		} else if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
+		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); ok {
 			if existing, found := directConstantValue(container, constName); found {
 				if useExisting(existing) {
 					return nil
@@ -3635,6 +3784,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			if module == nil {
 				module = object.NewModule("")
+			}
+		} else if container := vm.currentConstantContainer(); container != nil && !strings.Contains(name, "::") {
+			if existing, found := directConstantValue(container, name); found {
+				if useExisting(existing) {
+					return nil
+				}
+			}
+			if module == nil {
+				module = object.NewModule("")
+			}
+		} else if existing, ok := vm.rubyConsts[name]; ok {
+			if useExisting(existing) {
+				return nil
 			}
 		} else if container, constName, ok := vm.qualifiedConstantContainer(name); ok {
 			if existing, found := directConstantValue(container, constName); found {
@@ -3656,10 +3818,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			module = object.NewModule(name)
 		}
 
-		moduleVal := &object.EmeraldValue{
-			Type:  object.ValueModule,
-			Data:  module,
-			Class: core.R.Classes["Module"],
+		moduleVal := existingModuleValue
+		if moduleVal == nil {
+			moduleVal = &object.EmeraldValue{
+				Type:  object.ValueModule,
+				Data:  module,
+				Class: core.R.Classes["Module"],
+			}
 		}
 		vm.rubyConsts[name] = moduleVal
 		if container := vm.currentConstantContainer(); container != nil && !strings.Contains(name, "::") {
@@ -4157,6 +4322,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpRaise:
 		var exception *object.EmeraldValue
+		previousException := core.LastException
+		constructedException := false
 		if vm.sp > 0 {
 			exception = vm.pop()
 		}
@@ -4168,13 +4335,34 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					message = s
 				} else if exception.Type == object.ValueClass {
 					exceptionClass = exception.Data.(*object.Class)
+					if exceptionClass == nil || !classInheritsFrom(exceptionClass, core.R.Classes["Exception"]) {
+						exception = core.NewTypeError("exception class/object expected")
+						if vm.raiseException(frame, exception) {
+							return nil
+						}
+						vm.returnUnhandledException(frame, exception)
+						return nil
+					}
 					message = exceptionClass.Name
+				} else {
+					exception = core.NewTypeError("exception class/object expected")
+					if vm.raiseException(frame, exception) {
+						return nil
+					}
+					vm.returnUnhandledException(frame, exception)
+					return nil
 				}
 			}
 			exception = &object.EmeraldValue{
 				Type:  object.ValueException,
-				Data:  &object.RException{Message: message},
+				Data:  &object.RException{Message: message, Raised: true},
 				Class: exceptionClass,
+			}
+			constructedException = true
+		}
+		if constructedException && previousException != nil && len(vm.activeRescues) > 0 && previousException != exception {
+			if exc, ok := exception.Data.(*object.RException); ok && exc != nil && exc.Cause == nil {
+				exc.Cause = previousException
 			}
 		}
 		if vm.raiseException(frame, exception) {
@@ -4202,6 +4390,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		vm.push(core.LastException)
+		core.LastRaisedResult = nil
 
 	case compiler.OpRescueMatch:
 		count := int(vm.readUint8())
@@ -4488,6 +4677,9 @@ func (vm *VM) mod(left, right *object.EmeraldValue) *object.EmeraldValue {
 			return &object.EmeraldValue{Type: object.ValueInteger, Data: l % r, Class: core.R.Classes["Integer"]}
 		}
 	}
+	if left != nil && left.Class != nil {
+		return vm.send(left, "%", []*object.EmeraldValue{right})
+	}
 	return core.R.NilVal
 }
 
@@ -4753,6 +4945,9 @@ func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
 			return core.R.FalseVal
 		}
 	}
+	if result := directCompareMethod(left, right, "<"); result != nil {
+		return result
+	}
 	if core.CallMethod != nil && left != nil && core.ReceiverHasCallableMethod(left, "<=>") {
 		cmp := core.CallMethod(left, "<=>", right)
 		if cmp != nil && cmp.Type == object.ValueException {
@@ -4809,6 +5004,9 @@ func (vm *VM) greaterThan(left, right *object.EmeraldValue) *object.EmeraldValue
 			return core.R.FalseVal
 		}
 	}
+	if result := directCompareMethod(left, right, ">"); result != nil {
+		return result
+	}
 	if core.CallMethod != nil && left != nil && core.ReceiverHasCallableMethod(left, "<=>") {
 		cmp := core.CallMethod(left, "<=>", right)
 		if cmp != nil && cmp.Type == object.ValueException {
@@ -4846,11 +5044,24 @@ func comparisonFailedMessage(left, right *object.EmeraldValue) string {
 }
 
 func (vm *VM) lessThanOrEqual(left, right *object.EmeraldValue) *object.EmeraldValue {
-	return moduleCompare(left, right, "<=")
+	if result := moduleCompare(left, right, "<="); result != nil {
+		return result
+	}
+	return directCompareMethod(left, right, "<=")
 }
 
 func (vm *VM) greaterThanOrEqual(left, right *object.EmeraldValue) *object.EmeraldValue {
-	return moduleCompare(left, right, ">=")
+	if result := moduleCompare(left, right, ">="); result != nil {
+		return result
+	}
+	return directCompareMethod(left, right, ">=")
+}
+
+func directCompareMethod(left, right *object.EmeraldValue, op string) *object.EmeraldValue {
+	if core.CallMethod == nil || left == nil || !core.ReceiverHasCallableMethod(left, op) {
+		return nil
+	}
+	return core.CallMethod(left, op, right)
 }
 
 func moduleCompare(left, right *object.EmeraldValue, op string) *object.EmeraldValue {
@@ -5147,9 +5358,6 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 			return err
 		}
 		forwardArgs := args[1:]
-		if methodName != "initialize" && len(forwardArgs) == 1 && forwardArgs[0] != nil && forwardArgs[0].Type == object.ValueArray {
-			forwardArgs = forwardArgs[0].Data.([]*object.EmeraldValue)
-		}
 		prev := vm.visibilityBypass
 		vm.visibilityBypass = method != "public_send"
 		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, forwardArgs, true)
@@ -5205,7 +5413,7 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	if method == "instance_exec" && vm.currentBlock != nil {
 		block := vm.currentBlock
 		vm.currentBlock = nil
-		return vm.callBlockWithInstanceEvalContext(receiver, block, args...)
+		return vm.callBlockWithInstanceExecContext(receiver, block, args...)
 	}
 	if method == "instance_exec" {
 		return core.NewLocalJumpError("no block given")
@@ -5462,12 +5670,12 @@ afterInheritedClassMethodLookup:
 		if fallback := vm.constDefinedArgumentError(method, args); fallback != nil {
 			return nil, nil, fallback
 		}
+		if missingAsNameError {
+			return nil, nil, core.NewNameError("undefined method `" + method + "'")
+		}
 		if core.EvaluatingRaiseErrorMatcher() {
 			if numberedParameterMethodNamePattern.MatchString(method) {
 				return nil, nil, core.NewNoMethodError("undefined local variable or method `" + method + "'")
-			}
-			if missingAsNameError {
-				return nil, nil, core.NewNameError("undefined method `" + method + "'")
 			}
 			return nil, nil, core.NewNoMethodError("undefined method `" + method + "'")
 		}
@@ -5499,10 +5707,15 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 	if methodObj.Visibility == "undefined" {
 		return core.NewNoMethodError("undefined method `" + method + "'")
 	}
+	currentSelf := core.R.Main
+	if oldFrame.Bp >= 0 && oldFrame.Bp < len(vm.stack) && vm.stack[oldFrame.Bp] != nil {
+		currentSelf = vm.stack[oldFrame.Bp]
+	}
+	privateReceiverAllowed := receiver == core.R.Main || (parentMethod != "public_send" && receiver == currentSelf)
 	if !vm.visibilityBypass && parentMethod != "public" && parentMethod != "private" && parentMethod != "protected" &&
 		parentMethod != "module_function" && parentMethod != "public_class_method" && parentMethod != "private_class_method" &&
 		parentMethod != "using" && parentMethod != "refine" &&
-		(methodObj.Visibility == "private" || methodObj.Visibility == "protected") && receiver != core.R.Main {
+		(methodObj.Visibility == "private" || methodObj.Visibility == "protected") && !privateReceiverAllowed {
 		return core.NewNoMethodError(methodObj.Visibility + " method `" + method + "' called")
 	}
 	if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
@@ -6373,6 +6586,9 @@ func (vm *VM) currentClassStackSnapshot() []*object.EmeraldValue {
 }
 
 func (vm *VM) classVarScopeReceiver(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if vm.instanceExecClassVarScope != nil {
+		return vm.instanceExecClassVarScope
+	}
 	if len(vm.classStack) > 0 {
 		if scope := vm.classStack[len(vm.classStack)-1]; scope != nil {
 			return scope
@@ -6513,12 +6729,20 @@ func inheritsFrom(cls *object.Class, name string) bool {
 func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool {
 	previousException := core.LastException
 	core.LastException = exception
+	vm.attachExceptionLocations(exception)
+	markExceptionRaised(exception)
 	if len(vm.rescueStack) == 0 {
 		return false
 	}
 	handler := vm.rescueStack[len(vm.rescueStack)-1]
 	if handler.Frame != frame {
 		return false
+	}
+	for i := len(vm.activeRescues) - 1; i >= 0; i-- {
+		active := vm.activeRescues[i]
+		if active.Frame == frame && frame.Ip < active.EndOffset && len(vm.rescueStack) < active.RescueStackDepth {
+			return false
+		}
 	}
 	if handler.RescueOffset > 0 && frame.Ip >= handler.RescueOffset-1 {
 		return false
@@ -6529,6 +6753,7 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 			EndOffset:         handler.EndOffset,
 			Frame:             handler.Frame,
 			PreviousException: previousException,
+			RescueStackDepth:  len(vm.rescueStack),
 		})
 		handler.Frame.Ip = handler.RescueOffset - 1
 	} else if handler.EnsureOffset > 0 {
@@ -6552,9 +6777,43 @@ func (vm *VM) returningFromClassBodyBlock(frame *Frame) bool {
 
 func (vm *VM) returnUnhandledException(frame *Frame, exception *object.EmeraldValue) {
 	core.LastException = exception
+	core.LastRaisedResult = exception
+	vm.attachExceptionLocations(exception)
+	markExceptionRaised(exception)
 	vm.sp = frame.Bp
 	vm.push(exception)
 	frame.Ip = len(frame.Fn.Instructions) - 1
+}
+
+func (vm *VM) attachExceptionLocations(exception *object.EmeraldValue) {
+	if exception == nil || exception.Type != object.ValueException {
+		return
+	}
+	exc, ok := exception.Data.(*object.RException)
+	if !ok || exc == nil || len(exc.Backtrace) > 0 || len(exc.Locations) > 0 {
+		return
+	}
+	exc.Locations = vm.currentBacktraceFrames()
+}
+
+func shouldPropagateExceptionValue(value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueException {
+		return false
+	}
+	if core.LastRaisedResult == value {
+		return true
+	}
+	exc, ok := value.Data.(*object.RException)
+	return ok && exc != nil && exc.Raised
+}
+
+func markExceptionRaised(value *object.EmeraldValue) {
+	if value == nil || value.Type != object.ValueException {
+		return
+	}
+	if exc, ok := value.Data.(*object.RException); ok && exc != nil {
+		exc.Raised = true
+	}
 }
 
 func boolValue(value bool) *object.EmeraldValue {
@@ -7385,6 +7644,7 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	vm.currentBlock = nil
 	prevClassStack := vm.classStack
 	prevCatchStack := vm.catchStack
+	core.LastRaisedResult = nil
 	if errVal := rejectBlockArgument(fn, prevBlock); errVal != nil {
 		return errVal
 	}
@@ -7425,6 +7685,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		if err := vm.execute(op, frame); err != nil {
 			break
 		}
+		if vm.sp > frame.Bp {
+			top := vm.stack[vm.sp-1]
+			if top != nil && top.Type == object.ValueException && (core.LastRaisedResult == top || classInheritsFrom(top.Class, core.R.Classes["SystemExit"])) && !vm.frameHasActiveRescue(frame) {
+				break
+			}
+		}
 		frame = vm.frames[vm.fp]
 		if frame.BlockBreak || frame.BlockNextVal != nil {
 			break
@@ -7459,7 +7725,19 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	vm.frames = vm.frames[:vm.fp]
 	vm.fp--
 
+	if result == nil || result.Type != object.ValueException {
+		core.LastRaisedResult = nil
+	}
 	return result
+}
+
+func (vm *VM) frameHasActiveRescue(frame *Frame) bool {
+	for i := len(vm.activeRescues) - 1; i >= 0; i-- {
+		if vm.activeRescues[i].Frame == frame {
+			return true
+		}
+	}
+	return false
 }
 
 func (vm *VM) procBreakOwnerActive(proc *object.Proc) bool {
@@ -7800,6 +8078,32 @@ func (vm *VM) callBlockWithInstanceEvalContext(receiver *object.EmeraldValue, bl
 	return result
 }
 
+func (vm *VM) callBlockWithInstanceExecContext(receiver *object.EmeraldValue, block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	prev := vm.instanceExecClassVarScope
+	vm.instanceExecClassVarScope = blockLexicalClassVarScope(block)
+	defer func() {
+		vm.instanceExecClassVarScope = prev
+	}()
+	return vm.callBlockWithInstanceEvalContext(receiver, block, args...)
+}
+
+func blockLexicalClassVarScope(block *object.EmeraldValue) *object.EmeraldValue {
+	if block == nil {
+		return nil
+	}
+	var stack []*object.EmeraldValue
+	switch data := block.Data.(type) {
+	case *object.Closure:
+		stack = data.ClassStack
+	case *object.Proc:
+		stack = data.ClassStack
+	}
+	if len(stack) == 0 {
+		return nil
+	}
+	return stack[len(stack)-1]
+}
+
 func (vm *VM) instanceEvalContextClass(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if receiver == nil {
 		receiver = core.R.NilVal
@@ -8008,6 +8312,9 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 		if frame == nil || frame.Fn == nil {
 			continue
 		}
+		if core.InAtExitHooks && frame.Fn.Name == "__main__" && i == 0 {
+			continue
+		}
 		label := "main"
 		if frame.MethodName != "" {
 			label = frame.MethodName
@@ -8016,7 +8323,11 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 			case "main":
 				label = "main"
 			case "__block__", "__lambda__":
-				label = "block"
+				if core.InAtExitHooks && frame.Fn.Name == "__block__" {
+					label = "block in <main>"
+				} else {
+					label = "block"
+				}
 			default:
 				label = frame.Fn.Name
 			}
@@ -8041,6 +8352,14 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 		})
 	}
 	return frames
+}
+
+func (vm *VM) backtraceStrings(frames []object.RBacktraceLocation) []string {
+	result := make([]string, len(frames))
+	for i, frame := range frames {
+		result[i] = fmt.Sprintf("%s:%d:in '%s'", frame.Path, frame.Line, frame.Label)
+	}
+	return result
 }
 
 func (vm *VM) sourceLineForFrame(frame *Frame) int64 {

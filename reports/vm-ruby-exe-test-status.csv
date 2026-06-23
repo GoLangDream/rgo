@@ -1,0 +1,8 @@
+test,status,duration_ms
+TestFileWriteClassMethodCreatesFile,pass,270
+TestRubyExeInThreadCanBeSignaledBeforeJoin,pass,277
+TestRubyExeSetsProcessStatusForBitOperators,pass,202
+TestRubyExeSimulatesSimpleProcessExecEcho,pass,176
+TestRubyExeWithoutSourceCanBeSplattedIntoSpawn,pass,192
+TestRubyExeWithoutSourceUsesCurrentRgoBinary,pass,187
+TestTouchWithModeYieldsWritableFile,pass,181

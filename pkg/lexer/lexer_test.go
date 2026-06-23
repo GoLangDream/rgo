@@ -201,6 +201,19 @@ func TestHeredocInterpolationFlag(t *testing.T) {
 	}
 }
 
+func TestHeredocDecodesDoubleQuotedEscapes(t *testing.T) {
+	toks := tokenizeClean("s = <<CODE\n\\t# encoding: UTF-8\nCODE\nsingle = <<'TEXT'\n\\t# encoding: UTF-8\nTEXT\n")
+	if len(toks) != 6 {
+		t.Fatalf("expected 6 tokens, got %d: %v", len(toks), toks)
+	}
+	if toks[2].Literal != "\t# encoding: UTF-8\n" {
+		t.Fatalf("expected decoded tab in heredoc, got %q", toks[2].Literal)
+	}
+	if toks[5].Literal != "\\t# encoding: UTF-8\n" {
+		t.Fatalf("expected single-quoted heredoc to preserve escape, got %q", toks[5].Literal)
+	}
+}
+
 func TestSquigglyHeredocPreservesMarkerLineSuffix(t *testing.T) {
 	toks := tokenizeClean("eval(<<~CODE).should == nil\n  10\nCODE\n")
 	expected := []TokenType{IDENT, LPAREN, STRING, RPAREN, DOT, IDENT, EQUAL, NIL}

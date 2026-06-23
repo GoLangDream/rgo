@@ -1216,11 +1216,24 @@ func (l *Lexer) readPercentString() Token {
 	}
 
 	lit += l.input[position:l.position]
+	closeDelimiter := delimiter
 	l.readChar()
+
+	options := ""
+	if kind == 'r' {
+		for l.ch == 'i' || l.ch == 'm' || l.ch == 'x' || l.ch == 'o' || l.ch == 'e' || l.ch == 's' || l.ch == 'u' || l.ch == 'n' || l.ch == 'a' {
+			options += string(l.ch)
+			l.readChar()
+		}
+	}
 
 	tokenType := STRING
 	if kind == 'w' || kind == 'W' {
 		tokenType = WORDS
+	}
+	if kind == 'r' {
+		tokenType = REGEXP
+		lit = "%r" + string(openDelimiter) + lit + string(closeDelimiter) + options
 	}
 	if kind == 's' {
 		tokenType = SYMBOL
@@ -1519,6 +1532,9 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 
 	lit := l.input[contentStart:contentEnd]
+	if quote != '\'' {
+		lit = decodeHeredocEscapes(lit)
+	}
 	if l.ch == '\n' {
 		l.readChar()
 	}
@@ -1538,6 +1554,45 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 		Column:              column,
 		AllowsInterpolation: quote != '\'',
 	}
+}
+
+func decodeHeredocEscapes(input string) string {
+	if !strings.Contains(input, "\\") {
+		return input
+	}
+	var out strings.Builder
+	out.Grow(len(input))
+	for i := 0; i < len(input); i++ {
+		if input[i] != '\\' || i+1 >= len(input) {
+			out.WriteByte(input[i])
+			continue
+		}
+		i++
+		switch input[i] {
+		case 't':
+			out.WriteByte('\t')
+		case 'n':
+			out.WriteByte('\n')
+		case 'r':
+			out.WriteByte('\r')
+		case 'f':
+			out.WriteByte('\f')
+		case 'v':
+			out.WriteByte('\v')
+		case 'a':
+			out.WriteByte('\a')
+		case 'b':
+			out.WriteByte('\b')
+		case 'e':
+			out.WriteByte(0x1b)
+		case '\\':
+			out.WriteByte('\\')
+		default:
+			out.WriteByte('\\')
+			out.WriteByte(input[i])
+		}
+	}
+	return out.String()
 }
 
 func (l *Lexer) queueHeredocMarkerSuffix(suffix string) {

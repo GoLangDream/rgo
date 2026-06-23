@@ -133,7 +133,13 @@ if [ "$MODE" != "ruby" ]; then
   echo "[full-spec-gate] running rails specs from: $RAILS_ROOT"
   if [ ! -d "$RAILS_ROOT" ]; then
     echo "rails spec target not found: $RAILS_ROOT" >&2
-    exit 2
+    printf 'framework,status,duration_ms,exit_code,log\n' > "$RAILS_REPORT"
+    printf 'rails,target_missing,0,2,\n' >> "$RAILS_REPORT"
+    echo "[full-spec-gate] rails spec report: $RAILS_REPORT"
+    if [ "$CONTINUE_ON_FAIL" -eq 0 ]; then
+      exit 2
+    fi
+    exit 0
   fi
   if [ ! -f "$RAILS_ROOT/Gemfile" ] && [ ! -f "$RAILS_ROOT/Rakefile" ]; then
     echo "rails spec target missing Gemfile and Rakefile: $RAILS_ROOT" >&2

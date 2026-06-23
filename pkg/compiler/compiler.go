@@ -1252,6 +1252,9 @@ func (c *Compiler) Compile(node interface{}) error {
 		})
 		c.emit(OpAlias)
 	case *ast.ReturnExpression:
+		if c.scopeIndex == 0 && c.methodDepth == 0 && node.ReturnValue != nil {
+			fmt.Fprintln(os.Stderr, "warning: argument of top-level return is ignored")
+		}
 		if node.ReturnValue != nil {
 			if err := c.Compile(node.ReturnValue); err != nil {
 				return err

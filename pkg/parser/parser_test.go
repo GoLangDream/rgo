@@ -1757,6 +1757,20 @@ func TestParseRegexpLiteral(t *testing.T) {
 	}
 }
 
+func TestParsePercentRegexpLiteral(t *testing.T) {
+	expr := parseExpr(t, `%r{runner/mspec.rb}i`)
+	re, ok := expr.(*ast.RegexpLiteral)
+	if !ok {
+		t.Fatalf("expected RegexpLiteral, got %T", expr)
+	}
+	if re.Pattern != "runner/mspec.rb" {
+		t.Errorf("expected pattern runner/mspec.rb, got %s", re.Pattern)
+	}
+	if re.Options != "i" {
+		t.Errorf("expected option i, got %s", re.Options)
+	}
+}
+
 func TestParseLambdaWithBareParameter(t *testing.T) {
 	expr := parseExpr(t, `-> _ { true }`)
 	proc, ok := expr.(*ast.ProcLiteral)
@@ -3124,6 +3138,67 @@ func TestParseImplicitBeginRescueVariableInClass(t *testing.T) {
 rescue => e
   ScratchPad << e.message
 end`)
+}
+
+func TestParseRaiseAsDottedMethodName(t *testing.T) {
+	expr := parseExpr(t, `Object.new.raise("message", {cause: RuntimeError.new})`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "raise" {
+		t.Fatalf("expected dotted method raise, got %#v", call.Method)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 arguments, got %d", len(call.Args))
+	}
+}
+
+func TestParseRaiseAsDottedMethodNameInLambda(t *testing.T) {
+	expr := parseExpr(t, `-> { Object.new.raise("message", {cause: RuntimeError.new}) }`)
+	lambda, ok := expr.(*ast.ProcLiteral)
+	if !ok {
+		t.Fatalf("expected ProcLiteral, got %T", expr)
+	}
+	if len(lambda.Body.Statements) != 1 {
+		t.Fatalf("expected 1 lambda body statement, got %d", len(lambda.Body.Statements))
+	}
+	stmt, ok := lambda.Body.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected ExpressionStatement, got %T", lambda.Body.Statements[0])
+	}
+	call, ok := stmt.Expression.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", stmt.Expression)
+	}
+	if call.Method == nil || call.Method.Value != "raise" {
+		t.Fatalf("expected dotted method raise, got %#v", call.Method)
+	}
+}
+
+func TestParseRaiseAsDottedMethodNameOnInstanceVariableInLambda(t *testing.T) {
+	expr := parseExpr(t, `-> { @object.raise("message", {cause: RuntimeError.new}) }`)
+	lambda, ok := expr.(*ast.ProcLiteral)
+	if !ok {
+		t.Fatalf("expected ProcLiteral, got %T", expr)
+	}
+	if len(lambda.Body.Statements) != 1 {
+		t.Fatalf("expected 1 lambda body statement, got %d", len(lambda.Body.Statements))
+	}
+	stmt, ok := lambda.Body.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected ExpressionStatement, got %T", lambda.Body.Statements[0])
+	}
+	call, ok := stmt.Expression.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", stmt.Expression)
+	}
+	if call.Method == nil || call.Method.Value != "raise" {
+		t.Fatalf("expected dotted method raise, got %#v", call.Method)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 arguments, got %d", len(call.Args))
+	}
 }
 
 func TestParseArrayLiteralAtEndOfExpression(t *testing.T) {

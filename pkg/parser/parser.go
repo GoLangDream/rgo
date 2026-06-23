@@ -1304,6 +1304,10 @@ func (p *Parser) parseIdentifier() ast.Expression {
 		return p.parseCallExpression(ident)
 	}
 
+	if isReservedAssignmentIdentifier(ident.Value) {
+		return ident
+	}
+
 	if p.isArgumentStart(p.peekToken) && (!p.peekTokenIs(lexer.LBRACKET) || p.methodCanTakeBareArrayArgument(ident.Value)) {
 		call := &ast.MethodCall{
 			Token:    p.curToken,
@@ -1472,12 +1476,50 @@ func (p *Parser) parseRegexpLiteral() ast.Expression {
 			pattern = literal[1:lastSlash]
 			options = literal[lastSlash+1:]
 		}
+	} else if strings.HasPrefix(literal, "%r") && len(literal) >= 3 {
+		start := 2
+		open := literal[start]
+		close := percentRegexpCloseDelimiter(open)
+		depth := 1
+		for i := start + 1; i < len(literal); i++ {
+			if literal[i] == '\\' {
+				i++
+				continue
+			}
+			if close != open && literal[i] == open {
+				depth++
+				continue
+			}
+			if literal[i] == close {
+				depth--
+				if depth == 0 {
+					pattern = literal[start+1 : i]
+					options = literal[i+1:]
+					break
+				}
+			}
+		}
 	}
 	return &ast.RegexpLiteral{
 		Token:        p.curToken,
 		Pattern:      pattern,
 		Options:      options,
 		Interpolates: p.curToken.AllowsInterpolation,
+	}
+}
+
+func percentRegexpCloseDelimiter(open byte) byte {
+	switch open {
+	case '(':
+		return ')'
+	case '[':
+		return ']'
+	case '{':
+		return '}'
+	case '<':
+		return '>'
+	default:
+		return open
 	}
 }
 

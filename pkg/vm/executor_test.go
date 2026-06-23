@@ -2993,6 +2993,44 @@ func TestMspecShouldRegexpMatchLineEndingDollar(t *testing.T) {
 	}
 }
 
+func TestMspecShouldNumericComparisonsUseExpectationPayload(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "numeric matcher" do
+  it "counts successful numeric comparisons" do
+    1.should < 2
+1.should <= 1
+2.should > 1
+2.should >= 2
+1.25.should < 2.5
+1.should <= 1.5
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+	if runner.PassCount != 6 {
+		t.Fatalf("expected 6 passes, got %d", runner.PassCount)
+	}
+}
+
+func TestSecureRandomRequireInstallsRandomHelpers(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `require "securerandom"
+describe "secure random" do
+  it "returns random strings and numbers" do
+    SecureRandom.base64(16).length.should < 32
+    SecureRandom.hex(5).length.should == 10
+    SecureRandom.random_bytes(4).length.should == 4
+    SecureRandom.random_number(3).should < 3
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestMspecDescribeExecutesLambdaAssignment(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `describe "sample" do
@@ -3042,6 +3080,137 @@ end`)
 	if runner.ExampleCount != 0 {
 		t.Fatalf("expected 0 examples, got %d", runner.ExampleCount)
 	}
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelFloatIsCallableViaSend(t *testing.T) {
+	result, _ := runRuby(t, `Kernel.send(:Float, 1)`)
+	assertFloatResult(t, result, 1.0)
+}
+
+func TestKernelFloatRaiseErrorMatcherSeesConvertedException(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "Kernel.Float" do
+  it "raises TypeError for nil through send" do
+    -> { Kernel.send(:Float, nil) }.should raise_error(TypeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.ExampleCount != 1 {
+		t.Fatalf("expected 1 example, got %d", runner.ExampleCount)
+	}
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelIntegerRaisesFloatDomainErrorForNaN(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "Kernel.Integer" do
+  it "raises FloatDomainError for NaN" do
+    -> { Integer(Float::NAN) }.should raise_error(FloatDomainError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelFloatHandlesMinimalComplexValues(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "Kernel.Float complex" do
+  it "converts real-only complex values and rejects imaginary values" do
+    Float(Complex(1)).should == 1.0
+    -> { Float(Complex(2, 3)) }.should raise_error(RangeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringModuloDelegatesToRubySprintf(t *testing.T) {
+	result, _ := runRuby(t, `"%b %x %d %s" % [10, 10, 10, 10]`)
+	assertStringResult(t, result, "1010 a 10 10")
+}
+
+func TestStringModuloRaisesForUnusedArgumentsWhenDebugIsTrue(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "String#%" do
+  it "raises for unused arguments when $DEBUG is true" do
+    begin
+      old_debug = $DEBUG
+      $DEBUG = true
+      -> { "%s" % [1, 2] }.should raise_error(ArgumentError)
+    ensure
+      $DEBUG = old_debug
+    end
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringModuloRejectsToAryReturningNonArray(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "String#%" do
+  it "raises TypeError when to_ary returns a non-Array" do
+    obj = Object.new
+    def obj.to_ary
+      "x"
+    end
+    -> { "%s" % obj }.should raise_error(TypeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringModuloCharacterFormatSupportsPositionWidthAndTypeErrors(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "String#%" do
+  it "formats %c with positional arguments, star width and type errors" do
+    ("%2$c" % [10, 11, 14]).should == "\v"
+    ("%*c" % [10, 3]).should == "         \003"
+    -> { "%c" % Object }.should raise_error(TypeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringModuloNamedFormatTreatsHashNewAsHashArgument(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "String#%" do
+  it "raises KeyError for missing named values in Hash.new" do
+    -> { "%{foo}" % Hash.new { nil } }.should raise_error(KeyError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestStringModuloRaisesEncodingErrorsForIncompatibleArguments(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "String#%" do
+  it "raises encoding errors for incompatible string interpolation and %c ranges" do
+    -> { "hello %s".encode("utf-8") % "world".encode("UTF-16LE") }.should raise_error(Encoding::CompatibilityError)
+    -> { "%c".encode("ASCII") % 1286 }.should raise_error(RangeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
@@ -3126,6 +3295,46 @@ func TestEvalExecutesRubySource(t *testing.T) {
 	assertIntResult(t, result, 3)
 }
 
+func TestTopLevelBindingConstantIsBinding(t *testing.T) {
+	result, _ := runRuby(t, `TOPLEVEL_BINDING.class == Binding`)
+	assertBoolResult(t, result, true)
+}
+
+func TestEvalSyntaxErrorUsesProvidedFileAndLine(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+-> { eval("if true", TOPLEVEL_BINDING, "speccing.rb") }.should raise_error(SyntaxError, /speccing\.rb:1:/)
+-> { eval("if true", TOPLEVEL_BINDING, "speccing.rb", -100) }.should raise_error(SyntaxError, /speccing\.rb:-100:/)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestEvalIgnoresSpacedCallPatternInsideComments(t *testing.T) {
+	result, _ := runRuby(t, `eval("# configurations (including hierarchy, modules)\n1")`)
+	assertIntResult(t, result, 1)
+}
+
+func TestRaiseErrorMatcherPrefersUnhandledBlockExceptionOverRescuePreviousException(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `method = -> backtrace {
+  exception = nil
+  begin
+    raise
+  rescue
+    $@ = backtrace
+    exception = $!
+  end
+  exception
+}
+-> { method.call(:unhappy) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestEvalHeredocRegistersMspecExamples(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `eval <<-RUBY
@@ -3157,11 +3366,29 @@ func TestEvalEncodingRespectsSourceStringEncoding(t *testing.T) {
 	assertBoolResult(t, result, true)
 }
 
+func TestStringBReturnsBinaryEncodedString(t *testing.T) {
+	result, _ := runRuby(t, `"hello".b.encoding == Encoding::BINARY`)
+	assertBoolResult(t, result, true)
+}
+
 func TestEvalEncodingRespectsMagicComment(t *testing.T) {
 	result, _ := runRuby(t, `eval("# encoding: BINARY\n__ENCODING__") == Encoding::BINARY`)
 	assertBoolResult(t, result, true)
 
 	result, _ = runRuby(t, `eval("# encoding: us-ascii\n__ENCODING__") == Encoding::US_ASCII`)
+	assertBoolResult(t, result, true)
+}
+
+func TestEvalEncodingIgnoresEncodingCommentAfterFrozenStringLiteral(t *testing.T) {
+	result, _ := runRuby(t, `eval("# frozen_string_literal: true\n# encoding: UTF-8\n__ENCODING__".b) == Encoding::BINARY`)
+	assertBoolResult(t, result, true)
+}
+
+func TestEvalFreezesStringLiteralsWhenMagicCommentIsTrue(t *testing.T) {
+	result, _ := runRuby(t, `eval("# frozen_string_literal: true\n'frozen'.frozen?")`)
+	assertBoolResult(t, result, true)
+
+	result, _ = runRuby(t, `eval("# encoding: UTF-8\n# frozen_string_literal: true\n'frozen'.frozen?")`)
 	assertBoolResult(t, result, true)
 }
 
@@ -4712,6 +4939,361 @@ puts(x)`)
 	}
 }
 
+func TestKernelPutsExpandsArrays(t *testing.T) {
+	_, output := runRuby(t, `puts(["a", ["b", nil], :c])`)
+	expected := "a\nb\n\nc\n"
+	if output != expected {
+		t.Fatalf("expected %q, got %q", expected, output)
+	}
+}
+
+func TestKernelWarnValidatesUplevelAndCategoryKeywords(t *testing.T) {
+	result, _ := runRuby(t, `
+$VERBOSE = true
+class WarnCategory
+  def to_sym
+    :deprecated
+  end
+end
+results = []
+begin
+  warn "", uplevel: -1
+  results << "missing"
+rescue => e
+  results << e.class.to_s
+end
+begin
+  warn "", uplevel: -2
+  results << "missing"
+rescue => e
+  results << e.class.to_s
+end
+begin
+  warn "", category: Object.new
+  results << "missing"
+rescue => e
+  results << e.class.to_s
+end
+begin
+  warn "", category: WarnCategory.new
+  results << "ok"
+rescue => e
+  results << e.class.to_s
+end
+results
+`)
+	assertArrayOfStrings(t, result, []string{"ArgumentError", "ArgumentError", "TypeError", "ok"})
+}
+
+func TestKernelOpenUsesToOpenBeforeFileOpenSemantics(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kernel-open.txt")
+	if err := os.WriteFile(path, []byte("body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := fmt.Sprintf(`
+class OpenProxy
+  def initialize(value)
+    @value = value
+  end
+
+  def to_open(*args)
+    $open_args = args
+    @value
+  end
+end
+
+file = File.open(%q)
+opened = open(OpenProxy.new(file), 1, 2, 3)
+integer_error = begin
+  open(7)
+  "missing"
+rescue => e
+  e.class.to_s
+end
+[opened.kind_of?(File), $open_args, integer_error]
+`, path)
+	result, _ := runRuby(t, source)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected array result, got %#v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	assertBoolResult(t, values[0], true)
+	args := values[1].Data.([]*object.EmeraldValue)
+	if len(args) != 3 {
+		t.Fatalf("expected to_open to receive 3 args, got %d", len(args))
+	}
+	assertIntResult(t, args[0], 1)
+	assertIntResult(t, args[1], 2)
+	assertIntResult(t, args[2], 3)
+	assertStringResult(t, values[2], "TypeError")
+}
+
+func TestKernelLoadTypeChecksArrayArgumentBeforeArityWrapper(t *testing.T) {
+	result, _ := runRuby(t, `
+errors = []
+begin
+  send(:load, [])
+  errors << "missing"
+rescue => e
+  errors << e.class.to_s
+end
+begin
+  Kernel.send(:load, [])
+  errors << "missing"
+rescue => e
+  errors << e.class.to_s
+end
+errors
+`)
+	assertArrayOfStrings(t, result, []string{"TypeError", "TypeError"})
+}
+
+func TestRequireRelativePrefersRbSuffixForNonRbPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "feature.ext"), []byte(`$rgo_required_feature = "without_rb"`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "feature.ext.rb"), []byte(`$rgo_required_feature = "with_rb"`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	specFile := filepath.Join(dir, "spec.rb")
+	source := fmt.Sprintf(`
+require_relative %q
+[$rgo_required_feature, $LOADED_FEATURES.include?(%q)]
+`, filepath.Join(dir, "feature.ext"), filepath.Join(dir, "feature.ext.rb"))
+	result, _ := runRubyWithCurrentSpecFile(t, source, specFile)
+	values := result.Data.([]*object.EmeraldValue)
+	assertStringResult(t, values[0], "with_rb")
+	assertBoolResult(t, values[1], true)
+}
+
+func TestRequireStoresAbsoluteCleanPathForExplicitRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	codeDir := filepath.Join(dir, "code")
+	if err := os.Mkdir(codeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	feature := filepath.Join(codeDir, "load_fixture.rb")
+	if err := os.WriteFile(feature, []byte(`$rgo_required_feature = :loaded`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := fmt.Sprintf(`
+Dir.chdir(%q) do
+  require "../code/load_fixture.rb"
+end
+[$rgo_required_feature, $LOADED_FEATURES.include?(%q)]
+`, codeDir, feature)
+	result, _ := runRuby(t, source)
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0] == nil || values[0].Type != object.ValueSymbol || values[0].Data.(string) != "loaded" {
+		t.Fatalf("expected feature to load, got %v", values[0])
+	}
+	assertBoolResult(t, values[1], true)
+}
+
+func TestRequireExpandsTildeBeforeStoringLoadedFeature(t *testing.T) {
+	dir := t.TempDir()
+	feature := filepath.Join(dir, "load_fixture.rb")
+	if err := os.WriteFile(feature, []byte(`$rgo_required_feature = :loaded`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	if err := os.Setenv("HOME", dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Setenv("HOME", oldHome)
+	}()
+	result, _ := runRuby(t, fmt.Sprintf(`
+require "~/load_fixture"
+[$rgo_required_feature, $LOADED_FEATURES.include?(%q)]
+`, feature))
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0] == nil || values[0].Type != object.ValueSymbol || values[0].Data.(string) != "loaded" {
+		t.Fatalf("expected feature to load, got %v", values[0])
+	}
+	assertBoolResult(t, values[1], true)
+}
+
+func TestRequireUsesRubyEnvHomeForTildeExpansion(t *testing.T) {
+	dir := t.TempDir()
+	feature := filepath.Join(dir, "load_fixture.rb")
+	if err := os.WriteFile(feature, []byte(`$rgo_required_feature = :loaded`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`
+old_home = ENV["HOME"]
+begin
+  ENV["HOME"] = %q
+  require "~/load_fixture"
+ensure
+  ENV["HOME"] = old_home
+end
+[$rgo_required_feature, $LOADED_FEATURES.include?(%q)]
+`, dir, feature))
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0] == nil || values[0].Type != object.ValueSymbol || values[0].Data.(string) != "loaded" {
+		t.Fatalf("expected feature to load, got %v", values[0])
+	}
+	assertBoolResult(t, values[1], true)
+}
+
+func TestRequireStoresAbsoluteCleanPathForDuplicateSeparators(t *testing.T) {
+	dir := t.TempDir()
+	codeDir := filepath.Join(dir, "code")
+	if err := os.Mkdir(codeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	feature := filepath.Join(codeDir, "load_fixture.rb")
+	if err := os.WriteFile(feature, []byte(`$rgo_required_feature = :loaded`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(filepath.Separator) + string(filepath.Separator)
+	requirePath := strings.Join([]string{"..", "code", "load_fixture.rb"}, sep)
+	source := fmt.Sprintf(`
+$LOAD_PATH << "."
+Dir.chdir(%q) do
+  require %q
+end
+[$rgo_required_feature, $LOADED_FEATURES.include?(%q)]
+`, codeDir, requirePath, feature)
+	result, _ := runRuby(t, source)
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0] == nil || values[0].Type != object.ValueSymbol || values[0].Data.(string) != "loaded" {
+		t.Fatalf("expected feature to load, got %v", values[0])
+	}
+	assertBoolResult(t, values[1], true)
+}
+
+func TestFileSeparatorConstantAlias(t *testing.T) {
+	result, _ := runRuby(t, `[File::SEPARATOR, File::Separator, File::PATH_SEPARATOR]`)
+	values := result.Data.([]*object.EmeraldValue)
+	assertStringResult(t, values[0], string(filepath.Separator))
+	assertStringResult(t, values[1], string(filepath.Separator))
+	assertStringResult(t, values[2], string(filepath.ListSeparator))
+}
+
+func TestRequireRelativeFromLoadedFileStoresSymlinkPath(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "code")
+	if err := os.Mkdir(realDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	realPath := filepath.Join(realDir, "load_fixture.rb")
+	if err := os.WriteFile(realPath, []byte(`$rgo_required_file = __FILE__`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(dir, "codesymlink")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	requirePath := filepath.Join(dir, "requiring.rb")
+	if err := os.WriteFile(requirePath, []byte(`require_relative "codesymlink/load_fixture.rb"`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(linkDir, "load_fixture.rb")
+
+	source := fmt.Sprintf(`
+load %q
+features = $LOADED_FEATURES.select { |path| path.end_with?("load_fixture.rb") }
+[$rgo_required_file, features.include?(%q), features.include?(%q), features]
+`, requirePath, symlinkPath, realPath)
+	result, _ := runRuby(t, source)
+	values := result.Data.([]*object.EmeraldValue)
+	assertStringResult(t, values[0], symlinkPath)
+	assertBoolResult(t, values[1], true)
+	assertBoolResult(t, values[2], false)
+}
+
+func TestMspecShouldNotIncludeMatcherPassesWhenElementMissing(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+["present"].should_not include("missing")
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+	if runner.PassCount != 1 {
+		t.Fatalf("expected 1 pass, got %d", runner.PassCount)
+	}
+}
+
+func TestMspecIncludeMatcherAcceptsMultipleExpectedValues(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+[:a, :b, :c].should include(:a, :b)
+[:a, :b, :c].should_not include(:x, :y)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+	if runner.PassCount != 2 {
+		t.Fatalf("expected 2 passes, got %d", runner.PassCount)
+	}
+}
+
+func TestTouchBlockPutsWritesRawStringLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "touch-output.rb")
+	source := fmt.Sprintf(`
+relative = "fixture.rb"
+touch(%q) { |f| f.puts "require_relative #{relative.inspect}" }
+File.read(%q)
+`, path, path)
+	result, _ := runRuby(t, source)
+	assertStringResult(t, result, "require_relative \"fixture.rb\"\n")
+}
+
+func TestTmpEmptyNameReturnsDirectoryWithTrailingSeparator(t *testing.T) {
+	result, _ := runRuby(t, `tmp("")`)
+	assertStringResult(t, result, filepath.Join(os.TempDir(), "rgo-spec")+string(filepath.Separator))
+}
+
+func TestKernelLoadWrapTrueDoesNotLeakTopLevelMethods(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wrapped-load.rb")
+	if err := os.WriteFile(path, []byte(`
+def wrapped_load_method
+  :loaded
+end
+
+wrapped_load_method
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := fmt.Sprintf(`
+load %q, true
+begin
+  send(:wrapped_load_method)
+  "missing"
+rescue => e
+  e.class.to_s
+end
+`, path)
+	result, _ := runRuby(t, source)
+	assertStringResult(t, result, "NameError")
+}
+
+func TestKernelSendMissingMethodRaisesNameError(t *testing.T) {
+	result, _ := runRuby(t, `
+begin
+  send(:definitely_missing_method_for_send)
+  "missing"
+rescue => e
+  e.class.to_s
+end
+`)
+	assertStringResult(t, result, "NameError")
+}
+
+func TestMagicLineWorksInsideInfixExpression(t *testing.T) {
+	result, _ := runRuby(t, "\n\n__LINE__ - 1")
+	assertIntResult(t, result, 2)
+}
+
 func TestUnlessModifier(t *testing.T) {
 	_, output := runRuby(t, `x = 0
 x = 10 unless false
@@ -5056,6 +5638,19 @@ sleep(duration).should >= 0
 	}
 }
 
+func TestKernelSleepHonorsSubsecondDuration(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+20.times { sleep(0.0001) }
+elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+elapsed.should > 0.002`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestKernelTypePredicatesValidateClassOrModuleArgument(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `object = Object.new
@@ -5297,6 +5892,15 @@ $?.success?.should == false
 
 -> { system("false", exception: true) }.should raise_error(RuntimeError)
 -> { system("rgo-command-does-not-exist", exception: true) }.should raise_error(Errno::ENOENT)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelSystemRaisesForFailingRubyCmdWithException(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `-> { system(ruby_cmd("exit 1"), exception: true) }.should raise_error(RuntimeError)`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
@@ -5594,6 +6198,30 @@ func TestInstanceExecRunsBlockWithArguments(t *testing.T) {
 	assertIntResult(t, result, 7)
 }
 
+func TestInstanceExecPreservesClassVariableLexicalScope(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `
+module RgoInstanceExecCvarSpec
+  module Source
+    def self.included(base)
+      base.instance_exec { @@count = 2 }
+    end
+  end
+
+  module Receiver
+    include Source
+  end
+end
+
+RgoInstanceExecCvarSpec::Source.class_variables.should include(:@@count)
+RgoInstanceExecCvarSpec::Source.send(:class_variable_get, :@@count).should == 2
+RgoInstanceExecCvarSpec::Receiver.class_variables.should == []`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
 func TestProcessPidReturnsInteger(t *testing.T) {
 	result, _ := runRuby(t, `Process.pid.is_a?(Integer)`)
 	assertBoolResult(t, result, true)
@@ -5760,6 +6388,144 @@ rm_r script
 rm_r pid_file
 output`)
 	assertStringResult(t, result, "signaled\n")
+}
+
+func TestRubyExeFilePathSimulatesBeginWithFileName(t *testing.T) {
+	result, _ := runRuby(t, `script = tmp("ruby-exe-begin-file.rb")
+File.write(script, "BEGIN { puts __FILE__ }\n")
+output = ruby_exe(script)
+rm_r script
+output`)
+	if result == nil || result.Type != object.ValueString {
+		t.Fatalf("expected String, got %v", result)
+	}
+	if !strings.HasSuffix(result.Data.(string), "ruby-exe-begin-file.rb\n") {
+		t.Fatalf("expected output to end with script filename, got %q", result.Data.(string))
+	}
+}
+
+func TestRubyExeSimulatesEndWarningWithStderrRedirect(t *testing.T) {
+	result, _ := runRuby(t, `ruby_exe("def foo\n  END { }\nend\n", args: "2>&1")`)
+	assertStringResult(t, result, "warning: END in method; use at_exit\n")
+}
+
+func TestRubyExeEndHandlerExitSkipsRemainingHandlerBody(t *testing.T) {
+	result, _ := runRuby(t, `ruby_exe("END { print 3 }; END { print 4; exit; print 5 }; END { print 6 }")`)
+	assertStringResult(t, result, "643")
+}
+
+func TestRubyExeTopLevelReturnArgumentWarnsAndExitsZero(t *testing.T) {
+	result, _ := runRuby(t, `err = ruby_exe("return 10", args: "2>&1")
+[$?.exitstatus, err =~ /warning: argument of top-level return is ignored/]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	elements := result.Data.([]*object.EmeraldValue)
+	if len(elements) != 2 {
+		t.Fatalf("expected 2 elements, got %d", len(elements))
+	}
+	assertIntResult(t, elements[0], 0)
+	if elements[1] == nil || elements[1].Type == object.ValueNil || elements[1].Type == object.ValueBool && !elements[1].Data.(bool) {
+		t.Fatalf("expected warning regexp to match, got %v", elements[1])
+	}
+}
+
+func TestRubyExeNestedAtExitRunsImmediatelyAfterOuterHandler(t *testing.T) {
+	result, _ := runRuby(t, `ruby_exe("at_exit { puts 'first' }; at_exit { puts 'before'; at_exit { puts 'nested' }; puts 'after' }; at_exit { puts 'last' }")`)
+	assertStringResult(t, result, "last\nbefore\nafter\nnested\nfirst\n")
+}
+
+func TestRubyExeEndSharedExceptionScenarios(t *testing.T) {
+	result, _ := runRuby(t, `main_and_end = ruby_exe("END { raise 'at_exit_error' }; raise 'main_script_error'", args: "2>&1", exit_status: 1)
+ruby_exe("END { exit 43 }; exit 42", args: "2>&1", exit_status: 43)
+status_after_exit = $?.exitstatus
+stderr_order = ruby_exe("END { STDERR.puts 'last' }; END { exit 43 }; END { STDERR.puts 'first' }; exit 42", args: "2>&1", exit_status: 43)
+[
+  main_and_end.include?("at_exit_error (RuntimeError)"),
+  main_and_end.include?("main_script_error (RuntimeError)"),
+  status_after_exit == 43,
+  stderr_order == "first\nlast\n",
+  $?.exitstatus == 43,
+]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true, true})
+}
+
+func TestRubyExeEndHandlerSeesLastMainException(t *testing.T) {
+	result, _ := runRuby(t, `code = <<-RUBY
+END {
+  puts "The exception matches: \#{$! == $exception && $@ == $exception.backtrace} (message=\#{$!.message})"
+}
+begin
+  raise "foo"
+rescue => $exception
+  raise
+end
+RUBY
+out = ruby_exe(code, args: "2>&1", exit_status: 1)
+out`)
+	if result == nil || result.Type != object.ValueString {
+		t.Fatalf("expected String, got %v", result)
+	}
+	if !strings.Contains(result.Data.(string), "The exception matches: true (message=foo)\n") {
+		t.Fatalf("expected last exception line in output, got %q", result.Data.(string))
+	}
+}
+
+func TestRubyExeRequiredEndHandlerRunsWhenMainScriptParseFails(t *testing.T) {
+	result, _ := runRuby(t, `script = "vendor/ruby/spec/shared/kernel/fixtures/END.rb"
+out = ruby_exe("{", options: "-r#{script}", args: "2>&1", exit_status: 1)
+out`)
+	assertStringResult(t, result, "handler ran\nSyntaxError\n")
+}
+
+func TestRubyExeFormatWarnsForUnusedArgumentsWhenVerbose(t *testing.T) {
+	result, _ := runRuby(t, `ruby_exe("$VERBOSE = true\nformat(\"test\", 1)\n", args: "2>&1")`)
+	if result == nil || result.Type != object.ValueString {
+		t.Fatalf("expected String, got %v", result)
+	}
+	if !strings.Contains(result.Data.(string), "warning: too many arguments for format string") {
+		t.Fatalf("expected format warning, got %q", result.Data.(string))
+	}
+}
+
+func TestRubyExeIgnoresDisableGemsOptionForRgoSubprocess(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `ruby_exe("print srand(10)", options: "--disable-gems").should =~ /\A\d+\z/`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelPrintfWritesToSpecifiedIOAndGlobalStdout(t *testing.T) {
+	result, _ := runRuby(t, `require "stringio"
+io = StringIO.new("")
+specified = Kernel.printf(io, "%s", "x")
+stdout = $stdout
+begin
+  $stdout = io2 = StringIO.new("")
+  implicit = Kernel.printf("%s", "y")
+ensure
+  $stdout = stdout
+end
+[specified, io.string, implicit, io2.string]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 4 {
+		t.Fatalf("expected 4 values, got %d", len(values))
+	}
+	if values[0] != core.R.NilVal || values[2] != core.R.NilVal {
+		t.Fatalf("expected printf to return nil, got %v and %v", values[0].Inspect(), values[2].Inspect())
+	}
+	assertStringResult(t, values[1], "x")
+	assertStringResult(t, values[3], "y")
+}
+
+func TestStringLinesPreservesDefaultRecordSeparators(t *testing.T) {
+	result, _ := runRuby(t, `"foo\nbar\nbaz".lines`)
+	assertArrayOfStrings(t, result, []string{"foo\n", "bar\n", "baz"})
 }
 
 func TestIOEachLineHugeLimitRaisesRangeError(t *testing.T) {
@@ -6385,6 +7151,11 @@ $?.pid == pid`)
 	assertBoolResult(t, result, true)
 }
 
+func TestRubyExeWithoutSourceUsesCurrentRgoBinary(t *testing.T) {
+	result, _ := runRuby(t, `ruby_exe.first.end_with?("/rgo")`)
+	assertBoolResult(t, result, true)
+}
+
 func TestAttrReaderDefinesInstanceGetter(t *testing.T) {
 	result, _ := runRuby(t, `klass = Class.new do
   attr_reader :value
@@ -6640,6 +7411,32 @@ func TestStringGsubEmptyStringPatternTerminates(t *testing.T) {
 func TestStringGsubLineStartRegexpTerminates(t *testing.T) {
 	result, _ := runRuby(t, `"Text\nFoo".gsub(/^/, " ")`)
 	assertStringResult(t, result, " Text\n Foo")
+}
+
+func TestStringSubGsubSpecRegressionSemantics(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `
+-> { "hello".sub(Object.new, nil) }.should raise_error(TypeError)
+-> { "hello".gsub(nil, "x") }.should raise_error(TypeError)
+-> { "hello".sub(/[aeiou]/, []) }.should raise_error(TypeError)
+
+s = "hello"
+s.freeze
+-> { s.gsub!(/e/, "e") }.should raise_error(FrozenError)
+-> { s.sub!(/e/) { "e" } }.should raise_error(FrozenError)
+
+"hi".sub(/./) { |part| part + " " }.should == "h i"
+"hello".gsub(/[aeiou]/) { "*" }.should == "h*ll*"
+"hello".gsub(/./, "l" => "L").should == "LL"
+"abca".gsub!(/a/).to_a.should == ["a", "a"]
+
+source = "hllëllo"
+-> { source.gsub(/l/) { "Русский".force_encoding("iso-8859-5") } }.should raise_error(Encoding::CompatibilityError)
+source.gsub(/ë/) { "Русский".force_encoding("iso-8859-5") }.encoding.should == Encoding::ISO_8859_5`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
 }
 
 func TestKernelLoopRescuesStopIteration(t *testing.T) {
@@ -8444,6 +9241,11 @@ func TestStringRegexpMatchOperatorReturnsMatchIndex(t *testing.T) {
 	assertIntResult(t, result, 0)
 }
 
+func TestPercentRegexpCurlyDelimiterMatchesString(t *testing.T) {
+	result, _ := runRuby(t, `"vendor/ruby/mspec/lib/mspec/runner/mspec.rb" =~ %r{runner/mspec.rb}`)
+	assertIntResult(t, result, 28)
+}
+
 func TestStringRegexpMatchSupportsRubyAnchorsAndHexClass(t *testing.T) {
 	result, _ := runRuby(t, `"#<Module:0x1aF>" =~ /\A#<Module:0x\h+>\z/`)
 	assertIntResult(t, result, 0)
@@ -8499,6 +9301,18 @@ rescue TypeError
   true
 end`)
 	assertBoolResult(t, result, true)
+}
+
+func TestBareConstantLookupFallsBackToObjectConstants(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `Object.const_set(:ONLY_OBJECT_CONST_FOR_LOOKUP, :value)
+ONLY_OBJECT_CONST_FOR_LOOKUP.should == :value
+-> { ONLY_OBJECT_CONST_FOR_LOOKUP::X }.should raise_error(TypeError)
+Object.send(:remove_const, :ONLY_OBJECT_CONST_FOR_LOOKUP)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
 }
 
 func TestObjectDupDropsSingletonClassConstantsAndClonePreservesThem(t *testing.T) {
@@ -10825,6 +11639,28 @@ File.directory?(created).should == true
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestDirMkdirCoercesModeAndDirInspect(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "created")
+	core.RegisterMspec()
+	_, output := runRuby(t, fmt.Sprintf(`
+mode = mock('mode')
+mode.should_receive(:to_int).and_return(0666)
+Dir.mkdir(%q, mode).should == 0
+-> { Dir.mkdir(%q, Object.new) }.should raise_error(TypeError, "no implicit conversion of Object into Integer")
+d = Dir.new(%q)
+begin
+  d.inspect.should =~ /Dir/
+  d.inspect.should include(%q)
+ensure
+  d.close
+end`, target, filepath.Join(dir, "bad-mode"), dir, dir))
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
 	}
 }
 
@@ -14954,6 +15790,49 @@ ModuleSpecs::Autoload::Loaded.is_a?(Class)`, path))
 	}
 }
 
+func TestAutoloadRelativeUsesFileContextAndValidatesEvalContext(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+-> { eval('autoload_relative :EvalMissingContext, "missing.rb"') }.should raise_error(LoadError, /autoload_relative called without file context/)
+autoload_relative :NestedAutoloadRelativeRegression, "../kernel/fixtures/autoload_relative_b.rb"
+autoload?(:NestedAutoloadRelativeRegression).should.end_with?("autoload_relative_b.rb")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestQualifiedNestedModuleConstantAccessTriggersAutoload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested_autoload.rb")
+	if err := os.WriteFile(path, []byte("module QualifiedNestedAutoload\n  module Holder\n    class Loaded\n    end\n  end\nend\n"), 0o644); err != nil {
+		t.Fatalf("write autoload fixture: %v", err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`
+module QualifiedNestedAutoload
+  module Holder
+  end
+end
+QualifiedNestedAutoload::Holder.autoload(:Loaded, %q)
+QualifiedNestedAutoload::Holder::Loaded.is_a?(Class)`, path))
+	if result == nil || result.Type != object.ValueBool || !result.Data.(bool) {
+		t.Fatalf("expected nested qualified access to load class, got %v", result)
+	}
+}
+
+func TestModuleKernelReopensExistingKernelContainer(t *testing.T) {
+	result, _ := runRuby(t, `
+module Kernel
+  def module_kernel_reopen_regression
+    :ok
+  end
+end
+ModuleKernelReopenContinued = :ok`)
+	if result == nil || result.Type != object.ValueSymbol || result.Data.(string) != "ok" {
+		t.Fatalf("expected execution to continue after Kernel reopen, got %v", result)
+	}
+}
+
 func TestModuleUsingValidatesArgumentsAndReturnsReceiver(t *testing.T) {
 	result, _ := runRuby(t, `
 receiver = nil
@@ -16819,6 +17698,1126 @@ klass.new.minmax.should == [nil, nil]
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
+}
+
+func TestKernelPutcRaisesOnClosedStdout(t *testing.T) {
+	core.RegisterMspec()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "putc.txt")
+	_, _ = runRuby(t, fmt.Sprintf(`
+original_stdout = $stdout
+io = File.open(%q, "w")
+$stdout = io
+io.close
+-> { putc("a") }.should raise_error(IOError)
+-> { Kernel.putc("a") }.should raise_error(IOError)
+module KernelPutcClosedSpec
+  def self.putc_function(arg)
+    putc arg
+  end
+
+  def self.putc_method(arg)
+    Kernel.putc arg
+  end
+end
+-> { KernelPutcClosedSpec.putc_function("a") }.should raise_error(IOError)
+-> { KernelPutcClosedSpec.putc_method("a") }.should raise_error(IOError)
+$stdout = original_stdout`, path))
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelSendMethodsHaveVariableArity(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+method(:send).arity.should < 0
+method(:public_send).arity.should < 0`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelArrayConversionSemantics(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+class KernelArrayToArySpec
+  def to_ary
+    [1, 2]
+  end
+end
+
+class KernelArrayToASpec
+  def to_a
+    [3, 4]
+  end
+end
+
+class KernelArrayBadToArySpec
+  def to_ary
+    "bad"
+  end
+end
+
+Array(nil).should == []
+Array([1, 2]).should == [1, 2]
+Array(KernelArrayToArySpec.new).should == [1, 2]
+Array(KernelArrayToASpec.new).should == [3, 4]
+Array(Object.new).length.should == 1
+Kernel.Array(nil).should == []
+-> { Array(KernelArrayBadToArySpec.new) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelHashConversionSemantics(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+class KernelHashToHashSpec
+  def to_hash
+    { a: 1 }
+  end
+end
+
+class KernelHashBadToHashSpec
+  def to_hash
+    "bad"
+  end
+end
+
+Hash(nil).should == {}
+Hash([]).should == {}
+Hash({ a: 1 }).should == { a: 1 }
+Hash(KernelHashToHashSpec.new).should == { a: 1 }
+Kernel.Hash(nil).should == {}
+-> { Hash(Object.new) }.should raise_error(TypeError)
+-> { Hash(KernelHashBadToHashSpec.new) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelStringConversionErrorSemantics(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+class KernelStringNoToSSpec
+  undef_method :to_s
+end
+
+class KernelStringRespondsFalseSpec
+  def respond_to?(meth, include_private=false)
+    meth == :to_s ? false : super
+  end
+end
+
+class KernelStringRespondsTrueNoToSSpec
+  undef_method :to_s
+  def respond_to?(meth, include_private=false)
+    meth == :to_s ? true : super
+  end
+end
+
+class KernelStringBadToSSpec
+  def to_s
+    123
+  end
+end
+
+String(nil).should == ""
+String(false).should == "false"
+String(Object).should == "Object"
+-> { String(KernelStringNoToSSpec.new) }.should raise_error(TypeError)
+-> { String(KernelStringRespondsFalseSpec.new) }.should raise_error(TypeError)
+-> { String(KernelStringRespondsTrueNoToSSpec.new) }.should raise_error(TypeError)
+-> { String(KernelStringBadToSSpec.new) }.should raise_error(TypeError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelNumericConversionErrorsReachRaiseErrorMatcher(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `
+-> { Complex("not a complex") }.should raise_error(ArgumentError)
+-> { Rational(nil) }.should raise_error(TypeError)
+-> { Rational(1, 0) }.should raise_error(ZeroDivisionError)`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestKernelRaiseRejectsNonExceptionObjects(t *testing.T) {
+	cases := map[string]string{
+		"object":          `-> { raise(Object.new) }.should raise_error(TypeError, "exception class/object expected")`,
+		"true":            `-> { raise(true) }.should raise_error(TypeError, "exception class/object expected")`,
+		"false":           `-> { raise(false) }.should raise_error(TypeError, "exception class/object expected")`,
+		"nil":             `-> { raise(nil) }.should raise_error(TypeError, "exception class/object expected")`,
+		"objectMessage":   `-> { Object.new.send(:raise, Object.new, "message") }.should raise_error(TypeError, "exception class/object expected")`,
+		"objectMessageBt": `-> { Object.new.send(:raise, Object.new, "message", []) }.should raise_error(TypeError, "exception class/object expected")`,
+		"messageExtraArg": `-> { Object.new.send(:raise, "message", {}) }.should raise_error(TypeError, "exception class/object expected")`,
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			core.RegisterMspec()
+			_, output := runRuby(t, src)
+			runner := core.GetSpecRunner()
+			if runner.FailCount != 0 {
+				t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+			}
+		})
+	}
+}
+
+func TestKernelRaiseCauseSemantics(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `
+-> do
+  begin
+    raise StandardError, "first error"
+  rescue
+    Object.new.send(:raise, "second error")
+  end
+end.should raise_error(RuntimeError, "second error") do |error|
+  error.cause.should be_kind_of(StandardError)
+  error.cause.message.should == "first error"
+end
+
+-> {
+  begin
+    raise "Error 1"
+  rescue => error1
+    begin
+      raise "Error 2"
+    rescue => error2
+      begin
+        raise "Error 3"
+      rescue => error3
+        Object.new.send(:raise, error1, cause: error3)
+      end
+    end
+  end
+}.should raise_error(ArgumentError, "circular causes")`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestKernelSingletonMethodsReflection(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `
+module RgoSingletonMethodsSpec
+  module Prepended
+    def rgo_singleton_methods_marker
+    end
+    public :rgo_singleton_methods_marker
+  end
+
+  module M
+    def m_pub; end
+    def m_pro; end
+    protected :m_pro
+    def m_pri; end
+    private :m_pri
+  end
+
+  class P
+  end
+  P.extend M
+
+  ::Module.prepend Prepended
+
+  module SelfExtending
+    extend self
+  end
+end
+
+RgoSingletonMethodsSpec::P.singleton_methods(false).should == []
+RgoSingletonMethodsSpec::P.singleton_methods.should include(:m_pub, :m_pro)
+RgoSingletonMethodsSpec::P.singleton_methods.should_not include(:m_pri)
+mod = RgoSingletonMethodsSpec::SelfExtending
+mod.method(:rgo_singleton_methods_marker).owner.should == RgoSingletonMethodsSpec::Prepended
+ancestors = mod.singleton_class.ancestors
+ancestors[0...2].should == [mod.singleton_class, mod]
+ancestors.should include(RgoSingletonMethodsSpec::Prepended)
+mod.singleton_methods.should == []`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestModuleAutoloadRelativeLoadsRegisteredConstant(t *testing.T) {
+	core.RegisterMspec()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	specFile := filepath.Join(wd, "..", "..", "vendor", "ruby", "spec", "core", "module", "autoload_relative_spec.rb")
+	_, output := runRubyWithCurrentSpecFile(t, `
+require_relative '../../spec_helper'
+require_relative 'fixtures/classes'
+ModuleSpecs::Autoload.autoload_relative :AutoloadRelativeB, "fixtures/autoload_relative_a.rb"
+ModuleSpecs::Autoload::AutoloadRelativeB.should be_kind_of(Module)`, specFile)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestCallerFromAtExitOmitsMainFrame(t *testing.T) {
+	_, output := runRuby(t, `at_exit {
+  foo
+}
+
+def foo
+  puts caller(0)
+end
+`)
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 caller lines, got %d: %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], ":6:in 'foo'") {
+		t.Fatalf("expected foo frame, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], ":2:in 'block in <main>'") {
+		t.Fatalf("expected at_exit block frame, got %q", lines[1])
+	}
+}
+
+func TestCallerInSpecRunnerIncludesSyntheticMspecFrame(t *testing.T) {
+	oldSpecFile := core.CurrentSpecFile
+	oldRunner := os.Getenv("MSPEC_RUNNER")
+	core.CurrentSpecFile = filepath.Join("vendor", "ruby", "spec", "core", "kernel", "caller_spec.rb")
+	if err := os.Setenv("MSPEC_RUNNER", "1"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		core.CurrentSpecFile = oldSpecFile
+		if oldRunner == "" {
+			_ = os.Unsetenv("MSPEC_RUNNER")
+		} else {
+			_ = os.Setenv("MSPEC_RUNNER", oldRunner)
+		}
+	}()
+
+	result, _ := runRuby(t, `
+module KernelSpecs
+  class CallerTest
+    def self.locations(*args)
+      caller(*args)
+    end
+  end
+end
+def caller_spec_outer
+  KernelSpecs::CallerTest.locations(2)[0]
+end
+def caller_spec_wrapper
+  caller_spec_outer
+end
+caller_spec_wrapper
+`)
+	if result == nil || result.Type != object.ValueString {
+		t.Fatalf("expected caller string, got %#v", result)
+	}
+	if got := result.Data.(string); !strings.Contains(got, "runner/mspec.rb") {
+		t.Fatalf("expected synthetic mspec runner frame, got %q", got)
+	}
+}
+
+func TestExpectationEmptyMatcherHandlesHashes(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+{}.should.empty?
+{1 => 1}.should_not.empty?
+Hash.new(5).should.empty?
+Hash.new { 5 }.should.empty?
+Hash.new { |hsh, k| hsh[k] = k }.should.empty?
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashDefaultSurvivesClear(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = Hash.new(5)
+h[:a] = 1
+h.clear.should equal(h)
+h.default.should == 5
+h[:missing].should == 5
+
+h = {}
+h.default = "Go fish"
+h[:a] = 1
+h.clear
+h["z"].should == "Go fish"
+
+h = Hash.new { 5 }
+h[:a] = 1
+h.clear
+h.default_proc.should_not == nil
+
+-> { {}.freeze.clear }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashShiftUsesInsertionOrderAndRejectsFrozenReceiver(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2, c: 3 }
+visited = []
+shifted = []
+h.each_pair { |k, v|
+  visited << k
+  shifted << h.shift
+}
+visited.should == [:a, :b, :c]
+shifted.should == [[:a, 1], [:b, 2], [:c, 3]]
+h.should == {}
+
+-> { { a: 1 }.freeze.shift }.should raise_error(FrozenError)
+-> { {}.freeze.shift }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashReplaceTransfersDefaultsAndRejectsFrozenReceiver(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+hash = Hash.new(1)
+{ a: 1 }.replace(hash).default.should == 1
+
+pr = proc { |h, k| h[k] = [] }
+hash = Hash.new(&pr)
+{ a: 1 }.replace(hash).default_proc.should == pr
+
+hash = Hash.new(1)
+hash.replace(b: 2).default.should be_nil
+
+-> { { a: 1 }.freeze.replace({ a: 1 }) }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashMergeBangSharedUpdateSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+result = { a: 1 }.merge!({ b: 2 }, { c: 3 }, { d: 4 })
+result.should == { a: 1, b: 2, c: 3, d: 4 }
+
+h1 = { a: 2, b: -1 }
+h2 = { a: -2, c: 1 }
+h1.merge!(h2) { |k, x, y| 3.14 }.should equal(h1)
+h1.should == { c: 1, b: -1, a: 3.14 }
+
+-> { { a: 1 }.freeze.merge!(b: 2) }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashMergeUsesBlockForDuplicateKeysInOrder(t *testing.T) {
+	result, _ := runRuby(t, `
+h = { 1 => 2, 3 => 4, 5 => 6, "x" => nil, nil => 5, [] => [] }
+merge_pairs = []
+each_pairs = []
+h.each_pair { |k, v| each_pairs << [k, v] }
+merged = h.merge(h) { |k, v1, v2| merge_pairs << [k, v1]; v2 }
+merge_pairs == each_pairs && merged == h
+`)
+	if result == nil || result.Type != object.ValueBool || !result.Data.(bool) {
+		t.Fatalf("expected merge block to visit duplicate keys in order, got %v", result)
+	}
+}
+
+func TestHashDeleteBlockFrozenAndOrderedKeys(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+{ a: 1 }.delete(:missing) { |key| key }.should == :missing
+
+h = { a: 1, b: 2 }
+h.delete(:a).should == 1
+h[:c] = 3
+h.keys.should == [:b, :c]
+
+-> { { a: 1 }.freeze.delete(:missing) }.should raise_error(FrozenError)
+-> { {}.freeze.delete(:missing) }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashCompareByIdentityUsesObjectIdentity(t *testing.T) {
+	result, _ := runRuby(t, `
+first = ["foo"]
+second = ["foo"]
+h = {}
+h[first] = :regular
+regular_lookup = h[second]
+h.compare_by_identity
+h[second] = :identity
+[
+  h.compare_by_identity?,
+  h[first],
+  h[["foo"]],
+  h.values,
+  h.size,
+  h.compare_by_identity.equal?(h)
+]
+`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 6 {
+		t.Fatalf("expected 6 values, got %d", len(values))
+	}
+	assertBoolResult(t, values[0], true)
+	if values[1].Type != object.ValueSymbol || values[1].Data.(string) != "regular" {
+		t.Fatalf("expected first key lookup to keep original value, got %v", values[1])
+	}
+	assertNilResult(t, values[2])
+	valueList := values[3].Data.([]*object.EmeraldValue)
+	if len(valueList) != 2 {
+		t.Fatalf("expected two identity-distinct entries, got %d", len(valueList))
+	}
+	assertIntResult(t, values[4], 2)
+	assertBoolResult(t, values[5], true)
+}
+
+func TestHashKeepIfFiltersInPlaceAndReturnsEnumerator(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2, c: 3, d: 4 }
+h.keep_if { |k, v| v % 2 == 0 }.should equal(h)
+h.should == { b: 2, d: 4 }
+
+all_args = []
+{ 1 => 2, 3 => 4 }.keep_if { |*args| all_args << args }
+all_args.should == [[1, 2], [3, 4]]
+
+enum = { a: 1, b: 2 }.keep_if
+enum.size.should == 2
+enum.each { |k, v| v == 2 }
+
+-> { { a: 1 }.freeze.keep_if { true } }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashRejectAndRejectBangSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 9, c: 4 }.compare_by_identity
+h.reject { |k, _| k == :a }.compare_by_identity?.should == true
+h.reject { false }.default.should be_nil
+
+h = { a: 1, b: 2, c: 3 }
+h.reject! { |k, v| v.odd? }.should equal(h)
+h.should == { b: 2 }
+{ a: 1 }.reject! { |k, v| false }.should be_nil
+
+reject_bang_pairs = []
+delete_if_pairs = []
+{ a: 1, b: 2 }.reject! { |*pair| reject_bang_pairs << pair; false }
+{ a: 1, b: 2 }.delete_if { |*pair| delete_if_pairs << pair; false }
+reject_bang_pairs.should == delete_if_pairs
+
+-> { { a: 1 }.freeze.reject! { false } }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashCompactSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = Hash.new(1)
+h[:a] = nil
+h[:b] = 2
+copy = h.compact
+copy.should == { b: 2 }
+copy.default.should == 1
+h.should == { a: nil, b: 2 }
+
+pr = proc { |hash, key| hash[key] = [] }
+Hash.new(&pr).compact.default_proc.should == pr
+{}.compare_by_identity.compact.compare_by_identity?.should == true
+
+h.compact!.should equal(h)
+h.should == { b: 2 }
+h.compact!.should be_nil
+-> { { a: nil }.freeze.compact! }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashEntriesUsesToAOrder(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, 1 => :a, 3 => :b, b: 5 }
+pairs = []
+h.each_pair { |key, value| pairs << [key, value] }
+h.to_a.should == pairs
+h.entries.should == pairs
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashStoreRejectsFrozenReceiver(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1 }
+h.store(:b, 2).should == 2
+h.should == { a: 1, b: 2 }
+-> { h.freeze[:c] = 3 }.should raise_error(FrozenError)
+-> { h.store(:c, 3) }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashFlattenUsesToADepth(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: [2, 3] }
+h.flatten.should == [:a, 1, :b, [2, 3]]
+h.flatten(2).should == [:a, 1, :b, 2, 3]
+-> { h.flatten(Object.new) }.should raise_error(TypeError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashValuesAtUsesIndexSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 9, b: "a", c: -10, d: nil }
+h.values_at.should == []
+h.values_at(:a, :d, :b).should == [9, nil, "a"]
+Hash.new(1).values_at(:missing).should == [1]
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashTryConvertSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = {}
+Hash.try_convert(h).should equal(h)
+Hash.try_convert(Object.new).should be_nil
+
+obj = mock("to_hash")
+obj.should_receive(:to_hash).and_return(Object.new)
+-> { Hash.try_convert(obj) }.should raise_error(TypeError)
+
+boom = mock("to_hash")
+boom.should_receive(:to_hash).and_raise(RuntimeError)
+-> { Hash.try_convert(boom) }.should raise_error(RuntimeError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashFetchMissingKeySemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: nil }
+h.fetch(:a).should == 1
+h.fetch(:b, :default).should be_nil
+h.fetch(:missing, :default).should == :default
+h.fetch("a") { |key| key + "!" }.should == "a!"
+
+-> { h.fetch("foo") }.should raise_error(KeyError, 'key not found: "foo"') { |err|
+  err.receiver.should equal(h)
+  err.key.should == "foo"
+}
+-> { h.fetch }.should raise_error(ArgumentError)
+-> { h.fetch(1, 2, 3) }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashFetchValuesSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2, c: 3 }
+h.fetch_values(:c, :a).should == [3, 1]
+h.fetch_values.should == []
+h.fetch_values(:a, :z) { |key| key.to_s }.should == [1, "z"]
+-> { h.fetch_values(:z) }.should raise_error(KeyError) { |err|
+  err.receiver.should equal(h)
+  err.key.should == :z
+}
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashEachStrictCallablesReceivePair(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { "a" => 1 }
+pairs = []
+h.each { |key, value| pairs << [key, value] }
+pairs.should == [["a", 1]]
+
+obj = Object.new
+def obj.foo(key, value)
+end
+-> { h.each(&obj.method(:foo)) }.should raise_error(ArgumentError)
+-> { h.each(&-> key, value { }) }.should raise_error(ArgumentError)
+
+seen = []
+def obj.one(pair)
+  ScratchPad << pair
+end
+ScratchPad.record([])
+h.each(&obj.method(:one))
+ScratchPad.recorded.should == [["a", 1]]
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashComparisonSubsetSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h1 = { a: 1, b: 2 }
+h2 = { a: 1, b: 2, c: 3 }
+(h1 < h2).should == true
+(h1 <= h2).should == true
+(h2 > h1).should == true
+(h2 >= h1).should == true
+(h1 < h1).should == false
+({ a: 1 } < { a: 2 }).should == false
+
+o = Object.new
+def o.to_hash
+  { a: 1, b: 2, c: 3 }
+end
+(h1 < o).should == true
+-> { h1 < 1 }.should raise_error(TypeError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashDigSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { foo: [ { bar: [1] }, [nil, "str"] ] }
+h.dig(:foo, 0, :bar).should == [1]
+h.dig(:foo, 0, :bar, 0).should == 1
+h.dig(:foo, 1, 1).should == "str"
+-> { h.dig }.should raise_error(ArgumentError)
+-> { h.dig(:foo, 0, :bar, 0, 0) }.should raise_error(TypeError)
+-> { h.dig(:foo, 1, 1, 0) }.should raise_error(TypeError)
+
+default = { bar: 42 }
+Hash.new(default).dig(:foo, :bar).should == 42
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashInitializeRejectsFrozenReceiver(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1 }.freeze
+-> { h.instance_eval { initialize } }.should raise_error(FrozenError)
+-> { h.instance_eval { initialize(nil) } }.should raise_error(FrozenError)
+-> { h.instance_eval { initialize(5) } }.should raise_error(FrozenError)
+-> { h.instance_eval { initialize { 5 } } }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashRehashRejectsFrozenReceiver(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1 }
+h.rehash.should equal(h)
+-> { h.freeze.rehash }.should raise_error(FrozenError)
+-> { {}.freeze.rehash }.should raise_error(FrozenError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashTransformValuesBangFrozenAndEnumerator(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2 }
+h.transform_values!(&:succ).should equal(h)
+h.should == { a: 2, b: 3 }
+
+h = { a: 1, b: 2 }
+enum = h.transform_values!
+enum.size.should == 2
+enum.each(&:succ)
+h.should == { a: 2, b: 3 }
+
+-> { {}.freeze.transform_values!(&:succ) }.should raise_error(FrozenError)
+-> { { a: 1 }.freeze.transform_values!(&:succ) }.should raise_error(FrozenError)
+{ a: 1 }.freeze.transform_values!.should be_an_instance_of(Enumerator)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashTransformKeysSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2, c: 3 }
+h.transform_keys(&:succ).should == { b: 1, c: 2, d: 3 }
+h.should == { a: 1, b: 2, c: 3 }
+h.transform_keys({ a: :A }, &:to_s).should == { A: 1, "b" => 2, "c" => 3 }
+Hash.new(5).transform_keys.default.should be_nil
+{ a: 1 }.compare_by_identity.transform_keys(&:succ).compare_by_identity?.should == false
+
+h.transform_keys!(&:succ).should equal(h)
+h.should == { b: 1, c: 2, d: 3 }
+h.transform_keys!({ b: :B, d: :D })
+h.should == { B: 1, c: 2, D: 3 }
+
+h = { a: 1, b: 2 }
+enum = h.transform_keys!
+enum.size.should == 2
+enum.each(&:upcase).should equal(h)
+h.should == { A: 1, B: 2 }
+
+-> { {}.freeze.transform_keys!(&:upcase) }.should raise_error(FrozenError)
+-> { { a: 1 }.freeze.transform_keys!({ a: :A }) }.should raise_error(FrozenError)
+{ a: 1 }.freeze.transform_keys!.should be_an_instance_of(Enumerator)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashInspectAndToSFormatting(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: [1, 2], b: -2, d: -6, nil => nil }
+h.inspect.should == "{:a=>[1, 2], :b=>-2, :d=>-6, nil=>nil}"
+h.to_s.should == h.inspect
+
+key = mock("hash inspect key")
+value = mock("hash inspect value")
+key.should_receive(:inspect).and_return("key")
+value.should_receive(:inspect).and_return("value")
+{ key => value }.inspect.should == "{key=>value}"
+
+x = {}
+x[0] = x
+x.inspect.should == "{0=>{...}}"
+y = {}
+x = {}
+x[0] = y
+y[1] = x
+x.inspect.should == "{0=>{1=>{...}}}"
+y.inspect.should == "{1=>{0=>{...}}}"
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashToProcSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2 }
+pr = h.to_proc
+pr.should be_an_instance_of(Proc)
+pr.should.lambda?
+pr.arity.should == 1
+pr.call(:a).should == 1
+[:a, :b, :c].map(&pr).should == [1, 2, nil]
+
+Hash.new(9).to_proc.call(:missing).should == 9
+h.default_proc = -> hash, key { [hash.keys, key] }
+pr.call(:missing).should == [[:a, :b], :missing]
+
+other = { c: 3 }
+other.instance_exec(:a, &pr).should == 1
+-> { pr.call }.should raise_error(ArgumentError)
+-> { pr.call(:a, :b) }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashRuby2KeywordsHashCopySemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = Hash.new(1)
+h[:a] = 1
+h.instance_variable_set(:@foo, 42)
+kw = Hash.ruby2_keywords_hash(h)
+Hash.ruby2_keywords_hash?(h).should == false
+Hash.ruby2_keywords_hash?(kw).should == true
+kw.should == h
+kw.default.should == 1
+kw.instance_variable_get(:@foo).should == 42
+h[:a] = 2
+kw[:a].should == 1
+
+hash = {}.compare_by_identity
+Hash.ruby2_keywords_hash(hash).compare_by_identity?.should == true
+-> { Hash.ruby2_keywords_hash(nil) }.should raise_error(TypeError)
+-> { Hash.ruby2_keywords_hash?(nil) }.should raise_error(TypeError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestHashSelectFilterAndSharedSpecPreflight(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+h = { a: 1, b: 2, c: 3 }
+h.select { |k, v| v.odd? }.should == { a: 1, c: 3 }
+h.filter { |k, v| v > 1 }.should == { b: 2, c: 3 }
+h.select.default.should be_nil
+{ a: 1 }.compare_by_identity.select { true }.compare_by_identity?.should == true
+
+h = { a: 1, b: 2 }
+h.select! { |k, v| v <= 1 }.should equal(h)
+h.should == { a: 1 }
+h.select! { |k, v| true }.should be_nil
+-> { { a: 1 }.freeze.filter! { true } }.should raise_error(FrozenError)
+
+keyword_style = { _1: "a", _2: "b" }
+keyword_style.should == { _1: "a", _2: "b" }
+it "does not confuse the spec DSL with implicit it" do
+  { a: 1 }.select { |k, v| v == 1 }.should == { a: 1 }
+end
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestNilRationalizeSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+nil.rationalize.should == Rational(0, 1)
+nil.rationalize(0.1).should == Rational(0, 1)
+-> { nil.rationalize(0.1, 0.1) }.should raise_error(ArgumentError)
+-> { nil.rationalize(0.1, 0.1, 2) }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestThreadGroupDefaultConstant(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+ThreadGroup::Default.should be_kind_of(ThreadGroup)
+ThreadGroup::Default.should == Thread.main.group
+ThreadGroup::Default.list.should include(Thread.main)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestBuiltinRubyConstantsAreDefinedAndFrozen(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+[
+  RUBY_VERSION,
+  RUBY_COPYRIGHT,
+  RUBY_DESCRIPTION,
+  RUBY_ENGINE,
+  RUBY_ENGINE_VERSION,
+  RUBY_PLATFORM,
+  RUBY_RELEASE_DATE,
+  RUBY_REVISION,
+].each do |value|
+  value.should be_kind_of(String)
+  value.should.frozen?
+end
+RUBY_PATCHLEVEL.should be_kind_of(Integer)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestEnumeratorYielderAppendRejectsMultipleArguments(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+seen = []
+y = Enumerator::Yielder.new { |value| seen << value }
+(y << [1]).should equal(y)
+seen.should == [[1]]
+-> { y.<<(1, 2) }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestQueueNewCoercesEnumerableWithRubyErrors(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+enumerable = MockObject.new("mock-enumerable")
+enumerable.should_receive(:to_a).and_return([1, 2, 3])
+q = Queue.new(enumerable)
+q.size.should == 3
+q.pop.should == 1
+
+missing = MockObject.new("missing-to-a")
+-> { Queue.new(missing) }.should raise_error(TypeError, "can't convert MockObject into Array")
+
+bad = MockObject.new("bad-to-a")
+bad.should_receive(:to_a).and_return("string")
+-> { Queue.new(bad) }.should raise_error(TypeError, "can't convert MockObject into Array (MockObject#to_a gives String)")
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestBase64StrictDecode64Semantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+require "base64"
+Base64.strict_decode64("U2VuZCByZWluZm9yY2VtZW50cw==").should == "Send reinforcements"
+Base64.strict_decode64("SEk=").encoding.should == Encoding::BINARY
+-> { Base64.strict_decode64("U2VuZCByZWluZm9yY2VtZW50cw==\n") }.should raise_error(ArgumentError)
+-> { Base64.strict_decode64("=U2VuZCByZWluZm9yY2VtZW50cw==") }.should raise_error(ArgumentError)
+-> { Base64.strict_decode64("%3D") }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestShellwordsShellwordsSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+require "shellwords"
+Shellwords.shellwords('a "b b" a').should == ['a', 'b b', 'a']
+Shellwords.shellwords('a "\"b\" c" d').should == ['a', '"b" c', 'd']
+Shellwords.shellwords("a \"'b' c\" d").should == ['a', "'b' c", 'd']
+Shellwords.shellwords('a b\ c d').should == ['a', 'b c', 'd']
+Shellwords.shellsplit('printf "%s\n"').should == ['printf', '%s\n']
+-> { Shellwords.shellwords('a "b c d e') }.should raise_error(ArgumentError)
+-> { Shellwords.shellwords("a 'b c d e") }.should raise_error(ArgumentError)
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestTimeoutTimeoutSemantics(t *testing.T) {
+	_, output := runRuby(t, `
+require_relative "../../vendor/ruby/spec/spec_helper"
+require "timeout"
+RuntimeError.should be_ancestor_of(Timeout::Error)
+Timeout.timeout(1) { 42 }.should == 42
+-> { Timeout.timeout(-1) }.should raise_error(ArgumentError, "Timeout sec must be a non-negative number")
+-> { Timeout.timeout(1) { sleep } }.should raise_error(Timeout::Error, "execution expired")
+-> { Timeout.timeout(1, StandardError, "foobar") { sleep } }.should raise_error(StandardError, "foobar")
+-> { Timeout.timeout(1, StandardError, nil) { sleep } }.should raise_error(StandardError, "execution expired")
+`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
+func TestEnglishGlobalAliasesExposeCurrentException(t *testing.T) {
+	result, _ := runRuby(t, `
+require "English"
+exception = (1 / 0 rescue $ERROR_INFO)
+[
+  exception.kind_of?(Exception),
+  exception.backtrace.kind_of?(Array),
+  (1 / 0 rescue $ERROR_POSITION).kind_of?(Array)
+]
+`)
+	assertArrayOfBools(t, result, []bool{true, true, true})
 }
 
 func TestSuperCall(t *testing.T) {

@@ -25,7 +25,7 @@ func TestInspect(t *testing.T) {
 		{"false", &EmeraldValue{Type: ValueBool, Data: false}, "false"},
 		{"integer", &EmeraldValue{Type: ValueInteger, Data: int64(42)}, "42"},
 		{"float", &EmeraldValue{Type: ValueFloat, Data: 3.14}, "3.14"},
-		{"string", &EmeraldValue{Type: ValueString, Data: "hello"}, "hello"},
+		{"string", &EmeraldValue{Type: ValueString, Data: "hello"}, "\"hello\""},
 		{"symbol bare", &EmeraldValue{Type: ValueSymbol, Data: "foo"}, ":foo"},
 		{"symbol spaced", &EmeraldValue{Type: ValueSymbol, Data: "foo bar"}, ":\"foo bar\""},
 		{"symbol repeated operator", &EmeraldValue{Type: ValueSymbol, Data: "++"}, ":\"++\""},
