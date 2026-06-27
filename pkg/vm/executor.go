@@ -788,6 +788,12 @@ func (vm *VM) Run() error {
 		if err != nil {
 			return err
 		}
+		if vm.sp > frame.Bp {
+			top := vm.stack[vm.sp-1]
+			if top != nil && top.Type == object.ValueException && (core.LastRaisedResult == top || classInheritsFrom(top.Class, core.R.Classes["SystemExit"])) && !vm.frameHasActiveRescue(frame) {
+				break
+			}
+		}
 		frame = vm.frames[vm.fp]
 		instructions = frame.Fn.Instructions
 

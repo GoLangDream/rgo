@@ -40,7 +40,9 @@
 - [x] `vendor/ruby/spec/library/timeout` 最新局部刷新已全绿：`timeout_spec.rb` 为 `6 examples / 0 failures`，`error_spec.rb` 为 `1 example / 0 failures`。本轮补齐 `require "timeout"` 的本地 shim、`Timeout` 模块、`Timeout::Error < RuntimeError`，并实现当前 spec 覆盖的 `Timeout.timeout` 返回值、负数参数和指定异常/消息语义。
 - [x] `vendor/ruby/spec/library/English` 最新局部刷新已全绿：`2 pass / 2 files`，`27 examples / 0 failures`。本轮补齐 `require "English"` 的本地 shim 和标准 English 全局变量 aliases，并修正 VM 读取 alias global 时对 `$!` / `$@` 的动态解析，确保 rescue modifier 中 `$ERROR_INFO` / `$ERROR_POSITION` 可见。
 - [x] `vendor/ruby/spec/core/kernel/eval_spec.rb` 剩余隐藏 failure 已解除：根因为双引号语义 heredoc 未解码 `\t`，导致 magic encoding 注释前的 tab 被保留为反斜线+t，eval 源跳过常量定义。本轮为非单引号 heredoc 补常见 escape 解码并新增 lexer 回归；`eval_spec.rb` 当前 `56 examples / 0 failures`。
-- [ ] `vendor/ruby/spec/core/kernel` 当前刷新剩余 4 个非 pass：`caller_spec.rb` 为 `zero_examples`，`gsub_spec.rb` / `sub_spec.rb` 因 `ruby_version_is ""..."1.9"` guard 为 `zero_examples`，`exit_spec.rb` 为 timeout。`eval_spec.rb` 已从剩余列表移除；当前 kernel 刷新为 `113 pass / 118 files`。
+- [x] `vendor/ruby/spec/core/kernel/{caller,exit}_spec.rb` 已解除：`caller_spec.rb` 当前 `14 examples / 0 failures`，`exit_spec.rb` 当前 `30 examples / 0 failures`。本轮修正顶层 VM 对未被 rescue 的 `SystemExit` 返回值继续执行的问题、补齐 `Object#exit!` private 方法、让 `exit!` 跳过 `at_exit` handlers，并把 `exit` 参数缺少 `to_int` 时的内部 `NoMethodError` 规整为 `TypeError`。
+- [ ] `vendor/ruby/spec/core/kernel` 当前刷新剩余 2 个非 pass：`gsub_spec.rb` / `sub_spec.rb` 因整个文件受 `ruby_version_is ""..."1.9"` guard 包裹，当前均为 `zero_examples`。后续刷新 kernel 汇总时应把这类版本 guard 产物单独归类，避免误当作功能失败。
+- [ ] VM 全包 Go 测试需要单独排查：本轮 focused 测试通过，但 `go test ./pkg/vm -count=1 -json` 从 `TestRequiredEnumerableEachDefinerYieldsAllElements` 即出现既有 fixture 失败（返回 Object 而非 Array），随后在 `TestRubyExeInThreadCanBeSignaledBeforeJoin` 附近以 143 结束。按项目规则暂记录，后续单独收敛全包 gate。
 - [ ] `vendor/ruby/spec/core/data/to_s_spec.rb` 暂缓：当前运行时没有真正的 `Data` 类实现，`Data` 常量解析为 `nil`，导致 `DataSpecs::Measure` 等 fixture 依赖 mspec shim 漏洞继续执行；匿名递归 Data `to_s` 实际返回字符串 `"nil"`。后续应补原生 `Data.define`/实例存储/inspect/to_s 语义后再回收 data specs。
 
 ## 本次调试记录（2026-06-20）

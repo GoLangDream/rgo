@@ -463,6 +463,7 @@ var threadAbortOnExceptionDefault = false
 var atExitHooks []*object.EmeraldValue
 var endHookFns map[*object.Function]struct{}
 var InAtExitHooks bool
+var skipAtExitHooks bool
 var setTraceFuncValue *object.EmeraldValue
 var requiredFeatures = make(map[string]bool)
 var loadingFeatures = make(map[string]bool)
@@ -493,6 +494,10 @@ func RegisterEndHook(block *object.EmeraldValue) {
 }
 
 func RunAtExitHooks() {
+	if skipAtExitHooks {
+		skipAtExitHooks = false
+		return
+	}
 	runSignalExitTrap()
 	if len(atExitHooks) == 0 {
 		return
@@ -513,6 +518,11 @@ func RunAtExitHooks() {
 		result := CallBlockWithArgs(hook)
 		if result != nil && result.Type == object.ValueException {
 			LastException = result
+			if result.Class != nil && result.Class.Name == "SystemExit" {
+				if exc, ok := result.Data.(*object.RException); ok && exc != nil && exc.Message == "exit!" {
+					break
+				}
+			}
 		}
 	}
 }
@@ -1104,6 +1114,7 @@ func Init() {
 	kernelRand = rand.New(rand.NewSource(kernelRandSeed))
 	scratchPadRecorded = nil
 	atExitHooks = nil
+	skipAtExitHooks = false
 	endHookFns = make(map[*object.Function]struct{})
 	requiredFeatures = make(map[string]bool)
 	loadingFeatures = make(map[string]bool)
@@ -2790,6 +2801,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("loop", &object.Method{Name: "loop", Fn: builtinLoop, Arity: 0})
 	objectClass.DefineMethod("load", &object.Method{Name: "load", Fn: builtinLoad, Arity: -1})
 	objectClass.DefineMethod("exit", &object.Method{Name: "exit", Fn: builtinExit, Arity: -1})
+	objectClass.DefineMethod("exit!", &object.Method{Name: "exit!", Fn: builtinExitBang, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
 	objectClass.DefineMethod("caller", &object.Method{Name: "caller", Fn: builtinCaller, Arity: -1})
 	objectClass.DefineMethod("caller_locations", &object.Method{Name: "caller_locations", Fn: builtinCallerLocations, Arity: -1})
@@ -10501,6 +10513,7 @@ type rubyExeHandler struct {
 
 type rubyExeLifecycleState struct {
 	lastExceptionMessage string
+	exitBang             bool
 }
 
 var rubyExeMethodBlockRe = regexp.MustCompile(`(?s)\bdef\b[\s\S]*?\bend\b`)
@@ -10513,11 +10526,21 @@ func simulateRubyExeLifecycle(source string, filePath string) string {
 	output := executeRubyExeBlock("BEGIN", source, vars, filePath, state)
 	output += executeRubyExeMainRuntimeError(source, state)
 	handlers, warned := parseRubyExeHandlers(source, methodRanges)
+	withoutHandlers := rubyExeHandlerRe.ReplaceAllString(source, "")
+	if rubyExeContainsExitBang(withoutHandlers) {
+		if warned {
+			output += "warning: END in method; use at_exit\n"
+		}
+		return output
+	}
 	for len(handlers) > 0 {
 		idx := len(handlers) - 1
 		handler := handlers[idx]
 		handlers = handlers[:idx]
 		output += executeRubyExeStatements(handler.body, vars, filePath, state)
+		if state.exitBang {
+			break
+		}
 		nested, _ := parseRubyExeHandlers(handler.body, nil)
 		handlers = append(handlers, nested...)
 	}
@@ -10528,6 +10551,10 @@ func simulateRubyExeLifecycle(source string, filePath string) string {
 		return output
 	}
 	return simulateRubyExeLegacyBuiltin(source)
+}
+
+func rubyExeContainsExitBang(source string) bool {
+	return strings.Contains(source, "exit!") || strings.Contains(source, "send(:exit!") || strings.Contains(source, "send(:\"exit!\"")
 }
 
 func parseRubyExeHandlers(source string, methodRanges [][]int) ([]rubyExeHandler, bool) {
@@ -10695,6 +10722,9 @@ func executeRubyExeStatements(block string, vars map[string]string, filePath str
 				state.lastExceptionMessage = message
 				output += message + " (RuntimeError)\n"
 			}
+		case rubyExeContainsExitBang(part):
+			state.exitBang = true
+			return output
 		case part == "exit" || strings.HasPrefix(part, "exit ") || strings.HasPrefix(part, "exit("):
 			return output
 		}
@@ -25888,6 +25918,9 @@ func builtinExitBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if SetGlobalVariable != nil {
 		SetGlobalVariable("$?", newProcessStatus(-1, &status, nil))
 	}
+	if !InAtExitHooks {
+		skipAtExitHooks = true
+	}
 	return newSystemExit("exit!", status)
 }
 
@@ -27858,6 +27891,9 @@ func exitStatusFromArgs(args ...*object.EmeraldValue) (int64, *object.EmeraldVal
 	if CallMethod != nil {
 		coerced := CallMethod(arg, "to_int")
 		if coerced != nil && coerced.Type == object.ValueException {
+			if isNoMethodError(coerced) {
+				return 0, typeError("no implicit conversion to Integer")
+			}
 			return 0, coerced
 		}
 		if coerced != nil {

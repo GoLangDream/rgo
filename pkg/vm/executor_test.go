@@ -6430,6 +6430,49 @@ func TestRubyExeTopLevelReturnArgumentWarnsAndExitsZero(t *testing.T) {
 	}
 }
 
+func TestRubyExeExitBangFromFiberStopsProcess(t *testing.T) {
+	result, _ := runRuby(t, `out = ruby_exe("Fiber.new { Kernel.send(:exit!, 21) }.resume; print 'after'", args: "2>&1", exit_status: 21)
+[out, $?.exitstatus]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+	assertStringResult(t, values[0], "")
+	assertIntResult(t, values[1], 21)
+}
+
+func TestRubyExeExitBangSkipsAtExitHandlers(t *testing.T) {
+	result, _ := runRuby(t, `out = ruby_exe("at_exit { STDERR.puts 'at_exit' }; self.send(:exit!, 21)", args: "2>&1", exit_status: 21)
+[out, $?.exitstatus]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+	assertStringResult(t, values[0], "")
+	assertIntResult(t, values[1], 21)
+}
+
+func TestSpecRunnerExitBangRubyExeExpectationsPass(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "exit bang ruby_exe" do
+  it "counts the expectations as passing" do
+    out = ruby_exe("at_exit { STDERR.puts 'at_exit' }; self.send(:exit!, 21)", args: "2>&1", exit_status: 21)
+    out.should == ""
+    $?.exitstatus.should == 21
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestRubyExeNestedAtExitRunsImmediatelyAfterOuterHandler(t *testing.T) {
 	result, _ := runRuby(t, `ruby_exe("at_exit { puts 'first' }; at_exit { puts 'before'; at_exit { puts 'nested' }; puts 'after' }; at_exit { puts 'last' }")`)
 	assertStringResult(t, result, "last\nbefore\nafter\nnested\nfirst\n")
@@ -6814,14 +6857,15 @@ func TestProcessKillSignalZeroAcceptsCurrentProcess(t *testing.T) {
 }
 
 func TestProcessAbortRaisesSystemExit(t *testing.T) {
-	result, _ := runRuby(t, `Process.abort("message")`)
-	if result == nil || result.Type != object.ValueException {
-		t.Fatalf("expected SystemExit exception, got %v", result)
+	_, _ = runRuby(t, `Process.abort("message")`)
+	exception := core.LastException
+	if exception == nil || exception.Type != object.ValueException {
+		t.Fatalf("expected SystemExit exception, got %v", exception)
 	}
-	if result.Class == nil || result.Class.Name != "SystemExit" {
-		t.Fatalf("expected SystemExit class, got %v", result.Class)
+	if exception.Class == nil || exception.Class.Name != "SystemExit" {
+		t.Fatalf("expected SystemExit class, got %v", exception.Class)
 	}
-	exc := result.Data.(*object.RException)
+	exc := exception.Data.(*object.RException)
 	if exc.Message != "message" {
 		t.Fatalf("expected message, got %q", exc.Message)
 	}
@@ -6831,19 +6875,36 @@ func TestProcessAbortRaisesSystemExit(t *testing.T) {
 }
 
 func TestProcessExitRaisesSystemExitWithStatus(t *testing.T) {
-	result, _ := runRuby(t, `Process.exit(false)`)
-	if result == nil || result.Type != object.ValueException {
-		t.Fatalf("expected SystemExit exception, got %v", result)
+	_, _ = runRuby(t, `Process.exit(false)`)
+	exception := core.LastException
+	if exception == nil || exception.Type != object.ValueException {
+		t.Fatalf("expected SystemExit exception, got %v", exception)
 	}
-	if result.Class == nil || result.Class.Name != "SystemExit" {
-		t.Fatalf("expected SystemExit class, got %v", result.Class)
+	if exception.Class == nil || exception.Class.Name != "SystemExit" {
+		t.Fatalf("expected SystemExit class, got %v", exception.Class)
 	}
-	exc := result.Data.(*object.RException)
+	exc := exception.Data.(*object.RException)
 	if exc.Message != "exit" {
 		t.Fatalf("expected exit message, got %q", exc.Message)
 	}
 	if exc.Status == nil || *exc.Status != 1 {
 		t.Fatalf("expected status 1, got %v", exc.Status)
+	}
+}
+
+func TestProcessExitRaisesTypeErrorForNonIntegerLikeArgs(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "Process.exit argument conversion" do
+  it "raises TypeError for non-integer-like arguments" do
+    -> { Process.exit(Object.new) }.should raise_error(TypeError)
+    -> { Process.exit("0") }.should raise_error(TypeError)
+    -> { Process.exit([0]) }.should raise_error(TypeError)
+    -> { Process.exit(nil) }.should raise_error(TypeError)
+  end
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
 }
 
