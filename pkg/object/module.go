@@ -5,17 +5,22 @@ type Module struct {
 	NameValue           *EmeraldValue
 	TemporaryName       bool
 	IsRefinement        bool
+	RefinementTarget    *EmeraldValue
+	RefinementOwner     *EmeraldValue
 	Methods             map[string]*Method
 	Constants           map[string]*EmeraldValue
 	PrivateConstants    map[string]bool
 	DeprecatedConstants map[string]bool
 	Autoloads           map[string]string
+	ConstantLocations   map[string]ConstantLocation
+	AutoloadLocations   map[string]ConstantLocation
 	ClassVars           map[string]*EmeraldValue
 	InstanceVars        map[string]*EmeraldValue
 	Parent              *Module
 	IncludedModules     []*Module
 	PrependedModules    []*Module // Modules prepended via prepend
 	SingletonClass      *Class
+	UsedRefinements     []*EmeraldValue
 }
 
 func NewModule(name string) *Module {
@@ -26,6 +31,8 @@ func NewModule(name string) *Module {
 		PrivateConstants:    make(map[string]bool),
 		DeprecatedConstants: make(map[string]bool),
 		Autoloads:           make(map[string]string),
+		ConstantLocations:   make(map[string]ConstantLocation),
+		AutoloadLocations:   make(map[string]ConstantLocation),
 		ClassVars:           make(map[string]*EmeraldValue),
 		InstanceVars:        make(map[string]*EmeraldValue),
 	}
@@ -37,6 +44,14 @@ func (m *Module) DefineMethod(name string, method *Method) {
 
 func (m *Module) GetMethod(name string) (*Method, bool) {
 	method, ok := m.Methods[name]
+	if ok {
+		return method, true
+	}
+	for i := len(m.IncludedModules) - 1; i >= 0; i-- {
+		if method, ok := m.IncludedModules[i].GetMethod(name); ok {
+			return method, true
+		}
+	}
 	if !ok && m.Parent != nil {
 		return m.Parent.GetMethod(name)
 	}

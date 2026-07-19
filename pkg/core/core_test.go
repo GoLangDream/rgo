@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -132,8 +133,11 @@ func TestInitClassHierarchy(t *testing.T) {
 	if R.Classes["Object"].SuperClass != R.Classes["BasicObject"] {
 		t.Error("Object should inherit from BasicObject")
 	}
-	if R.Classes["Integer"].SuperClass != R.Classes["Object"] {
-		t.Error("Integer should inherit from Object")
+	if R.Classes["Integer"].SuperClass != R.Classes["Numeric"] {
+		t.Error("Integer should inherit from Numeric")
+	}
+	if R.Classes["Numeric"].SuperClass != R.Classes["Object"] {
+		t.Error("Numeric should inherit from Object")
 	}
 	if R.Classes["String"].SuperClass != R.Classes["Object"] {
 		t.Error("String should inherit from Object")
@@ -175,7 +179,7 @@ func TestIntDiv(t *testing.T) {
 }
 
 func TestIntDivByZero(t *testing.T) {
-	assertNil(t, callMethod(t, mkInt(10), "/", mkInt(0)))
+	assertExceptionType(t, callMethod(t, mkInt(10), "/", mkInt(0)), R.Classes["ZeroDivisionError"])
 }
 
 func TestIntMod(t *testing.T) {
@@ -183,7 +187,7 @@ func TestIntMod(t *testing.T) {
 }
 
 func TestIntModByZero(t *testing.T) {
-	assertNil(t, callMethod(t, mkInt(17), "%", mkInt(0)))
+	assertExceptionType(t, callMethod(t, mkInt(17), "%", mkInt(0)), R.Classes["ZeroDivisionError"])
 }
 
 func TestIntPow(t *testing.T) {
@@ -279,7 +283,7 @@ func TestFloatDiv(t *testing.T) {
 }
 
 func TestFloatDivByZero(t *testing.T) {
-	assertNil(t, callMethod(t, mkFloat(10.0), "/", mkFloat(0)))
+	assertFloat(t, callMethod(t, mkFloat(10.0), "/", mkFloat(0)), math.Inf(1))
 }
 
 func TestFloatToS(t *testing.T) {
@@ -336,6 +340,19 @@ func TestStringCapitalize(t *testing.T) {
 
 func TestStringReverse(t *testing.T) {
 	assertStr(t, callMethod(t, mkStr("hello"), "reverse"), "olleh")
+}
+
+func TestStringChopRemovesOneByteFromBinaryString(t *testing.T) {
+	value := mkStr("\xD0\xBF")
+	SetStringEncoding(value, "BINARY")
+	if encoding := stringEncodingName(value); encoding != "BINARY" {
+		t.Fatalf("expected BINARY encoding, got %q", encoding)
+	}
+	chunks := stringCharacterChunks(value)
+	if len(chunks) != 2 || len(chunks[1]) != 1 {
+		t.Fatalf("expected two byte chunks, got %#v", chunks)
+	}
+	assertStr(t, stringChop(value), "\xD0")
 }
 
 func TestStringInclude(t *testing.T) {
@@ -472,12 +489,12 @@ func TestHashIndexSetNilMap(t *testing.T) {
 	hash := mkMapHash(nil)
 	key := mkStr("k")
 	assertInt(t, callMethod(t, hash, "[]=", key, mkInt(42)), 42)
-	h, ok := hash.Data.(map[*object.EmeraldValue]*object.EmeraldValue)
+	h, ok := hash.Data.(*object.RHash)
 	if !ok {
-		t.Fatalf("expected map data, got %T", hash.Data)
+		t.Fatalf("expected RHash data, got %T", hash.Data)
 	}
-	if len(h) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(h))
+	if len(h.Pairs) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(h.Pairs))
 	}
 	assertInt(t, callMethod(t, hash, "[]", key), 42)
 }
@@ -573,4 +590,93 @@ func TestStringMethodsHandleObjectBackedStringValues(t *testing.T) {
 	assertStr(t, callMethod(t, wrapped, "<<", mkStr("suffix")), "suffix")
 	assertInt(t, callMethod(t, wrapped, "<=>", wrapped), 0)
 	assertExceptionType(t, callMethod(t, mkStr("abc"), "insert", mkInt(-5), mkStr("x")), R.Classes["IndexError"])
+}
+
+func TestShellQuoteJoinPreservesRubyGlobalReferences(t *testing.T) {
+	got := shellQuoteJoin([]string{"rgo", "-e", `$magic_comment_result = "x"`})
+	want := `'rgo' '-e' '$magic_comment_result = "x"'`
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestComparableEqualStopsObjectCompareRecursion(t *testing.T) {
+	previousCallMethod := CallMethod
+	defer func() { CallMethod = previousCallMethod }()
+
+	left := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(R.Classes["Object"]), Class: R.Classes["Object"]}
+	right := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(R.Classes["Object"]), Class: R.Classes["Object"]}
+	calls := 0
+	CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
+		calls++
+		if calls > 4 {
+			return R.NilVal
+		}
+		if ComparableEqual(receiver, args...) == R.TrueVal {
+			return mkInt(0)
+		}
+		return R.NilVal
+	}
+
+	result := ComparableEqual(left, right)
+	if result != R.FalseVal || calls != 1 {
+		t.Fatalf("expected one comparison and false, got calls=%d result=%s", calls, result.Inspect())
+	}
+}
+
+func TestExceptionMessageRetainsObjectAndCallsToS(t *testing.T) {
+	previousCallMethod := CallMethod
+	defer func() { CallMethod = previousCallMethod }()
+	CallMethod = func(receiver *object.EmeraldValue, name string, args ...*object.EmeraldValue) *object.EmeraldValue {
+		method, ok := receiver.Class.GetMethod(name)
+		if !ok {
+			return R.NilVal
+		}
+		return method.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue)(receiver, args...)
+	}
+
+	messageClass := object.NewClass("MessageForExceptionTest")
+	messageClass.SuperClass = R.Classes["Object"]
+	messageClass.DefineMethod("to_s", &object.Method{Name: "to_s", Arity: 0, Fn: func(_ *object.EmeraldValue, _ ...*object.EmeraldValue) *object.EmeraldValue {
+		return mkStr("converted message")
+	}})
+	message := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(messageClass), Class: messageClass}
+
+	exceptionClassValue := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Exception"], Class: R.Classes["Class"]}
+	exception := classNew(exceptionClassValue, message)
+	assertStr(t, callMethod(t, exception, "to_s"), "converted message")
+}
+
+func TestExceptionEqualComparesClassMessageAndBacktrace(t *testing.T) {
+	left := newExceptionObject(R.Classes["RuntimeError"], "message")
+	right := newExceptionObject(R.Classes["RuntimeError"], "message")
+	exceptionSetBacktrace(left, mkArr(mkStr("same:1")))
+	exceptionSetBacktrace(right, mkArr(mkStr("same:1")))
+
+	assertBool(t, callMethod(t, left, "==", right), true)
+}
+
+func TestExceptionDupCallsInitializeDup(t *testing.T) {
+	previousCallMethod := CallMethod
+	defer func() { CallMethod = previousCallMethod }()
+
+	called := false
+	klass := object.NewClass("CopyableExceptionTest")
+	klass.SuperClass = R.Classes["Exception"]
+	klass.DefineMethod("initialize_dup", &object.Method{Name: "initialize_dup", Arity: 1, Fn: func(receiver *object.EmeraldValue, _ ...*object.EmeraldValue) *object.EmeraldValue {
+		called = true
+		return receiver
+	}})
+	CallMethod = func(receiver *object.EmeraldValue, name string, args ...*object.EmeraldValue) *object.EmeraldValue {
+		method, ok := receiver.Class.GetMethod(name)
+		if !ok {
+			return R.NilVal
+		}
+		return method.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue)(receiver, args...)
+	}
+
+	duplicate := methodDup(newExceptionObject(klass, "message"))
+	if duplicate.Type == object.ValueException && !called {
+		t.Fatal("Exception#dup did not call initialize_dup")
+	}
 }

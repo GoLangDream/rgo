@@ -11,6 +11,8 @@ type Class struct {
 	PrivateConstants    map[string]bool
 	DeprecatedConstants map[string]bool
 	Autoloads           map[string]string
+	ConstantLocations   map[string]ConstantLocation
+	AutoloadLocations   map[string]ConstantLocation
 	ClassVars           map[string]*EmeraldValue
 	ClassMethods        map[string]*Method
 	InstanceVars        map[string]*EmeraldValue
@@ -20,6 +22,10 @@ type Class struct {
 	SingletonClass      *Class
 	IncludedModules     []*Module // Modules included via include
 	PrependedModules    []*Module // Modules prepended via prepend
+	UsedRefinements     []*EmeraldValue
+	StructFields        []string
+	StructKeywordInit   int
+	DirectSubclasses    []*Class
 }
 
 func NewClass(name string) *Class {
@@ -30,6 +36,8 @@ func NewClass(name string) *Class {
 		PrivateConstants:    make(map[string]bool),
 		DeprecatedConstants: make(map[string]bool),
 		Autoloads:           make(map[string]string),
+		ConstantLocations:   make(map[string]ConstantLocation),
+		AutoloadLocations:   make(map[string]ConstantLocation),
 		ClassVars:           make(map[string]*EmeraldValue),
 		ClassMethods:        make(map[string]*Method),
 		InstanceVars:        make(map[string]*EmeraldValue),
@@ -72,8 +80,10 @@ func (c *Class) GetMethodWithOwner(name string) (*Method, *Class, bool) {
 		return method, c, true
 	}
 
-	// Check included modules
-	for _, mod := range c.IncludedModules {
+	// Check included modules. Later includes have higher priority in Ruby's
+	// ancestor chain.
+	for i := len(c.IncludedModules) - 1; i >= 0; i-- {
+		mod := c.IncludedModules[i]
 		if method, ok := mod.GetMethod(name); ok {
 			return method, c, true
 		}
@@ -132,9 +142,11 @@ func (c *Class) NewInstance() *EmeraldValue {
 type Object struct {
 	Class            *Class
 	InstanceVars     map[string]*EmeraldValue
+	InstanceVarOrder []string
 	ClassVars        map[string]*EmeraldValue
 	SingletonMethods map[string]*Method
 	SingletonClass   *Class
+	StructValues     []*EmeraldValue
 }
 
 func NewObject(class *Class) *Object {
@@ -154,6 +166,9 @@ func (o *Object) GetInstanceVar(name string) *EmeraldValue {
 }
 
 func (o *Object) SetInstanceVar(name string, value *EmeraldValue) {
+	if _, exists := o.InstanceVars[name]; !exists {
+		o.InstanceVarOrder = append(o.InstanceVarOrder, name)
+	}
 	o.InstanceVars[name] = value
 }
 

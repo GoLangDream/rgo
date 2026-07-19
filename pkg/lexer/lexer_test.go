@@ -30,6 +30,18 @@ func tokenizeClean(input string) []Token {
 	return result
 }
 
+func TestEndMarkerPermanentlyEndsLexing(t *testing.T) {
+	tokens := tokenizeClean("before\n__END__\nafter")
+	if len(tokens) != 1 || tokens[0].Type != IDENT || tokens[0].Literal != "before" {
+		t.Fatalf("expected only the token before __END__, got %v", tokens)
+	}
+
+	tokens = tokenizeClean("value__END__ = 1")
+	if len(tokens) == 0 || tokens[0].Literal != "value__END__" {
+		t.Fatalf("embedded __END__ must remain an identifier, got %v", tokens)
+	}
+}
+
 func TestIntegerLiterals(t *testing.T) {
 	tests := []struct {
 		input   string
@@ -146,7 +158,9 @@ func TestStringLiterals(t *testing.T) {
 		{"escape tab", `"hello\tworld"`, "hello\tworld"},
 		{"escape quote", `"say \"hi\""`, `say "hi"`},
 		{"escape nul", `"hello\0world"`, "hello\x00world"},
-		{"escape ordinary hash", `"\#@"`, "#@"},
+		{"octal escapes are raw bytes", `"\303\202"`, "\xC3\x82"},
+		{"unicode escape", `"\u3042"`, "あ"},
+		{"escape ordinary hash", `"\#@"`, EscapedHashInterpolation + "@"},
 	}
 
 	for _, tt := range tests {
@@ -179,12 +193,22 @@ func TestDoubleQuotedStringKeepsHashCharacter(t *testing.T) {
 }
 
 func TestSquigglyHeredocToken(t *testing.T) {
-	toks := tokenizeClean("code = <<~CODE\n  10\nCODE\n")
+	toks := tokenizeClean("code = <<~CODE\n    first\n      second\nCODE\n")
 	if len(toks) != 3 {
 		t.Fatalf("expected 3 tokens, got %d: %v", len(toks), toks)
 	}
 	if toks[2].Type != STRING {
 		t.Fatalf("expected heredoc STRING token, got %s %q", toks[2].Type, toks[2].Literal)
+	}
+	if toks[2].Literal != "first\n  second\n" {
+		t.Fatalf("expected common indentation removed, got %q", toks[2].Literal)
+	}
+}
+
+func TestSquigglyHeredocJoinsEscapedNewline(t *testing.T) {
+	toks := tokenizeClean("code = <<~CODE\n  a\n  b\\\n  c\nCODE\n")
+	if len(toks) != 3 || toks[2].Literal != "a\nbc\n" {
+		t.Fatalf("expected escaped newline to join lines, got %v", toks)
 	}
 }
 
@@ -198,6 +222,13 @@ func TestHeredocInterpolationFlag(t *testing.T) {
 	}
 	if toks[5].AllowsInterpolation {
 		t.Fatalf("expected single-quoted heredoc to disable interpolation")
+	}
+}
+
+func TestQuotedHeredocIdentifierMustEndOnDeclarationLine(t *testing.T) {
+	tokens := tokenizeClean("<<\"HERE\n\"\nbody\nHERE\n")
+	if len(tokens) == 0 || tokens[0].Type != ILLEGAL {
+		t.Fatalf("expected illegal unterminated quoted heredoc identifier, got %v", tokens)
 	}
 }
 
@@ -260,6 +291,13 @@ func TestRegexpLiteral(t *testing.T) {
 	}
 	if toks[0].Literal != `/foo/i` {
 		t.Errorf("expected literal /foo/i, got %q", toks[0].Literal)
+	}
+}
+
+func TestPercentRegexpAllowsBackslashAsDelimiter(t *testing.T) {
+	toks := tokenizeClean(`%r\ foo \`)
+	if len(toks) != 1 || toks[0].Type != REGEXP || toks[0].Literal != `%r\ foo \` {
+		t.Fatalf("expected backslash-delimited regexp, got %v", toks)
 	}
 }
 
@@ -700,7 +738,7 @@ func TestBarePercentString(t *testing.T) {
 	if toks[0].Type != STRING {
 		t.Fatalf("expected STRING, got %s", toks[0].Type)
 	}
-	if toks[0].Literal != `"utf_16be \u3042"` {
+	if toks[0].Literal != `"utf_16be あ"` {
 		t.Fatalf("unexpected literal %q", toks[0].Literal)
 	}
 }
@@ -757,6 +795,13 @@ func TestPercentStringWithNestedInterpolationBraces(t *testing.T) {
 	}
 }
 
+func TestPercentQStringDecodesDoubleQuotedEscapes(t *testing.T) {
+	toks := tokenizeClean(`%Q[A\nB\tC]`)
+	if len(toks) != 1 || toks[0].Type != STRING || toks[0].Literal != "A\nB\tC" {
+		t.Fatalf("expected decoded percent-Q string, got %v", toks)
+	}
+}
+
 func TestSafeNavigatorToken(t *testing.T) {
 	toks := tokenizeClean("nil&.to_s")
 	if len(toks) != 3 {
@@ -792,8 +837,18 @@ func TestSingleQuotedEscapedBackslash(t *testing.T) {
 	if len(toks) != 3 {
 		t.Fatalf("expected 3 tokens, got %d: %v", len(toks), toks)
 	}
-	if toks[1].Type != STRING || toks[1].Literal != `\\` {
+	if toks[1].Type != STRING || toks[1].Literal != `\` {
 		t.Fatalf("expected escaped backslash string, got %s %q", toks[1].Type, toks[1].Literal)
+	}
+}
+
+func TestSingleQuotedStringPreservesNonUTF8SourceBytes(t *testing.T) {
+	toks := tokenizeClean("'\xa7A\xa6n'")
+	if len(toks) != 1 || toks[0].Type != STRING {
+		t.Fatalf("expected one STRING token, got %v", toks)
+	}
+	if toks[0].Literal != "\xa7A\xa6n" {
+		t.Fatalf("expected raw Big5 bytes, got % x", []byte(toks[0].Literal))
 	}
 }
 
@@ -1191,6 +1246,13 @@ func TestHexEscapeInStringPreservesRawByte(t *testing.T) {
 	}
 }
 
+func TestHexEscapeInCommandLiteralPreservesRawByte(t *testing.T) {
+	toks := tokenizeClean("`echo \\xC2`")
+	if len(toks) != 1 || !toks[0].CommandLiteral || toks[0].Literal != "echo \xc2" {
+		t.Fatalf("expected command literal with raw byte c2, got %#v", toks)
+	}
+}
+
 func TestBangOperator(t *testing.T) {
 	toks := tokenizeClean("!")
 	if len(toks) != 1 {
@@ -1220,6 +1282,19 @@ func TestCharacterLiteral(t *testing.T) {
 	for i, lit := range expected {
 		if toks[i].Type != STRING || toks[i].Literal != lit {
 			t.Fatalf("token %d: expected STRING %q, got %s %q", i, lit, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
+func TestControlAndMetaCharacterLiterals(t *testing.T) {
+	toks := tokenizeClean(`?\C-z ?\M-z ?\M-\C-z`)
+	expected := []string{"\x1a", "\xfa", "\x9a"}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, want := range expected {
+		if toks[i].Type != STRING || toks[i].Literal != want {
+			t.Fatalf("token %d: expected STRING %x, got %s %x", i, []byte(want), toks[i].Type, []byte(toks[i].Literal))
 		}
 	}
 }
@@ -1256,9 +1331,11 @@ func TestImaginaryNumericSuffixTokens(t *testing.T) {
 		typ     TokenType
 		literal string
 	}{
-		{"1i", INT, "1"},
-		{"0.0i", FLOAT, "0.0"},
-		{"1.0e2i", FLOAT, "1.0e2"},
+		{"1i", IMAGINARY, "1"},
+		{"0.0i", IMAGINARY, "0.0"},
+		{"1.0e2i", IMAGINARY, "1.0e2"},
+		{"0x2ai", IMAGINARY, "0x2a"},
+		{"0b101i", IMAGINARY, "0b101"},
 	}
 
 	for _, tt := range tests {

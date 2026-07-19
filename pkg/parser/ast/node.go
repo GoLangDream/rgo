@@ -2,6 +2,7 @@ package ast
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/GoLangDream/rgo/pkg/lexer"
 )
@@ -81,6 +82,15 @@ type RationalLiteral struct {
 	Value string
 }
 
+type ImaginaryLiteral struct {
+	Token   lexer.Token
+	Numeric Expression
+}
+
+func (i *ImaginaryLiteral) expressionNode()      {}
+func (i *ImaginaryLiteral) TokenLiteral() string { return i.Token.Literal }
+func (i *ImaginaryLiteral) String() string       { return i.Token.Literal + "i" }
+
 func (r *RationalLiteral) expressionNode()      {}
 func (r *RationalLiteral) TokenLiteral() string { return r.Token.Literal }
 func (r *RationalLiteral) String() string       { return r.Token.Literal }
@@ -95,6 +105,21 @@ type StringLiteral struct {
 func (s *StringLiteral) expressionNode()      {}
 func (s *StringLiteral) TokenLiteral() string { return s.Token.Literal }
 func (s *StringLiteral) String() string       { return s.Token.Literal }
+
+type StringConcatExpression struct {
+	Token lexer.Token
+	Parts []*StringLiteral
+}
+
+func (s *StringConcatExpression) expressionNode()      {}
+func (s *StringConcatExpression) TokenLiteral() string { return s.Token.Literal }
+func (s *StringConcatExpression) String() string {
+	var out strings.Builder
+	for _, part := range s.Parts {
+		out.WriteString(part.String())
+	}
+	return out.String()
+}
 
 type SymbolLiteral struct {
 	Token lexer.Token
@@ -210,10 +235,12 @@ func (t *TernaryExpression) String() string {
 }
 
 type RangeExpression struct {
-	Token     lexer.Token
-	Left      Expression
-	Right     Expression
-	Exclusive bool
+	Token        lexer.Token
+	Left         Expression
+	Right        Expression
+	Exclusive    bool
+	StartMissing bool
+	EndMissing   bool
 }
 
 func (r *RangeExpression) expressionNode()      {}
@@ -229,6 +256,7 @@ func (r *RangeExpression) String() string {
 type BlockExpression struct {
 	Token             lexer.Token
 	Params            []*Identifier
+	ParamPatterns     []*ParameterPattern
 	BlockLocals       []string
 	ParamDefaults     []Expression
 	RestParam         *Identifier
@@ -237,10 +265,19 @@ type BlockExpression struct {
 	RejectKeywords    bool
 	SingleDestructure bool
 	KeywordRestOnly   bool
+	KeywordRestParam  *Identifier
 	KeywordParams     []*KeywordParam
 	BlockParam        *Identifier
 	RejectBlock       bool
 	Statements        []Statement
+}
+
+type ParameterPattern struct {
+	Token     lexer.Token
+	Name      *Identifier
+	Children  []*ParameterPattern
+	Rest      *ParameterPattern
+	RestIndex int
 }
 
 func (b *BlockExpression) expressionNode()      {}
@@ -293,9 +330,11 @@ type CaseExpression struct {
 }
 
 type PatternMatchExpression struct {
-	Token   lexer.Token
-	Left    Expression
-	Pattern string
+	Token       lexer.Token
+	Left        Expression
+	Pattern     string
+	Guard       Expression
+	GuardUnless bool
 }
 
 func (p *PatternMatchExpression) expressionNode()      {}
@@ -338,6 +377,7 @@ type WhileExpression struct {
 	Token     lexer.Token
 	Condition Expression
 	Body      *BlockExpression
+	Post      bool
 }
 
 func (w *WhileExpression) expressionNode()      {}
@@ -350,6 +390,7 @@ type UntilExpression struct {
 	Token     lexer.Token
 	Condition Expression
 	Body      *BlockExpression
+	Post      bool
 }
 
 func (u *UntilExpression) expressionNode()      {}
@@ -410,8 +451,10 @@ type DefExpression struct {
 	Token            lexer.Token
 	Name             *Identifier
 	Params           []*Identifier
+	ParamPatterns    []*ParameterPattern
 	ParamDefaults    []Expression
 	RestParam        *Identifier // *rest parameter, nil if none
+	RestParamIndex   int
 	RejectKeywords   bool
 	KeywordRestOnly  bool
 	KeywordRestParam *Identifier
@@ -467,6 +510,7 @@ func (d *DefExpression) String() string {
 type ClassExpression struct {
 	Token             lexer.Token
 	Name              *Identifier
+	Absolute          bool
 	SuperClass        Expression
 	SingletonReceiver Expression
 	Body              *BlockExpression
@@ -486,9 +530,10 @@ func (c *ClassExpression) String() string {
 }
 
 type ModuleExpression struct {
-	Token lexer.Token
-	Name  *Identifier
-	Body  *BlockExpression
+	Token    lexer.Token
+	Name     *Identifier
+	Absolute bool
+	Body     *BlockExpression
 }
 
 func (m *ModuleExpression) expressionNode()      {}
@@ -788,6 +833,8 @@ type MethodCall struct {
 	KeywordArgs       []*KeywordArg
 	Block             *BlockExpression
 	Safe              bool
+	Assignment        bool
+	LogicalAssignment lexer.TokenType
 	ParenthesizedArgs bool
 }
 
@@ -881,9 +928,10 @@ func (b *BeginExpression) String() string {
 }
 
 type RaiseExpression struct {
-	Token   lexer.Token
-	Error   Expression
-	Message Expression
+	Token            lexer.Token
+	Error            Expression
+	Message          Expression
+	MessageIsKeyword bool
 }
 
 func (r *RaiseExpression) statementNode()       {}
@@ -984,15 +1032,19 @@ func (d *DefinedExpression) TokenLiteral() string { return d.Token.Literal }
 func (d *DefinedExpression) String() string       { return "defined?(" + d.Expression.String() + ")" }
 
 type ProcLiteral struct {
-	Token          lexer.Token
-	Params         []*Identifier
-	ParamDefaults  []Expression
-	RestParam      *Identifier
-	RestParamIndex int
-	RejectKeywords bool
-	BlockParam     *Identifier
-	RejectBlock    bool
-	Body           *BlockExpression
+	Token            lexer.Token
+	Params           []*Identifier
+	ParamPatterns    []*ParameterPattern
+	ParamDefaults    []Expression
+	RestParam        *Identifier
+	RestParamIndex   int
+	RejectKeywords   bool
+	KeywordRestOnly  bool
+	KeywordRestParam *Identifier
+	KeywordParams    []*KeywordParam
+	BlockParam       *Identifier
+	RejectBlock      bool
+	Body             *BlockExpression
 }
 
 func (p *ProcLiteral) expressionNode()      {}

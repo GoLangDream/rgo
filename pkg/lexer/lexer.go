@@ -1,7 +1,6 @@
 package lexer
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -10,6 +9,7 @@ import (
 
 type Lexer struct {
 	input        string
+	encoding     string
 	position     int
 	readPosition int
 	ch           rune
@@ -21,12 +21,36 @@ type Lexer struct {
 }
 
 func New(input string) *Lexer {
+	return NewWithEncoding(input, "UTF-8")
+}
+
+func NewWithEncoding(input, encoding string) *Lexer {
 	l := &Lexer{
-		input: input,
-		line:  1,
+		input:    input,
+		encoding: strings.ToUpper(strings.ReplaceAll(encoding, "_", "-")),
+		line:     1,
 	}
 	l.readChar()
 	return l
+}
+
+func (l *Lexer) decodeRuneAt(position int) (rune, int) {
+	if position >= len(l.input) {
+		return 0, 0
+	}
+	if l.encoding == "WINDOWS-31J" || l.encoding == "CP932" || l.encoding == "SJIS" || l.encoding == "SHIFT-JIS" {
+		first := l.input[position]
+		if ((first >= 0x81 && first <= 0x9f) || (first >= 0xe0 && first <= 0xfc)) && position+1 < len(l.input) {
+			second := l.input[position+1]
+			if (second >= 0x40 && second <= 0x7e) || (second >= 0x80 && second <= 0xfc) {
+				return '\u0100', 2
+			}
+		}
+		if first >= 0xa1 && first <= 0xdf {
+			return '\u0100', 1
+		}
+	}
+	return utf8.DecodeRuneInString(l.input[position:])
 }
 
 func (l *Lexer) readChar() {
@@ -34,7 +58,7 @@ func (l *Lexer) readChar() {
 		l.ch = 0
 		l.position = l.readPosition
 	} else {
-		r, w := utf8.DecodeRuneInString(l.input[l.readPosition:])
+		r, w := l.decodeRuneAt(l.readPosition)
 		l.ch = r
 		l.position = l.readPosition
 		l.readPosition += w
@@ -52,7 +76,7 @@ func (l *Lexer) peekChar() rune {
 	if l.readPosition >= len(l.input) {
 		return 0
 	}
-	r, _ := utf8.DecodeRuneInString(l.input[l.readPosition:])
+	r, _ := l.decodeRuneAt(l.readPosition)
 	return r
 }
 
@@ -62,13 +86,13 @@ func (l *Lexer) peekCharN(n int) rune {
 		if pos >= len(l.input) {
 			return 0
 		}
-		_, w := utf8.DecodeRuneInString(l.input[pos:])
+		_, w := l.decodeRuneAt(pos)
 		pos += w
 	}
 	if pos >= len(l.input) {
 		return 0
 	}
-	r, _ := utf8.DecodeRuneInString(l.input[pos:])
+	r, _ := l.decodeRuneAt(pos)
 	return r
 }
 
@@ -344,9 +368,12 @@ func (l *Lexer) NextToken() Token {
 		tok = l.readGlobalVariable()
 		return tok // readGlobalVariable already advanced past content
 	case '_':
-		if len(l.input[l.position:]) >= 5 && l.input[l.position:l.position+5] == "__END__" {
-			tok.Type = EOF
-			tok.Literal = ""
+		if l.column == 1 && len(l.input[l.position:]) >= 7 && l.input[l.position:l.position+7] == "__END__" &&
+			(l.position+7 == len(l.input) || l.input[l.position+7] == '\n' || l.input[l.position+7] == '\r') {
+			l.position = len(l.input)
+			l.readPosition = len(l.input)
+			l.ch = 0
+			return Token{Type: EOF, Literal: "", Line: tok.Line, Column: tok.Column}
 		} else {
 			tok = l.readIdentifier()
 			return tok // readIdentifier already advanced past content
@@ -513,7 +540,7 @@ func (l *Lexer) readGlobalVariable() Token {
 				l.readChar()
 			}
 			return Token{
-				Type:    IDENT,
+				Type:    DOLLAR,
 				Literal: "$-" + l.input[position:l.position],
 				Line:    l.line,
 				Column:  l.column,
@@ -601,27 +628,8 @@ func (l *Lexer) readDecimalNumber(position int) Token {
 		return l.readExponent(position)
 	}
 
-	if l.ch == 'r' {
-		l.readChar()
-		lit := l.input[position:l.position]
-		lit = removeUnderscores(lit)
-		return Token{
-			Type:    RATIONAL,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
-		}
-	}
-	if l.ch == 'i' {
-		lit := l.input[position:l.position]
-		lit = removeUnderscores(lit)
-		l.readChar()
-		return Token{
-			Type:    INT,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
-		}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
 	}
 
 	lit := l.input[position:l.position]
@@ -635,10 +643,27 @@ func (l *Lexer) readDecimalNumber(position int) Token {
 	}
 }
 
+func (l *Lexer) readNumericSuffix(position int) (Token, bool) {
+	if l.ch != 'r' && l.ch != 'i' {
+		return Token{}, false
+	}
+	suffix := l.ch
+	literal := removeUnderscores(l.input[position:l.position])
+	l.readChar()
+	if suffix == 'r' {
+		literal += "r"
+		return Token{Type: RATIONAL, Literal: literal, Line: l.line, Column: l.column}, true
+	}
+	return Token{Type: IMAGINARY, Literal: literal, Line: l.line, Column: l.column}, true
+}
+
 func (l *Lexer) readHexNumber(position int) Token {
 	l.readChar()
 	for isHexDigit(l.ch) || l.ch == '_' {
 		l.readChar()
+	}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
 	}
 
 	lit := l.input[position:l.position]
@@ -657,6 +682,9 @@ func (l *Lexer) readBinaryNumber(position int) Token {
 	for isBinaryDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
+	}
 
 	lit := l.input[position:l.position]
 	lit = removeUnderscores(lit)
@@ -673,6 +701,9 @@ func (l *Lexer) readOctalNumber(position int) Token {
 	l.readChar()
 	for isOctalDigit(l.ch) || l.ch == '_' {
 		l.readChar()
+	}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
 	}
 
 	lit := l.input[position:l.position]
@@ -695,27 +726,8 @@ func (l *Lexer) readFloat(position int) Token {
 		return l.readExponent(position)
 	}
 
-	if l.ch == 'r' {
-		l.readChar()
-		lit := l.input[position:l.position]
-		lit = removeUnderscores(lit)
-		return Token{
-			Type:    RATIONAL,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
-		}
-	}
-	if l.ch == 'i' {
-		lit := l.input[position:l.position]
-		lit = removeUnderscores(lit)
-		l.readChar()
-		return Token{
-			Type:    FLOAT,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
-		}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
 	}
 
 	lit := l.input[position:l.position]
@@ -751,16 +763,8 @@ func (l *Lexer) readExponent(position int) Token {
 			Column:  l.column,
 		}
 	}
-	if l.ch == 'i' {
-		lit := l.input[position:l.position]
-		lit = removeUnderscores(lit)
-		l.readChar()
-		return Token{
-			Type:    FLOAT,
-			Literal: lit,
-			Line:    l.line,
-			Column:  l.column,
-		}
+	if token, ok := l.readNumericSuffix(position); ok {
+		return token
 	}
 
 	lit := l.input[position:l.position]
@@ -781,7 +785,7 @@ func (l *Lexer) readString(singleQuote bool) Token {
 	position := l.position
 
 	if singleQuote {
-		lit := l.readSingleQuotedString(position, quote)
+		lit := l.readSingleQuotedString(quote)
 		return Token{
 			Type:                STRING,
 			Literal:             lit,
@@ -794,26 +798,34 @@ func (l *Lexer) readString(singleQuote bool) Token {
 	}
 }
 
-func (l *Lexer) readSingleQuotedString(position int, quote rune) string {
+func (l *Lexer) readSingleQuotedString(quote rune) string {
+	var result strings.Builder
+	start := l.position
 	for l.ch != quote && l.ch != 0 {
 		if l.ch == '\\' && (l.peekChar() == quote || l.peekChar() == '\\') {
+			result.WriteString(l.input[start:l.position])
 			l.readChar()
+			result.WriteRune(l.ch)
+			l.readChar()
+			start = l.position
+			continue
 		}
 		l.readChar()
 	}
-
-	lit := l.input[position:l.position]
-	// 不在这里调用 l.readChar()，让 NextToken 函数处理
-
-	return lit
+	result.WriteString(l.input[start:l.position])
+	return result.String()
 }
 
 func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 	var lit string
+	hasUnicodeEscape := false
 
 	for l.ch != quote && l.ch != 0 {
 		if l.ch == '\\' {
-			if l.peekChar() == '#' && l.peekCharN(2) == '{' {
+			if l.peekChar() == 'u' {
+				hasUnicodeEscape = true
+			}
+			if l.peekChar() == '#' && (l.peekCharN(2) == '{' || l.peekCharN(2) == '$' || l.peekCharN(2) == '@') {
 				lit += l.input[position:l.position]
 				l.readChar() // skip '\'
 				l.readChar() // skip '#'
@@ -831,7 +843,7 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 			lit += l.input[position:l.position]
 			lit += l.readStringInterpolation()
 			position = l.position
-		} else if l.ch == '#' && l.peekChar() == '$' {
+		} else if l.ch == '#' && (l.peekChar() == '$' || l.peekChar() == '@') {
 			lit += l.input[position:l.position]
 			lit += l.readVarInterpolation()
 			position = l.position
@@ -853,6 +865,7 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 	return Token{
 		Type:                STRING,
 		AllowsInterpolation: true,
+		HasUnicodeEscape:    hasUnicodeEscape,
 		Literal:             lit,
 		Line:                l.line,
 		Column:              l.column,
@@ -927,7 +940,7 @@ func (l *Lexer) readOctalEscape() string {
 	if err != nil {
 		return seq
 	}
-	return string(rune(value))
+	return string([]byte{byte(value)})
 }
 
 func (l *Lexer) readHexEscape() string {
@@ -953,8 +966,18 @@ func (l *Lexer) readUnicodeEscape() string {
 			seq += string(l.ch)
 			l.readChar()
 		}
-		l.readChar()
-		return fmt.Sprintf("\\u%s", seq)
+		if l.ch == '}' {
+			l.readChar()
+		}
+		var builder strings.Builder
+		for _, part := range strings.Fields(seq) {
+			value, err := strconv.ParseInt(part, 16, 32)
+			if err != nil {
+				return "\\u{" + seq + "}"
+			}
+			builder.WriteRune(rune(value))
+		}
+		return builder.String()
 	}
 
 	var seq string
@@ -962,7 +985,11 @@ func (l *Lexer) readUnicodeEscape() string {
 		seq += string(l.ch)
 		l.readChar()
 	}
-	return seq
+	value, err := strconv.ParseInt(seq, 16, 32)
+	if err != nil {
+		return "\\u" + seq
+	}
+	return string(rune(value))
 }
 
 func (l *Lexer) readControlEscape() string {
@@ -1023,11 +1050,13 @@ func (l *Lexer) readStringInterpolation() string {
 }
 
 func (l *Lexer) readVarInterpolation() string {
-	l.readChar()
-
+	l.readChar() // skip '#'
 	start := l.position
-
+	sigil := l.ch
 	if l.ch == '@' || l.ch == '$' {
+		l.readChar()
+	}
+	if sigil == '@' && l.ch == '@' {
 		l.readChar()
 	}
 
@@ -1036,30 +1065,15 @@ func (l *Lexer) readVarInterpolation() string {
 	}
 
 	lit := l.input[start:l.position]
-	return "#$" + lit
+	return "#" + lit
 }
 
 func (l *Lexer) readRawString() Token {
 	l.readChar()
-
-	position := l.position
-	var lit string
-
-	for l.ch != '`' && l.ch != 0 {
-		l.readChar()
-	}
-
-	lit += l.input[position:l.position]
+	tok := l.readDoubleQuotedString(l.position, '`')
+	tok.CommandLiteral = true
 	l.readChar()
-
-	return Token{
-		Type:                STRING,
-		Literal:             lit,
-		Line:                l.line,
-		Column:              l.column,
-		AllowsInterpolation: true,
-		CommandLiteral:      true,
-	}
+	return tok
 }
 
 func (l *Lexer) readCharacterLiteral() Token {
@@ -1071,6 +1085,31 @@ func (l *Lexer) readCharacterLiteral() Token {
 	if l.ch == '\\' {
 		l.readChar()
 		switch l.ch {
+		case 'C':
+			if l.peekChar() == '-' {
+				l.readChar()
+				l.readChar()
+				lit = string([]byte{byte(l.ch) & 0x1f})
+			} else {
+				lit = "C"
+			}
+		case 'M':
+			if l.peekChar() == '-' {
+				l.readChar()
+				l.readChar()
+				value := byte(l.ch)
+				if l.ch == '\\' && l.peekChar() == 'C' {
+					l.readChar()
+					if l.peekChar() == '-' {
+						l.readChar()
+						l.readChar()
+						value = byte(l.ch) & 0x1f
+					}
+				}
+				lit = string([]byte{value | 0x80})
+			} else {
+				lit = "M"
+			}
 		case 'n':
 			lit = "\n"
 		case 't':
@@ -1145,7 +1184,7 @@ func (l *Lexer) readPercentString() Token {
 	}
 
 	openDelimiter := delimiter
-	interpolates := kind != 'q' && kind != 'i'
+	interpolates := kind == 0 || kind == 'Q' || kind == 'W' || kind == 'I' || kind == 'r'
 	pairedDelimiter := true
 	if delimiter == '(' {
 		delimiter = ')'
@@ -1166,12 +1205,19 @@ func (l *Lexer) readPercentString() Token {
 	depth := 1
 
 	for l.ch != 0 {
-		if l.ch == '\\' {
-			if interpolates && l.peekChar() == '#' && l.peekCharN(2) == '{' {
+		if l.ch == '\\' && (pairedDelimiter || delimiter != '\\') {
+			if interpolates && l.peekChar() == '#' && (l.peekCharN(2) == '{' || l.peekCharN(2) == '$' || l.peekCharN(2) == '@') {
 				lit += l.input[position:l.position]
 				l.readChar() // skip '\\'
 				l.readChar() // skip '#'
 				lit += EscapedHashInterpolation
+				position = l.position
+				continue
+			}
+			if interpolates && kind != 'r' {
+				lit += l.input[position:l.position]
+				l.readChar()
+				lit += l.readEscapeSequence()
 				position = l.position
 				continue
 			}
@@ -1231,6 +1277,9 @@ func (l *Lexer) readPercentString() Token {
 	if kind == 'w' || kind == 'W' {
 		tokenType = WORDS
 	}
+	if kind == 'i' || kind == 'I' {
+		tokenType = SYMBOLS
+	}
 	if kind == 'r' {
 		tokenType = REGEXP
 		lit = "%r" + string(openDelimiter) + lit + string(closeDelimiter) + options
@@ -1258,6 +1307,8 @@ func isBarePercentDelimiter(ch rune) bool {
 }
 
 func (l *Lexer) readSlashOrRegexp() Token {
+	startLine := l.line
+	startColumn := l.column
 	canStartRegexp := l.slashCanStartRegexp()
 	l.readChar()
 
@@ -1321,8 +1372,8 @@ func (l *Lexer) readSlashOrRegexp() Token {
 		Type:                REGEXP,
 		Literal:             lit,
 		AllowsInterpolation: containsUnescapedInterpolation(lit),
-		Line:                l.line,
-		Column:              l.column,
+		Line:                startLine,
+		Column:              startColumn,
 	}
 }
 
@@ -1482,8 +1533,10 @@ func (l *Lexer) previousNonWhitespaceCharIsDot() bool {
 
 func (l *Lexer) readHeredoc(line, column int) Token {
 	allowIndentedTerminator := false
+	squiggly := false
 	if l.ch == '-' || l.ch == '~' {
 		allowIndentedTerminator = true
+		squiggly = l.ch == '~'
 		l.readChar()
 	}
 
@@ -1498,7 +1551,10 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 		l.readChar()
 	}
 	delimiter := l.input[start:l.position]
-	if quote != 0 && l.ch == quote {
+	if quote != 0 {
+		if l.ch != quote {
+			return Token{Type: ILLEGAL, Literal: "unterminated quoted heredoc identifier", Line: line, Column: column}
+		}
 		l.readChar()
 	}
 
@@ -1532,6 +1588,9 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 
 	lit := l.input[contentStart:contentEnd]
+	if squiggly {
+		lit = dedentHeredoc(lit)
+	}
 	if quote != '\'' {
 		lit = decodeHeredocEscapes(lit)
 	}
@@ -1556,6 +1615,36 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 }
 
+func dedentHeredoc(input string) string {
+	lines := strings.SplitAfter(input, "\n")
+	minIndent := -1
+	for _, line := range lines {
+		content := strings.TrimSuffix(line, "\n")
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		indent := 0
+		for indent < len(content) && (content[indent] == ' ' || content[indent] == '\t') {
+			indent++
+		}
+		if minIndent < 0 || indent < minIndent {
+			minIndent = indent
+		}
+	}
+	if minIndent <= 0 {
+		return input
+	}
+	var out strings.Builder
+	for _, line := range lines {
+		remove := 0
+		for remove < len(line) && remove < minIndent && (line[remove] == ' ' || line[remove] == '\t') {
+			remove++
+		}
+		out.WriteString(line[remove:])
+	}
+	return out.String()
+}
+
 func decodeHeredocEscapes(input string) string {
 	if !strings.Contains(input, "\\") {
 		return input
@@ -1569,6 +1658,7 @@ func decodeHeredocEscapes(input string) string {
 		}
 		i++
 		switch input[i] {
+		case '\n':
 		case 't':
 			out.WriteByte('\t')
 		case 'n':
@@ -1761,26 +1851,13 @@ func (l *Lexer) colonFollowsIdentifier() bool {
 
 func (l *Lexer) readQuotedSymbol() Token {
 	quote := l.ch
-	l.readChar()
-	position := l.position
-	for l.ch != quote && l.ch != 0 {
-		if l.ch == '\\' && l.peekChar() != 0 {
-			l.readChar()
-		}
-		l.readChar()
-	}
-
-	lit := l.input[position:l.position]
+	token := l.readString(quote == '\'')
 	if l.ch == quote {
 		l.readChar()
 	}
-
-	return Token{
-		Type:    SYMBOL,
-		Literal: ":" + lit,
-		Line:    l.line,
-		Column:  l.column,
-	}
+	token.Type = SYMBOL
+	token.Literal = ":" + token.Literal
+	return token
 }
 
 func endsWith(s, suffix string) bool {

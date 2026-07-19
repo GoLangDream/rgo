@@ -41,6 +41,152 @@ func parseWithErrors(input string) []string {
 	return p.Errors()
 }
 
+func TestPercentWordsDecodeEscapedBackslash(t *testing.T) {
+	expr := parseExpr(t, `%w[\\]`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 1 {
+		t.Fatalf("expected one-element ArrayLiteral, got %T (%v)", expr, expr)
+	}
+	word, ok := array.Elements[0].(*ast.StringLiteral)
+	if !ok || word.Value != `\` {
+		t.Fatalf("expected one backslash word, got %T (%v)", array.Elements[0], array.Elements[0])
+	}
+}
+
+func TestPercentWordsKeepEscapedWhitespaceInsideWord(t *testing.T) {
+	expr := parseExpr(t, `%w[one two\ words]`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 2 {
+		t.Fatalf("expected two-element ArrayLiteral, got %T (%v)", expr, expr)
+	}
+	word, ok := array.Elements[1].(*ast.StringLiteral)
+	if !ok || word.Value != "two words" {
+		t.Fatalf("expected escaped space inside second word, got %T (%v)", array.Elements[1], array.Elements[1])
+	}
+}
+
+func TestWindows31JHashLabelTreatsTrailByteAsIdentifierContent(t *testing.T) {
+	input := "{\x87]: 1}"
+	p := New(lexer.NewWithEncoding(input, "Windows-31J"))
+	p.ParseProgram()
+	if errors := p.Errors(); len(errors) != 0 {
+		t.Fatalf("expected Windows-31J label to parse, got %v", errors)
+	}
+}
+
+func TestPercentRegexpParsesBackslashDelimiter(t *testing.T) {
+	expr := parseExpr(t, `%r\ foo \`)
+	literal, ok := expr.(*ast.RegexpLiteral)
+	if !ok || literal.Pattern != " foo " {
+		t.Fatalf("expected backslash-delimited regexp body, got %T (%v)", expr, expr)
+	}
+}
+
+func TestRescueModifierInSpacedMethodArgumentStaysInsideArgument(t *testing.T) {
+	expr := parseExpr(t, `1.+ (raise("Error") rescue 1)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected one argument, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[0].(*ast.BeginExpression); !ok {
+		t.Fatalf("expected rescued argument, got %T", call.Args[0])
+	}
+}
+
+func TestMethodParameterDestructuringPattern(t *testing.T) {
+	expr := parseExpr(t, `def unpack((a, *middle, z)); [a, middle, z]; end`)
+	definition, ok := expr.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected DefExpression, got %T", expr)
+	}
+	if len(definition.Params) != 1 || len(definition.ParamPatterns) != 1 {
+		t.Fatalf("expected one physical parameter and pattern, got %d and %d", len(definition.Params), len(definition.ParamPatterns))
+	}
+	pattern := definition.ParamPatterns[0]
+	if pattern == nil || len(pattern.Children) != 2 || pattern.Rest == nil || pattern.RestIndex != 1 {
+		t.Fatalf("unexpected pattern: %#v", pattern)
+	}
+	if pattern.Children[0].Name.Value != "a" || pattern.Rest.Name.Value != "middle" || pattern.Children[1].Name.Value != "z" {
+		t.Fatalf("unexpected pattern names: %#v", pattern)
+	}
+}
+
+func TestMethodRestParameterPreservesPostParameterPosition(t *testing.T) {
+	expr := parseExpr(t, `def last(*, value); value; end`)
+	definition, ok := expr.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected DefExpression, got %T", expr)
+	}
+	if definition.RestParam == nil || definition.RestParamIndex != 0 {
+		t.Fatalf("expected anonymous rest before post parameter, got %#v at %d", definition.RestParam, definition.RestParamIndex)
+	}
+	if len(definition.Params) != 1 || definition.Params[0].Value != "value" {
+		t.Fatalf("unexpected post parameters: %#v", definition.Params)
+	}
+}
+
+func TestLambdaParameterDestructuringPattern(t *testing.T) {
+	expr := parseExpr(t, `-> ((a, (b, *tail))) { [a, b, tail] }`)
+	lambda := expr.(*ast.ProcLiteral)
+	if len(lambda.Params) != 1 || len(lambda.ParamPatterns) != 1 {
+		t.Fatalf("expected one lambda parameter pattern, got %d and %d", len(lambda.Params), len(lambda.ParamPatterns))
+	}
+	pattern := lambda.ParamPatterns[0]
+	if pattern == nil || len(pattern.Children) != 2 || len(pattern.Children[1].Children) != 1 || pattern.Children[1].Rest == nil {
+		t.Fatalf("unexpected nested lambda pattern: %#v", pattern)
+	}
+}
+
+func TestArrowLambdaCountsEachParenthesizedParameter(t *testing.T) {
+	expr := parseExpr(t, `-> (a, (*b, c), d, (*e), (*)) { }`)
+	lambda := expr.(*ast.ProcLiteral)
+	if len(lambda.Params) != 5 || len(lambda.ParamPatterns) != 5 {
+		t.Fatalf("expected five physical parameters and patterns, got %d and %d", len(lambda.Params), len(lambda.ParamPatterns))
+	}
+}
+
+func TestArrowLambdaPreservesAnonymousRestParameter(t *testing.T) {
+	expr := parseExpr(t, `-> (*) { }`)
+	lambda := expr.(*ast.ProcLiteral)
+	if lambda.RestParam == nil || lambda.RestParamIndex != 0 {
+		t.Fatalf("expected anonymous rest parameter, got %#v at %d", lambda.RestParam, lambda.RestParamIndex)
+	}
+}
+
+func TestArrowLambdaKeywordParameters(t *testing.T) {
+	expr := parseExpr(t, `-> (required:, optional: 1, **rest) { [required, optional, rest] }`)
+	lambda := expr.(*ast.ProcLiteral)
+	if len(lambda.KeywordParams) != 2 || lambda.KeywordParams[0].Name != "required" || lambda.KeywordParams[0].Default != nil {
+		t.Fatalf("unexpected required keyword metadata: %#v", lambda.KeywordParams)
+	}
+	if lambda.KeywordParams[1].Name != "optional" || lambda.KeywordParams[1].Default == nil {
+		t.Fatalf("unexpected optional keyword metadata: %#v", lambda.KeywordParams[1])
+	}
+	if lambda.KeywordRestParam == nil || lambda.KeywordRestParam.Value != "rest" {
+		t.Fatalf("unexpected keyword rest metadata: %#v", lambda.KeywordRestParam)
+	}
+}
+
+func TestLambdaKeywordDefaultCanDefineNestedLambda(t *testing.T) {
+	parse(t, `@a = -> (a: @a = -> (a: 1) { a }, b:) do
+  [a, b]
+end`)
+	parse(t, `@a = lambda do |a: (@a = -> (a: 1) { a }), b:|
+  [a, b]
+end`)
+}
+
+func TestBlockParameterDestructuringPattern(t *testing.T) {
+	expr := parseExpr(t, `target { |(a, *tail)| [a, tail] }`)
+	call := expr.(*ast.MethodCall)
+	if call.Block == nil || len(call.Block.Params) != 1 || len(call.Block.ParamPatterns) != 1 || call.Block.ParamPatterns[0].Rest == nil {
+		t.Fatalf("unexpected block parameter pattern: %#v", call.Block)
+	}
+}
+
 func assertContainsError(t *testing.T, errs []string, substr string) {
 	t.Helper()
 	for _, err := range errs {
@@ -49,6 +195,67 @@ func assertContainsError(t *testing.T, errs []string, substr string) {
 		}
 	}
 	t.Fatalf("expected parse error containing %q, got %v", substr, errs)
+}
+
+func TestEndlessRangeRemainsOneArgumentBeforeComma(t *testing.T) {
+	expr := parseExpr(t, `Enumerator.product(1.., ["A", "B"])`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 arguments, got %d: %s", len(call.Args), expr.String())
+	}
+	rangeExpr, ok := call.Args[0].(*ast.RangeExpression)
+	if !ok {
+		t.Fatalf("expected first argument RangeExpression, got %T", call.Args[0])
+	}
+	if _, ok := rangeExpr.Right.(*ast.NilExpression); !ok {
+		t.Fatalf("expected missing range end, got %T", rangeExpr.Right)
+	}
+}
+
+func TestParenthesizedSuperHasExplicitSingleExpressionArgument(t *testing.T) {
+	program := parse(t, `def value(x, y); super(x + 3 * y); end`)
+	statement := program.Statements[0].(*ast.ExpressionStatement)
+	definition := statement.Expression.(*ast.DefExpression)
+	bodyStatement := definition.Body.Statements[0].(*ast.ExpressionStatement)
+	superExpression := bodyStatement.Expression.(*ast.SuperExpression)
+	if superExpression.ImplicitArgs || len(superExpression.Args) != 1 {
+		t.Fatalf("expected one explicit super argument, implicit=%v args=%d", superExpression.ImplicitArgs, len(superExpression.Args))
+	}
+}
+
+func TestKeywordAndHasLowerPrecedenceThanAssignment(t *testing.T) {
+	expr := parseExpr(t, `x = 1 and y = 2`)
+	logical, ok := expr.(*ast.InfixExpression)
+	if !ok || logical.Operator != "and" {
+		t.Fatalf("expected top-level and expression, got %T: %s", expr, expr.String())
+	}
+	if _, ok := logical.Left.(*ast.AssignExpression); !ok {
+		t.Fatalf("expected assignment on left, got %T", logical.Left)
+	}
+	if _, ok := logical.Right.(*ast.AssignExpression); !ok {
+		t.Fatalf("expected assignment on right, got %T", logical.Right)
+	}
+}
+
+func TestCompoundAssignmentsDoNotConsumeArgumentCommas(t *testing.T) {
+	array, ok := parseExpr(t, `[a += 1, a += 1]`).(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 2 {
+		t.Fatalf("expected two array elements, got %T: %s", array, array.String())
+	}
+	call, ok := parseExpr(t, `target(a += 1, a += 1)`).(*ast.MethodCall)
+	if !ok || len(call.Args) != 2 {
+		t.Fatalf("expected two call arguments, got %T: %s", call, call.String())
+	}
+}
+
+func TestUndefParsesEveryCommaSeparatedMethod(t *testing.T) {
+	undef, ok := parseExpr(t, `undef :first, :second`).(*ast.UndefExpression)
+	if !ok || len(undef.Methods) != 2 {
+		t.Fatalf("expected two undef methods, got %T: %s", undef, undef.String())
+	}
 }
 
 func TestParseLambdaRejectsDuplicateNamedParameters(t *testing.T) {
@@ -227,7 +434,19 @@ func TestParseCatchWithoutBlockInLambdaCallChain(t *testing.T) {
 }
 
 func TestParseDefinedWithThrowCallChain(t *testing.T) {
-	parse(t, `defined?(throw(:out, 42).foo).should == :unreachable`)
+	l := lexer.New(`defined?(throw(:out, 42).foo)`)
+	p := New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		t.Fatalf("parser errors: %v", p.Errors())
+	}
+	expr := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.DefinedExpression).Expression
+	if _, ok := expr.(*ast.MethodCall); !ok {
+		if thrown, isThrow := expr.(*ast.ThrowExpression); isThrow {
+			t.Fatalf("expected MethodCall, got ThrowExpression label=%T value=%T extra=%d", thrown.Label, thrown.Value, len(thrown.ExtraArgs))
+		}
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
 }
 
 func TestParseThrowWithBareSecondArgument(t *testing.T) {
@@ -297,6 +516,19 @@ func TestParseLambdaWithCallArgumentAndEmptyBlock(t *testing.T) {
 
 func TestParseNestedBlockCallChainWithSymbolProcArgument(t *testing.T) {
 	parse(t, `10.times.map { Thread.new { x = nil; 100.times { x = p.call }; x } }.map(&:value)`)
+}
+
+func TestParseNestedThreadNewRetainsInnerBlock(t *testing.T) {
+	expr := parseExpr(t, `2.times.map { Thread.new { 1 } }`)
+	outer, ok := expr.(*ast.MethodCall)
+	if !ok || outer.Block == nil || len(outer.Block.Statements) != 1 {
+		t.Fatalf("expected outer map block, got %T: %v", expr, expr)
+	}
+	statement := outer.Block.Statements[0].(*ast.ExpressionStatement)
+	inner, ok := statement.Expression.(*ast.MethodCall)
+	if !ok || inner.Block == nil {
+		t.Fatalf("expected Thread.new inner block, got %T: %v", statement.Expression, statement.Expression)
+	}
 }
 
 func TestParseBareBlockCallChain(t *testing.T) {
@@ -600,6 +832,36 @@ func TestParseConstantBracketCallWithNestedArrayArguments(t *testing.T) {
 	parse(t, `Set[[:b, 2], [:a, 1]]`)
 }
 
+func TestParseConstantBracketCallWithCharacterLiteralArgument(t *testing.T) {
+	program := parse(t, `Set[?c, "b", :a]`)
+	if len(program.Statements) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
+	}
+	stmt, ok := program.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected ExpressionStatement, got %T", program.Statements[0])
+	}
+	call, ok := stmt.Expression.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", stmt.Expression)
+	}
+	if len(call.Args) != 3 {
+		t.Fatalf("expected 3 args, got %d", len(call.Args))
+	}
+}
+
+func TestParseConstantBracketCallWithStringArguments(t *testing.T) {
+	program := parse(t, `Set["c", "b", :a]`)
+	stmt := program.Statements[0].(*ast.ExpressionStatement)
+	call, ok := stmt.Expression.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", stmt.Expression)
+	}
+	if len(call.Args) != 3 {
+		t.Fatalf("expected 3 args, got %d", len(call.Args))
+	}
+}
+
 func TestParseRaiseWithExceptionClassAndMessage(t *testing.T) {
 	input := "raise StandardError, 'Oops'"
 
@@ -832,7 +1094,7 @@ func TestParseSpecialGlobalVariableSymbolArgument(t *testing.T) {
 }
 
 func TestParseArrayClassBracketMethodCall(t *testing.T) {
-	input := `Array.[](5, true, nil, "a")`
+	input := `ArraySpecs::MyArray.[](5, true, nil, "a")`
 
 	l := lexer.New(input)
 	p := New(l)
@@ -843,6 +1105,11 @@ func TestParseArrayClassBracketMethodCall(t *testing.T) {
 	}
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
+	}
+	statement := program.Statements[0].(*ast.ExpressionStatement)
+	call := statement.Expression.(*ast.MethodCall)
+	if len(call.Args) != 4 {
+		t.Fatalf("expected 4 arguments, got %d: %s", len(call.Args), call.String())
 	}
 }
 
@@ -1543,6 +1810,42 @@ gamma]`)
 	}
 }
 
+func TestNestedBreakCallKeepsFollowingOuterBlockStatements(t *testing.T) {
+	expr := parseExpr(t, `invoke do
+  ["a"].bsearch { |value| break }.should be_nil
+  events << nil
+  events << :after
+end`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Block == nil {
+		t.Fatalf("expected method call with block, got %T", expr)
+	}
+	if len(call.Block.Statements) != 3 {
+		t.Fatalf("expected 3 outer block statements, got %d: %s", len(call.Block.Statements), call.Block.String())
+	}
+}
+
+func TestParsePercentSymbolArrayLiteral(t *testing.T) {
+	expr := parseExpr(t, `%i[alpha beta
+gamma]`)
+	arr, ok := expr.(*ast.ArrayLiteral)
+	if !ok {
+		t.Fatalf("expected ArrayLiteral, got %T", expr)
+	}
+	if len(arr.Elements) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(arr.Elements))
+	}
+	for i, want := range []string{"alpha", "beta", "gamma"} {
+		sym, ok := arr.Elements[i].(*ast.SymbolLiteral)
+		if !ok {
+			t.Fatalf("element %d: expected SymbolLiteral, got %T", i, arr.Elements[i])
+		}
+		if sym.Value != want {
+			t.Fatalf("element %d: expected %q, got %q", i, want, sym.Value)
+		}
+	}
+}
+
 func TestParseArrayLiteralWithBlockCallAndLambdaElements(t *testing.T) {
 	parse(t, `[Proc.new{}, -> {}, proc {}]`)
 	parse(t, `[Proc.new{}, -> {}, proc {}].each { |p| p.binding }`)
@@ -1768,6 +2071,28 @@ func TestParsePercentRegexpLiteral(t *testing.T) {
 	}
 	if re.Options != "i" {
 		t.Errorf("expected option i, got %s", re.Options)
+	}
+}
+
+func TestParsePercentRegexpLiteralRemovesEscapingForNonMetaDelimiter(t *testing.T) {
+	expr := parseExpr(t, `%r@\@@`)
+	re, ok := expr.(*ast.RegexpLiteral)
+	if !ok {
+		t.Fatalf("expected RegexpLiteral, got %T", expr)
+	}
+	if re.Pattern != "@" {
+		t.Fatalf("expected @, got %q", re.Pattern)
+	}
+}
+
+func TestParsePercentRegexpLiteralPreservesEscapedGreaterThanDelimiter(t *testing.T) {
+	expr := parseExpr(t, `%r>\>>`)
+	re, ok := expr.(*ast.RegexpLiteral)
+	if !ok {
+		t.Fatalf("expected RegexpLiteral, got %T", expr)
+	}
+	if re.Pattern != `\>` {
+		t.Fatalf("expected escaped greater-than, got %q", re.Pattern)
 	}
 }
 
@@ -2016,6 +2341,64 @@ func TestParsePower(t *testing.T) {
 	}
 	if infix.Operator != "**" {
 		t.Errorf("expected **, got %s", infix.Operator)
+	}
+}
+
+func TestParsePowerBindsBeforeUnaryMinusAndAssociatesRight(t *testing.T) {
+	expr := parseExpr(t, "-2 ** 3 ** 2")
+	prefix, ok := expr.(*ast.PrefixExpression)
+	if !ok || prefix.Operator != "-" {
+		t.Fatalf("expected outer unary minus, got %T (%v)", expr, expr)
+	}
+	outerPower, ok := prefix.Right.(*ast.InfixExpression)
+	if !ok || outerPower.Operator != "**" {
+		t.Fatalf("expected power under unary minus, got %T", prefix.Right)
+	}
+	innerPower, ok := outerPower.Right.(*ast.InfixExpression)
+	if !ok || innerPower.Operator != "**" {
+		t.Fatalf("expected right-associated power, got %T", outerPower.Right)
+	}
+}
+
+func TestRangeBindsBeforeTernary(t *testing.T) {
+	expr := parseExpr(t, "from..to ? 3 : 4")
+	ternary, ok := expr.(*ast.TernaryExpression)
+	if !ok {
+		t.Fatalf("expected TernaryExpression, got %T (%v)", expr, expr)
+	}
+	rangeCondition, ok := ternary.Condition.(*ast.RangeExpression)
+	if !ok || rangeCondition.Exclusive {
+		t.Fatalf("expected inclusive range condition, got %T (%v)", ternary.Condition, ternary.Condition)
+	}
+
+	expr = parseExpr(t, "from...to ? 3 : 4")
+	ternary, ok = expr.(*ast.TernaryExpression)
+	if !ok {
+		t.Fatalf("expected TernaryExpression, got %T (%v)", expr, expr)
+	}
+	rangeCondition, ok = ternary.Condition.(*ast.RangeExpression)
+	if !ok || !rangeCondition.Exclusive {
+		t.Fatalf("expected exclusive range condition, got %T (%v)", ternary.Condition, ternary.Condition)
+	}
+}
+
+func TestParseBitwiseOperatorsBelowArithmeticWithRubyPrecedence(t *testing.T) {
+	expr := parseExpr(t, "1 | 2 ^ 3 & 4 + 5")
+	bitOr, ok := expr.(*ast.InfixExpression)
+	if !ok || bitOr.Operator != "|" {
+		t.Fatalf("expected outer bitwise OR, got %T (%v)", expr, expr)
+	}
+	bitXor, ok := bitOr.Right.(*ast.InfixExpression)
+	if !ok || bitXor.Operator != "^" {
+		t.Fatalf("expected XOR under OR, got %T", bitOr.Right)
+	}
+	bitAnd, ok := bitXor.Right.(*ast.InfixExpression)
+	if !ok || bitAnd.Operator != "&" {
+		t.Fatalf("expected AND under XOR, got %T", bitXor.Right)
+	}
+	sum, ok := bitAnd.Right.(*ast.InfixExpression)
+	if !ok || sum.Operator != "+" {
+		t.Fatalf("expected arithmetic under AND, got %T", bitAnd.Right)
 	}
 }
 
@@ -2564,6 +2947,32 @@ end`)
 	}
 }
 
+func TestParseDottedMethodCallWithNestedCallArgumentAndDoBlock(t *testing.T) {
+	expr := parseExpr(t, `Dir.chdir(fixture(__FILE__)) do
+  ruby_exe("script.rb")
+end`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method.Value != "chdir" {
+		t.Fatalf("expected chdir, got %s", call.Method.Value)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected 1 arg, got %d", len(call.Args))
+	}
+	nested, ok := call.Args[0].(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected nested MethodCall argument, got %T", call.Args[0])
+	}
+	if nested.Method.Value != "fixture" || len(nested.Args) != 1 {
+		t.Fatalf("expected fixture(__FILE__), got %#v", nested)
+	}
+	if call.Block == nil {
+		t.Fatal("expected do block")
+	}
+}
+
 func TestParseDottedSendWithSymbolAndLocalArguments(t *testing.T) {
 	expr := parseExpr(t, `Dir.send(:glob, pattern)`)
 	call, ok := expr.(*ast.MethodCall)
@@ -2666,6 +3075,20 @@ func TestParseHashWithArrow(t *testing.T) {
 	}
 	if len(hash.Pairs) != 1 {
 		t.Errorf("expected 1 pair, got %d", len(hash.Pairs))
+	}
+}
+
+func TestParseArrayKeyHashRocketAsCallArgument(t *testing.T) {
+	expr := parseExpr(t, `spawn("cmd", [:out, :err] => "file")`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 arguments, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[1].(*ast.HashLiteral); !ok {
+		t.Fatalf("expected second argument to be HashLiteral, got %T", call.Args[1])
 	}
 }
 
@@ -3219,9 +3642,17 @@ end`)
 }
 
 func TestParseMethodDefinitionWithConstantReceiver(t *testing.T) {
-	parse(t, `def TARGET.defs_method
+	program := parse(t, `def TARGET.defs_method
   self
-end`)
+end
+after_definition`)
+	if len(program.Statements) != 2 {
+		t.Fatalf("expected definition and following statement, got %d", len(program.Statements))
+	}
+	defn := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.DefExpression)
+	if _, ok := defn.Receiver.(*ast.Constant); !ok {
+		t.Fatalf("expected constant receiver, got %T", defn.Receiver)
+	}
 }
 
 func TestParseMultiAssignWithIndexTargets(t *testing.T) {
@@ -3498,6 +3929,79 @@ func TestParseBareMethodCallWithTrailingBlock(t *testing.T) {
 	}
 }
 
+func TestParseBareCallKeepsDoBlockOutsideDottedArgument(t *testing.T) {
+	program := parse(t, `refine Array.singleton_class do
+  def ===(value)
+    true
+  end
+end`)
+	call, ok := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "refine" || call.Block == nil || len(call.Args) != 1 {
+		t.Fatalf("expected refine call with one argument and trailing block, got %T: %v", program.Statements[0], program.Statements[0])
+	}
+	argument, ok := call.Args[0].(*ast.MethodCall)
+	if !ok || argument.Method == nil || argument.Method.Value != "singleton_class" || argument.Block != nil {
+		t.Fatalf("expected singleton_class argument without block, got %T: %v", call.Args[0], call.Args[0])
+	}
+}
+
+func TestParsePinnedRangeExpressionInHashPattern(t *testing.T) {
+	expr := parseExpr(t, `case {released_at: Time.new(2018, 12, 25)}
+in {released_at: ^(Time.new(2010)..Time.new(2020))}
+  true
+end`)
+	caseExpr, ok := expr.(*ast.CaseExpression)
+	if !ok || len(caseExpr.Clauses) != 1 || len(caseExpr.Clauses[0].Conditions) != 1 {
+		t.Fatalf("expected one case pattern clause, got %T: %s", expr, expr.String())
+	}
+	match, ok := caseExpr.Clauses[0].Conditions[0].(*ast.PatternMatchExpression)
+	if !ok {
+		t.Fatalf("expected pattern match expression, got %T", caseExpr.Clauses[0].Conditions[0])
+	}
+	want := "{ released_at : ^ ( Time.new( 2010 ) .. Time.new( 2020 ) ) }"
+	if match.Pattern != want {
+		t.Fatalf("expected pattern %q, got %q", want, match.Pattern)
+	}
+}
+
+func TestParseNestedEndHookStaysInsideOuterBlock(t *testing.T) {
+	program := parse(t, `END { puts :first }; END { puts :before; END { puts :nested }; puts :after }; END { puts :last }`)
+	if len(program.Statements) != 3 {
+		t.Fatalf("expected three top-level END calls, got %d: %s", len(program.Statements), program.String())
+	}
+	stmt, ok := program.Statements[1].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected expression statement, got %T", program.Statements[1])
+	}
+	outer, ok := stmt.Expression.(*ast.MethodCall)
+	if !ok || outer.Method == nil || outer.Method.Value != "END" || outer.Block == nil {
+		t.Fatalf("expected second top-level END call with block, got %T: %s", stmt.Expression, stmt.Expression.String())
+	}
+	if len(outer.Block.Statements) != 3 {
+		t.Fatalf("expected nested END between two puts calls, got %d statements: %s", len(outer.Block.Statements), outer.Block.String())
+	}
+	innerStmt, ok := outer.Block.Statements[1].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected nested expression statement, got %T", outer.Block.Statements[1])
+	}
+	inner, ok := innerStmt.Expression.(*ast.MethodCall)
+	if !ok || inner.Method == nil || inner.Method.Value != "END" || inner.Block == nil {
+		t.Fatalf("expected nested END call with block, got %T: %s", innerStmt.Expression, innerStmt.Expression.String())
+	}
+}
+
+func TestParseSpacedGroupedArgumentKeepsDotChainInsideArgument(t *testing.T) {
+	expr := parseExpr(t, `double (5).to_s`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "double" || len(call.Args) != 1 {
+		t.Fatalf("expected double call with one argument, got %T: %s", expr, expr.String())
+	}
+	argument, ok := call.Args[0].(*ast.MethodCall)
+	if !ok || argument.Method == nil || argument.Method.Value != "to_s" {
+		t.Fatalf("expected .to_s inside the argument, got %T: %s", call.Args[0], call.Args[0].String())
+	}
+}
+
 func TestParseBareMethodCallWithLambdaArgumentAndDoBlock(t *testing.T) {
 	program := parse(t, `guard -> { true } do
   it "x" do
@@ -3513,8 +4017,90 @@ end`)
 	}
 }
 
+func TestParseNestedDoBlockInsideLambdaKeepsTrailingBlockOnCall(t *testing.T) {
+	program := parse(t, `describe :shared, shared: true do
+  guard -> {
+    with_timezone "UTC" do
+      true
+    end
+  } do
+    it "x" do
+      1
+    end
+  end
+end`)
+	if len(program.Statements) != 1 {
+		t.Fatalf("expected one top-level statement, got %d: %s", len(program.Statements), program.String())
+	}
+	describeCall := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	if describeCall.Block == nil || len(describeCall.Block.Statements) != 1 {
+		t.Fatalf("expected guard inside describe block, got %s", describeCall.String())
+	}
+	guardCall, ok := describeCall.Block.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	if !ok || guardCall.Method.Value != "guard" || guardCall.Block == nil {
+		t.Fatalf("expected guard with trailing block, got %T: %s", describeCall.Block.Statements[0], describeCall.Block.String())
+	}
+}
+
 func TestParseBlockWithEmptyPipes(t *testing.T) {
 	parse(t, "@y.z { || 1 }")
+}
+
+func TestParseCatchBraceBlockWithSemicolonExpressions(t *testing.T) {
+	expr := parseExpr(t, "catch(:tag) { 1; :last }")
+	catchExpr, ok := expr.(*ast.CatchExpression)
+	if !ok {
+		t.Fatalf("expected CatchExpression, got %T", expr)
+	}
+	if catchExpr.Body == nil || len(catchExpr.Body.Statements) != 2 {
+		t.Fatalf("expected two catch body statements, got %#v", catchExpr.Body)
+	}
+}
+
+func TestParseCatchDoBlockWithSingleIdentifier(t *testing.T) {
+	expr := parseExpr(t, "catch :tag do\nwork\nend")
+	catchExpr, ok := expr.(*ast.CatchExpression)
+	if !ok {
+		t.Fatalf("expected CatchExpression, got %T", expr)
+	}
+	if catchExpr.Body == nil || len(catchExpr.Body.Statements) != 1 {
+		t.Fatalf("expected one catch body statement, got %#v", catchExpr.Body)
+	}
+}
+
+func TestParseCatchInsideMethodBlockKeepsFollowingStatementInOrder(t *testing.T) {
+	expr := parseExpr(t, `it "clears" do
+  catch :exit do
+    begin
+      raise "exception"
+    rescue
+      throw :exit
+    end
+  end
+  $!.should be_nil
+end`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Block == nil {
+		t.Fatalf("expected method call with block, got %T", expr)
+	}
+	if len(call.Block.Statements) != 2 {
+		t.Fatalf("expected catch followed by assertion, got %d statements: %s", len(call.Block.Statements), call.Block.String())
+	}
+	first := call.Block.Statements[0].(*ast.ExpressionStatement).Expression
+	if _, ok := first.(*ast.CatchExpression); !ok {
+		t.Fatalf("expected first statement to be catch, got %T", first)
+	}
+}
+
+func TestParseBlockLocalAfterSemicolonIsNotAParameter(t *testing.T) {
+	expr := parseExpr(t, `[1].each { |; glark| glark }`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Block == nil {
+		t.Fatalf("expected method block, got %T", expr)
+	}
+	if len(call.Block.Params) != 0 || len(call.Block.BlockLocals) != 1 || call.Block.BlockLocals[0] != "glark" {
+		t.Fatalf("unexpected block parameter metadata: params=%v locals=%v", call.Block.Params, call.Block.BlockLocals)
+	}
 }
 
 func TestParseBlockWithDestructuredParameters(t *testing.T) {
@@ -3676,6 +4262,17 @@ func TestParseKeywordArgNamedIn(t *testing.T) {
 
 func TestParseKeywordArgNamedPrepend(t *testing.T) {
 	parse(t, `concerning(:Foo, prepend: true) { }`)
+}
+
+func TestParseKeywordArgNamedUndef(t *testing.T) {
+	expr := parseExpr(t, `value.encode(undef: :replace)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.KeywordArgs) != 1 || call.KeywordArgs[0].Name != "undef" {
+		t.Fatalf("expected undef keyword argument, got %#v", call.KeywordArgs)
+	}
 }
 
 func TestParseCommentWithHexEscapesAfterKeywordArgCall(t *testing.T) {
@@ -3975,6 +4572,23 @@ func TestParseForwardArgumentsCall(t *testing.T) {
 	parse(t, "bar(...)")
 }
 
+func TestParseForwardArgumentsMethodCapturesAllArgumentKinds(t *testing.T) {
+	expr := parseExpr(t, `def forward(...); target(...); end`)
+	definition, ok := expr.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected DefExpression, got %T", expr)
+	}
+	if definition.RestParam == nil || definition.RestParam.Value != "__rgo_forward_args" {
+		t.Fatalf("unexpected forwarded positional capture: %#v", definition.RestParam)
+	}
+	if definition.KeywordRestParam == nil || definition.KeywordRestParam.Value != "__rgo_forward_kwargs" {
+		t.Fatalf("unexpected forwarded keyword capture: %#v", definition.KeywordRestParam)
+	}
+	if definition.BlockParam == nil || definition.BlockParam.Value != "__rgo_forward_block" {
+		t.Fatalf("unexpected forwarded block capture: %#v", definition.BlockParam)
+	}
+}
+
 func TestParseMatchOperatorMethodDefinition(t *testing.T) {
 	parse(t, `class FalseClass
   def =~(o)
@@ -4249,6 +4863,16 @@ func TestParseDefinedWithoutParentheses(t *testing.T) {
 	parse(t, `(not defined? qqq).should == true`)
 }
 
+func TestParseGroupedDefinedMultipleAssignment(t *testing.T) {
+	l := lexer.New(`defined?((left, right = 1, 2))`)
+	p := New(l)
+	program := p.ParseProgram()
+	expr := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.DefinedExpression).Expression
+	if _, ok := expr.(*ast.MultiAssignExpression); !ok {
+		t.Fatalf("expected MultiAssignExpression, got %T", expr)
+	}
+}
+
 func TestParseKeywordLiteralMethodNameAfterDot(t *testing.T) {
 	expr := parseExpr(t, `VariablesSpecs.false`)
 	call, ok := expr.(*ast.MethodCall)
@@ -4454,6 +5078,42 @@ func TestParseBareIncludeWithNoArguments(t *testing.T) {
 	parse(t, `Module.new do
   include
 end`)
+}
+
+func TestBraceBlockBindsToBareCallArgument(t *testing.T) {
+	expr := parseExpr(t, `using Module.new { refine Array do; alias_method :original_count, :count; end }`)
+	usingCall, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected using MethodCall, got %T", expr)
+	}
+	if usingCall.Block != nil {
+		t.Fatal("expected brace block to bind to Module.new argument, not using")
+	}
+	if len(usingCall.Args) != 1 {
+		t.Fatalf("expected one using argument, got %d", len(usingCall.Args))
+	}
+	newCall, ok := usingCall.Args[0].(*ast.MethodCall)
+	if !ok || newCall.Method == nil || newCall.Method.Value != "new" || newCall.Block == nil {
+		t.Fatalf("expected Module.new argument with block, got %#v", usingCall.Args[0])
+	}
+	if len(newCall.Block.Statements) != 1 {
+		t.Fatalf("expected one statement in Module.new block, got %d", len(newCall.Block.Statements))
+	}
+	statement, ok := newCall.Block.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected expression statement, got %T", newCall.Block.Statements[0])
+	}
+	refineCall, ok := statement.Expression.(*ast.MethodCall)
+	if !ok || refineCall.Method == nil || refineCall.Method.Value != "refine" || refineCall.Block == nil {
+		t.Fatalf("expected refine call with do block, got %#v", statement.Expression)
+	}
+}
+
+func TestBraceBlockContainingDoBlockKeepsFollowingStatement(t *testing.T) {
+	program := parse(t, `refinery = Module.new { refine Array do; end }; refinery`)
+	if len(program.Statements) != 2 {
+		t.Fatalf("expected two statements, got %d", len(program.Statements))
+	}
 }
 
 func TestParseBlockCallFollowedByIndex(t *testing.T) {

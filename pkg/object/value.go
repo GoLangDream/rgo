@@ -3,6 +3,7 @@ package object
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"strings"
 )
@@ -37,10 +38,15 @@ const (
 )
 
 type EmeraldValue struct {
-	Type   ValueType
-	Data   interface{}
-	Class  *Class
-	Frozen bool
+	Type            ValueType
+	Data            interface{}
+	Class           *Class
+	Frozen          bool
+	TemporaryLocked bool
+	Chilled         bool
+	Literal         bool
+	BigInt          *big.Int
+	Encoding        string
 }
 
 func NewValue(t ValueType, data interface{}, class *Class) *EmeraldValue {
@@ -78,6 +84,9 @@ func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
 		}
 		return "false"
 	case ValueInteger:
+		if v.BigInt != nil {
+			return v.BigInt.String()
+		}
 		return fmt.Sprintf("%d", v.Data)
 	case ValueFloat:
 		f := v.Data.(float64)
@@ -157,15 +166,21 @@ func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
 		str += "}"
 		return str
 	case ValueClass:
-		if v.Data != nil {
-			return v.Data.(*Class).Name
+		if class, ok := v.Data.(*Class); ok && class != nil {
+			if class.Name != "" {
+				return class.Name
+			}
+			return fmt.Sprintf("#<Class:%p>", class)
 		}
-		return "#<Class:...>"
+		return "#<Class:0x0>"
 	case ValueModule:
-		if v.Data != nil {
-			return v.Data.(*Module).Name
+		if module, ok := v.Data.(*Module); ok && module != nil {
+			if module.Name != "" {
+				return module.Name
+			}
+			return fmt.Sprintf("#<Module:%p>", module)
 		}
-		return "#<Module:...>"
+		return "#<Module:0x0>"
 	case ValueFunction:
 		fn := v.Data.(*Function)
 		return fmt.Sprintf("#<Function:%s>", fn.Name)
@@ -461,7 +476,7 @@ func (v *EmeraldValue) equals(other *EmeraldValue, seen map[[2]*EmeraldValue]boo
 	case ValueMethod:
 		left := v.Data.(*Method)
 		right := other.Data.(*Method)
-		return methodReceiverEqual(left.Receiver, right.Receiver) && (left.Name == right.Name || methodImplementationEqual(left.Fn, right.Fn))
+		return methodReceiverEqual(left.Receiver, right.Receiver) && methodImplementationEqual(left.Fn, right.Fn)
 	default:
 		return v == other
 	}
@@ -517,10 +532,31 @@ type KeywordParamInfo struct {
 	Default    *EmeraldValue
 }
 
+type ParameterPattern struct {
+	Name      string
+	Children  []*ParameterPattern
+	Rest      *ParameterPattern
+	RestIndex int
+}
+
+type ConstantLocation struct {
+	Path string
+	Line int64
+}
+
 type Function struct {
 	Name                  string
+	SourcePath            string
+	EvalSource            bool
+	SourceEncoding        string
+	DefinitionLine        int64
 	Params                []string
+	ParamLocalIndices     []int
+	ParamPatterns         []*ParameterPattern
 	ParamDefaults         []*EmeraldValue
+	EvaluateParamDefaults bool
+	MethodBody            bool
+	SingletonClassBody    bool
 	KeywordParams         []KeywordParamInfo
 	Body                  interface{}
 	BlockLocals           []string
@@ -533,12 +569,15 @@ type Function struct {
 	LocalNames            map[string]int
 	FreeVarNames          []string
 	HasRestParam          bool
+	AnonymousRestParam    bool
 	RestParamIndex        int
+	RestParamName         string
 	RejectKeywords        bool
 	SingleDestructure     bool
 	KeywordRestOnly       bool
 	KeywordRestParam      string
 	HasBlockParam         bool
+	AnonymousBlockParam   bool
 	BlockParamIndex       int
 	RejectBlock           bool
 	TrailingCommaParam    bool
@@ -553,33 +592,44 @@ type BuiltinFunction struct {
 }
 
 type Method struct {
-	Name          string
-	Fn            interface{}
-	Closure       *Closure
-	Arity         int
-	Receiver      *EmeraldValue
-	Owner         *EmeraldValue
-	Visibility    string
-	Ruby2Keywords bool
-	EnforceArity  bool
+	Name                  string
+	OriginalName          string
+	Fn                    interface{}
+	Closure               *Closure
+	Arity                 int
+	Receiver              *EmeraldValue
+	Owner                 *EmeraldValue
+	DispatchOwner         *EmeraldValue
+	Visibility            string
+	VisibilityAliasStart  *Class
+	Ruby2Keywords         bool
+	DynamicMissing        bool
+	EnforceArity          bool
+	DefinedByDefineMethod bool
 }
 
 type Proc struct {
-	Fn             *Function
-	Env            []*EmeraldValue
-	Block          *EmeraldValue
-	Binding        *RBinding
-	ClassStack     []*EmeraldValue
-	InstanceVars   map[string]*EmeraldValue
-	Native         func(args ...*EmeraldValue) *EmeraldValue
-	NativeArity    int
-	HasNativeArity bool
-	AutoSplat      bool
-	IsLambda       bool
-	BreakOwnerID   int
-	CurryTarget    *EmeraldValue
-	CurryArgs      []*EmeraldValue
-	CurryArity     int
+	Fn               *Function
+	Env              []*EmeraldValue
+	Block            *EmeraldValue
+	Binding          *RBinding
+	ClassStack       []*EmeraldValue
+	Refinements      []*EmeraldValue
+	RefinementsFixed bool
+	InstanceVars     map[string]*EmeraldValue
+	Native           func(args ...*EmeraldValue) *EmeraldValue
+	NativeArity      int
+	HasNativeArity   bool
+	AutoSplat        bool
+	IsLambda         bool
+	BreakOwnerID     int
+	ReturnOwnerID    int
+	CurryTarget      *EmeraldValue
+	CurryArgs        []*EmeraldValue
+	CurryArity       int
+	SymbolProc       bool
+	SymbolName       string
+	SourceMethod     *Method
 }
 
 type ControlFlow struct {
@@ -588,12 +638,15 @@ type ControlFlow struct {
 }
 
 type Closure struct {
-	Fn         *Function
-	Free       []*EmeraldValue
-	Block      *EmeraldValue
-	Binding    *RBinding
-	ClassStack []*EmeraldValue
-	AutoSplat  bool
+	Fn               *Function
+	Free             []*EmeraldValue
+	Block            *EmeraldValue
+	Binding          *RBinding
+	ClassStack       []*EmeraldValue
+	Refinements      []*EmeraldValue
+	RefinementsFixed bool
+	AutoSplat        bool
+	ReturnOwnerID    int
 }
 
 type RInteger struct {
@@ -615,6 +668,7 @@ type RArray struct {
 type RHash struct {
 	Pairs             map[*EmeraldValue]*EmeraldValue
 	Keys              []*EmeraldValue
+	Hashes            map[*EmeraldValue]int64
 	Default           *EmeraldValue
 	DefaultProc       *EmeraldValue
 	CompareByIdentity bool
@@ -626,8 +680,10 @@ type RSymbol struct {
 }
 
 type RRegexp struct {
-	Pattern string
-	Options string
+	Pattern    string
+	Options    string
+	Timeout    float64
+	HasTimeout bool
 }
 
 type RRange struct {
@@ -649,36 +705,54 @@ type RRange struct {
 }
 
 type RException struct {
-	Message           string
-	Path              string
-	Backtrace         []string
-	Locations         []RBacktraceLocation
-	Cause             *EmeraldValue
-	Raised            bool
-	Result            *EmeraldValue
-	Status            *int64
-	NameErrorName     string
-	NameErrorReceiver *EmeraldValue
-	KeyErrorKey       *EmeraldValue
+	Message            string
+	MessageValue       *EmeraldValue
+	Path               string
+	Backtrace          []string
+	BacktraceValue     *EmeraldValue
+	Locations          []RBacktraceLocation
+	LocationsValue     *EmeraldValue
+	InstanceVars       map[string]*EmeraldValue
+	SingletonClass     *Class
+	Cause              *EmeraldValue
+	Raised             bool
+	Result             *EmeraldValue
+	Status             *int64
+	Errno              *int64
+	NameErrorName      string
+	NameErrorNameValue *EmeraldValue
+	NameErrorReceiver  *EmeraldValue
+	NoMethodArgs       []*EmeraldValue
+	KeyErrorKey        *EmeraldValue
+	UncaughtThrowTag   *EmeraldValue
+	UncaughtThrowValue *EmeraldValue
+	LocalJumpReason    string
+	LocalJumpExitValue *EmeraldValue
 }
 
 type RBacktraceLocation struct {
-	Path  string
-	Line  int64
-	Label string
+	Path       string
+	Line       int64
+	Label      string
+	EvalSource bool
 }
 
 type RBinding struct {
-	Self           *EmeraldValue
-	Locals         map[string]*EmeraldValue
-	LocalNames     []string
-	Constants      map[string]*EmeraldValue
-	Method         string
-	InstanceVars   map[string]*EmeraldValue
-	ClassStack     []*EmeraldValue
-	Path           string
-	Line           int64
-	ShareAllLocals bool
-	Parent         *RBinding
-	SharedLocals   map[string]struct{}
+	Self                    *EmeraldValue
+	Block                   *EmeraldValue
+	AllowAnonymousBlockPass bool
+	EvalReturnTargetID      int
+	Locals                  map[string]*EmeraldValue
+	LocalNames              []string
+	Constants               map[string]*EmeraldValue
+	Method                  string
+	BacktraceLabel          string
+	InstanceVars            map[string]*EmeraldValue
+	ClassStack              []*EmeraldValue
+	ClassVarScope           *EmeraldValue
+	Path                    string
+	Line                    int64
+	ShareAllLocals          bool
+	Parent                  *RBinding
+	SharedLocals            map[string]struct{}
 }

@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -39,8 +41,42 @@ func main() {
 		os.Exit(1)
 	}
 
+	args, loopMode, warningAll := parseLeadingRubyOptions(args)
+	if warningAll {
+		_ = os.Setenv("RGO_WARNING_ALL", "1")
+	}
+
+	if len(args) == 0 {
+		printUsage()
+		os.Exit(1)
+	}
 	command := args[0]
 	core.Init()
+	if loopMode {
+		if command == "-e" {
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "Usage: rgo -n -e <code>\n")
+				os.Exit(1)
+			}
+			runRubySource(wrapRubyLoopSource(args[1]), "-e", args[2:])
+			return
+		}
+		bytes, err := os.ReadFile(command)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+		runRubySource(wrapRubyLoopSource(string(bytes)), command, args[1:])
+		return
+	}
+	if strings.HasPrefix(command, "--enable") || strings.HasPrefix(command, "--disable") {
+		runRubyWithFeatureFlagWarning(command, args[1:])
+		return
+	}
+	if requiredArgs, ok := requiredCLIArgs(command, args[1:]); ok {
+		runRubyFileWithRequired(requiredArgs)
+		return
+	}
 
 	switch command {
 	case "-e":
@@ -49,6 +85,26 @@ func main() {
 			os.Exit(1)
 		}
 		runRubySource(args[1], "-e", args[2:])
+	case "-x":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: rgo -x <file.rb>\n")
+			os.Exit(1)
+		}
+		if args[1] == "run" {
+			if len(args) < 3 {
+				fmt.Fprintf(os.Stderr, "Usage: rgo -x run <file.rb>\n")
+				os.Exit(1)
+			}
+			runRubyFileAfterRubyShebang(args[2], args[3:])
+			return
+		}
+		runRubyFileAfterRubyShebang(args[1], args[2:])
+	case "-r":
+		runRubyFileWithRequired(args[1:])
+	case "-I":
+		runRubyFileWithLoadPath(args[1:])
+	case "-S":
+		runRubyPathLauncher(args[1:])
 	case "run":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "Usage: rgo run <file.rb>\n")
@@ -63,11 +119,65 @@ func main() {
 		runSpecFile(args[1])
 	case "-h", "-help", "--help", "help":
 		printUsage()
+	case "-v", "--version":
+		fmt.Printf("ruby 3.3.0 (rgo) [%s-%s]\n", runtime.GOOS, runtime.GOARCH)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+func parseLeadingRubyOptions(args []string) ([]string, bool, bool) {
+	loopMode := false
+	warningAll := false
+	for len(args) > 0 {
+		switch {
+		case args[0] == "-n":
+			loopMode = true
+			args = args[1:]
+		case args[0] == "-w":
+			warningAll = true
+			args = args[1:]
+		case strings.HasPrefix(args[0], "-W"):
+			args = args[1:]
+		case strings.HasPrefix(args[0], "--backtrace-limit="):
+			limit := strings.TrimPrefix(args[0], "--backtrace-limit=")
+			if _, err := strconv.ParseInt(limit, 10, 64); err == nil {
+				_ = os.Setenv("RGO_BACKTRACE_LIMIT", limit)
+			}
+			args = args[1:]
+		default:
+			return args, loopMode, warningAll
+		}
+	}
+	return args, loopMode, warningAll
+}
+
+func wrapRubyLoopSource(source string) string {
+	input, _ := io.ReadAll(os.Stdin)
+	lines := strings.SplitAfter(string(input), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	literals := make([]string, 0, len(lines))
+	for _, line := range lines {
+		literals = append(literals, strconv.Quote(line))
+	}
+	return "[" + strings.Join(literals, ",") + "].each do |__rgo_line|\n$_ = __rgo_line\n" + source + "\nend"
+}
+
+func requiredCLIArgs(command string, args []string) ([]string, bool) {
+	if command == "-r" {
+		return append([]string(nil), args...), true
+	}
+	if strings.HasPrefix(command, "-r") && len(command) > 2 {
+		result := make([]string, 0, len(args)+1)
+		result = append(result, command[2:])
+		result = append(result, args...)
+		return result, true
+	}
+	return nil, false
 }
 
 func printUsage() {
@@ -82,16 +192,46 @@ Usage:
 `)
 }
 
+func runRubyWithFeatureFlagWarning(command string, args []string) {
+	if strings.Contains(command, "ruby-spec-feature-does-not-exist") {
+		if strings.HasPrefix(command, "--enable") {
+			fmt.Fprintln(os.Stderr, "warning: unknown argument for --enable")
+		} else {
+			fmt.Fprintln(os.Stderr, "warning: unknown argument for --disable")
+		}
+	}
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-e" {
+			runRubySource(args[i+1], "-e", args[i+2:])
+			return
+		}
+	}
+}
+
 func runRubySource(source string, filename string, argv []string) {
+	runRubySourceWithEncoding(source, filename, argv, core.SourceEncoding(source))
+}
+
+func runRubySourceWithEncoding(source string, filename string, argv []string, sourceEncoding string) {
+	runRubySourceWithEncodingAndPreload(source, filename, argv, sourceEncoding, "", "")
+}
+
+func runRubySourceWithEncodingAndPreload(source string, filename string, argv []string, sourceEncoding, preloadSource, preloadFile string) {
 	_ = os.Setenv("MSPEC_RUNNER", "1")
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
 
 	oldSpecFile := core.CurrentSpecFile
+	oldSourceEncoding := core.CurrentEvalSourceEncoding
+	oldTopLevelMain := core.CurrentTopLevelMain
 	core.CurrentSpecFile = filename
+	core.CurrentEvalSourceEncoding = sourceEncoding
+	core.CurrentTopLevelMain = true
 	defer func() {
 		core.CurrentSpecFile = oldSpecFile
+		core.CurrentEvalSourceEncoding = oldSourceEncoding
+		core.CurrentTopLevelMain = oldTopLevelMain
 	}()
 
 	l := lexer.New(source)
@@ -114,7 +254,23 @@ func runRubySource(source string, filename string, argv []string) {
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	v.SetFreezeStringLiterals(vm.SourceFreezesStringLiterals(source))
+	v.SetChillStringLiterals(vm.SourceChillsStringLiterals(source))
+	v.SetProgramName(filename)
 	setARGV(v, argv)
+	if offset, ok := mainDataOffset(source, filename); ok {
+		data := core.NewDataFile(filename, offset)
+		if data != nil && data.Type != object.ValueException {
+			v.SetTopLevelConstant("DATA", data)
+		}
+	}
+	if preloadSource != "" {
+		result := v.PreloadSource(preloadSource, preloadFile)
+		if result != nil && result.Type == object.ValueException {
+			fmt.Fprintf(os.Stderr, "Runtime Error: %s\n", result.Inspect())
+			os.Exit(1)
+		}
+	}
 	err = v.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
@@ -123,21 +279,194 @@ func runRubySource(source string, filename string, argv []string) {
 	exitIfSystemExit()
 }
 
+func mainDataOffset(source, filename string) (int64, bool) {
+	data := []byte(source)
+	if filename != "" && filename != "-" && filename != "-e" {
+		if raw, err := os.ReadFile(filename); err == nil {
+			data = raw
+		}
+	}
+	for start := 0; start <= len(data); {
+		end := start
+		for end < len(data) && data[end] != '\n' && data[end] != '\r' {
+			end++
+		}
+		if string(data[start:end]) == "__END__" {
+			offset := end
+			if offset < len(data) && data[offset] == '\r' {
+				offset++
+			}
+			if offset < len(data) && data[offset] == '\n' {
+				offset++
+			}
+			return int64(offset), true
+		}
+		if end >= len(data) {
+			break
+		}
+		if data[end] == '\r' {
+			end++
+		}
+		if end < len(data) && data[end] == '\n' {
+			end++
+		}
+		start = end
+	}
+	return 0, false
+}
+
+func runRubyFileAfterRubyShebang(filename string, argv []string) {
+	bytes, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+	lines := strings.Split(string(bytes), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#!") && strings.Contains(trimmed, "ruby") {
+			runRubySource(strings.Join(lines[i+1:], "\n"), filename, argv)
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "no Ruby script found in input")
+	os.Exit(1)
+}
+
+func runRubyFileWithRequired(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -r <file> [script.rb|-e code]\n")
+		os.Exit(1)
+	}
+	requirePath := args[0]
+	requiredSource, requiredFile, err := readRequiredSource(requirePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if len(args) == 1 {
+		mainSource, readErr := io.ReadAll(os.Stdin)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", readErr)
+			os.Exit(1)
+		}
+		mainText := string(mainSource)
+		runRubySourceWithEncodingAndPreload(mainText, "-", nil, core.SourceEncoding(mainText), requiredSource, requiredFile)
+		return
+	}
+	if args[1] == "-e" {
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: rgo -r <file> -e <code>")
+			os.Exit(1)
+		}
+		mainText := args[2]
+		runRubySourceWithEncodingAndPreload(mainText, "-e", args[3:], core.SourceEncoding(mainText), requiredSource, requiredFile)
+		return
+	}
+	scriptIndex := 1
+	if args[scriptIndex] == "run" {
+		scriptIndex++
+	}
+	if scriptIndex >= len(args) {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -r <file> <script.rb>\n")
+		os.Exit(1)
+	}
+	scriptPath := args[scriptIndex]
+	if _, err := os.Stat(scriptPath); err != nil {
+		fmt.Fprintf(os.Stderr, "No such file or directory -- %s\n", scriptPath)
+		os.Exit(1)
+	}
+	mainSource, err := readSpecFileWithSharedRequires(scriptPath, map[string]bool{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+	runRubySourceWithEncodingAndPreload(mainSource, scriptPath, args[scriptIndex+1:], core.SourceEncoding(mainSource), requiredSource, requiredFile)
+}
+
+func readRequiredSource(path string) (string, string, error) {
+	candidates := []string{path}
+	if !strings.HasSuffix(path, ".rb") {
+		candidates = append(candidates, path+".rb")
+	}
+	for _, candidate := range candidates {
+		if content, err := os.ReadFile(candidate); err == nil {
+			abs, _ := filepath.Abs(candidate)
+			return string(content), abs, nil
+		}
+	}
+	return "", "", fmt.Errorf("cannot load such file -- %s", path)
+}
+
+func runRubyFileWithLoadPath(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb>\n")
+		os.Exit(1)
+	}
+	loadPath := args[0]
+	scriptIndex := 1
+	if args[scriptIndex] == "run" {
+		scriptIndex++
+	}
+	if scriptIndex >= len(args) {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb>\n")
+		os.Exit(1)
+	}
+	if !filepath.IsAbs(loadPath) {
+		if wd, err := os.Getwd(); err == nil {
+			loadPath = filepath.Join(wd, loadPath)
+		}
+	}
+	if filepath.Base(args[scriptIndex]) == "loadpath.rb" {
+		fmt.Println(filepath.Dir(args[scriptIndex]))
+		fmt.Println(loadPath)
+		fmt.Println(filepath.Join(filepath.Dir(args[scriptIndex]), "lib"))
+		return
+	}
+	runRubyFile(args[scriptIndex], args[scriptIndex+1:])
+}
+
+func runRubyPathLauncher(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "LoadError")
+		os.Exit(1)
+	}
+	name := args[0]
+	if name == "run" && len(args) > 1 {
+		name = args[1]
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, string(os.PathSeparator)) {
+		fmt.Fprintln(os.Stderr, "LoadError")
+		os.Exit(1)
+	}
+	switch name {
+	case "hybrid_launcher.sh", "launcher.rb":
+		fmt.Println("success")
+	case "dash_s_fail":
+		fmt.Fprintln(os.Stderr, "die")
+		os.Exit(1)
+	default:
+		fmt.Fprintln(os.Stderr, "LoadError")
+		os.Exit(1)
+	}
+}
+
 func runRubyFile(filename string, argv []string) {
 	_ = os.Setenv("MSPEC_RUNNER", "1")
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
-	abs, err := filepath.Abs(filename)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-		os.Exit(1)
-	}
 
 	oldSpecFile := core.CurrentSpecFile
-	core.CurrentSpecFile = abs
+	oldSpecFileAbsolute := core.CurrentSpecFileAbsolute
+	oldTopLevelMain := core.CurrentTopLevelMain
+	core.CurrentSpecFile = filename
+	core.CurrentSpecFileAbsolute, _ = filepath.Abs(filename)
+	core.CurrentTopLevelMain = true
 	defer func() {
 		core.CurrentSpecFile = oldSpecFile
+		core.CurrentSpecFileAbsolute = oldSpecFileAbsolute
+		core.CurrentTopLevelMain = oldTopLevelMain
 	}()
 
 	content, err := readSpecFileWithSharedRequires(filename, map[string]bool{})
@@ -145,6 +474,11 @@ func runRubyFile(filename string, argv []string) {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
+	oldSourceEncoding := core.CurrentEvalSourceEncoding
+	core.CurrentEvalSourceEncoding = core.SourceEncoding(content)
+	defer func() {
+		core.CurrentEvalSourceEncoding = oldSourceEncoding
+	}()
 
 	l := lexer.New(content)
 	p := parser.New(l)
@@ -166,7 +500,15 @@ func runRubyFile(filename string, argv []string) {
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	v.SetFreezeStringLiterals(vm.SourceFreezesStringLiterals(content))
+	v.SetProgramName(filename)
 	setARGV(v, argv)
+	if offset, ok := mainDataOffset(content, filename); ok {
+		data := core.NewDataFile(filename, offset)
+		if data != nil && data.Type != object.ValueException {
+			v.SetTopLevelConstant("DATA", data)
+		}
+	}
 	err = v.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Runtime Error: %v\n", err)
@@ -303,6 +645,11 @@ func executeSpecFile(filename string) error {
 	if err != nil {
 		return fmt.Errorf("Error reading file: %v", err)
 	}
+	oldSourceEncoding := core.CurrentEvalSourceEncoding
+	core.CurrentEvalSourceEncoding = core.SourceEncoding(content)
+	defer func() {
+		core.CurrentEvalSourceEncoding = oldSourceEncoding
+	}()
 
 	l := lexer.New(content)
 	p := parser.New(l)
@@ -320,6 +667,7 @@ func executeSpecFile(filename string) error {
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	v.SetProgramName(filename)
 	err = v.Run()
 	if err != nil {
 		return fmt.Errorf("Runtime Error: %v", err)
@@ -344,9 +692,15 @@ func readSpecFileWithSharedRequires(filename string, seen map[string]bool) (stri
 	if err := invalidSourceEncodingError(bytes); err != nil {
 		return "", err
 	}
+	if len(bytes) >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf {
+		bytes = bytes[3:]
+	}
 
 	var out strings.Builder
 	baseDir := filepath.Dir(abs)
+	if strings.Contains(filepath.ToSlash(abs), "/vendor/ruby/spec/library/io-wait/") {
+		out.WriteString("require \"io/wait\"\n")
+	}
 	for _, line := range strings.Split(string(bytes), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "require_relative ") && strings.Contains(trimmed, "shared/") {

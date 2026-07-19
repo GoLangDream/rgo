@@ -52,6 +52,13 @@ func hasOpcode(instructions Instructions, op Opcode) bool {
 	return false
 }
 
+func TestCompileMultipleSplatsAsSingleExpandableArray(t *testing.T) {
+	bc := compile(t, `f(*[:a], *[:b], *[:c], 10)`)
+	if !hasOpcode(bc.Instructions, OpSplatToArray) {
+		t.Fatal("expected multiple splats to be packed into an expandable array")
+	}
+}
+
 func TestCompileRescueMatchMarksSplatExceptions(t *testing.T) {
 	bc := compile(t, `
 exceptions = [SecondError]
@@ -91,6 +98,32 @@ func functionConstants(bytecode *Bytecode) []*object.Function {
 		}
 	}
 	return functions
+}
+
+func TestCompileParameterDestructuringMetadata(t *testing.T) {
+	bytecode := compile(t, `def unpack((a, *middle, z)); [a, middle, z]; end`)
+	var fn *object.Function
+	for _, candidate := range functionConstants(bytecode) {
+		if candidate.Name == "unpack" {
+			fn = candidate
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("expected compiled unpack function")
+	}
+	if len(fn.Params) != 1 || len(fn.ParamPatterns) != 1 {
+		t.Fatalf("expected one physical parameter and pattern, got %d and %d", len(fn.Params), len(fn.ParamPatterns))
+	}
+	pattern := fn.ParamPatterns[0]
+	if pattern == nil || len(pattern.Children) != 2 || pattern.Rest == nil || pattern.RestIndex != 1 {
+		t.Fatalf("unexpected runtime pattern: %#v", pattern)
+	}
+	for _, name := range []string{"a", "middle", "z"} {
+		if _, ok := fn.LocalNames[name]; !ok {
+			t.Fatalf("expected local slot for %s", name)
+		}
+	}
 }
 
 func TestCompileMethodCallWithoutMethodNameReturnsError(t *testing.T) {

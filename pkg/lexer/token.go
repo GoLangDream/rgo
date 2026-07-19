@@ -13,14 +13,16 @@ const (
 
 	EscapedHashInterpolation = "\x00#"
 
-	IDENT    TokenType = "IDENT"
-	INT      TokenType = "INT"
-	FLOAT    TokenType = "FLOAT"
-	RATIONAL TokenType = "RATIONAL"
-	STRING   TokenType = "STRING"
-	WORDS    TokenType = "WORDS"
-	SYMBOL   TokenType = "SYMBOL"
-	REGEXP   TokenType = "REGEXP"
+	IDENT     TokenType = "IDENT"
+	INT       TokenType = "INT"
+	FLOAT     TokenType = "FLOAT"
+	RATIONAL  TokenType = "RATIONAL"
+	IMAGINARY TokenType = "IMAGINARY"
+	STRING    TokenType = "STRING"
+	WORDS     TokenType = "WORDS"
+	SYMBOLS   TokenType = "SYMBOLS"
+	SYMBOL    TokenType = "SYMBOL"
+	REGEXP    TokenType = "REGEXP"
 
 	ASSIGN   TokenType = "="
 	PLUS     TokenType = "+"
@@ -170,6 +172,7 @@ type Token struct {
 	// AllowsInterpolation indicates whether this literal should be interpreted as an
 	// interpolated string (double-quoted style).
 	AllowsInterpolation bool
+	HasUnicodeEscape    bool
 	CommandLiteral      bool
 	Line                int
 	Column              int

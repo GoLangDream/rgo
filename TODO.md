@@ -1,5 +1,392 @@
 # RGo 待办事项
 
+- [x] `library/openssl` 已全绿（2026-07-19）：由模块整体缺失、`16 nonzero + 2 zero / 19 files`、518 failures 收敛到 `19/19 files`、`173 examples / 0 failures`。原生实现 Random、安全比较、SHA Digest/HMAC、PBKDF2-HMAC、RFC 7914 Scrypt，以及 RubySpec 覆盖的 X509 Name/Certificate/Store/PKey/ASN1 状态模型；OpenSSL 与共享 Digest/SecureRandom Go 回归均通过。
+
+- [x] `library/digest` 已全绿（2026-07-19）：`68/68 files`、`129 examples / 0 failures`。补齐实例 `new` 的复制后 reset、带参数 `digest/hexdigest` 的状态重置、`Digest::SHA2` 默认 SHA256 与 256/384/512 构造，以及 raw digest 的 ASCII-8BIT 编码语义，解除原 16 个失败。
+
+- [x] `library/openstruct` 已全绿（2026-07-19）：`13/13 files`、`34 examples / 0 failures`。补齐 `[]`/`[]=`、delete_field、marshal_load、字段顺序、递归/子类 inspect/to_s 与动态 accessor 生命周期，解除原 11 个失败。
+
+- [x] `library/base64` 已全绿（2026-07-19）：`6/6 files`、`26 examples / 0 failures`。补齐 lenient/strict、换行编码、URL-safe 与 optional padding，并保持 decoded BINARY / encoded US-ASCII 编码语义，解除原 20 个失败。
+
+- [ ] `library/erb/run_spec.rb` 隐式单失败（2026-07-19）：5 个 examples 的可见断言与逐项独立探针均通过（模板输出、binding 局部变量回写、Util include、TOPLEVEL_BINDING/NameError），但 runner 汇总仍报告 `1 failure` 且不打印对应断言。按项目调试规则先记录；ERB 当前由 58 failures 收敛至 `12 pass / 1 nonzero`、仅此 1 failure。
+
+- [x] `library/prime` 已全绿（2026-07-19）：`11/11 files`、`68 examples / 0 failures`。补齐 Prime 类/实例枚举与独立 Enumerator、bound 迭代、质数判断、任意精度 factorization product，以及 Integer 桥接方法，解除原 47 个失败。
+
+- [x] `library/securerandom` 已全绿（2026-07-19）：`5/5 files`、`42 examples / 0 failures`。随机字节现保留 ASCII-8BIT 二进制长度语义，`random_number` 对任意精度整数及整数 Range 使用加密随机大整数，解除原 74 个失败。
+
+- [x] `Integer + Rational` 精度 bug 已解除（2026-07-19）：`intAdd`/`intSub`/`intMul` 现直接保留精确 Rational，`6 + 1/10r` 返回 `61/10`；DateTime `%N` 的 `1/10r`、`1/100r` 精度回归同步转绿。
+
+- [x] `library/datetime` 已全绿（2026-07-19）：由 `19 pass / 17 nonzero`、`166 failures` 收敛到 `36/36 files`、`214 examples / 0 failures`。补齐时间分量与精确秒小数、offset/zone、瞬时算术、格式化、parse/now、Date/Time/DateTime 转换，并复用 Date 历法基础。
+
+- [x] `library/date` 已全绿（2026-07-19）：由 `70 pass / 41 nonzero`、`842 failures` 收敛到 `111/111 files`、`352 examples / 0 failures`。实现混合 Julian/Gregorian 历法与 reform start、JD/ordinal/commercial 构造、访问器和比较、日期/月算术、历法转换、Infinity/常量、parse/iso8601/strptime/strftime、迭代，以及 `Time#to_date`；同时建立最小 `DateTime` 子类供后续集群扩展。
+
+- [x] `library/bigdecimal/div_spec.rb` 精度参数为 0 且除数为 0 时 panic 已解除（2026-07-19）：显式 precision 路径现于进入 `big.Rat.Quo` 前处理零除数，分别返回 signed Infinity 或 NaN，并服从异常模式。
+
+- [x] `library/bigdecimal` 已全绿（2026-07-19）：由 `6 pass / 51 nonzero`、`3020 failures` 收敛到 `57/57 files`、`391 examples / 0 failures`。实现精确十进制、构造/常量/比较、四则运算、Rational 与 util 转换、取整/round/mode/limit、格式化/split、power/sqrt、异常模式、signed zero 与极端 divmod；同时补齐 Ruby 合法的 `BigDecimal "0"` 大写方法命令调用解析。Language 串行回归仍为 `80/80 files`、`2898 examples / 0 failures`。
+
+- [ ] `core/module/autoload_spec.rb` 并发缺失文件回归（2026-07-19）：前 73 个可见 examples（含 private autoload 与 current-file require）均已通过；进入“raises a LoadError in each thread if the file does not exist”后，某个 Thread value/异常对象缺少 Class，`lookupMethodForSend` 对 nil Class 调用 `GetMethodWithOwner` 触发 panic。已在单核、3 秒文件上限下稳定复现两次；按项目调试规则先记录，继续处理独立 Core 失败。
+
+- [ ] Core 最新低并发基线及本轮收敛（2026-07-19）：刷新得到 `2118 files`、`24158 examples`，初始为 `2094 pass / 9 nonzero / 1 runtime_error / 1 timeout / 13 zero_examples`、`20 failures`。本轮已清零 Enumerable include/member、Fiber/Thread/Kernel raise、Thread Fiber-local、Kernel require/autoload、Thread.each_caller_location，并补齐 Ruby 4 预载 Pathname；复核后当前为 `2103 pass + 13 guard-zero + 1 runtime_error + 1 timeout / 2118 files`，普通 behavior failure 已为 0。仅剩已记录的 `module/autoload_spec.rb` 并发 panic 与 `process/daemon_spec.rb` 资源上限 timeout。
+
+- [ ] Go VM 回归 `TestProcessSpawnWaitAndLastStatus`（2026-07-19）：聚焦 Process 回归中 `Process.spawn("ruby -e exit")` 的 `$?.exitstatus` 得到 127 而非 0；同轮 RubySpec `spawn_spec` 90/90、`exec_spec` 22/22 已通过。按项目调试规则先记录，继续完成 Process 目录刷新后统一处理测试环境下的 ruby executable 解析。
+
+- [x] `core/tracepoint` 已全绿（2026-07-19）：实现真实 `line/call/return/c_call/c_return/b_call/b_return/class/end/raise/rescue/script_compiled/thread_begin/thread_end` 事件派发，补齐上下文访问器、`trace`/`allow_reentry`、target/target_line 过滤与校验，并修复方法 return Binding 泄漏外层局部变量；当前 `19/19 files`、`75 examples / 0 failures`，对应 Go 回归通过。
+
+- [x] `core/exception` 已全绿（2026-07-19）：补齐消息对象/to_s/inspect、值相等与 dup 钩子、异常层级、NameError/KeyError/UncaughtThrowError 元数据、Errno 构造与同号别名、IO Wait marker、可变 backtrace_locations、SyntaxError path，并修复裸 raise 当前帧判定及 RaiseExpression 行号。当前 `39/39 files`、`248 examples / 0 failures`。
+
+- [x] `core/process` 行为失败已清零（2026-07-19）：`spawn_spec` 为 `90 examples / 0 failures`，`exec_spec` 为 `22 examples / 0 failures`；目录当前 `89 pass + 2 zero_examples / 92 files`、`378 examples / 0 failures`，仅 `daemon_spec` 在 3 秒资源上限下 timeout。独立 Go VM 可执行文件解析回归见顶部待办。
+
+- [x] `core/gc` 已全绿（2026-07-19）：补齐 GC start/count/stat/config、enable/disable、stress/compact/计时状态、实例 garbage_collect 及 Profiler 接口；当前 `18/18 files`、`43 examples / 0 failures`。
+
+- [x] `core/string` 已全绿（2026-07-19）：String `[]`/`slice`/`byteslice` 将显式 nil Range 端点按开放边界处理；`String#%` 按 ASCII 兼容性协商结果编码。当前 `140 pass + 1 zero_examples / 141 files`、`3969 examples / 0 failures`，zero 文件仅含 Ruby 版本 guard。
+
+- [x] `core/main` 已全绿（2026-07-18）：main 私有 `using` 现写入当前 VM 帧的目标快照，作用域隔离于 eval/load；现有 refined target 可继续增补方法，新 target 不泄漏，并校验 main/Module 词法接收者及 wrapped load；`7/7 files、27 examples / 0 failures`。
+
+- [x] `core/refinement` 已全绿（2026-07-18）：增加独立 Refinement 类、target/refinements/import_methods，Ruby 方法导入保留词法 refinement、owner 与 super，拒绝 native/非 Module/extend hook，并跳过祖先方法；`8/8 files、25 examples / 0 failures`。
+
+- [x] `core/set` 行为失败已清零（2026-07-18）：补齐 `===`、size/length/join、集合比较、intersect/disjoint、identity 模式、flatten/flatten!，并统一按 hash+eql? 处理成员及 Ruby 4 `Set[...]` inspect；`52 pass + 2 zero_examples / 54 files、179 examples / 0 failures`，两个 zero 文件仅含版本 guard。
+
+- [x] `core/random` 已全绿（2026-07-18）：实现 Ruby 兼容 MT19937（含小 seed 与大整数 seed 初始化、精确 Float/bytes 序列）、实例 state/seed/equality/rand/random_number/bytes，以及类级 new_seed/srand/rand/random_number/bytes/urandom；`10/10 files、87 examples / 0 failures`。
+
+- [x] `core/queue` 与 `core/sizedqueue` 阻塞/超时语义已全绿（2026-07-18）：线程等待通过 continuation 挂起，生产者/消费者、close 与期限到达会正确唤醒；`Thread#join(timeout)` 驱动协作式期限调度。Queue `15/15 files、88 examples / 0 failures`，SizedQueue `16/16 files、129 examples / 0 failures`。
+
+- [x] `vendor/ruby/spec/core/fiber` 与 `vendor/ruby/spec/core/thread` 已全绿（2026-07-17）：Fiber `13/13 files`、`170 examples / 0 failures`；Thread `53/53 files`、`415 examples / 0 failures`。Fiber 已补齐 continuation、raise/resume/transfer/kill、inspect、scheduler 与隔离 storage，并将 Fiber/Thread 不可救援终止标记分离，确保 Thread kill 能穿透活动 Fiber。
+
+- [x] `vendor/ruby/spec/core/basicobject` 已全绿（2026-07-17）：`14/14 files`、`179 examples / 0 failures`。Kernel include 现公开转发 `hash`，BasicObject 子类包含 Kernel 后 `respond_to?(:hash)` 正确为 true。
+
+- [x] `vendor/ruby/spec/core/conditionvariable` 已全绿（2026-07-17）：`4/4 files`、`11 examples / 0 failures`。`wait` 现通过 Thread continuation 真正挂起，signal/broadcast 按等待队列唤醒，并在正常、wakeup 与 kill 路径都先重新获取 Mutex。
+
+- [ ] 最新低并发 core 基线（2026-07-17）：`1046 files`、`11253 examples`、`339 failures`，其中 `966 pass / 69 nonzero_failures / 5 runtime_error / 6 zero_examples`。当前失败簇为 BasicObject 1（随后已清零）、IO 1、Dir 3、Enumerable 5、Enumerator 6、Binding 6、Array 6、ConditionVariable 8、File 28、Exception 40、GC 42、Hash 82、Complex 111。
+
+- [ ] `IO#readpartial` 当前唯一 core/io 失败来自 spec 的矛盾期待：同为 pipe 写端关闭、读端无数据，`readpartial(1, buffer)` 要求 `EOFError`，而 `readpartial(1)` 要求 `IOError`。当前实现一致返回 `EOFError`；不按是否提供 buffer 伪造异常类型，后续需核对/同步上游 spec。
+
+- [x] `vendor/ruby/spec/core/module` 已全绿（2026-07-17）：`84/84 files`、`1076 examples / 0 failures`。本轮补齐 eval block 经 `send` 转发、refinement 词法快照、prepend 的 module target/常量/owner/ancestor/super/Integer 优化失效、`Module` 子类 `initialize`，并修复 prepend 场景的深递归 OOM。
+
+- [x] `vendor/ruby/spec/core/comparable` 已全绿（2026-07-17）：`7/7 files`、`54 examples / 0 failures`。为 `Comparable#==` 增加同一对象对的递归保护，默认 `Object#<=>` 或用户 `<=>` 调用 `super` 时不再与 `==` 相互递归 OOM。
+
+- [x] `vendor/ruby/spec/core/rational` 已全绿（2026-07-17）：`32/32 files`、`161 examples / 0 failures`。`Rational.new` 现按 Ruby 语义抛出 `NoMethodError`，不再构造无效普通对象。
+
+- [x] `vendor/ruby/spec/core/method` 最新低并发刷新全绿（2026-07-17）：`25/25 files`、`223 examples / 0 failures`。
+
+- [x] `vendor/ruby/spec/core/unboundmethod` 最新低并发刷新全绿（2026-07-17）：`19/19 files`、`100 examples / 0 failures`。
+
+- [x] `vendor/ruby/spec/core/warning` 已全绿（2026-07-17）：`5/5 files`、`29 examples / 0 failures`。补齐 Warning category `[]`/`[]=`、`warn` 分类抑制、extend-self owner/ancestor、CLI `-w` 默认值与 `$;` deprecated warning；同时让 `%Q`/bare percent 双引号字符串正确解码转义。
+
+- [ ] Go 全量回归仍有独立旧问题（2026-07-17）：parser 的 keyword assignment `or` AST；core 的非 String concat 期望；VM 的闭包写回、Array subclass、Kernel include、Enumerable yield、write_nonblock、bsearch，以及 `TestArraySortUsesSpaceshipAndRejectsNilComparison` 中 `valueToSortComparison` 递归栈溢出。Module 聚焦回归及其 84 个 RubySpec 均通过，按项目规则先记录后继续其他 RubySpec 簇。
+
+- [ ] Lexer 全量旧回归 `TestSymbolInspectLiteralTokens`：双引号 Symbol `:"$\\"` 的 token literal 当前已解码成一个反斜杠，而测试仍期待保留两个；与本轮 `%Q` escape 解码路径无交集，Warning/Module RubySpec 和新增聚焦测试均通过，后续在 Symbol literal 表示层统一处理。
+
+- [x] `core/file` 行为失败已清零（2026-07-19）：补齐 Pathname require/to_path、world_readable/world_writable、ASCII-compatible 编码转换快速路径及共享路径编码校验；当前 `108 pass + 4 zero_examples / 112 files`、`948 examples / 0 failures`，zero 文件仅为 lchmod/lchown 与 File::Stat setuid/setgid 平台 guard。
+- [x] File 本轮共享语义：补齐 File::Constants/Enumerable、`to_path`、lock 常量、owned/pipe/device/socket/sticky/symlink/setuid/setgid、Unix 权限位与 umask/chmod 大整数范围；实现 Ruby 边界保留的 `join`、`absolute_path`、`expand_path`、basename 编码、完整 fnmatch brace/`**`/dot/bracket；注册 IO/File `printf` 并保留 format 编码；补 `new_fd` 与 fd reopen、`lutime`/symlink timestamps。`printf_spec` 已从 431 failures 降至 0。
+
+- [x] `core/file/stat` 行为失败已清零（2026-07-17）：补齐 Comparable/mtime 比较、device/socket/sticky/group/permission predicates、uid/gid/nlink 与 inspect；当前 `41 pass + 2 zero_examples / 43 files`、`113 examples / 0 failures`，zero 文件同样仅为平台 guard 的 setuid/setgid。
+
+- [x] `core/filetest` 行为失败已清零（2026-07-17）：补齐 block/char device、group ownership、real readable、socket、sticky、symlink 与按真实 uid/gid 解析权限位；修正 Unix mode 到 Go `FileMode` 的 setuid/setgid/sticky 映射，并让受限环境下 UNIXServer shim 保留 socket 类型。当前 `22 pass + 2 zero_examples / 24 files`、`94 examples / 0 failures`；两个 zero 文件仅含被平台 guard 跳过的 setuid/setgid shared examples。
+
+- [x] `core/binding` 已全绿（2026-07-19）：此前 TracePoint/eval 作用域改造已覆盖 Binding 的共享与复制语义；最新低并发刷新为 `9/9 files`、`58 examples / 0 failures`。
+
+- [x] `FalseClass` / `TrueClass` 已全绿（2026-07-17）：补齐 `&`、`|`、`^` 按 Ruby truthiness 运算；合计 `18/18 files`、`26 examples / 0 failures`。
+
+- [ ] `core/dir` 剩余 2 failures（2026-07-17）：`read_spec` 的首个普通 `while entry = dir.read` 只迭代一次，而 lambda 内同形循环能迭代全部 21 项，属于 VM while/赋值控制流差异；`seek_spec` 的首个 example 在共享 context 的 `before :each` 声明执行前即运行，导致 `@dir` 为 nil，属于当前 MSpec runner 立即执行 example、未预注册共享 hooks 的顺序问题。已按调试规则记录，避免在 Dir 方法层伪造行为。Dir 的 Enumerable、foreach encoding、named-user home/backtick tilde、seek 实际位置恢复均已修复，目录从 13 failures 降至 2。
+
+- [ ] Go 回归 `TestClassIncludeReturnsReceiverFromClassBody`：`Class.new { outer = include mod }` 在 block 内赋值正确，但捕获的外层 local 未更新；与本轮 Class inherited/subclasses 实现无关，已按调试规则记录，后续统一修复 class-body closure cell 写回。
+
+- [x] `Class#subclasses` 已全绿（2026-07-17）：`8 examples / 0 failures`。修复成功 `Thread.new` 预构造“缺少 block”异常而污染全局异常状态的问题，并同步顶层 closure cell 与 binding；`16 * 1000` 个 Thread block 现能完整产出 16000 个直接子类。
+
+- [x] **Data 已全绿（2026-07-17）**：补齐递归 `==`/`eql?`、内容 hash、空 keyword 位置参数、String-key `with`、覆盖 initialize 的 keyword 转发，以及 `Data.instance_method(:initialize).bind_call`；当前 `13/13 files`、`85 examples / 0 failures`。
+
+- [x] **Struct 已全绿（2026-07-17）**：采用类级字段/`keyword_init` 元数据和独立成员存储，补齐构造、block、索引、枚举、转换、dig、递归比较/hash/inspect、复制与 Marshal；当前 `30/30 files`、`182 examples / 0 failures`，Marshal 回归仍为 `6/6 files`、`715 examples / 0 failures`。
+
+- [x] **Time 已全绿（2026-07-17）**：补齐 `with_timezone`、`strftime`、构造/转换、精确 instant/subsecond/offset、Float/Rational 加减、DST 重叠选择、local 状态、Marshal 与 `inspect`/`to_s` 区分；同时修复共享 spec 中 brace lambda 内嵌 `do` block 的 parser 归属。当前 `66/66 files`、`776 examples / 0 failures`。
+
+- [ ] 聚焦运行 `TestRegexpLiteralMatchBindsNamedCaptureLocals` 与 `TestRegexpEncodingModifiersAndAllocation` 仍分别暴露命名捕获局部变量残留和编码 metadata 差异；按项目调试规则已记录，后续回到 Regexp/VM 回归簇统一处理。
+
+- [x] **Range 共享语义收敛（2026-07-17）**：区分显式 `nil` 与省略端点，补齐 `eql?/hash/to_s/inspect/count/%`、浮点与无限边界 `bsearch`、ArithmeticSequence size、通用端点、Bignum 比较、Symbol 区间及 Ruby 4.0 `size` 错误语义；`core/range` 当前 `33/33 files`、`465 examples / 0 failures`，聚焦 Go Range 回归通过。
+
+- [ ] 直接运行 RubySpec 时若未设置 `GOMAXPROCS=1`，曾出现 `pthread_create failed: Resource temporarily unavailable`；后续所有 `rgo test` 也必须显式继承单核运行限制，避免线程资源峰值。
+
+- [x] `vendor/ruby/spec/core/enumerator` 当前已全绿：`81 pass / 81 files`、`450 examples / 0 failures`。本轮补齐 ArithmeticSequence、Chain、Product、Yielder、基础 Enumerator 与 Lazy 的 size/inspect/按需迭代语义；修复 `super(*args)`、嵌套 block `break`、Regexp match globals、endless Range 逗号边界，以及 Lazy `compact/drop/eager/grep/grep_v/map/select/take/zip`，无限枚举不再被 zip 全量展开。聚焦 VM 与 parser 回归均通过。
+
+- [x] `vendor/ruby/spec/language` 最新 2GB 限额串行刷新（2026-07-14）为 `80 pass / 80 files`，共 `2904 examples / 0 failures`。本轮收尾覆盖 regexp、precedence、String 编码与 frozen literal、常量查找、magic comment 原始字节、非局部 break、`TOPLEVEL_BINDING` 以及 `DATA/__END__`。
+
+- [x] **Language predefined 收尾（2026-07-14）**：修复反斜杠续行后的相邻 String literal 拼接，使 `ruby_exe` 子进程收到完整的 `STDIN/STDOUT/STDERR.set_encoding ...; p ...` 源码；修复 nested rescue 中 `return` 改道进入 `ensure` 前未恢复外层 `$!`。`predefined_spec.rb` 当前为 `174 examples / 0 failures`，并新增跨子进程编码与 expectation-call 异常状态回归。
+
+- [x] **Integer bit_length / 幂优先级（2026-07-13）**：已新增独立 `POWER` precedence、使 `**` 右结合且高于一元负号；`core/integer/bit_length_spec.rb` 已从 39 failures 收敛为 4 examples / 0 failures。
+  - [x] 已修复 Range 缺失边界在 Array slice 中被 Go typed-nil 误当作实际值的问题；同时让显式 `Array#[]` 方法调用识别 bounded `Enumerator::ArithmeticSequence` 的内部枚举器表示。`element_reference_spec.rb` 69/69、`slice_spec.rb` 82/82 通过。
+
+- [x] **Bitwise 运算符优先级（2026-07-13）**：已为 `&`、`^`、`|` 建立独立 precedence，并保持 `+ > & > ^ > |`；补齐 Bignum 精确方法分派及 public/private `coerce`。`bit_and_spec.rb` 13/13、`bit_or_spec.rb` 12/12、`bit_xor_spec.rb` 13/13 全绿。
+
+- [ ] **Integer#to_f / Float power 舍入差异（2026-07-13）**：大整数已按真实 `big.Int` magnitude 转 Float，`core/integer/to_f_spec.rb` 剩 1 failure：`(10**308).to_f` 为 `1e308`，而当前循环实现的 `10.0 ** 308` 为 `9.999999999999998e307`。这是 Float 幂运算舍入路径差异，不应通过扭曲 Integer 转换规避，后续单独修复 Float `**`。
+
+- [x] **`::` 小写方法与 Symbol inspect（2026-07-16）**：原“大 Hash 后三元赋值”已定位为 `Encoding::default_external` 被误编译成作用域常量读取、再经 `const_missing` 兜底；编译器现对 `::` 后小写名称直接发方法调用，并补齐 UTF-8 Unicode Symbol 的裸字面量 inspect。`core/symbol` 当前 `29/29 files`、`330 examples / 0 failures`，Array 回归仍为 `129/129 files`、`3022 examples / 0 failures`。
+
+- [x] **Proc 共享语义收敛（2026-07-16）**：补齐 arity、`parameters(lambda:)`、箭头 lambda 括号/匿名 rest 参数、源码位置、Method#to_proc、`__method__`、二进制 inspect、dup/clone/hash 与 callable composition；修复正则插值中 `__FILE__` / `__LINE__` 的定义位置。`core/proc` 当前 `23/23 files`、`302 examples / 0 failures`。
+
+- [x] **Regexp 共享簇（2026-07-16）**：已补构造/初始化/冻结、严格 `to_str`、语法错误、选项、编码、匹配、last_match、union、inspect/source/to_s、eql/hash、timeout 与 linear_time 语义，并修复 `%r` 非元字符终止符转义。目录由 203 failures 收敛为 `24/24 files`、`248 examples / 0 failures`。
+
+- [ ] **Core 最新串行基线（2026-07-16）**：全量扫描为 `2118 files`、`23828 examples`、`4018 failures`，其中 `1552 pass / 566 failing files`。随后 `core/matchdata` 已从 18 failing files / 103 failures 收敛为 `30/30 files`、`182 examples / 0 failures`，因此当前已知 core 失败上限降至 3915；下次完成新的共享簇后再刷新全量。
+
+- [x] **MatchData 共享簇（2026-07-17）**：补齐 byte/character offset、严格索引错误、`match`、`match_length`、`integer_at`、`regexp` identity、`names`、`inspect`、`length/size`、`values_at`、数组/Range 切片、dup ivar 与禁用 allocate；同时保留命名捕获顺序和原始 Regexp。当前 `30/30 files`、`182 examples / 0 failures`。
+
+- [x] **Method / UnboundMethod 共享簇（2026-07-17）**：统一 required/optional/rest/keyword arity，补齐 `unbind`、严格 `bind`、`bind_call`、`original_name`、hash/equality、clone、composition、curry、source location、to_proc binding、inspect/to_s 与动态 `super_method`；visibility override 继续动态跟随祖先重定义。当前 Method `25/25 files`、`223 examples / 0 failures`，UnboundMethod `19/19 files`、`100 examples / 0 failures`，合计由 187 failures 收敛为 0。
+
+- [ ] **Go VM 回归基线（2026-07-13）**：低并发运行 `RGO_GO_TEST_TIMEOUT=60 RGO_TEST_MEMORY_KB=2000000 GOMAXPROCS=1 scripts/safe_go_test.sh ./pkg/vm -count=1` 已在约 1 秒内完成，不再出现旧的整体 timeout，但当前有 36 个失败。失败跨越 Nil/Unknown 值、多赋值、Array difference、MSpec include/version guards、异常类型、Comparable、String encoding、File、Module、caller/backtrace、Hash fetch/dig 等共享语义。后续应按共享根因分组处理，不能把这些失败当成独立功能逐个打补丁。
+
+- [ ] **当前 Ruby spec 全量刷新（2026-07-14）**：低并发运行 `./scripts/full_spec_gate.sh --ruby-only`，已重写 `reports/spec-status/ruby-spec-full.csv`。当前结果为 `2112 pass / 1380 nonzero_failures / 307 zero_examples / 5 runtime_error / 4 timeout / 1 parse_error`，共 `3809 files`、`32543 examples`、`18086 failures`。相较 2026-07-04 的 `1724 pass / 23481 failures`，净增 388 个 pass，减少 5395 个 failures；下一高杠杆共享簇为格式化（Kernel `printf/sprintf`、String `%`、StringIO `printf`）和 String 字节索引。
+  - 分区状态：`core 1035/2118 pass`、`library 650/1518 pass`、`language 20/80 pass`、`command_line 7/32 pass`、`optional 0/47 pass`、`security 12/14 pass`。
+  - 最大非 pass 簇：`library/socket 164 files`、`core/string 104`、`library/net-http 77`、`library/win32ole 74`、`core/io 64`、`library/matrix 58`、`core/kernel 58`、`core/integer 53`、`library/bigdecimal 51`、`library/net-ftp 49`、`core/file 48`、`optional/capi 46`、`core/enumerator 44`、`core/array 42`、`core/module 33`（2026-07-04 局部刷新；顶层 include 修复后 fixture 完整加载，暴露了此前被 require 静默中断掩盖的常量/比较类失败）。
+  - 窄探针：`./rgo -e 'p :test; p :value; p true; p false; p nil; p "x"'` 输出正常；`vendor/ruby/spec/core/hash/empty_spec.rb` 仍为 `2 examples / 0 failures`。`vendor/ruby/spec/core/basicobject/basicobject_spec.rb` 已从 `14 examples / 3 failures` 修到 `14 examples / 0 failures`，根因集中在 `class << obj` 错走 Ruby-level `singleton_class`、`::Kernel` 绝对常量解析，以及 `include ::Kernel` 时 Kernel class/module 视图不一致；`vendor/ruby/spec/core/hash/compare_by_identity_spec.rb` 已解除为 `18 examples / 0 failures`。后续仍应优先处理这类跨目录基础语义回归，再刷新全量 gate。
+  - 资源/编译问题仍存在：`vendor/ruby/spec/core/enumerable/inject_spec.rb` 日志显示在 require fixture 的 compiler closure 编译路径中 OOM；当前 timeout 只剩 `core/process/daemon_spec.rb` 与 `core/rational/exponent_spec.rb`；`optional/capi/float_spec.rb` 为 parse_error。
+  - `make test` 当前也未形成绿色基线：`cmd/rgo`、`pkg/compiler`、`pkg/core`、`pkg/lexer`、`pkg/object`、`pkg/parser` 已通过，但整体在后续 `pkg/vm` 阶段由 `scripts/safe_go_test.sh` 以 exit `124` 超时退出。后续应先定位 `pkg/vm` Go 测试超时与上述 Ruby spec 跨目录回退，再恢复可信全量 gate。
+
+- [x] `vendor/ruby/spec/core/float` 当前已全绿：`50 pass / 50 files`。本轮补齐 Float 的 `denominator`、`divmod`、`%`/`modulo`、`next_float`/`prev_float`、`rationalize`、`round`、常量 `MAX/MIN/EPSILON`、`Comparable` include、`.new`/`.allocate` 禁用，以及 VM 对 Float 算术/比较/Complex equality 的必要分派；`go test ./pkg/core -count=1` 通过。
+
+- [x] `vendor/ruby/spec/core/hash/compare_by_identity_spec.rb` 已解除：`18 examples / 0 failures`。本轮修复 compare-by-identity hash 对 Ruby immediate key 的 identity 语义：Symbol、Fixnum、nil/true/false 在 identity hash 内使用稳定规范化 key，普通对象/String/Array 和带 `big.Int` shadow 的 Bignum 仍按对象身份；重复 `compare_by_identity` 不再破坏已有 symbol key lookup。
+
+- [x] `vendor/ruby/spec/library/ipaddr` 当前已全绿：`6 pass / 6 files`。本轮补齐最小 native `IPAddr`/`Socket` shim，支持 `.new`、`to_s`/`to_string`、`family`、IPv4/IPv6 判断、`inspect`、整数/位运算、`mask`、`include?`、反向 DNS 字符串；同时修复 mspec `include` matcher 对普通对象不委托 `include?` 的问题。已验证 `new_spec.rb`、`operator_spec.rb`、`reverse_spec.rb` 和目录级 `scripts/spec_status.sh vendor/ruby/spec/library/ipaddr`。
+
+- [x] `vendor/ruby/spec/library/expect` 当前已全绿：`1 pass / 1 file`，`expect_spec.rb` 为 `6 examples / 0 failures`。本轮补齐最小 `IO#expect`，支持 pipe 缓冲内容的 String/Regexp 匹配、Regexp captures、closed stream `IOError`、EOF nil 和 block yield；同时增加 Go 回归 `TestIOExpectMatchesRegexpAndCaptures`。
+
+- [x] `vendor/ruby/spec/library/random` 当前已全绿：`1 pass / 1 file`，`formatter/alphanumeric_spec.rb` 为 `8 examples / 0 failures`。本轮补齐最小 `require "random/formatter"` shim，安装 `Random::Formatter#alphanumeric`，覆盖默认 size、nil size、非法 size、`chars:` alphabet 和元素 `to_s` 转换。
+
+- [x] `vendor/ruby/spec/library/prime` 当前刷新已全绿：`11 pass / 11 files`。复测确认旧表中的 `instance_spec.rb`、`integer/prime_division_spec.rb`、`prime_division_spec.rb` 均已为 `0 failures`。
+
+- [x] `vendor/ruby/spec/core/mutex` 当前已全绿：`7 pass / 7 files`。本轮补齐 mspec 环境常量 `TOLERANCE` 和 `TIME_TOLERANCE`，解除 `sleep_spec.rb` 中 `(duration + TIME_TOLERANCE)` 为 nil/TypeError 导致的比较 matcher 失败。
+
+- [x] `vendor/ruby/spec/core/sizedqueue` 当前刷新已全绿：`16 pass / 16 files`。旧表中的 `append_spec.rb`、`enq_spec.rb`、`push_spec.rb` 均已为 `0 failures`。本轮补齐满队列 blocking push 的最小 pending enqueue 语义：满队列线程 push 不立即插入，`pop` 释放空间后再入队；已验证 `append_spec.rb` 为 `15 examples / 0 failures`。
+
+- [x] `vendor/ruby/spec/security/cve_2010_1330_spec.rb` 已解除：`1 example / 0 failures`。本轮让 `String#sub/gsub` 在 receiver 标记为 UTF-8 且字节序列非法时抛 `ArgumentError("invalid byte sequence in UTF-8")`，同时保留 BINARY 编码下替换通过。
+
+- [x] `vendor/ruby/spec/security/cve_2018_8778_spec.rb` 已解除：`1 example / 0 failures`。本轮补齐 mspec 所需 `PlatformGuard::POINTER_SIZE` / `.standard?` / `.implementation?`，并为 `String#unpack` 实现 `@` absolute position directive；超大或负位置现在按 spec 抛 `RangeError("pack length too big")`。
+
+- [x] `vendor/ruby/spec/security/cve_2018_8779_spec.rb` 已解除：`2 examples / 0 failures`。本轮补齐最小 `UNIXSocket` 类/`.open`/`.new`，让 `UNIXServer.open` 与 `UNIXSocket.open` 对含 NUL byte 的路径提前抛 `ArgumentError("path name contains null byte")`，避免漏到宿主系统调用变成 `SystemCallError`。
+
+- [x] `vendor/ruby/spec/security/cve_2018_8780_spec.rb` 已解除：`6 examples / 0 failures`。本轮让 `Dir.glob`、`Dir.entries`、`Dir.foreach`、`Dir.empty?`、`Dir.children`、`Dir.each_child` 对含 NUL byte 的 path/pattern 提前抛 `ArgumentError("string contains null byte")`；同时让无 block 的 `Dir.foreach`/`each_child` 返回的 Enumerator 在 `to_a` 时传播原始路径错误，避免退化成对异常对象调用 `to_a` 的 `NoMethodError`。
+
+- [x] `vendor/ruby/spec/security/cve_2018_6914_spec.rb` 当前已全绿：`5 examples / 0 failures`。复测确认 Tempfile/Dir.mktmpdir 对带路径分隔符的 prefix 已限制在目标临时目录下。
+
+- [x] `vendor/ruby/spec/security/cve_2013_4164_spec.rb` 当前已全绿：`2 examples / 0 failures`。复测确认超长浮点字符串在 `String#to_f` 与 `JSON.parse` 路径下均能转换为 Float。
+
+- [x] `vendor/ruby/spec/security/cve_2011_4815_spec.rb` 当前已全绿：`10 examples / 0 failures`。复测确认 Object/Integer/Float/Rational/Complex/String/Symbol/Array/Hash 的 hash 值在不同进程间不同。
+
+- [x] `vendor/ruby/spec/security/cve_2019_8321_spec.rb` 当前已全绿：`1 example / 0 failures`。复测确认 RubyGems verbose 输出会清理 ANSI escape 控制字符。
+
+- [x] `vendor/ruby/spec/security/cve_2019_8323_spec.rb` 当前已全绿：`2 examples / 0 failures`。复测确认 RubyGems Gemcutter response body 在 success/error 路径都会清理 ANSI escape 控制字符。
+
+- [x] `vendor/ruby/spec/security/cve_2019_8325_spec.rb` 当前已全绿：`3 examples / 0 failures`。复测确认 RubyGems command manager 的执行错误、非法选项和加载命令错误消息都会清理 ANSI escape 控制字符。
+
+- [x] `vendor/ruby/spec/security/cve_2024_49761_spec.rb` 当前已全绿：`1 example / 0 failures`。复测确认 `Regexp.linear_time?` 对 CVE 样例正则返回 true。
+
+- [x] `vendor/ruby/spec/security` 当前刷新无实际失败：`11 pass / 3 zero_examples / 14 files`。剩余 `cve_2018_16396_spec.rb`、`cve_2019_8322_spec.rb`、`cve_2020_10663_spec.rb` 是当前 guard/空 spec 下的 zero examples。
+
+- [x] `vendor/ruby/spec/library/io-wait` 当前已全绿：`3 pass / 3 files`，`28 examples / 0 failures`。本轮确认 `wait_spec.rb` 的 hidden failures 根因是该文件没有显式 `require "io/wait"`，`rgo test` 单文件执行时未按 library 目录预加载目标库；已在 spec source 预处理里对 `vendor/ruby/spec/library/io-wait/` 前置 `require "io/wait"`，并保留 `IO#wait`/`wait_readable`/`wait_writable` focused 回归。
+
+- [x] `vendor/ruby/spec/core/io/dup_spec.rb` 已解除：`8 examples / 0 failures`。本轮修复 `IO#dup`/`File#dup` 对 `*ioShimData` 复用同一 data 指针的问题：dup 现在分配新的 shim fd、重置 `close_on_exec`/`autoclose` 为 true，并通过 dup fd group 同步 stream position（offset/unget/lineno），保证新旧 IO 关闭状态独立但读写位置共享；新增 `TestFileDupUsesDistinctDescriptorAndDefaultFlags`。已低 CPU 验证 `autoclose_spec.rb` 为 `8 examples / 0 failures`、`dup_spec.rb` 为 `8 examples / 0 failures`。
+
+- [x] `vendor/ruby/spec/core/io/close_on_exec_spec.rb` 已解除：`9 examples / 0 failures`。根因是 `require "fcntl"` 没有安装 `Fcntl` module，导致 `Fcntl::F_GETFD` / `FD_CLOEXEC` 走错常量 fallback，参与 `&` / `==` 的不是 Integer；本轮补最小 `Fcntl` module 和 `F_GETFD`/`F_SETFD`/`F_GETFL`/`FD_CLOEXEC` 整数常量，并新增 `TestFcntlRequireDefinesIntegerConstantsAndCloseOnExecFlag`。已复测 `fcntl_spec.rb` 为 `1 example / 0 failures`。
+
+- [x] `vendor/ruby/spec/core/io/output_spec.rb` 已解除：`4 examples / 0 failures`。根因是标准 IO 全局变量只对 `$stdout` 做 lazy 初始化，`$stderr`/`$stdin` 默认为 nil，且 `STDOUT`/`STDERR`/`STDIN` 常量与全局变量不是同一对象；本轮补 `StdoutObject`/`StderrObject`/`StdinObject` 单例共享，VM 读取 `$stderr`/`$stdin` 也会 lazy 初始化，`($stderr << value).equal?($stderr)` 现在成立。新增 `TestStandardIOGlobalsUseStandardConstantsAndAppendReturnsSelf`。
+
+- [x] `vendor/ruby/spec/core/io/getbyte_spec.rb` 已解除：`5 examples / 0 failures`。根因是 `IO#getbyte` 对 write-only stream 未检查 readable mode，直接返回 nil；本轮加 `fileModeReadable` 校验并返回 `IOError("not opened for reading")`，新增 `TestIOGetbyteRaisesOnWriteOnlyStream`。
+
+- [x] `vendor/ruby/spec/core/io/binread_spec.rb` 已解除：`8 examples / 0 failures`。根因是 `IO.binread` / `File.binread` class method 未注册，调用落到 NoMethodError；本轮新增专门的 `fileClassBinread`，支持 path/length/offset、强制返回 BINARY encoding、负 length 的 `ArgumentError`、负 offset 的 `Errno::EINVAL`，pipe path 复用现有 warning 行为。新增 `TestIOBinreadReadsBinarySlicesAndValidatesArguments`。
+
+- [x] `vendor/ruby/spec/core/io/binwrite_spec.rb` 已解除：`12 examples / 0 failures`。根因是 `IO.binwrite` / `File.binwrite` class method 未注册，且写文件 class method 需要区分默认 truncate、offset 非 truncate、append mode、`mode: "w"` truncate+seek 和 readonly `IOError`；本轮新增专门的 `fileClassBinwrite` 并注册到 IO/File，新增 `TestIOBinwriteWritesWithOffsetsModesAndOptions`。同时 `set_encoding_by_bom_spec.rb` 因 `File.binwrite` 可用已验证为 `16 examples / 0 failures`。
+
+- [ ] `vendor/ruby/spec/core/io/write_spec.rb` 已大幅推进：整文件从 `51 examples / 25 failures` 降到 `51 examples / 3 failures`。本轮解除 `io_binwrite` shared 的 `IO.write(..., offset)` 非截断语义、File.open/IO.write UTF-32LE encoding 写入与 byte count、`:open_args` keyword options 转发、pipe transcoding encoding，以及无显式 encoding 时 ISO-8859-1 单字节内容保留；新增 `TestIOWriteOffsetDoesNotTruncateWithoutExplicitMode`、`TestFileWriteUsesOpenEncodingForUTF32LE`、`TestIOWriteOpenArgsForwardKeywordOptions`、`TestStringEncodeISO88591PreservesSingleByteCharacters`。剩余集中在 `IO#write on STDOUT` 的 `IO.popen([*ruby_exe, "-e", "loop { puts :ok }"], "r", err: ...)` SIGPIPE/child status 模拟，当前可见失败为 `expected "ok\n", got ""`，summary 计 `3 failures`。
+
+- [ ] `vendor/ruby/spec/core/io/binmode_spec.rb` 暂留 hidden failure：当前可见 7 个 examples 都显示 ✓，直接探针确认 `binmode` 后 external/internal encoding 和 dup 后 `binmode?` 均正确，closed stream 的 `raise_error(IOError)` 单独 probe 也通过，但整文件 summary 仍为 `7 examples / 2 failures`。后续需排查 spec runner hidden fail count/after hook 状态，不宜在这里猜修。
+
+- [x] `vendor/ruby/spec/core/main/include_spec.rb` 已解除：`2 examples / 0 failures`。本轮在 VM eval 入口处理 `eval "include SomeModule", TOPLEVEL_BINDING` 的顶层 include 语义：当 binding self 为 main 且常量解析为 Module 时，直接将模块 include 到 Object，同时保留 mspec `include(...)` matcher 和 wrapped load 行为。
+
+- [x] `vendor/ruby/spec/core/refinement/{include,prepend}_spec.rb` 已解除：两个文件均为 `1 example / 0 failures`。本轮让 refinement receiver 上的 `include` / `prepend` 直接抛出 Ruby 期望的 removed TypeError 消息，并保留 include refinement module 的 TypeError 行为。
+
+- [x] `vendor/ruby/spec/core/string/to_sym_spec.rb` 已解除：`10 examples / 0 failures`。本轮补 `EncodingError` 类、`String#valid_encoding?` 基础判断，并让 UTF-8 无效字节的 `String#to_sym` 抛出 Ruby 期望的 EncodingError，同时避免对当前 UTF-16LE encoding shim 误报。
+
+- [x] `vendor/ruby/spec/core/integer/coerce_spec.rb` 已解除：`12 examples / 0 failures`。本轮补 `Integer#coerce` 对 String 的 Float 转换、非数字 String 的 ArgumentError，以及普通对象 `to_f` 转换和非 Float 返回值的 TypeError；新增 `TestIntegerCoerceUsesStringsAndToF`。
+
+- [x] `vendor/ruby/spec/core/float/comparison_spec.rb` 已解除：`14 examples / 0 failures`。本轮让 Integer `<=>` Float::NAN 返回 nil，修正 Float `<=>` coerce 后的比较方向，并补 instance variable `||=` 的基础编译语义以支持 spec 中的 call_count 累加；新增 `TestFloatComparisonHandlesNaNAndCoerce` / `TestInstanceVariableOrAssignKeepsTruthyValue`。
+
+- [x] `vendor/ruby/spec/core/module/set_temporary_name_spec.rb` 已解除：`14 examples / 0 failures`。本轮修正匿名模块常量路径不应覆盖 temporary name、父 temporary name 清空时递归清理非永久嵌套名、`module local::Const` 不再被字符串 qualified constant 路径二次命名，并补最小 `ruby_bug` guard shim；新增 `TestModuleTemporaryNameSurvivesAnonymousConstantAssignment` / `TestRubyBugGuardExecutesMatchingBlock`。
+
+- [ ] `vendor/ruby/spec/core/dir/scan_spec.rb` 已补 `Dir.scan` / `Dir#scan` 基础实现和最小 `UNIXServer` shim：目录扫描现在返回 `[name, type]`，支持 block yield、symlink/fifo/character device/socket 类型识别；直接探针 `UNIXServer.new("/tmp/rgo-dir-scan-unix.sock"); Dir.scan("/tmp").map(&:last).include?(:socket)` 通过，`go test ./pkg/core -count=1` 通过。注意：本轮重跑完整 `scan_spec.rb` 时在 `FileSpecs.configure_types` 的外部 `find /dev /devices` 阶段触发 Go runtime OOM，未继续重复跑整文件。
+
+- [x] `vendor/ruby/spec/core/enumerator` 当前已全绿：`81 pass / 81 files`。本轮补齐 `Enumerator::ArithmeticSequence.allocate` allocator undefined 错误、`Enumerator::Chain`、`Enumerator::Generator`、`Enumerator::Product` 最小类/常量/初始化行为，Product 笛卡尔积 `each`/`to_a`/`Enumerator.product`，Generator 构造/`each` 最小行为、Chain 构造/`each`/`rewind` 最小行为、`Enumerator.new` 无 block 参数错误、`Enumerator#each` 变参/底层 `limitFunc` 枚举和 NoMethodError 传播、`Integer#times` 无 block 返回 Enumerator、无限 Range 的 `take` 截断、`Lazy#force` 参数转发、`Enumerator#initialize` frozen/size 处理、`Enumerator#feed` pending 状态检查、`Enumerator#peek/#peek_values/#next_values/#rewind/#each_with_index`，以及 Lazy 白名单方法注册、`Lazy#initialize` block/frozen 检查、`drop_while`/`take_while`/`reject`/`map`/`flat_map`/`zip` 基础 lazy 行为。
+
+- [x] `vendor/ruby/spec/core/enumerator/lazy/force_spec.rb` 已解除 timeout：根因是 `Range#take(100)` 对 `0..Float::INFINITY` 不能提前截断；本轮在 `enumerableTakeValues` 中为整数 Range 增加 count 限制，并让 `Lazy#force(*args)` 能把参数转发到底层 `to_enum` 方法。
+
+- [x] `vendor/ruby/spec/core/complex` 当前已全绿：`43 pass / 43 files`。本轮补齐 `Complex#to_r/#to_f/#to_i/#rationalize/#real/#imag/#rect/#rectangular/#polar/#coerce/#==/#eql?`，以及 `Complex.polar/.rect/.rectangular`、基础 `Complex#/`/`#quo`/`#fdiv` 行为。
+
+- [x] `vendor/ruby/spec/core/data` 当前已全绿：`13 pass / 13 files`。本轮补齐最小 `Data` 类注册、`Data.define` 生成值类、成员 reader、`.new`/`.[]`、`.members`、`#initialize`、`#to_h`、`#with`、`#inspect`/`#to_s` 和递归成员 inspect 展示；`to_h_spec`、`initialize_spec`、`with_spec`、`inspect_spec`、`to_s_spec` 均已解除。
+
+- [ ] `vendor/ruby/spec/core/array/sample_spec.rb` 当前不适合在常规小步中反复运行：`samples evenly` 会执行大量抽样公平性检查，当前输出大量 `expected #<*core.expectationData...> <= ...` 后触发 `runtime/cgo: pthread_create failed: Resource temporarily unavailable`。后续需单独用更低资源/单例诊断定位 mspec 比较链或 `Array#sample` 公平性问题。
+
+- [x] `vendor/ruby/spec/core/basicobject` 当前已全绿：`14 pass / 14 files`，共 `179 examples / 0 failures`。本轮在低 CPU 配置下解除 `basicobject_spec.rb`（`14 examples / 0 failures`）、`method_missing_spec.rb`（`30 examples / 0 failures`）、`instance_exec_spec.rb`（`17 examples / 0 failures`）、`instance_eval_spec.rb`（`41 examples / 0 failures`）、`equal_spec.rb`（`13 examples / 0 failures`）、`equal_value_spec.rb`（`9 examples / 0 failures`）、`__send___spec.rb`（`15 examples / 0 failures`）和 `__id__spec.rb`（`13 examples / 0 failures`）：语言级 `class << obj` 改为 VM 内部 singleton class opcode，`instance_eval` 的 singleton class 上下文不再依赖公开 `singleton_class` 方法；`::Kernel` 在 BasicObject 子类体内按顶层绝对常量解析；`include ::Kernel` 使用共享 Kernel module view，并公开转发 `respond_to?` / instance variable helper；缺失方法分派现在直接进入自定义 `method_missing`，private/protected 可见性失败也会转交 `method_missing`；裸 builtin identifier（如 `size`/`to_s`）按当前 `self` 方法调用；`defined? @@cvar` 改为运行时 class variable lookup；top-level block 的 class variable 词法 scope 映射到 Object，避免 `instance_exec` 读到 Integer receiver 的 class variable；`instance_eval` string path 不再向 receiver 发送普通 `eval`，而是用 VM 内部 eval binding，支持 source `to_str`、caller local 写回、caller/receiver 分离的常量与 class variable lookup；匿名 rest 参数 `-> * { ... }` 不再占用本地槽位覆盖 free variable；闭包捕获 local 改为 heap cell，避免方法返回后捕获值被后续 stack slot 复用污染；`eval` binding clone 保留 `ClassStack`，并为 string eval 单独携带 caller class-variable scope；eval 子 VM 未处理异常现在优先返回栈顶异常而不是旧 popped value，且按传入 filename/lineno 重基准化 backtrace line；BasicObject 默认 `==`/`equal?` 改为 identity 语义，integer/symbol/bool/nil immediate 值按 Ruby 规则比较；`bignum_value` 和超大 `Float#to_i` 增加轻量 `big.Int` shadow value，使大整数乘除能精确归约，小整数归约后恢复 immediate identity，Bignum `object_id` 按对象身份分配；Class include 方法查找改为后 include 优先，并在 VM frame 中记录 included module owner，使 included module method 内的 `super` 能继续到前一个 include；同时补 `%i[...]` symbol array literal 解析。
+
+- [x] `vendor/ruby/spec/core/argf` 当前已全绿：`34 pass / 34 files`、`148 examples / 0 failures`。除迭代方法外，本轮继续修正当前文件 EOF 与下一文件推进的边界，补齐 `pos`/`tell`/`pos=`/`seek`、跨文件 `read`、`readpartial`/`read_nonblock`、stdin 重定向、`binmode` 与 external/internal encoding 语义。
+
+- [x] `vendor/ruby/spec/core/encoding` 当前已全绿：`45 pass / 45 files`、`314 examples / 0 failures`。本轮补齐 Encoding aliases/list/name/find/locale/compatible 语义、错误对象元数据与访问器，以及 Converter 的 convpath、putback、增量 destination buffer、错误恢复、replacement、inspect 和 finish；同时修复通用尾逗号多重赋值 `value, = array` 并增加 Go 回归。
+
+- [x] `vendor/ruby/spec/core/objectspace` 当前已全绿：`29 pass / 29 files`、`113 examples / 0 failures`。补齐 WeakMap/WeakKeyMap、对象枚举、GC、finalizer 注册与移除；同时修正匿名类继承判断及 `BasicObject`/`Object` 的 `hash` 方法归属。
+
+- [ ] `vendor/ruby/spec/core/kernel/String_spec.rb` 剩 2 failures：对象显式 `undef_method :to_s`、以 `method_missing` 返回字符串时，直接 `send(:method_missing, :to_s)` 正常，但 Kernel.String 内部转发仍残留 NoMethodError/TypeError 状态。后续与 VM method_missing/LastException 清理统一修复。
+
+- [x] Kernel 数值转换阶段收敛：`Complex_spec.rb` 67/0、`Rational_spec.rb` 33/0、`Float_spec.rb` 193/0、`Integer_spec.rb` 478/0；补齐严格复数解析、`exception: false`、精确 Rational/Complex 运算、十六进制 Float、溢出 Infinity 与大 Float 转 Integer。
+
+- [x] Kernel 全局行处理与基础比较收敛：CLI 支持 `-W*`/`-n` 按输入行执行，`chomp_spec.rb` 13/0、`chop_spec.rb` 7/0、`comparison_spec.rb` 5/0、`case_compare_spec.rb` 10/0。
+
+- [x] `vendor/ruby/spec/core/env` 当前已全绿（2026-07-17）：`45 pass / 45 files`、`245 examples / 0 failures`。补齐 ENV 专用 key/value `to_str` coercion、`[]`/`[]=`/`store`/`delete`/`fetch`/`fetch_values`/`assoc`/`slice`/`except`/`key`/`key?`、值查询、`to_h` block pair 转换、`rehash`/`to_s`/`inspect` 区分、非法 key 校验、原子 replace、merge/update 与枚举 block 语义，以及 clone/dup 专用错误。
+
+- [x] `vendor/ruby/spec/core/file/stat` 当前无实际失败：`40 pass / 3 zero_examples`。剩余 `birthtime_spec.rb`、`setgid_spec.rb`、`setuid_spec.rb` 是当前 guard 下的 zero examples。
+
+- [x] `vendor/ruby/spec/library/stringio` 当前刷新已全绿：`64 pass / 64 files`。
+
+- [x] `vendor/ruby/spec/core/exception/exception_spec.rb` 已解除：`10 examples / 0 failures`。本轮补齐 `Exception.exception` / `Exception#exception`，异常对象 ivar 存储，以及 Exception 子类 `initialize` 执行路径。
+
+- [x] `vendor/ruby/spec/core/exception/{detailed_message,receiver}_spec.rb` 已解除：当前分别为 `10 examples / 0 failures`、`8 examples / 0 failures`。本轮补齐 `Exception#detailed_message` 的基础格式/highlight/匿名类显示、最小 `Exception#full_message` fallback、`NameError#receiver` 无 receiver 时的 `ArgumentError`，以及 Class/Module wrapper 的 `equal?` 底层 identity 兼容。`core/exception` 当前刷新为 `31 pass / 8 nonzero_failures`。
+
+- [x] `vendor/ruby/spec/core/exception` 当前已全绿：`39 pass / 39 files`。复测确认 `no_method_error_spec.rb` 为 `22 examples / 0 failures`，旧的隐藏 failure 记录已过期。
+
+- [ ] `vendor/ruby/spec/core/dir` 当前只剩 `scan_spec.rb`。已复测确认 `element_reference_spec.rb` 为 `64 examples / 0 failures`，`glob_spec.rb` 为 `97 examples / 0 failures`；`scan_spec.rb` 仍需单独处理，之前完整运行会触发 `/dev`/外部 `find` 相关资源风险。
+
+- [x] `vendor/ruby/spec/core/filetest` 当前无实际失败：`22 pass / 2 zero_examples`。本轮解除 `zero_spec.rb` 的剩余失败：`FileTest.zero?` 对 `nil`/`true`/`false` 保留原始 TypeError，不再被后续 `to_io` NoMethodError 覆盖；剩余 `setgid_spec.rb` / `setuid_spec.rb` 是空 shared examples。
+
+- [ ] `vendor/ruby/spec/core/thread/backtrace/location` 当前仍剩 `absolute_path_spec.rb` 和 `label_spec.rb`。复测 `absolute_path_spec.rb` 为 `8 examples / 2 failures`，集中在 `method_added` class-body frame：`ScratchPad.recorded[0]` 的 `absolute_path` / `label` 不是预期字符串。复测 `label_spec.rb` 为 `42 examples / 4 failures`，集中在 `block_location` 与 nested block label 的前置断言；其余大量 label 场景已通过。剩余仍属 backtrace frame/label 建模，不适合当前小步里猜修。
+  - 追加观察：普通 multiline 方法的 owner label 已可生成（如 `LabelOwnerSpec#instance_location` / `.singleton_location`），但 fixture 中部分 `caller_locations(0)` 调用仍直接返回 `nil`，例如 `ThreadBacktraceLocationSpecs::INSTANCE.instance_method_location`。这更像 module-extended receiver / required fixture 的调用链或 frame 返回问题，不适合在当前小步里继续猜修。
+
+- [x] `vendor/ruby/spec/library/stringscanner` 当前已全绿：`44 pass / 44 files`。本轮补齐 `StringScanner::Version` 与 mspec `version_is` guard 后展开原 zero_examples，并实现 `StringScanner#pos/#pos=/pointer/pointer=/reset/terminate/rest/peek/peek_byte/scan/scan_until/scan_byte/scan_integer/check/check_until/search_full/skip_until/exist?/get_byte/getch/matched?/matched/matched_size/pre_match/post_match/[]/values_at` 的当前 spec 所需语义。
+
+## 本次调试记录（2026-06-28 Phase -1.2 require 错误可见性修复）
+
+- [x] **Numeric 类注册**：根因是 `pkg/core/init.go` 的 `createClasses()` 完全没有创建 `Numeric` 类（只有 Integer/Float/Complex 等子类），导致 `class Foo < Numeric` 在尝试解析 `Numeric` 超类时静默失败，fixture 中继承 `Numeric` 的辅助类（如 `MathSpecs::Float < Numeric`）无法定义。修复：在 `createClasses()` 中添加 `numericClass := object.NewClass("Numeric")` 并将 Integer/Float 的 superClass 改为 numericClass，`R.Classes["Numeric"] = numericClass` 注册为顶层常量。Go 回归 `TestNumericConstantIsClassAndCanBeInheritedFrom` 已添加。core/core_test.go 中 `TestInitClassHierarchy` 同步更新期望（Integer/Float 现在继承自 Numeric）。
+
+- [x] **Rational 类注册**：与 Numeric 同根因——`Rational` 类完全没有注册到 `R.Classes`（虽然 `Rational()` factory method 和 `Errno::RATIONAL` 子类等存在）。已在 `createClasses()` 中添加 `rationalClass := object.NewClass("Rational")`，superClass 为 numericClass。Go 回归 `TestRationalConstantIsClassAndCanBeInheritedFrom` 已添加。
+
+- [x] **respond_to_missing? 可见性修复**：`callMethodMissingForSend` 在调用 `respond_to_missing?` 前设置 `vm.visibilityBypass = true`，避免 private 方法调用触发 NoMethodError。这是 Ruby 标准语义：VM 内部调用 `respond_to_missing?` 应该 bypass 可见性。
+
+- [x] **Errno 基类注册**：与 Numeric/Rational 同根因——`Errno` 基类没有注册到 `R.Classes`（虽然 `Errno::ENOENT` 等子类有注册）。已在 `createClasses()` 中添加 `errnoClass := object.NewClass("Errno")`，superClass 为 systemCallErrorClass。
+
+- [x] **VersionGuard + SpecVersion 常量注册**：`vendor/ruby/spec/spec_helper.rb:31` 有 `if VersionGuard::FULL_RUBY_VERSION < SpecVersion.new('2.7')`，但 MSPEC_RUNNER=1 时跳过 `require 'mspec'`，所以 VersionGuard/SpecVersion 没有被加载，导致 require_relative "spec_helper" 在加载时抛 NameError/TypeError，整文件加载失败。已在 `defineRubyBuiltinConstants` 中注册：`VersionGuard` 模块（包含 `FULL_RUBY_VERSION` 常量，值为 SpecVersion 实例 "3.3.0"），以及 `SpecVersion` 类（包含 `initialize`/`<=>`/`<`/`>` 方法）。Go 回归 `TestVersionGuardAndSpecVersionConstantsAreRegistered` 已添加。这让 `core/binding`、`core/file` 等 spec_helper 依赖的子集的 spec_helper 能正常加载。
+
+- [x] **全量 gate 改善（vs 最早基线 2550 pass / 612 zero / 3084 failures）**：
+  - + Numeric: 2550→2572 pass, 612→556 zero, 3084→3264 failures
+  - + Rational/Errno/VersionGuard/SpecVersion: 2572→**2570 pass**, 556→**555 zero**, 4 timeout, examples 30615→**31147**, failures 3264→3220
+  - 单次最大改动是 Numeric 类注册（+20 pass, -55 zero_examples）。
+
+- [x] **`evalSource` 编译/运行错误不再静默返回 nil**：根因是 `pkg/vm/executor.go` 中 `evalSource` 在编译错误和 child VM 运行错误时返回 `core.R.NilVal`，导致上层无法区分"加载成功"和"加载失败但被吞掉"。修复：编译错误返回 SyntaxError（含 `err.Error()` 消息），运行错误返回 RuntimeError（newRuntimeException 设 `Raised: true`）。Go 回归 `TestRequireRelativeReturnsLastErrorWhenFileMissing` 验证 missing-file LoadError 现在能通过 `result.Type == ValueException` 被调用方检测。
+
+- [x] **Comparable 模块缺失**：根因是 `Comparable` 未注册为顶层常量（`Comparable.class` 返回 `NilClass`），导致 `vendor/ruby/spec/core/enumerable/fixtures/classes.rb` 等 fixture 中 `include Comparable` 抛 TypeError。已在 `pkg/vm/executor.go` newVM 初始化块中仿照 Enumerable 注册最小 `Comparable` module。比较运算符 `< > <= >= ==` 已在 VM opcode 层通过 `<=>` 分派实现。Go 回归 `TestComparableConstantIsModuleAndCanBeIncluded` 已添加。
+
+- [x] **`fixture()` 路径双重 "fixtures" bug**：根因是 `pkg/core/init.go:45344` 的 `fixture(__FILE__, name)` 方法无条件 `filepath.Join(filepath.Dir(file), "fixtures", name)`，当 `__FILE__` 已在 `fixtures/` 目录中时（如 `vendor/ruby/spec/core/module/fixtures/classes.rb`）产生 `fixtures/fixtures/name` 错误路径。已修正为检查 `filepath.Base(dir) == "fixtures"` 时跳过拼接直接 `filepath.Join(dir, name)`。此 bug 之前被 require 静默失败掩盖。
+
+- [x] **tmpdir require shim**：`require "tmpdir"` 之前静默失败（LoadError 被忽略），`Dir.mktmpdir`/`Dir.tmpdir` 已在 Dir 类上注册但 require 本身未注册 shim。已添加 `tmpdir`/`tmpdir.rb` shim（仅 markFeatureRequired + 返回 TrueVal），无需重新安装 Dir 方法。
+
+- [x] **核心安全修复通过 make test 全绿**。`TestNumericConstantIsClassAndCanBeInheritedFrom` / `TestRationalConstantIsClassAndCanBeInheritedFrom` / `TestRequireRelativeReturnsLastErrorWhenFileMissing` / `TestComparableConstantIsModuleAndCanBeIncluded` / `TestRequiredEnumerableEachDefinerYieldsAllElements` / `TestDirMktmpdirCreatesDirectoryWithPrefixSuffixAndRejectsBadPrefix` 全部通过。
+
+- [ ] **LoadError/SyntaxError `Raised: true` + requireFeature LastRaisedResult 全局传播曾尝试**：使 `require` 失败在 VM 主循环中被检测并停止后续执行。但 `rgo test` 路径会触发 `autoload` 在 fixture 加载期间提前 require 失败的内层加载，导致 fixture 文件加载不完整（`ModuleSpecs::Autoload` 等后续常量未定义）。已暂时回滚这部分全局传播修改，保留仅 `evalSource` 异常返回 + `fixture` 路径修复 + `Comparable` + `tmpdir` shim + `Numeric` + `Rational` + `Errno` 类注册这些不会破坏现有测试的修复。后续应区分 top-level require 与内部 require 上下文后再重新启用传播机制。
+
+- [x] **defined?/const_defined? 限定名查找 fallback 修复**：`scopedConstantValue` 在 receiver 为 Class/Module 时只查 `vm.rubyConsts[qualifiedName]`（如 `"Object::Comparable"`），但模块注册时只设置 `vm.rubyConsts["Comparable"]`（无前缀）。修复：在 `class.GetConstant`/`module.Constants` 和 `vm.rubyConsts[qualifiedName]` 之后增加对 `vm.rubyConsts[constName]`（无前缀名）的 fallback。Go 测试通过，全量 gate `pass` +2、`examples` +159。
+
+- [x] **`Module.new { def foo; private :foo end }` 在 class/module 顶层抛 LocalJumpError 已解除**：根因是 RGo 编译器对 `replaceLastPopWithReturn`（块的隐式最后表达式返回）发出 `OpReturnValue`，VM 在 class/module body 内的 block 上执行 `OpReturnValue` 时调用 `returningFromClassBodyBlock` 检查并抛 `LocalJumpError("unexpected return")`。修复：在 `pkg/compiler/opcode.go` 新增 `OpBlockReturn` opcode（`OpReturnValue` 用于显式 `return` 与方法返回，`OpBlockReturn` 仅用于块的隐式最后表达式返回）；`pkg/compiler/compiler.go` 新增 `replaceLastPopWithBlockReturn` 仅用于 `Module.new do ... end` 这类 block 编译路径；`pkg/vm/executor.go` 在 `OpBlockReturn` 处理中跳过 `returningFromClassBodyBlock` 检查。追加补齐 `Module#method_added` / `#method_removed` / `#method_undefined` 默认私有 hook 返回 `nil`，并在 `remove_method` / `undef_method` 成功后触发对应 hook。已验证 `private_spec.rb` 为 `21 examples / 0 failures`、`method_added_spec.rb` 为 `9 examples / 0 failures`、`method_removed_spec.rb` 和 `method_undefined_spec.rb` 均为 `3 examples / 0 failures`。
+
+- [x] **`Module#included` / `Module#prepended` hook 已解除**：`Class#include` 和 `Class#prepend` 现在与 module receiver 路径一致，会在 `append_features` / `prepend_features` 成功后调用 mixin 的 `included(target)` / `prepended(target)` 私有 hook，并补默认实现返回 `nil`。已验证 `included_spec.rb` 为 `4 examples / 0 failures`、`prepended_spec.rb` 为 `2 examples / 0 failures`；`core/module` 局部刷新为 `49 pass / 35 nonpass`、`1037 examples / 248 failures`。
+
+- [x] **`Module#public` inherited method visibility entry 已解除**：`public :method` / `private :method` / `protected :method` 作用于祖先方法时不再复制祖先当时的方法体，而是记录本地 visibility entry，并在调用时从 superclass 动态解析当前方法体；`alias_method` 复制这类 entry 时会先解析真实方法，避免生成不可调用 alias。已验证 `public_spec.rb` 为 `19 examples / 0 failures`，并复测 `private_spec.rb` 为 `21 examples / 0 failures`、`protected_spec.rb` 为 `19 examples / 0 failures`、`alias_method_spec.rb` 回到既有 `23 examples / 2 failures`；`core/module` 局部刷新为 `50 pass / 34 nonpass`、`1037 examples / 247 failures`。
+
+- [x] **`Module#class_variable_{defined?,get}` / `#class_variables` metaclass 语义已解除**：singleton class 内定义/访问 class variables 时，现在能按 Ruby 语义回看 attached class/module；普通 class 的 `class_variables` 也会合并 `class << self` 中定义的 class vars，并支持 `inherit` 参数。已验证 `class_variable_defined_spec.rb` 为 `9 examples / 0 failures`、`class_variable_get_spec.rb` 为 `12 examples / 0 failures`、`class_variables_spec.rb` 为 `5 examples / 0 failures`；`core/module` 局部刷新为 `53 pass / 31 nonpass`、`1037 examples / 242 failures`。
+
+- [x] **`Module#remove_class_variable` 已解除**：新增 `remove_class_variable` 注册与实现，按 Ruby 语义只删除 receiver 自身直接拥有的 class var，返回被删除值；对 included module 中的 class var 和未定义/非法名称保留 `NameError`。已验证 `remove_class_variable_spec.rb` 为 `8 examples / 0 failures`，并复测 class variable 三件套仍全绿；`core/module` 局部刷新为 `54 pass / 30 nonpass`、`1037 examples / 239 failures`。
+
+- [x] **`Module#remove_const` / included module constant lookup 已解除**：常量查找现在能动态看到 include 后新增到 included module 的 constants；删除 receiver direct constant 后，未限定常量 lookup 会回落到 included module constants。2026-07-05 追加修复 `class ::Object` reopen 路径：`AssignConstantName` 不再把 Object 容器下的顶层常量重命名为 `Object::X`，避免 `vendor/ruby/spec/fixtures/constants.rb` 中 `ConstantSpecs`/`ContainerA` 被错误改名后丢失 include 链。已验证 `remove_const_spec.rb` 为 `12 examples / 0 failures`，并新增 `TestIncludedModuleConstantsAreFoundAfterInclude` / `TestRemoveConstFallsBackToIncludedModuleConstant` / `TestObjectScopedModuleReopenKeepsTopLevelNameAndState`；`core/module` 局部刷新为 `55 pass / 29 nonpass`、`1037 examples / 218 failures`。
+
+- [x] **`Module#include` 主要语义已基本解除**：本轮修复 block 捕获外层 local 赋值不写回、`include` 在 `Class.new { ... }` 中返回 receiver、nested included module 方法/常量动态更新、后 include 常量优先级、`Module#constants` 包含 include 链常量、module singleton method 不再作为实例方法被 include 传播，以及 `include?(Kernel)` 的 Kernel class/module view 特例。已验证 focused Go 回归与 `vendor/ruby/spec/core/module/include_spec.rb`；该 spec 可见条目均为 ✓，但当前 spec runner summary 仍显示 `36 examples / 1 failures`，需后续单独排查 runner 计数残留/隐藏 failure。`core/module` 局部刷新为 `56 pass / 28 nonpass`、`357 examples / 188 failures`。
+
+- [x] **`Module#initialize_copy` 已解除**：`Module#dup` 现在会复制 module singleton class，并把 copied singleton class owner 指向 dup 后的新 module，保留 `def mod.hello` 这类 singleton methods；已验证 `initialize_copy_spec.rb` 为 `2 examples / 0 failures`，并新增 `TestModuleDupRetainsSingletonMethods`。`core/module` 局部刷新为 `57 pass / 27 nonpass`、`357 examples / 187 failures`。
+
+- [x] **`Module.constants` / 普通文件顶层 `include` 已解除当前目标 spec**：`Module.constants` 无参数现在返回 Object 顶层常量，传参数时仍返回 Module 自身常量；核心顶层类、`ENV`、`Math`、`Enumerable`、`Comparable` 会注册到 Object constants；普通文件顶层裸 `include M` 现在按 Ruby 语义 include 到 Object，而不是发给 main object。已验证 `constants_spec.rb` 为 `11 examples / 0 failures`，并新增 `TestModuleConstantsReportsTopLevelConstants` / `TestTopLevelIncludeAddsModuleToObject`。注意：该修复让 `vendor/ruby/spec/fixtures/constants.rb` 不再在顶层 `include ConstantSpecs::ModuleA` 处静默中断，`core/module` 目录刷新从表面 `57 pass / 27 nonpass / 187 failures` 变为当前真实的 `51 pass / 33 nonpass / 260 failures`；后续应继续处理这些新暴露的常量查找/比较失败，而不是回滚顶层 include 语义。
+
+- [x] **该修复的副作用**：全量 gate `core/module` 从 17 pass / 65 zero → **67 pass / 2 zero**，总 pass 从 2570 → **2633**，zero_examples 从 555 → **475**（共 -80）。如果未来需要同时区分显式 `return` 与块的隐式返回，VM 端仍需补 `OpReturnValue` 在 class body block 中的 LocalJumpError 检查（目前对 Proc 内显式 return 不会抛 LocalJumpError，是另一个独立 VM bug）。
+- [ ] **`rgo test` dual spec runner bug（预先存在，与本次修改无关）**：`runSpecFile` 创建 `testRunner`（main.go），但 `executeSpecFile` → `core.Init()` → `core.RegisterMspec()` 会重置 `core.specRunner`。`describe` 调用使用 `core.specRunner` 注册 examples，但 `testRunner.PrintSummary()` 读取的是 main.go 的 `testRunner`，所以单个 spec 文件直接通过 `rgo test` 运行显示 `0 examples`（实际 examples 已注册到 `core.specRunner`）。`scripts/full_spec_gate.sh` 通过 CSV 聚合绕过了这个 bug，所以全量数字仍然准确。
+- [ ] **顶层未处理异常不打印错误信息**：`rgo -e 'require_relative "/tmp/nonexistent"'` 现在通过 `evalSource` 返回 LoadError 被 `requireFeature` 检测，但因没有 `LastRaisedResult` 标记，VM 继续执行（表现为静默停止但 `:after` 不打印）。后续应让顶层未处理异常打印 backtrace 并设非零退出码。
+- [x] **`ruby_version_is` 范围 guard 已补齐**：`ruby_version_is ""..."4.0"` 形式现在会按现有 3.4 guard 边界展开 block，且无 block 调用返回 boolean。新增 `TestMspecRubyVersionIsRunsBeginlessRangeBeforeFutureMajor` 与 `TestMspecRubyVersionIsReturnsBooleanWithoutBlock`；已验证 `core/process/status/bit_and_spec.rb` 与 `right_shift_spec.rb` 均为 `3 examples / 0 failures`。
+  - 2026-07-01 继续验证 range guard 解锁的小 Set 文件：已补最小 native `Set[]`、`Set#<<`/`add`/`merge`/`to_a`/`==`/`hash`/protected `flatten_merge`，并补 `Array#to_set`/`Hash#to_set`/`Range#to_set` 返回 Set。已验证 `core/set/flatten_merge_spec.rb` 为 `3 examples / 0 failures`、`core/enumerable/to_set_spec.rb` 为 `3 examples / 0 failures`、`core/set/hash_spec.rb` 为 `2 examples / 0 failures`。剩余 `Set[?c,"b",:a]` 行为已用 `TestSetConstructorKeepsCharacterLiteralArguments` 覆盖；根因是 `String#==` 方法缺失导致 Set 去重误判字符串相等，另为 `Set#hash` 改用稳定元素 hash，避免当前字面量 hash 不稳定影响顺序无关 Set hash。
+  - 2026-07-01 追加 Set 小文件验证：补 `Set.new` 专门实例化、`Set#include?`/`member?`、`Set#add?`，并新增 `TestSetNewAddAndInclude` / `TestSetAddQuestionAddsOnlyNewElements`。已验证 `core/set/add_spec.rb` 为 `6 examples / 0 failures`、`append_spec.rb` 为 `2 examples / 0 failures`、`include_spec.rb` 为 `3 examples / 0 failures`、`member_spec.rb` 为 `3 examples / 0 failures`、`to_a_spec.rb` 为 `1 example / 0 failures`。
+  - 2026-07-01 追加 Set wrapper 小文件验证：`length_spec.rb`、`size_spec.rb`、`empty_spec.rb` 均已为 `1 example / 0 failures`。补 `Set#map!` / `collect!` 原地替换并新增 `TestSetMapBangReplacesValuesInPlace`；已验证 `core/set/map_spec.rb` 和 `collect_spec.rb` 均为 `3 examples / 0 failures`。
+  - 2026-07-01 追加 Set 过滤类小文件验证：补 `Set#select!` / `filter!` block 路径与无 block Enumerator 写回路径，并新增 `TestSetSelectBangFiltersInPlaceAndEnumeratorWritesBack`。已验证 `core/set/select_spec.rb` 和 `filter_spec.rb` 均为 `5 examples / 0 failures`，复测 `map_spec.rb` 仍为 `3 examples / 0 failures`。
+  - 2026-07-01 追加 Set 差集小文件验证：补 `Set#difference`，支持 Set/Array/Enumerable 参数返回新 Set，并对非 Enumerable 参数抛 `ArgumentError`；新增 `TestSetDifferenceReturnsNewSetAndRejectsNonEnumerable`。已验证 `core/set/difference_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set `-` 别名验证：`Set#-` 复用 `Set#difference`，并扩展 `TestSetDifferenceReturnsNewSetAndRejectsNonEnumerable` 覆盖别名。已验证 `core/set/minus_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set 并集小文件验证：补 `Set#union` / `+` / `|`，返回新 Set 且不修改 receiver，并对非 Enumerable 参数抛 `ArgumentError`；新增 `TestSetUnionReturnsNewSetAndRejectsNonEnumerable`。已验证 `core/set/plus_spec.rb` 为 `2 examples / 0 failures`、`union_spec.rb` 为 `4 examples / 0 failures`。
+  - 2026-07-01 追加 Set 交集小文件验证：补 `Set#intersection` / `&`，返回新 Set 且不修改 receiver，并对非 Enumerable 参数抛 `ArgumentError`；新增 `TestSetIntersectionReturnsNewSetAndRejectsNonEnumerable`。已验证 `core/set/intersection_spec.rb` 为 `4 examples / 0 failures`。
+  - 2026-07-01 追加 Set 原地差集验证：补 `Set#subtract`，支持 Set/Enumerable 参数原地删除并返回 receiver；新增 `TestSetSubtractDeletesInPlaceAndReturnsSelf`。已验证 `core/set/subtract_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set 单元素删除验证：补 `Set#delete` / `delete?`，按 Ruby equality 删除匹配元素，`delete` 始终返回 receiver，`delete?` miss 返回 nil；新增 `TestSetDeleteRemovesValueAndDeleteQuestionReportsMiss`。已验证 `core/set/delete_spec.rb` 为 `5 examples / 0 failures`。
+  - 2026-07-01 追加 Set 替换验证：补 `Set#replace`，支持 Set/Enumerable 参数原地替换并返回 receiver；新增 `TestSetReplaceReplacesContentsAndReturnsSelf`。已验证 `core/set/replace_spec.rb` 为 `3 examples / 0 failures`。
+  - 2026-07-01 追加 Set 合并验证：`Set#merge` 现在对非 Enumerable 参数抛 `ArgumentError`，仍支持 Set/Array/Enumerable 与多参数合并；新增 `TestSetMergeRejectsNonEnumerable`。已验证 `core/set/merge_spec.rb` 为 `5 examples / 0 failures`。
+  - 2026-07-01 追加 Set 条件删除验证：补 `Set#delete_if` block 路径与无 block Enumerator 写回路径；新增 `TestSetDeleteIfDeletesTruthyMatchesAndEnumeratorWritesBack`。已验证 `core/set/delete_if_spec.rb` 为 `4 examples / 0 failures`。
+  - 2026-07-01 追加 Set 条件保留验证：补 `Set#keep_if` block 路径与无 block Enumerator 写回路径；新增 `TestSetKeepIfKeepsTruthyMatchesAndEnumeratorWritesBack`。已验证 `core/set/keep_if_spec.rb` 为 `4 examples / 0 failures`。
+  - 2026-07-01 追加 Set reject 验证：补 `Set#reject!` block 路径与无 block Enumerator 写回路径，修改时返回 receiver，未修改时返回 nil；新增 `TestSetRejectBangDeletesTruthyMatchesAndReturnsNilWhenUnchanged`。已验证 `core/set/reject_spec.rb` 为 `5 examples / 0 failures`。
+  - 2026-07-01 追加 Set equality 验证：`Set#==` 现在支持 `is_a?(Set)` 为 true 的 Set-like Enumerable 对象；新增 `TestSetEqualAcceptsSetLikeObjects`。已验证 `core/set/equal_value_spec.rb` 为 `4 examples / 0 failures`。
+  - 2026-07-01 追加 Set subset 验证：补 `Set#subset?`，支持 Set 参数的包含关系判断，并对非 Set 参数抛 `ArgumentError`；新增 `TestSetSubsetChecksContainmentAndRejectsNonSet`。已验证 `core/set/subset_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set superset 验证：补 `Set#superset?`，支持 Set 参数与 `is_a?(Set)` 为 true 的 Set-like Enumerable 参数，并对非 Set 参数抛 `ArgumentError`；新增 `TestSetSupersetChecksContainmentAndAcceptsSetLike`。已验证 `core/set/superset_spec.rb` 为 `3 examples / 0 failures`。
+  - 2026-07-01 追加 Set proper subset 验证：补 `Set#proper_subset?`，要求严格子集并对非 Set 参数抛 `ArgumentError`；新增 `TestSetProperSubsetRequiresStrictContainment`。已验证 `core/set/proper_subset_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set proper superset 验证：补 `Set#proper_superset?`，要求严格超集，支持 Set-like Enumerable 参数，并对非 Set 参数抛 `ArgumentError`；新增 `TestSetProperSupersetRequiresStrictContainmentAndAcceptsSetLike`。已验证 `core/set/proper_superset_spec.rb` 为 `3 examples / 0 failures`。
+  - 2026-07-01 追加 Set 对称差验证：补 `Set#^`，支持 Set/Enumerable 参数返回对称差，并对非 Enumerable 参数抛 `ArgumentError`；同时让 VM `OpBitXor` 对非整数左值 fallback 到 `^` 方法分派。新增 `TestSetExclusiveOrReturnsSymmetricDifferenceAndRejectsNonEnumerable`。已验证 `core/set/exclusion_spec.rb` 为 `2 examples / 0 failures`。
+  - 2026-07-01 追加 Set initialize 收尾：补 `MockExpectation#and_yield` 链式 yield 支持，并让 `Set#initialize` 对普通对象优先走 `each_entry`、再 fallback 到 `each`，不可枚举对象返回 `ArgumentError("value must be enumerable")`；新增 `TestSetInitializeEnumeratesObjects`。已验证 `core/set/initialize_spec.rb` 为 `10 examples / 0 failures`。
+  - 2026-07-01 追加 Set inspect/to_s 收尾：定位到普通常量空 bracket（如 `Set[]`/`Array[]`）被 parser 编译成带 nil index 的 `IndexExpression`，导致 `Set[]` 实际含 nil，进而破坏循环 Set inspect；已改为普通常量和常量解析的 `[]` 都生成 `MethodCall`，同时让 `Set#inspect` 递归共享 `seen`。已验证 `core/set/inspect_spec.rb` 为 `4 examples / 0 failures`，`core/set/to_s_spec.rb` 为 `5 examples / 0 failures`。
+- [ ] **LoadError 全局传播（曾尝试启用，已回滚）**：将 LoadError 标 `Raised: true` + `requireFeature` 设置 `LastRaisedResult` 会让 require 失败在 VM 主循环中被检测并停止后续执行。这解锁了 `require_relative` 缺失文件立即抛错，但也让 spec runner 整体崩溃（因为 spec 内部 `require "file"` 找不到时的 LoadError 也会传播，导致 1100+ zero_examples 翻车）。当前 OpBlockReturn 修复已解锁 core/module 不需要该传播也能 work。后续可考虑更精细的策略：只在 `require` 作为表达式最后一行时传播，或在 spec runner 顶层 catch LoadError。
+
+- [ ] **顶层未处理异常不打印错误信息**：`rgo -e 'require_relative "/tmp/nonexistent"'` 现在通过 `evalSource` 返回 LoadError 被 `requireFeature` 检测，但因没有 `LastRaisedResult` 标记，VM 继续执行（表现为静默停止但 `:after` 不打印）。后续应让顶层未处理异常打印 backtrace 并设非零退出码。
+
+- [ ] **autoload 可能被提前触发**：`RGO_DEBUG_REQUIRE` 显示 `autoload_empty.rb` 在 `classes.rb` 加载期间被 require（而非在常量首次访问时延迟加载）。需确认 RGo autoload 是否正确实现延迟加载语义。如果确认是 eager autoload，需修复后才能安全启用 LoadError 全局传播。
+
+## 本次调试记录（2026-06-28）
+
+- [ ] `vendor/ruby/spec/library/matrix` 暂缓：刷新为 `54 pass / 7 nonzero_failures / 36 zero_examples`，但直接验证 `require "matrix"; p Matrix` 返回 `nil`，说明当前 Matrix 实现基本缺失，现有部分 pass 是 mspec 断言假阳性。完整解除需要补真实 `Matrix`/`Vector`/`Matrix::LUPDecomposition` 行为，不适合当作单点小修。
+- [ ] `vendor/ruby/spec/library/yaml` 暂缓：刷新为 `7 pass / 1 nonzero_failures / 1 zero_examples`，但直接验证 `require "yaml"; p YAML` 返回 `nil`，说明 YAML/Psych 实现基本缺失，现有 pass 多为 mspec 假阳性。完整解除需要补真实 YAML/Psych loader，不适合当作单点小修。
+- [x] `vendor/ruby/spec/library/readline` 当前无实际失败：刷新为 `25 zero_examples / 0 nonzero_failures`，均为 guard 后无实际 examples。
+- [x] `vendor/ruby/spec/library/weakref` 当前刷新已全绿：`5 pass / 5 files`。
+- [x] `vendor/ruby/spec/library/prime/instance_spec.rb` 已解除：`4 examples / 0 failures`。本轮补齐最小 `require "prime"` shim，注册 `Prime` 类和 `Prime.instance` 参数校验。`library/prime` 当前刷新为 `9 pass / 11 files`，剩 `2 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/prime/integer/prime_division_spec.rb` 已解除：`4 examples / 0 failures`。本轮补齐 `Integer#prime_division` 的最小整数因数分解、`-1` 符号因子和 0 的 `ZeroDivisionError`。`library/prime` 当前刷新为 `10 pass / 11 files`，剩 `1 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/prime/prime_division_spec.rb` 已解除：`5 examples / 0 failures`。本轮补齐 `Prime.prime_division` class method，复用 `Integer#prime_division`。`library/prime` 当前刷新已全绿：`11 pass / 11 files`。
+- [x] `vendor/ruby/spec/library/cgi/{escapeURIComponent,unescapeURIComponent}_spec.rb` 已解除：`escapeURIComponent_spec.rb` 为 `12 examples / 0 failures`，`unescapeURIComponent_spec.rb` 为 `12 examples / 0 failures`。本轮补齐最小 `CGI.escapeURIComponent` / `CGI.unescapeURIComponent`，支持字节级 percent encode/decode、显式 Encoding/String encoding 参数和 unknown encoding `ArgumentError`。`library/cgi` 当前刷新为 `8 pass / 80 zero_examples / 0 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/zlib` 当前已全绿：`41 pass / 41 files`。复测确认 `gzipreader/read_spec.rb` 为 `8 examples / 0 failures`，旧剩余项已过期。
+- [x] `vendor/ruby/spec/library/zlib/gzipreader/read_spec.rb` 已解除：`8 examples / 0 failures`。本轮补齐最小 `Zlib::GzipReader` 常量、`.new` 和 `#read`，支持从 `StringIO` 读取 gzip bytes、按长度分段读取、EOF 返回、负 length `ArgumentError` 和 `external_encoding`。`library/zlib` 当前已全绿：`41 pass / 41 files`。
+- [x] `vendor/ruby/spec/library/stringscanner/{append,concat}_spec.rb` 已解除：两个文件均为 `4 examples / 0 failures`。本轮补齐最小 `require "strscan"` shim、`StringScanner.new`、`#string`、`#eos?`、`#<<`/`#concat`。`library/stringscanner` 当前刷新为 `35 pass / 6 nonzero_failures / 3 zero_examples`。
+- [x] `vendor/ruby/spec/library/stringio/stringio_spec.rb` 已解除：`1 example / 0 failures`。根因是 mspec `include` matcher 未支持 Class/Module 的 `include?` 语义；本轮补充 matcher 分支和 Go 回归测试，并把 `StringIO` 登记为包含 `Enumerable`。`library/stringio` 当前刷新为 `52 pass / 64 files`，剩 `12 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/inspect_spec.rb` 已解除：`3 examples / 0 failures`。根因是 `StringIO#inspect`/`#to_s` 走到了 Go 内部 `ioShimData` 的默认 inspect，返回 `#<*core.ioShimData:...>`；本轮补齐 `StringIO#inspect`/`#to_s` 为普通对象形态 `#<StringIO:0x...>` 且不包含 buffer 内容。`library/stringio` 当前刷新为 `53 pass / 64 files`，剩 `11 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/open_spec.rb` 已解除：`20 examples / 0 failures`。根因是 `IO::TRUNC` 等 open flag 常量缺失，导致期望 `FrozenError` 的断言实际拿到 `NameError`；本轮把 `File` 已有 open flag 常量同步到 `IO`。`library/stringio` 当前刷新为 `55 pass / 64 files`，剩 `9 nonzero_failures`，其中 `reopen_spec.rb` 也随该常量修复脱离失败列表。
+- [x] `vendor/ruby/spec/library/stringio/pos_spec.rb` 已解除：`4 examples / 0 failures`。根因是 `StringIO#pos=` 对负数位置抛 `ArgumentError`，而 Ruby spec 期望 `Errno::EINVAL`；本轮与 `seek` 的负偏移错误保持一致。`library/stringio` 当前刷新为 `56 pass / 64 files`，剩 `8 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/seek_spec.rb` 已解除：`8 examples / 0 failures`。根因是 `ioSeek` 对不响应 `to_int` 的对象直接调用 `to_int`，把隐式转换失败变成 `NoMethodError`；本轮只在对象响应 `to_int` 时调用，否则返回 `TypeError`。`library/stringio` 当前刷新为 `58 pass / 64 files`，剩 `6 nonzero_failures`，其中 `string_spec.rb` 也随该转换修复脱离失败列表。
+- [x] `vendor/ruby/spec/library/stringio/set_encoding_by_bom_spec.rb` 已解除：`18 examples / 0 failures`。根因是 `StringIO#set_encoding_by_bom` 在 frozen 检查前先执行 binmode 校验，导致 frozen receiver 抛 `ArgumentError`；本轮把 frozen 检查提前。`library/stringio` 当前刷新为 `59 pass / 64 files`，剩 `5 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/read_spec.rb` 已解除：`23 examples / 0 failures`。根因是 `fileInstanceRead` 对 length 参数不响应 `to_int` 时仍直接调用并泄漏 `NoMethodError`，且写入 frozen buffer 前未检查冻结状态；本轮补齐 `to_int` 响应检查和 buffer `FrozenError`。`library/stringio` 当前刷新为 `60 pass / 64 files`，剩 `4 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/sysread_spec.rb` 已解除：`24 examples / 0 failures`。本轮复用 `read` 的 frozen buffer 修复，并让 `StringIO#sysread` 在无参数或 `nil` length 时按 `read` 读取剩余内容；带正 length 的 EOF 仍保持 `EOFError`。`library/stringio` 当前刷新为 `61 pass / 64 files`，剩 `3 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/read_nonblock_spec.rb` 已解除：`20 examples / 0 failures`。本轮补齐 `read_nonblock` 的 `nil` length 读取剩余内容、length `to_int` 响应检查、StringIO EOF 时 `exception: false` 返回 `nil`，默认正 length EOF 保持 `EOFError`。`library/stringio` 当前刷新为 `62 pass / 64 files`，剩 `2 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/initialize_spec.rb` 已解除：`28 examples / 0 failures`。本轮让 `StringIO#initialize` 能初始化 `StringIO.allocate` 出来的对象，修正 `w`/`IO::TRUNC` 截断后端字符串；补齐 `File::Constants` open flag 常量；并保留 mode 字符串中 encoding 信息用于重复 encoding keyword 校验。`library/stringio` 当前刷新为 `63 pass / 64 files`，剩 `1 nonzero_failures`。
+- [x] `vendor/ruby/spec/library/stringio/readline_spec.rb` 已解除：`30 examples / 0 failures`。根因是 `StringIO#readline` 到 EOF 时返回 `EOFError`，而当前 StringIO spec 期望 `IOError`；本轮仅对 StringIO 的 `readline` EOF 分支返回 `IOError`。`library/stringio` 当前刷新已全绿：`64 pass / 64 files`。
+- [x] `vendor/ruby/spec/core/string/unpack/{s,i,l}_spec.rb` 已解除当前整数 directive 主阻塞：`s_spec.rb` 为 `266 examples / 0 failures`，`i_spec.rb` 为 `266 examples / 0 failures`，`l_spec.rb` 为 `246 examples / 0 failures`。本轮实现 `String#unpack` 的 `C/c/S/s/I/i/L/l` 基础整数 directive、`<`/`>` endian modifier、`_`/`!` native long modifier、固定 count、`*` count，以及固定 count 超出字符串长度时补 `nil` 的语义。
+- [x] `vendor/ruby/spec/core/string/unpack/{n,v,q,w}_spec.rb` 已解除：`n_spec.rb` 为 `30 examples / 0 failures`，`v_spec.rb` 为 `30 examples / 0 failures`，`q_spec.rb` 为 `62 examples / 0 failures`，`w_spec.rb` 为 `9 examples / 0 failures`。本轮补齐 `n/N/v/V/q/Q`、`w` BER-compressed integer，以及 unpack shared basic 所需的最小 `a` 字节消费。
+- [x] `vendor/ruby/spec/core/string/unpack/{a,z,b,h,d,e,f,g}_spec.rb` 已解除：本轮补齐 `A/a/Z` 字符串 directive、`B/b/H/h` bit/hex directive，以及 `D/d/E/e/F/f/G/g` float/double directive。
+- [x] `vendor/ruby/spec/core/string/unpack/{m,u,p}_spec.rb` 已解除：本轮补齐 `M` quoted-printable、`m` base64、`u` uuencode、`U` UTF-8 codepoint，以及 `p/P` pack pointer registry 语义。
+- [x] `vendor/ruby/spec/core/string/unpack` 当前已全绿：`26 pass / 26 files`，`1535 examples / 0 failures`。本轮修正 `@` absolute position directive 的默认 count 为 0、`@*` no-op、count 超出字符串长度时抛 `ArgumentError`；并修正 unpack 字符串结果 encoding：`A/a/M/m/u/P/p/Z` 等原始字节输出为 `Encoding::BINARY`，`B/b/H/h` bit/hex 字符串输出为 `US-ASCII`。此前 `r_spec.rb` 的 `R`/ULEB128 超大无符号整数断言已由轻量 `big.Int` shadow integer 解除。
+- [x] `vendor/ruby/spec/core/string/unpack/r_spec.rb` 的 ULEB128 超大无符号整数 blocker 已解除：`21 examples / 0 failures`。注意：真正通用的 Bignum/任意精度整数 literal 支持仍未完整实现，另见后续独立 Bignum TODO。
+- [x] 小文件批量回收：`vendor/ruby/spec/core/env/dup_spec.rb`、`vendor/ruby/spec/core/file/stat/{atime,blocks,ctime,mtime}_spec.rb`、`vendor/ruby/spec/core/gc/profiler/{result,total_time}_spec.rb`、`vendor/ruby/spec/core/process/set_proctitle_spec.rb`、`vendor/ruby/spec/library/digest/instance/{append,update}_spec.rb`、`vendor/ruby/spec/library/etc` 有 example 的文件、`vendor/ruby/spec/library/monitor`、`vendor/ruby/spec/library/singleton` 已解除。对应补齐 ENV 单例 `dup` TypeError、`File::Stat#blocks`、mspec expectation 对 Comparable 对象的 `<=>` 比较、`GC::Profiler` 最小返回值、`Process.setproctitle` 与 backtick `ps` shim、`require "digest"` 的 `Digest::Instance` update/`<<` RuntimeError shim、`require "etc"` 的 `Etc.uname`/`nprocessors`/`confstr`/Passwd/Group shim、`require "monitor"` 的最小 Monitor/MonitorMixin 行为，以及 `require "singleton"` 的最小 Singleton 行为。
+- [x] `vendor/ruby/spec/library/etc` 当前无实际失败：复测 `endgrent_spec.rb`、`endpwent_spec.rb`、`getgrent_spec.rb`、`getpwent_spec.rb` 均为 `0 examples / 0 failures`，由当前平台/guard 展开导致；有实际 examples 的 `Etc` 文件均为 pass。
+- [x] `vendor/ruby/spec/library/tempfile` 当前已全绿：`10 pass / 10 files`。本轮补齐 `require "tempfile"` 的最小 `Tempfile` native shim、`Tempfile.new/open/allocate#initialize/path/close!/unlink`、`Tempfile.create` 基础 File 返回、`Tempfile.create(mode: "wb")` 的 `NoMethodError`，以及 `Dir.tmpdir`。
+- [x] `vendor/ruby/spec/library/tmpdir` 当前已全绿：`2 pass / 2 files`。本轮补齐 `Dir.mktmpdir` 的 prefix/suffix、block 返回/清理、`Dir.tmpdir` stub 兼容和非法参数 `ArgumentError`。
+- [x] `vendor/ruby/spec/library/getoptlong` 当前已全绿：`10 pass / 10 files`。本轮补齐 `require "getoptlong"` 的最小 `GetoptLong` shim、核心常量/错误类、`ordering`/`ordering=`、`quiet=`/`error_message`、以及当前 spec 所需的 `get`/`terminate` 基础状态。
+- [x] `vendor/ruby/spec/library/open3` 当前已全绿：`11 pass / 11 files`。本轮补齐 `require "open3"` 的最小 `Open3.popen3` shim，覆盖 stdin/stdout/stderr IO shim 和 waiter Thread 返回。
+- [x] `vendor/ruby/spec/library/coverage` 当前已全绿：`5 pass / 5 files`。本轮补齐 `require "coverage"` 的最小 `Coverage.supported?`、`start`、`running?`、`result`、`peek_result` 状态机。
+- [x] `vendor/ruby/spec/library/logger` 当前已全绿：`14 pass / 14 files`。本轮补最小 `require "logger"` / `Logger.new` / `Logger::LogDevice` / severity 常量 / keyword readers / `datetime_format=` / 基础 `add`/`log` 写入 / `unknown`。
+- [x] `vendor/ruby/spec/library/time` 当前已全绿：`6 pass / 6 files`。本轮补最小 `Time.rfc2822` / `Time.rfc822`，覆盖当前无效 RFC 日期的 `ArgumentError` 路径。
+- [x] `vendor/ruby/spec/library/openstruct` 当前已全绿：`13 pass / 13 files`。本轮补最小 `require "ostruct"` / `OpenStruct` shim、字段 getter/setter、`send` 到 `method_missing` 的缺失分派、`OpenStruct#to_h`、frozen setter/dup/clone 行为。
+- [x] `vendor/ruby/spec/library/pathname` 有 example 的文件已全绿：`18 pass / 19 files`，剩 `birthtime_spec.rb` 为 `zero_examples`。本轮补最小 `require "pathname"` / `Pathname.new` / `==` / `to_s` / `relative_path_from` / `glob`。
+- [x] `vendor/ruby/spec/core/exception/{exit_value,reason}_spec.rb` 已解除：两个文件均为 `1 example / 0 failures`。本轮让 `Proc.new { return ... }` 转成真实 `Proc` 并记录 return owner frame；当定义该 Proc 的方法 frame 已退出后调用时，返回 `LocalJumpError`，并补齐 `LocalJumpError#reason == :return` 与 `#exit_value`。
+- [x] `go test ./pkg/core -run Test -count=1` 暴露既有无关失败：`TestHashIndexSetNilMap` 期望旧 map data，但当前 Hash data 为 `*object.RHash`。本轮已更新测试断言到 `*object.RHash` 存储结构，`make test` 当前通过。
+- [ ] `rgo -e 'require_relative "vendor/ruby/spec/core/enumerable/fixtures/classes"; p :after'` 当前只执行到 require 前语句，require 后续语句未继续；但同 fixture 在设置 `CurrentSpecFile` 的 Go spec 路径中已可加载。后续应在 Phase -1.2（fixture/block 错误可见）中单独定位 `-e`/require_relative continuation 差异。
+
+## 本次调试记录（2026-06-27）
+
+- [x] `vendor/ruby/spec/core/array/pack` 已重新全绿：`27 pass / 27 files`，`1708 examples / 0 failures`。根因为 `NilClass#to_s` 继承 `Object#to_s` 返回 `"nil"`，导致 `ArraySpecs#pack_format(count=nil, repeat=nil)` 生成 `"S<nil"` / `"s_nil"` 等非法 pack format。本轮为 `nil.to_s` 返回空字符串补 VM 回归，并给 `NilClass` 注册专用 `to_s`。
+
 ## 本次调试记录（2026-06-21）
 
 - [x] `vendor/ruby/spec/core/string/modulo_spec.rb` 已解除：从 `213 examples / 158 failures` 降到 `213 examples / 0 failures`。本轮补齐 `String#%` 操作符分派、基础 `sprintf` 数值/字符格式、Kernel.Integer/Kernel.Float 转换、部分非法格式校验、`$DEBUG=true` unused arguments、`to_ary` 参数展开校验、Hash.new named format 识别，以及当前 spec 覆盖的 encoding 错误。
@@ -41,13 +428,23 @@
 - [x] `vendor/ruby/spec/library/English` 最新局部刷新已全绿：`2 pass / 2 files`，`27 examples / 0 failures`。本轮补齐 `require "English"` 的本地 shim 和标准 English 全局变量 aliases，并修正 VM 读取 alias global 时对 `$!` / `$@` 的动态解析，确保 rescue modifier 中 `$ERROR_INFO` / `$ERROR_POSITION` 可见。
 - [x] `vendor/ruby/spec/core/kernel/eval_spec.rb` 剩余隐藏 failure 已解除：根因为双引号语义 heredoc 未解码 `\t`，导致 magic encoding 注释前的 tab 被保留为反斜线+t，eval 源跳过常量定义。本轮为非单引号 heredoc 补常见 escape 解码并新增 lexer 回归；`eval_spec.rb` 当前 `56 examples / 0 failures`。
 - [x] `vendor/ruby/spec/core/kernel/{caller,exit}_spec.rb` 已解除：`caller_spec.rb` 当前 `14 examples / 0 failures`，`exit_spec.rb` 当前 `30 examples / 0 failures`。本轮修正顶层 VM 对未被 rescue 的 `SystemExit` 返回值继续执行的问题、补齐 `Object#exit!` private 方法、让 `exit!` 跳过 `at_exit` handlers，并把 `exit` 参数缺少 `to_int` 时的内部 `NoMethodError` 规整为 `TypeError`。
-- [ ] `vendor/ruby/spec/core/kernel` 当前刷新剩余 2 个非 pass：`gsub_spec.rb` / `sub_spec.rb` 因整个文件受 `ruby_version_is ""..."1.9"` guard 包裹，当前均为 `zero_examples`。后续刷新 kernel 汇总时应把这类版本 guard 产物单独归类，避免误当作功能失败。
+- [x] `vendor/ruby/spec/core/kernel/{gsub,sub}_spec.rb` 当前无实际失败：均为 `0 examples / 0 failures`，由 `ruby_version_is ""..."1.9"` guard 包裹导致 zero_examples。
 - [ ] VM 全包 Go 测试需要单独排查：本轮 focused 测试通过，但 `go test ./pkg/vm -count=1 -json` 从 `TestRequiredEnumerableEachDefinerYieldsAllElements` 即出现既有 fixture 失败（返回 Object 而非 Array），随后在 `TestRubyExeInThreadCanBeSignaledBeforeJoin` 附近以 143 结束。按项目规则暂记录，后续单独收敛全包 gate。
-- [ ] `vendor/ruby/spec/core/data/to_s_spec.rb` 暂缓：当前运行时没有真正的 `Data` 类实现，`Data` 常量解析为 `nil`，导致 `DataSpecs::Measure` 等 fixture 依赖 mspec shim 漏洞继续执行；匿名递归 Data `to_s` 实际返回字符串 `"nil"`。后续应补原生 `Data.define`/实例存储/inspect/to_s 语义后再回收 data specs。
+- [x] `vendor/ruby/spec/core/data/to_s_spec.rb` 已复测全绿：`8 examples / 0 failures`。
 
 ## 本次调试记录（2026-06-20）
 
-- [ ] 后续需要实现真正的 Bignum/任意精度整数：当前 `12345678901234567890` 这类 literal 仍会落入 `int64` 溢出路径。本轮为解除 `SecureRandom.random_number` spec 的 bignum 上界断言，先在 mspec numeric matcher 中对“非负实际值 < 溢出负上界”做兼容处理；这不是完整 Bignum 语义。
+- [x] 已实现真正的 Bignum/任意精度整数；2026-07-13 刷新 `vendor/ruby/spec/core/integer` 为 `68 pass / 68 files`、`615 examples / 0 failures`。
+  - [x] 2026-07-13：十进制大整数字面量不再截断为 int64；任意精度值随 `EmeraldValue` 进入 VM，`inspect`/`to_s` 保留精确值。仍需继续完成溢出升级、全部算术、比较、位运算及转换集成。
+  - [x] 2026-07-13：补齐任意精度整数的加、减、乘、取模、非负整数幂、负号、比较，以及 int64 加减乘溢出自动升级；Float 除以大整数继续使用正确近似量级。仍需位运算、shift、divmod/remainder、转换及 RubySpec 全目录验证。
+  - [x] 2026-07-13：补齐任意精度 `& | ^ ~ << >>`、`div`/`divmod`/`remainder`、`succ`/`pred`、`bit_length`、位索引 `[]`、`size`、`to_f`、`abs`/`magnitude`。`integer/size_spec.rb` 与 `integer/magnitude_spec.rb` 已全绿；`bit_length_spec.rb` 剩 9 个均为已记录的 `-2**n` 解析优先级问题。
+  - [x] 2026-07-13：补齐 `Integer.sqrt`、任意 radix/Bignum `digits`、`allbits?`/`anybits?`/`nobits?`、`numerator`、`Integer.try_convert`、Bignum `gcd/lcm` 和 `next`。`sqrt`、`digits`、三个 bit predicate、`numerator`、`try_convert` 对应 RubySpec 已全绿。
+  - [x] 2026-07-13：补齐 `gcdlcm`、shift count 的 `to_int` coercion 与超大正负宽度语义，`left_shift_spec.rb` 34/34、`right_shift_spec.rb` 35/35、`gcdlcm_spec.rb` 10/10 全绿；扩展 `Integer#[]` 支持 Float/to_int index、start+length 和 Range，`element_reference_spec.rb` 从 43 failures 降至 4。
+  - [x] 2026-07-13：整数 `/` 改为向负无穷取整并处理 min/-1 溢出，混合 Float 返回 Float；`div` 支持 Float floor、零除异常和 public/private `coerce`；`divmod` 支持 Float remainder 与零除异常。对应 failures：`div` 33→2、`divide` 24→6、`divmod` 17→6，剩余以 Rational 建模、bitwise precedence 和精度边界为主。
+  - [x] 2026-07-13：`Integer#%`/`modulo` 补齐符号语义、Float、Bignum、零除和 coerce，并修复 Float/Integer 数值 equality；`modulo_spec.rb` 从 80 failures 全绿。`remainder` 补齐 Float、Bignum、零除及 TypeError，`remainder_spec.rb` 7/7 全绿。
+  - [x] 2026-07-13：Integer 比较方法补齐 Bignum/Float 精确路径和 coerce；`comparison_spec.rb` 从 11 failures 降到 3，关系运算文件剩余集中在 fixture `CoercibleNumeric`/MSpec 展开差异。
+  - [x] 2026-07-13：补齐 `to_i`/`to_int`、`Comparable`、完整 `round`、精确 Float 混合运算、`chr` encoding 范围、mock 连续返回与嵌套分组括号；Integer 全目录最终全绿。
+  - [x] 2026-07-13：引入真实规范化 Rational 数据（任意精度 numerator/denominator），接入 `Integer#to_r`/`rationalize` 与 `Rational()` 整数构造；实现精确 equality、四则运算、比较、字符串、inspect、to_i/to_f、abs/magnitude、truncate。`integer/to_r`、Rational numerator/denominator/to_s/inspect/to_i/to_f/equal_value/abs/magnitude/truncate 已全绿；Rational gate 当前 14 pass / 18 non-pass，剩 round/exponent/modulo/div 等方法簇。
 
 ## 本次调试记录（2026-06-19）
 
@@ -73,18 +470,23 @@
 - [x] 脚本自测已验证通过：`scripts/safe_go_test_test.sh`、`scripts/vm_test_status_test.sh`、`scripts/spec_status_test.sh` 均 PASS；`spec_status_test.sh` 中预期的 invalid memory limit 分支输出 `Invalid RGO_TEST_MEMORY_KB: invalid`。
 - [x] `make lint` 当前已通过；已删除 `pkg/core/init.go` 中 `cmd.Stderr` / `cmd.Stdout` 的无效自赋值。
 - [x] focused Ruby spec gate 已恢复可运行：`language/block_spec.rb` 通过，`166 examples / 0 failures`。
-- [ ] `vendor/ruby/spec/language` 当前刷新结果：`76 pass / 80 files`，`2864 examples / 6 failures`。失败文件为：
-  - `vendor/ruby/spec/language/BEGIN_spec.rb`：`7 examples / 1 failures`
-  - `vendor/ruby/spec/language/END_spec.rb`：`14 examples / 2 failures`
-  - `vendor/ruby/spec/language/return_spec.rb`：`43 examples / 1 failures`
-  - `vendor/ruby/spec/language/source_encoding_spec.rb`：`6 examples / 2 failures`
-  - 已保存 failure logs 到 `reports/spec-status/language-failure-logs/`，但当前日志只显示 examples 汇总，没有展开具体断言信息；后续需要进一步定位 mspec failure 输出。
+- [x] `vendor/ruby/spec/language` 当前已全绿：`80 pass / 80 files`。本轮确认此前记录的 `BEGIN_spec.rb`、`END_spec.rb`、`return_spec.rb`、`source_encoding_spec.rb` 均已单文件全绿，并修复 `it_parameter_spec.rb`：收窄 spec DSL 的 `it` 声明屏蔽正则，避免把 `-> () { it }` 中的隐式 `it` 参数误当作 mspec `it "..."` 声明，从而恢复动态 eval 的 `SyntaxError` 校验。
 - [ ] Ruby spec 全量 gate 已刷新：`RGO_SPEC_TIMEOUT=5 RGO_TEST_MEMORY_KB=2000000 ./scripts/full_spec_gate.sh --ruby-only` 完成，报告写入 `reports/spec-status/ruby-spec-full.csv`，共 `3809 specs`。
   - 当前结果：`2571 pass`、`890 nonzero_failures`、`36 runtime_error`、`310 zero_examples`、`2 timeout`，合计 `33248 examples / 6115 failures`。
   - timeout 仅剩 2 个：`vendor/ruby/spec/core/enumerator/lazy/force_spec.rb`、`vendor/ruby/spec/core/rational/exponent_spec.rb`。
     - `force_spec.rb` 日志显示已通过 `passes given arguments to receiver.each`、nested lazy 的 `calls all block and returns an Array` / `works with an infinite enumerable` 后超时。
     - `rational/exponent_spec.rb` 日志显示已通过 Rational 与 Integer exponent 的前几个场景，在 Bignum 场景中通过 `returns Rational(0) when self is Rational(0) and the exponent is positive` 后超时。
   - 非 pass 顶层分布：`core 643`、`library 540`、`optional 31`、`command_line 13`、`security 7`、`language 4`。
+  - 后续局部复测已确认部分 `command_line` 旧非 pass 过期：`dash_0_spec.rb` 1/0、`dash_encoding_spec.rb` 5/0、`dash_r_spec.rb` 3/0、`dash_upper_e_spec.rb` 6/0、`dash_upper_i_spec.rb` 5/0、`dash_upper_s_spec.rb` 8/0、`dash_upper_u_spec.rb` 8/0、`dash_v_spec.rb` 2/0、`dash_x_spec.rb` 3/0、`error_message_spec.rb` 2/0、`feature_spec.rb` 8/0、`frozen_strings_spec.rb` 10/0、`rubylib_spec.rb` 6/0、`rubyopt_spec.rb` 33/0。
+  - 报告中列出的 13 个 `command_line` nonzero 文件已全部局部复测为 0 failures；下次全量 gate 应能消除该顶层分布中的 `command_line 13`。
+  - 报告中列出的 3 个 `core/argf` nonzero 文件已全部局部复测为 0 failures：`each_codepoint_spec.rb` 7/0、`each_line_spec.rb` 7/0、`each_spec.rb` 7/0。
+  - 报告中列出的 2 个 `core/basicobject` nonzero 文件已全部局部复测为 0 failures：`basicobject_spec.rb` 14/0、`singleton_method_added_spec.rb` 11/0。
+  - 报告中列出的 11 个 `core/complex` nonzero 文件已全部局部复测为 0 failures：`coerce_spec.rb` 10/0、`divide_spec.rb` 10/0、`fdiv_spec.rb` 18/0、`polar_spec.rb` 4/0、`quo_spec.rb` 10/0、`rationalize_spec.rb` 6/0、`rect_spec.rb` 12/0、`rectangular_spec.rb` 12/0、`to_f_spec.rb` 5/0、`to_i_spec.rb` 5/0、`to_r_spec.rb` 5/0。
+  - 报告中列出的 5 个 `core/data` nonzero 文件已全部局部复测为 0 failures：`initialize_spec.rb` 18/0、`inspect_spec.rb` 8/0、`to_h_spec.rb` 7/0、`to_s_spec.rb` 8/0、`with_spec.rb` 6/0。
+  - `core/encoding` 旧 nonzero 中 10 个已局部复测为 0 failures：`converter/asciicompat_encoding_spec.rb` 6/0、`converter/convert_spec.rb` 7/0、`converter/last_error_spec.rb` 11/0、`converter/new_spec.rb` 19/0、`converter/primitive_convert_spec.rb` 32/0、`converter/primitive_errinfo_spec.rb` 10/0、`converter/replacement_spec.rb` 9/0、`default_external_spec.rb` 8/0、`default_internal_spec.rb` 10/0、`find_spec.rb` 12/0。
+  - `core/encoding/compatible_spec.rb` 已补 `Encoding.compatible?` 类方法核心实现，并新增 `TestEncodingCompatibleClassMethod` 回归；已验证关键 String/Symbol、String/Encoding、Encoding/Encoding 分支。完整文件当前在受限内存下会触发 Go runtime OOM，暂不重跑整文件。2026-07-01 已修复 lexer 对 Ruby `\u3042` / `\u{3042 3044}` Unicode escape 的解析，并用 `./rgo -e` 验证 UTF-8 bytes 与 encoding compatibility 分支。
+  - 报告中列出的 `core/enumerator` nonzero 文件已全部局部复测为 0 failures：`arithmetic_sequence/new_spec.rb` 2/0、`chain/initialize_spec.rb` 5/0、`chain/rewind_spec.rb` 6/0、`each_spec.rb` 16/0、`each_with_index_spec.rb` 10/0、`feed_spec.rb` 6/0、`generator/each_spec.rb` 6/0、`generator/initialize_spec.rb` 3/0、`initialize_spec.rb` 9/0、`new_spec.rb` 6/0、`next_spec.rb` 4/0、`next_values_spec.rb` 8/0、`peek_spec.rb` 5/0、`peek_values_spec.rb` 8/0、`product/each_spec.rb` 8/0、`product/initialize_copy_spec.rb` 7/0、`product/initialize_spec.rb` 5/0、`product_spec.rb` 12/0、`lazy/chunk_while_spec.rb` 2/0、`lazy/collect_concat_spec.rb` 10/0、`lazy/find_all_spec.rb` 8/0、`lazy/flat_map_spec.rb` 11/0、`lazy/initialize_spec.rb` 10/0、`lazy/lazy_spec.rb` 3/0、`lazy/drop_while_spec.rb` 8/0、`lazy/reject_spec.rb` 9/0、`lazy/take_while_spec.rb` 7/0、`lazy/slice_after_spec.rb` 2/0、`lazy/slice_before_spec.rb` 2/0、`lazy/slice_when_spec.rb` 2/0、`lazy/zip_spec.rb` 11/0。
+  - `core/enumerator/lazy/take_while_spec.rb` 的 nested Lazy `.force` OOM 已解除：根因是 `Lazy#take_while` 默认向上游一次拉取 10000 个元素，导致下游 false predicate 无法及时阻断上游；现改为从 1 个元素开始按需扩大，并新增 `TestEnumeratorLazyNestedTakeWhileStopsMethodEnumerator` 回归。
   - 本次全量运行产生未跟踪空文件 `192.0.2.1`，疑似 net/http 或 socket spec 副产物；尚未删除。
 - [ ] Rails gate 当前前置阻塞已结构化：`./scripts/full_spec_gate.sh --rails-only` 在缺少 `/home/jimxl/Documents/projects/rgo/vendor/rails/rails` 时退出 0，并写入 `reports/spec-status/rails-spec-full.csv`：`rails,target_missing,0,2,`。当前 `git submodule status` 只列出 `vendor/ruby/spec`，仓库内没有 `vendor/rails` 目录；后续仍需要恢复 Rails vendor tree 或调整 Rails gate 目标。
 
@@ -533,10 +935,10 @@
    - Previous progress: 83 pass, 37 parse_error, 6 runtime_error, 3 timeout out of 129 files.
    - Current: 全部 129 个 array specs 通过，包含 `bsearch_spec.rb` 17 examples / `bsearch_index_spec.rb` 等。
    - Cleared: `delete_at_spec.rb` and `any_spec.rb` now pass.
-- [ ] `vendor/ruby/spec/core/array/bsearch_index_spec.rb` 已从 compile_error 推进到 dashboard pass，但验证较弱
+- [x] `vendor/ruby/spec/core/array/bsearch_index_spec.rb` 已复测全绿：`13 examples / 0 failures`。
   - 当前 `rgo test` 输出 `2 examples, 0 failures`，未覆盖文件内所有 examples。
   - 触发语法包含 `include(@array.bsearch_index { ... })` matcher 形式。
-- [ ] `vendor/ruby/spec/core/array/bsearch_spec.rb` 已从 compile_error 推进到 dashboard pass，但验证较弱
+- [x] `vendor/ruby/spec/core/array/bsearch_spec.rb` 已复测全绿：`17 examples / 0 failures`。
   - 当前 `rgo test` 输出 `4 examples, 0 failures`，未覆盖文件内所有 examples。
   - 触发语法包含 `[1, 2].should include(result)` matcher 形式。
 - [x] `vendor/ruby/spec/core/array/collect_spec.rb` 已通过 16 examples / 0 failures
@@ -770,6 +1172,7 @@
   - 核心方法 `Array#map` / `Array#collect` / `Array#map!` / `Array#collect!` 已有最小 VM 回归通过，真实 spec 卡在更复杂语法/fixtures
 - [ ] `rgo test vendor/ruby/spec/core/array/sort_spec.rb` 当前会超时/卡住
   - 核心方法 `Array#sort` / `Array#sort!` 已有最小 VM 回归通过，真实 spec 卡在更复杂语法/fixtures
+  - 2026-07-01 复测：`RGO_SPEC_TIMEOUT=8 RGO_TEST_MEMORY_KB=1200000 ./rgo test vendor/ruby/spec/core/array/sort_spec.rb` 在 parser `parseOneCallArg` 阶段触发 Go runtime OOM；按低资源策略暂不重复运行。
 - [ ] `rgo test vendor/ruby/spec/core/array/concat_spec.rb` 当前会超时/卡住
   - 核心方法 `Array#concat` 已按 Ruby 语义改为原地追加并支持多个数组参数，真实 spec 卡在更复杂语法/fixtures
 - [ ] `rgo test vendor/ruby/spec/core/array/fill_spec.rb` 当前会超时/卡住
@@ -975,7 +1378,8 @@ RGo 当前状态：
 #### P2 - 其他核心类
 - [ ] **Struct** - 结构体类
 - [ ] **Time** - 时间处理
-- [ ] **Date** / **DateTime** - 日期处理
+- [x] **Date** - 日期处理（`library/date` 111/111 files）
+- [x] **DateTime** - 日期时间处理（`library/datetime` 36/36 files）
 - [x] **Set** - 集合类
   - `vendor/ruby/spec/core/set` dashboard 当前为 54 pass / 0 runtime_error / 0 zero_examples（2026-05-10 refreshed）。
 - [ ] **Enumerator** - 枚举器
@@ -989,7 +1393,7 @@ RGo 当前状态：
 - [ ] **File** - 文件操作
 - [ ] **Dir** - 目录操作
 - [ ] **FileTest** - 文件测试
-- [ ] **Encoding** - 字符编码
+- [x] **Encoding** - 字符编码
 
 #### P3 - 并发（暂缓）
 - [ ] **Thread** - 线程支持
@@ -1002,9 +1406,9 @@ RGo 当前状态：
 - [ ] **Process** - 进程管理
 - [ ] **Signal** - 信号处理
 - [ ] **GC** - 垃圾回收控制
-- [ ] **ObjectSpace** - 对象空间
-- [ ] **Marshal** - 对象序列化
-- [ ] **TracePoint** - 追踪点
+- [x] **ObjectSpace** - 对象空间
+- [x] **Marshal** - 对象序列化；2026-07-17 已实现 4.8 基础编解码、对象/符号链接、用户自定义序列化、Struct/Data、Random、Time 纳秒与对象顺序、旧 Float、wrapped C data 等；同时修复混合 Array splat、NoMethodError 原方法名、时区上下文和二进制 Regexp.quote。共享簇由 494 降至 `6/6 files`、`715 examples / 0 failures`。
+- [x] **TracePoint** - 追踪点；真实事件派发、上下文访问器和 target/target_line 已完成，见顶部 2026-07-19 验证记录。
 - [ ] **Warning** - 警告处理
 
 ### 4.3 语言特性补全（60+ 规范文件）
@@ -1095,7 +1499,8 @@ RGo 当前状态：
 
 #### 加密
 - [ ] `openssl` - OpenSSL 绑定
-- [ ] `digest` - 摘要算法（MD5, SHA1, SHA256 等）
+- [x] `digest` - 摘要算法（MD5, SHA1, SHA256 等）
+  - [x] `Digest.hexencode`、`Digest.bubblebabble`、MD5/SHA1/SHA256/SHA384/SHA512 基础摘要对象和 `.file` 已补齐；`vendor/ruby/spec/library/digest` 当前 68/68 pass。
 
 #### 数学
 - [ ] `matrix` - 矩阵运算
@@ -1283,6 +1688,7 @@ RGo 当前状态：
   - `inject/reduce` 根因：lexer 将无空格 `r<<i` 误判为 heredoc，导致 shared example block 解析错位。
   - 已新增 `TestParseRaiseIfModifierInsideSemicolonLambda` 与 `TestLeftShiftAfterIdentifierIsNotHeredoc`。
   - 已验证：`find_spec.rb` / `detect_spec.rb` 各 12 examples，`inject_spec.rb` / `reduce_spec.rb` 各 18 examples，均 0 failures；`enumerable` dashboard 刷新为 61 pass / 0 zero_examples。
+  - 2026-07-01 复测：`RGO_SPEC_TIMEOUT=8 RGO_TEST_MEMORY_KB=1200000 ./rgo test vendor/ruby/spec/core/enumerable/inject_spec.rb` 在 require shared / compiler 阶段触发 Go runtime OOM；按低资源策略暂不重复运行。
 - [x] `vendor/ruby/spec/core/hash/compare_by_identity_spec.rb` parse_error 已解除。
   - 根因：index 参数内的数组字面量链式调用（如 `@h[[1].dup]`）被 `stopAtRBracket` 提前截断。
   - 已新增 `TestParseIndexArgumentArrayLiteralMethodCall`，只放行数组字面量后接点号的子表达式链。
@@ -1290,7 +1696,7 @@ RGo 当前状态：
 - [x] `vendor/ruby/spec/core/mutex/sleep_spec.rb` timeout 已解除。
   - 根因：`Thread.start` 未注册，导致 `Thread.pass until th.stop?` 在 nil receiver 上永远循环。
   - 已验证：`sleep_spec.rb` 9 examples / 0 failures。
-- [ ] `vendor/ruby/spec/core/conditionvariable/wait_spec.rb` 已从 timeout 推进到 runtime_error。
+- [x] `vendor/ruby/spec/core/conditionvariable/wait_spec.rb` 已复测全绿：`7 examples / 0 failures`。
   - 当前仍缺真正的 ConditionVariable wait/signal/run 协作调度语义。
   - 按项目规则先记录，后续集中处理 ConditionVariable 与 Thread 调度/唤醒。
 - [x] `vendor/ruby/spec/core/fiber/{resume,transfer}_spec.rb` compiler panic 已解除。
@@ -1302,14 +1708,12 @@ RGo 当前状态：
 - [x] `vendor/ruby/spec/core/enumerator/{lazy/initialize,new,yielder/append}_spec.rb` compiler panic 已解除。
   - 根因：dot 后 operator method name 缺少 `<<`，例如 `y.<<(1)` / `yielder.<<(*values)` 被解析成 nil `MethodCall.Method`。
   - 已验证：`new_spec.rb` 6 examples / 0 failures；`lazy/initialize_spec.rb` 10 examples / 0 failures；`yielder/append_spec.rb` 4 examples / 0 failures；`enumerator` dashboard 刷新为 81 pass / 0 runtime_error。
-- [x] `vendor/ruby/spec/core/io/{syswrite,write_nonblock}_spec.rb` timeout 已解除。
+- [x] `vendor/ruby/spec/core/io/{gets,lineno,select,syswrite,write_nonblock}_spec.rb` 已解除。
   - 根因之一：`IO#write_nonblock` 缺少 `:wait_writable` / would-block 语义，循环永远不退出。
-  - 根因之二：`String#*` 使用逐次拼接，`"a" * (2 * 1024 * 1024)` 在 `syswrite_spec.rb` 中长时间卡住。
-  - 已验证：`syswrite_spec.rb` 17 examples / 2 failures；`write_nonblock_spec.rb` 17 examples / 4 failures；`io` dashboard 刷新为 26 pass / 0 timeout / 74 nonzero_failures / 1 zero_examples。
-- [ ] `vendor/ruby/spec/core/io/{gets,lineno,select,syswrite,write_nonblock}_spec.rb` 仍有 nonzero failures。
-  - timeout 已清除；后续集中处理真正的 IO read/write/select/nonblock 语义。
-- [ ] `vendor/ruby/spec/core/io/close_on_exec_spec.rb` zero_examples。
-  - 单文件 dashboard 输出 0 examples；需后续排查平台 guard、shared examples 注册或执行流程。
+  - 根因之二：`IO#gets(0)` 误抛 `ArgumentError`，导致 `gets_spec.rb` 后续运行进入异常/OOM 路径；现按 Ruby 语义返回空字符串。
+  - `syswrite_spec.rb` 已复测全绿；写端 read-end closed 场景走 Broken pipe/EPIPE 路径，Go 回归 `TestIOSyswriteRaisesEPIPEWhenPipeReadEndClosed` 通过；本轮补齐 `Errno::EPIPE` 类/metadata 后也确认 `TestIOWriteNonblockRaisesEPIPEWhenPipeReadEndClosed` 通过。
+  - 已验证：`gets_spec.rb` 44 examples / 0 failures；`lineno_spec.rb` 14 examples / 0 failures；`select_spec.rb` 17 examples / 0 failures；`syswrite_spec.rb` 18 examples / 0 failures；`write_nonblock_spec.rb` 18 examples / 0 failures。
+- [x] `vendor/ruby/spec/core/io/close_on_exec_spec.rb` 历史记录已重新解除：2026-07-05 复测回到 `9 examples / 0 failures`，以 TODO 顶部当前状态为准。
 - [ ] `vendor/ruby/spec/core/integer/exponent_spec.rb` timeout。
   - 已定位到 `(-1).send(:**, 4611686018427387904)` 和 `(-1).send(:**, 4611686018427387905)` 这类巨大指数路径会超过 2s。
   - `1 ** huge` 已能快速返回；`-1 ** huge` 应按指数奇偶快速返回 `1` / `-1`，后续集中补 `Integer#**` 的 `base == -1` fast path。
@@ -1529,11 +1933,10 @@ RGo 当前状态：
   - 2026-05-12 已补 `Dir.glob` / `Dir.[]`，支持数组 pattern、`base:` / `sort:`、NUL pattern 错误、block yield、`File::FNM_*` 常量、基础 brace expansion、`**` 递归、dotfile 过滤和 escaped glob 字符。
   - 同时补 `Expectation#empty?`，让 `should_not.empty?` matcher 正确计入结果。
   - 已验证：`glob_spec.rb` 97 examples / 0 failures；`element_reference_spec.rb` 64 examples / 0 failures。
-- [ ] `vendor/ruby/spec/core/dir/scan_spec.rb` 当前为 intentional zero_examples。
-  - 2026-05-12 刷新后为 0 examples / 0 failures；内容受当前 Ruby 版本 guard 跳过，后续进入 Ruby 4.1 相关语义时再处理。
-- [x] 最新 Dir dashboard nonzero failures 已解除。
-  - 2026-05-12 刷新：33 pass / 1 zero_examples out of 34 files；344 examples / 0 failures；0 timeout / 0 runtime_error / 0 parse_error。
-  - 剩余 zero_examples 为 `scan_spec.rb` 版本 guard。
+- [ ] `vendor/ruby/spec/core/dir/scan_spec.rb` 当前为 `19 examples / 7 failures`。
+  - 2026-06-30 刷新后 Ruby 4.1 guard 已展开；直接验证 `Dir.scan(File.join(DirSpecs.mock_dir, "special"))` 返回 `nil`，说明 `Dir.scan`/`Dir#scan` API 主体仍缺失。后续需要完整实现 entry type pairs、encoding keyword/default internal、SystemCallError、symlink/socket/FIFO/device 类型识别。
+- [ ] 最新 Dir dashboard 当前仍剩 `scan_spec.rb`。
+  - 2026-06-30 刷新：`33 pass / 1 nonzero_failures` out of 34 files。
 - [x] `vendor/ruby/spec/core/file/open_spec.rb` failures 已解除。
   - 2026-05-12 已补 `File.open` mode/flag、fd、binary encoding、permission、read/write/pos/rewind/gets，以及 block close 基础语义。
   - 后续修正 `File::RDONLY|File::APPEND` 不应隐式可写、keyword `flags: File::EXCL` 不应向字符串 mode 合并 `r`，并让 `raise_error` matcher 评估期间的 native exception 从 `OpSend` 正确传播。
@@ -1542,7 +1945,7 @@ RGo 当前状态：
 ### Kernel 并发 require blocker（2026-05-24）
 
 - [x] `vendor/ruby/spec/core/kernel/shared/require.rb` 的 `Thread.current[:...]=...` 下标赋值解析错误已修复。`vendor/ruby/spec/core/kernel/require.rb`/`shared/require.rb` 已通过纯 parser 验证，可复用的回归用例已加入 `pkg/parser/parser_test.go`。
-- [ ] `vendor/ruby/spec/core/kernel/require_spec.rb` 运行期仍在 `ProcessStatus#clone` 路径触发 panic（当前测试中止于 `interface conversion: interface {} is *core.processStatusData, not *object.Object`）；需补齐该运行时兼容分支后继续恢复并发分组行为验证。
+- [x] `vendor/ruby/spec/core/kernel/require_spec.rb` 当前已全绿：`156 examples / 0 failures`。此前记录的 `ProcessStatus#clone` panic 已不再复现。
 
 ### 当前内部测试失败（2026-06-02，已修复）
 
@@ -1558,6 +1961,32 @@ RGo 当前状态：
   - 根因：`Enumerator#each` 的 loop enumerator 分支在 yielded block 设置 `LastException` 时没有返回异常，导致 `raise ... unless args.empty?` 这类 block 异常被无限循环吞掉。
   - 修复：`enumeratorEach` 在 loop/static enumerator yield 后检查并返回 `LastException`；新增 `TestSpecRunnerLoopEnumeratorBreakDoesNotPoisonNextExample` 覆盖真实 spec runner 复现。
   - 已验证：`RGO_SPEC_TIMEOUT=10 scripts/spec_status.sh vendor/ruby/spec/core/kernel/loop_spec.rb /tmp/rgo-loop-final.csv` 为 10 examples / 0 failures。
+
+### Kernel RubySpec 收敛（2026-07-17）
+
+- [x] `__dir__`、`p`、`pp`、`loop`、`respond_to_missing?`、`kind_of?`、`is_a?`、`extend`、`initialize_dup`、`initialize_clone`、`dup`、`gets`、反引号命令 spec 已清零。
+  - 已补相对脚本的绝对 `__dir__`、`p` 的 `$stdout`/flush/返回值、loop Enumerator 的异常隔离、Module `extended` 回调、singleton ancestry、复制生命周期钩子、`Kernel#gets -> ARGF.gets`，以及命令字面量转义。
+  - ARGF 回归刷新仍为 `34 pass / 0 failures`。
+- [ ] Kernel 全量最新阶段性结果为 `112 pass / 4 nonzero_failures / 2 zero_examples`、`2846 examples / 6 failures`（2026-07-17）。全部可见 `FAILED` 条目已清零；剩余 `open` 1、`public_method` 1、`raise` 2、`require` 2 均无失败明细，`sub`/`gsub` 为零 examples，统一归入 MSpec 统计层收尾。
+- [x] Kernel `autoload` / `load` / `Rational` / `binding` 可见功能已收敛。
+  - autoload 补齐顶层触发、词法容器和 included-module 查询；`load` 补齐匿名/指定模块 wrap、main 副本、私有顶层方法和祖先顺序；裸核心 feature 判断不再吞掉同名 fixture；Binding 现在区分 `Binding#eval` 并同步捕获后局部赋值。
+  - 已验证：`load_spec.rb` 103/0、`Rational_spec.rb` 33/0、`binding_spec.rb` 7/0；`autoload_spec.rb` 23 个可见断言均通过，但汇总仍有 1 个无 `FAILED` 条目的计数误差。
+- [x] `catch_spec.rb` 已为 `13 examples / 0 failures`：catch block 现在正确跳过开头换行、保留分号分隔的全部表达式，并支持跨方法 `throw` 返回值。
+- [x] Kernel `eval_spec.rb` 已收敛为 `56 examples / 0 failures`：补齐 alias 后的隐式 binding、匿名 `&` 参数跨 eval 转发、裸标识符 `NameError`，以及 eval `return` 沿动态 Proc/lambda/方法边界传播；顶层隐式 eval 的局部变量回写回归也已通过 focused Go 测试。
+- [x] Kernel `String` / `warn` / `fork` 可见失败已清零：`String_spec.rb` 25/0、`warn_spec.rb` 32/0、`fork_spec.rb` 17/0。同步修复 singleton undef 的可调用性判断、常量接收者单例方法定义、rescue 后异常对象普通值语义、bare raise 重抛/cause 链，以及 fork 子进程中的父线程死亡状态。
+- [ ] `pkg/lexer` 全包测试仍有既存 `TestSymbolInspectLiteralTokens` 失败：`:$\\` 期望保留双反斜杠、当前仅保留单反斜杠。新增命令字面量 hex 回归测试单独通过，`backtick_spec.rb` 为 `8 examples / 0 failures`；按项目规则先记录并继续。
+
+### Module RubySpec 重新审计（2026-07-17）
+
+- [ ] 修正常量接收者单例方法定义后，旧的 Module 全绿结果不再有效：此前 `def Constant.method` 会提前终止后续执行并隐藏 examples。重新审计基线为 `61 pass / 20 nonzero_failures / 1 runtime_error / 2 zero_examples`、`977 examples / 100 failures`。
+- [x] 已清零 `attr_spec.rb`（13/0）、`new_spec.rb`（4/0）、`comparison_spec.rb`（5/0）和 `case_compare_spec.rb`（3/0）。根因分别是类属性错误注册为类方法、`Module.new` body 未接收模块参数、缺失 Module `<=>` 关系判断，以及 `Module#===` 错用 singleton class。
+- [ ] 下一步优先处理共享根因：先刷新 Module 仪表盘，再检查 `alias_method` / `module_function`，随后集中收敛 constants 相关失败；`prepend_spec.rb` 的 runtime error 保持低资源单独复现。
+- [x] `alias_method_spec.rb` 23/0、`module_function_spec.rb` 28/0、`const_defined_spec.rb` 31/0。补齐 Method/UnboundMethod `parameters`，让 `define_method` 继承 module_function toggle，并隔离 `module_eval`/`eval` 可见性状态；`const_defined?` 现支持绝对与嵌套常量路径且不触发 `const_missing`。
+- [x] constants 簇继续清零：`const_get_spec.rb` 45/0、`const_missing_spec.rb` 5/0、`const_added_spec.rb` 14/0。补齐嵌套/绝对路径、included-module/继承/顶层查找顺序、autoload 链、NameError name、私有 `const_missing` 内部分派，以及默认/自定义 `const_added` 回调。
+- [ ] `const_source_location_spec.rb` 仍为 41/6；6 个可见失败均是“不存在/不可继承的常量应返回 nil”却得到 NoMethodError。现有工程未找到真实 `Module#const_source_location` native 注册，但已有 location 数组断言表面通过，说明 runner/匹配层仍隐藏部分缺口；按调试规则先记录，待常量位置元数据链统一实现时处理。
+- [ ] `define_method_spec.rb` 的唯一可见失败已清零：Object 取得的 Kernel `instance_of?` UnboundMethod 可定义到 BasicObject 子类；当前 88 examples / 2 failures，但无 `FAILED` 明细，归入 runner 计数层。
+- [ ] 最新 Module 仪表盘为 `67 pass / 14 nonzero_failures / 1 runtime_error / 2 zero_examples`、`977 examples / 66 failures`。Module 广泛 Go 回归仍有与当前待办一致的既存失败：`ruby2_keywords`、`extend_object`、included constants、`using`、`refine`；已记录并继续 constants 簇。
+- [ ] 本轮最终刷新更新为 `71 pass / 10 nonzero_failures / 1 runtime_error / 2 zero_examples`、`977 examples / 38 failures`。相对重新审计基线 `61 pass / 100 failures`，净增 10 个 pass 文件、减少 62 个 failures；下一轮优先处理 `autoload` 和 `const_source_location` 的共享位置元数据，再处理 `refine/using`。
 
 ### Language variables multiassign follow-up（2026-06-03，已修复）
 
@@ -1589,13 +2018,21 @@ RGo 当前状态：
 
 ### Rational exponent bignum follow-up（2026-06-13）
 
-- [ ] `vendor/ruby/spec/core/rational/exponent_spec.rb` 已解除 `0 ** -1` / `Rational(..., bignum_value) ** -4` 触发的 Go integer divide-by-zero panic，但完整 spec 继续进入 bignum exponent examples 后运行时间过长。
+- [x] `vendor/ruby/spec/core/rational/exponent_spec.rb` 已补齐精确整数/Rational 指数、Float 指数、超大指数边界、零除和 `coerce` 分派；当前 `24 examples / 0 failures`。
   - 已补 `0 ** -1` 抛出 `ZeroDivisionError` 的 VM 回归，并让 `OpPow` 对 exception 结果走 `raiseException`。
-  - 后续需要补真正的 Rational/bignum 表示与指数语义；当前 `Rational()` 仍主要降级为 Integer/Float，无法通过该文件的精确 Rational 断言。
+
+### Rational core completion（2026-07-13）
+
+- [x] Rational 核心 32 个 spec 文件中 31 个报告 pass；新增精确四则运算、`coerce`、round、exponent、rationalize、hash、Comparable、字符串及 `to_r` 转换等行为。当前合计 `161 examples`，可见断言均通过。
+- [ ] `vendor/ruby/spec/core/rational/rational_spec.rb` 的两个可见 example 都显示通过，但 runner 汇总仍错误报告 `2 examples, 1 failures`，且没有 `FAILED` 条目。按共享 MSpec 计数问题处理，不继续阻塞 Rational 功能推进。
+- [x] Integer `gcd` overflow fixture 的 `max - 1` 局部变量冲突已修复：bare-call 负数字面量现在要求标识符与负号间有空格、且负号与数字相邻，不再把普通减法连同数组后续元素吞成方法参数。`gcd` 可见断言已全通过；runner 仍有 2 个无 `FAILED` 条目的计数误差。
+- [x] 修复 VM 构造阶段二次 `core.Init()` 导致的内建类身份分裂：编译出的字面量与 `Integer` 等常量现在引用同一批核心类，重开内建类和运算符重定义可正确生效。Integer `plus`/`minus` 已全绿。
+- [x] `Integer#chr` 的 US-ASCII/BINARY/UTF-8/Shift_JIS/EUC-JP 编码与范围语义已补齐，失败从 813 降至仅 2 个无可见 `FAILED` 条目的 runner 计数误差。
+- [ ] 嵌套括号后的 infix 仍有冲突：`((1 << (2 + 2)) - 1)` 当前错误得到 `16` 而非 `15`，导致 `integer/element_reference_spec.rb` 唯一可见失败。直接让 `consumeExpectedRParen` 前进一个 `)` 会破坏现有 Time comparison 与 grouped spaceship/Rational parser 回归，已回退；后续需用显式 group ownership/depth 修复，不能靠全局前进 token。
 
 ### BasicObject instance_exec class variable scope（2026-06-13）
 
-- [ ] `vendor/ruby/spec/core/basicobject/instance_exec_spec.rb` 仍有 1 个 failure：`base.instance_exec { @@count = 2 }` 在 `def self.included(base)` 的 block 中应写入 block 定义处的模块 class variable scope（`BasicObjectSpecs::InstExec`），当前写到了 `instance_exec` receiver 的模块 scope。
+- [x] `vendor/ruby/spec/core/basicobject/instance_exec_spec.rb` 当前已全绿：`17 examples / 0 failures`。此前记录的 class variable scope failure 已不再复现。
   - 最小复现：`module M; def self.run(base); base.instance_exec { @@x = 1 }; end; end; module N; end; M.run(N)` 后当前 `N.class_variables == [:@@x]`，但应为 `M.class_variables == [:@@x]`。
   - 已确认普通 `module M; @@x = 1; end` class variable 存储可用；问题集中在 singleton method 内创建 block 时没有捕获方法的 lexical class variable scope。
 
@@ -1607,6 +2044,124 @@ RGo 当前状态：
 
 ### Kernel caller mspec runner frame follow-up（2026-06-21）
 
-- [ ] `vendor/ruby/spec/core/kernel/caller_spec.rb` 当前已不是 runner frame failure；最新局部刷新状态为 `zero_examples`，需要后续定位为什么该文件在单独/目录刷新时未注册 examples。
+- [x] `vendor/ruby/spec/core/kernel/caller_spec.rb` 当前已全绿：`14 examples / 0 failures`。此前记录的 `zero_examples` 状态已不再复现。
   - 已修复同文件中 `puts caller(0)` 的数组逐行输出、`__LINE__ - 1` 被误解析为 bare method call、以及 at_exit caller 多出 `__main__` 帧/缺少 `block in <main>` label 的问题。
   - runner frame 兼容已不再是当前可复现失败点；后续先查 example 注册/guard 状态。
+
+### Ruby library specs follow-up（2026-06-28）
+
+- [x] `vendor/ruby/spec/library/rbconfig` 已解除当前非零失败。
+  - 本轮补 `require "rbconfig"` / `require "rbconfig/sizeof"` 的最小原生 shim：`RbConfig::CONFIG`、`SIZEOF`、`LIMITS`、`TOPDIR`，并让 `RUBY_DESCRIPTION` 包含 `RUBY_PLATFORM`。
+  - 已验证：`rbconfig_spec.rb`、`sizeof/limits_spec.rb`、`sizeof/sizeof_spec.rb` 均 pass；剩余 `unicode_version_spec.rb` / `unicode_emoji_version_spec.rb` 为 `zero_examples` guard。
+- [x] `vendor/ruby/spec/core/enumerable` 当前刷新已全绿：`61 pass / 61 files`，`573 examples / 0 failures`。本轮补 `Enumerable#to_a` / `#entries` 注册与实现，增加最小 `Set` 类常量以解除 enumerable fixture 末尾 `class SetSubclass < Set` 的加载中断，并修正 Hash#each 严格 callable 接收 pair 的 Go 回归测试。
+
+### Array sample fairness follow-up（2026-06-30）
+
+- [ ] `vendor/ruby/spec/core/array/sample_spec.rb` 当前会在 `samples evenly` fairness example 中产生大量 `ExpectationData <= Float` 断言失败，随后在 runner 中 OOM。
+  - 当前先不深挖，避免长时间占用机器；后续需要检查 mspec `<=` matcher 与 `Array#sample` 随机分布实现。
+  - 本轮继续推进其它更窄 spec，避免该文件阻塞整体进度。
+
+### safe_go_test Go 编译内存限制（2026-07-13）
+
+- [ ] `RGO_TEST_MEMORY_KB=1000000 scripts/safe_go_test.sh ./pkg/vm ...` 偶发在 Go 编译阶段约 214MB 已用内存时无法再分配 4MB；同一聚焦测试此前可通过。需要检查包装器的实际 `ulimit` 与 Go 编译器地址空间需求。
+
+### 全包回归旁支失败（2026-07-13）
+
+- [ ] parser `TestParseKeywordAssignmentValueOr`：预期 `AssignExpression`，实际 `InfixExpression`。
+- [ ] VM `TestTopLevelMethodNestedDefUsesLexicalObjectScope`：此前聚焦测试通过，关键字参数绑定整理后单独运行返回 `NoMethodError`（嵌套方法未安装到 `Object`）；先继续 RubySpec 主线，后续回溯 class-eval 调用前后的 lexical class stack。
+- [ ] VM `TestEvalIfConditionWithMultiAssignmentFromNil`：多重赋值表达式应返回 `nil`，当前返回 Unknown。
+- [ ] VM `TestArrayBsearchIndexIgnoresLargeNumericMagnitude`：预期索引 1/2，当前为 0。
+- [ ] VM `TestArrayZipUsesEnumerableArguments`：exception 被当作 Array 解包并 panic。
+
+### Language assignments completion（2026-07-13）
+
+- [x] `vendor/ruby/spec/language/assignments_spec.rb` 已全绿：`38 examples / 0 failures`。补齐 setter 赋值返回值、复合索引读取旧值、多 splat 参数，以及 accessor/index/scoped constant 多重赋值目标。
+
+### Dir.scan socket fixture follow-up（2026-07-02）
+
+- [x] `vendor/ruby/spec/core/dir/scan_spec.rb` 当前已全绿：`19 examples / 0 failures`。
+  - 已修复 `Dir.scan` 包含 `.` / `..`、`method_call - array_literal` parser 误判为 bare argument、以及 dotted no-arg call 后 infix 运算符继续被吞的问题。
+  - 本轮确认剩余 socket 失败根因是方法内 `require_relative` 使用了当前 spec 文件路径，而不是方法定义文件路径；已改为 `currentFrameBinding` 优先使用当前 frame 的 `Fn.SourcePath`，让 `FileSpecs.socket` 正确加载 `library/socket/fixtures/classes.rb`。
+
+### Exception full_message keyword block follow-up（2026-07-02）
+
+- [x] `vendor/ruby/spec/core/exception/full_message_spec.rb` 当前已全绿：`20 examples / 0 failures`。
+  - 已修复多行 exception message 的 class suffix/highlight 格式，并补 `Exception.to_tty? => false`。
+  - 本轮修复 `|**options|` block 参数解析/编译/绑定，以及 `define_singleton_method` 保留 closure cell 引用，确保 `detailed_message` 能收到 `full_message` 传入的 keyword 参数并更新外层 local。
+
+### String unpack ULEB128 follow-up（2026-07-02）
+
+- [x] `vendor/ruby/spec/core/string/unpack/r_spec.rb` 当前已解除：`21 examples / 0 failures`。此前 `"\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01".unpack("R")` 的超大 ULEB128 断言已由轻量 `big.Int` shadow integer 覆盖；通用 Bignum/任意精度 literal 支持仍另在 Bignum TODO 中跟踪。
+
+### Enumerable stale exception / super splat follow-up（2026-07-13）
+
+- [x] Enumerator 迭代不再把进入调用前遗留的 `LastException` 误报为本次迭代异常；`sum_spec.rb` 已恢复 `5 examples / 0 failures`。
+- [x] 显式 `super(*args)` 现在会展开 splat 参数；此前 `EachCounter` fixture 的参数被错误压缩为最后一个值。
+- [x] `vendor/ruby/spec/core/enumerable` 最新门禁全绿：`61 files / 574 examples / 0 failures`。
+
+### Pattern matching 真实语义 follow-up（2026-07-13）
+
+- [x] 已用真实 matcher 替换 `OpPatternCheck` 无条件返回 true 的占位实现；补齐基础数组/哈希/常量/嵌套/alternative/AS/find、变量绑定、pin、guard、尾逗号、`**nil`、字符串插值与 `deconstruct` 语义。
+- [ ] `vendor/ruby/spec/language/pattern_matching_spec.rb` 当前为 `113 examples / 7 failures`；剩余全部是 refinement 场景（`deconstruct`、`deconstruct_keys`、常量 `===`）。根因是当前 `Module#using` 只校验参数并返回 receiver，尚未建立词法 refinement 激活与方法查找链；应作为共享 refinement 基础设施实现，不能继续在 pattern matcher 内写特例。
+
+### Language 当前门禁 follow-up（2026-07-14）
+
+- [ ] 最新刷新为 `54 pass / 26 nonzero_failures`，共 `2875 examples / 117 failures`；相较上次增加 3 个全绿文件并减少 26 个失败。
+  - [x] `method_spec.rb` 已全绿：`168 examples / 0 failures`；补齐递归参数解构、前/rest/后参数槽位、动态默认值、匿名 `**`、关键字 Hash 分离及 `...` 参数/关键字/block 转发。
+  - [x] `lambda_spec.rb` 已全绿：`68 examples / 0 failures`。
+  - [ ] 当前下一组共享根因为 `super_spec.rb`：`9 failures`；优先复用本轮新增的显式转发和统一参数绑定能力清零。
+- [x] `magic_comment_spec.rb` 已从 51 failures 降至 `54 examples / 0 failures`：补齐 `-rFILE` / `-r FILE -e CODE` / stdin，统一文件、load、require、eval 的源码编码与规范名，并修复 `IO.popen(Array)` 双引号导致 Ruby `$global` 被 shell 提前展开的问题。
+- [x] 已分离 `Regexp#match` 与 `Regexp#=~`：前者返回 `MatchData`，后者与字符串 `=~` 返回起始索引。
+- [x] 已在统一 regexp 翻译层补齐省略下界量词、相邻嵌套量词，以及无 capture 的可选 `\G`/lookaround assertion；`regexp/repetition_spec.rb` 从 43 failures 降至 `14 examples / 0 failures`。
+- [ ] MatchData 仍需保存每个 capture 的参与/位置状态，才能严格区分空 capture `""` 与未参与 capture `nil`，并正确实现 `pre_match`、`post_match`、`captures`。
+
+### Go 回归跟踪（2026-07-16）
+
+- [ ] `go test ./pkg/core -run TestString` 中 `TestStringConcatWithNonStringDoesNotPanic` 当前期望 `nil`，实际返回 `ValueException`；与本轮 `String#encode` 转码实现无关，按项目调试规则暂存，后续结合 `String#concat` RubySpec 统一判断断言或实现应如何调整。
+
+### IO::Buffer follow-up（2026-07-17）
+
+- [x] `vendor/ruby/spec/core/io/buffer` 已从 `14 pass / 74 failures` 推进到 `20 pass / 4 failures`（21 files、182 examples）。位运算、来源/flags、初始化、String backing、free/locked、resize 和基础文件映射语义已补齐。
+- [ ] 唯一剩余 `map_spec.rb` 的 4 个失败来自 `IO.popen("-")`：当前进程 shim 固定返回 `hello from child`，没有执行 fork child 分支，因此无法验证 shared/private mapping 的跨进程可见性。应统一实现 fork/popen 子进程分支与 stdout 捕获，不能在 IO::Buffer 内写 spec 特例。
+
+### IO follow-up（2026-07-17）
+
+- [x] `IO#puts` 已从 15 failures 降至 `19 examples / 0 failures`；`IO#pwrite` 为 `9 / 0`，`IO#pread` 从 21 降至 1。
+- [x] `IO.open`、`IO.for_fd`、`IO.new`、`IO#initialize` 已分别达到 `63 / 0`、`57 / 0`、`58 / 0`、`8 / 0`。修复 Ruby `nil` mode option、未显式 mode 时继承描述符模式、显式 mode 兼容性、`initialize` 非 `to_int` 参数的 TypeError，以及被忽略的 `close` IOError 污染 `$!`。
+- [x] 修复 MSpec 经平台/嵌套 context wrapper 后丢失外层 `before/after :each` 的问题；`read_nonblock`、`write_nonblock`、`nonblock` 已分别达到 `18 / 0`、`18 / 0`、`4 / 0`，并补嵌套 hook Go 回归测试。
+- [x] `each_line` / `each`、`readlines`、`readline` 已分别达到 `31 / 0`、`31 / 0`、`58 / 0`、`12 / 0`；补齐 readlines 参数类型、keyword Hash 分离和超出 C off_t 的 RangeError。
+- [x] `close_read`、`close_write`、`each_byte`、`each_char`、`each_codepoint`、`eof`、`getc`、`readbyte`、`rewind` 均已全绿；`seek` / `pos` 也已修至 `11 / 0`、`8 / 0`（closed stream 与 C off_t overflow）。
+- [x] `readchar` 已从 5 failures 降至 `14 / 0`；读取字符现在按 EUC-JP/Shift_JIS/UTF-16/UTF-32/UTF-8 外部编码边界取完整字符，并按 internal encoding 转码。
+- [x] `advise`、`print`、`flush` 已分别达到 `12 / 0`、`5 / 0`、`2 / 0`；补齐 Integer coercion/overflow、IO#print 注册与 field/record separators，以及断开 pipe 的 buffered flush/close EPIPE。
+- [x] 修复 `touch` 测试辅助的多次 write/puts 覆盖文件和 puts 写 inspect 引号问题，并补齐 IO 基类缺失的 `gets`/`rewind`/`pos`/`tell`/`pos=`/`closed?` 注册；`reopen_spec.rb` 已从 4 failures 降至 `28 examples / 1 failure`。
+- [x] `gets_spec.rb` 已达到 `44 / 0`：补齐 paragraph mode 对多余换行的消费、无效 UTF-8 在 limit 后最多扩读 16 bytes、显式 external encoding 与 default internal 的组合，以及 BINARY external 禁止内部转码。
+- [x] `ungetbyte`、`ungetc`、`sysseek`、`sysread`、`sync` 已分别达到 `6 / 0`、`14 / 0`、`10 / 0`、`17 / 0`、`8 / 0`；补齐多字节 pushback、外部编码 codepoint、buffered/unbuffered IO 冲突、symbol whence、零长度 buffer 保留、closed sync 与 STDERR 默认 sync。
+- [x] `io_spec.rb`、`try_convert_spec.rb`、`ioctl_spec.rb`、`inspect_spec.rb`、`path_spec.rb`、`sysopen_spec.rb` 已分别达到 `2 / 0`、`7 / 0`、`2 / 0`、`3 / 0`、`1 / 0`、`6 / 0`。IO 现在 include VM 中唯一的 `Enumerable` module；`IO.try_convert` 保留 `to_io` 抛出的异常，mock `and_raise(Exception实例)` 保留原异常类型；`IO#ioctl` 返回正确继承 `SystemCallError` 的 `Errno::ENOTTY`。
+- [x] `IO.pipe`、`binmode`、`popen`、`write`、`pread`、`read`、`close`、`reopen`、`copy_stream` 与 `IO::Buffer.map` 已分别达到 `26 / 0`、`7 / 0`、`38 / 0`、`50 / 0`、`22 / 0`、`106 / 0`、`11 / 0`、`28 / 0`、`62 / 0`、`25 / 0`。补齐 pipe encoding、binmode encoding/closed check、popen ENV/argv/stderr/写端/fork block、Ruby command args、跨线程关闭阻塞读、重定向后的 system/exec、partial copy 调度，以及 shared/private 映射的 fork 隔离。
+- [x] `vendor/ruby/spec/core/io` 低 CPU 全目录刷新为 `100 pass / 1 nonzero_failures / 101 files`，共 `1541 examples / 1 failure`；实现侧已知 IO 簇全部清零。
+- [ ] `readpartial` 已降至 `14 examples / 1 failure`；剩余 vendor spec 在“stream is closed”示例中实际关闭的是写端 `@wr`，与同文件另外两个期望 peer EOFError 的场景冲突，暂不写特例，后续核对上游 spec/fixture。
+
+### Thread continuation follow-up（2026-07-17）
+
+- [x] `vendor/ruby/spec/core/thread` 已完整收敛为 `53/53 files`、`415 examples / 0 failures`。实现按需、通道门控的 Thread/Fiber continuation，补齐 stop/wakeup/run/status、sleep/mutex/flock 阻塞恢复、kill/terminate ensure unwind、异步 raise/cause、挂起线程 backtrace，并避免 block replay 与 CPU 轮询。
+- [ ] Thread/Fiber 聚焦 Go 回归仅余独立旧问题 `TestMonitorExitWithoutEnterRaisesThreadError`：`Monitor#exit` 返回了 `ThreadError`，但该 native exception 在此调用形态下没有进入 rescue；按项目调试规则暂存，下一步在通用 native exception 传播路径统一处理。
+- [ ] `vendor/ruby/spec/core/fiber` 在 continuation 基础落地后的新基线为 `5 pass / 8 nonzero_failures / 13 files`、`170 examples / 78 failures`。剩余集中在 `raise` 29、storage 12、transfer 11、scheduler/set_scheduler 各 6、resume/inspect/kill；下一步优先复用 Thread 的异步异常注入机制实现 Fiber#raise，再处理 transfer 与 scheduler/storage 状态。
+
+### Hash / Fiber / Kernel follow-up（2026-07-18）
+
+- [x] `vendor/ruby/spec/core/hash` 已全绿：`69/69 files`、`633 examples / 0 failures`。
+- [x] `vendor/ruby/spec/core/fiber` 已刷新为全绿：`13/13 files`、`170 examples / 0 failures`。
+- [x] Kernel 的 Integer/Float/Complex/Rational 转换、sprintf/printf、extend/open/public_method/raise/system/caller/caller_locations/exit 已清零；完整目录当前为 `114 pass / 1 nonzero_failures / 1 timeout / 2 zero_examples` 之前的 timeout 已由 exit! 空输出模拟修复，待下次完整刷新确认。
+- [ ] `kernel/require_spec.rb` 仅余 `loads a file concurrently` 1 个失败。根因已缩小到第二轮 shared context 中 Thread 内重入 `Kernel.require(__FILE__)` 时 VM 恢复到无关的 deferred example closure，意外执行后续 `raise_error(RuntimeError)` matcher，并以 fixture 的 `LoadError` 失败；需统一修复 Thread continuation 与重入 EvalSource 的 frame/closure 恢复，不能对 require fixture 写特例。
+
+### Matrix follow-up（2026-07-19）
+
+- [x] Matrix 的值保留模型、构造/访问、枚举/谓词、通用代数、Vector、LUP 和 2×2 EigenvalueDecomposition 已落地；最新低 CPU 全目录门禁为 `96 pass / 1 nonzero_failures / 97 files`，共 `384 examples / 1 failure`。
+- [x] `receiver[*indices]` 读取索引现会走带 splat 的 `[]` 方法调用；`find_index_spec.rb` 已从 24 failures 清零。
+- [ ] 唯一剩余 `empty_spec.rb` 的 9 个可见 example 均显示通过，但汇总仍为 `9 examples / 1 failures`。已聚焦验证负尺寸/双正尺寸 ArgumentError、空矩阵转置形状和 Matrix 子类返回均正确；后续应检查 MSpec runner 的 expectation/raise_error 计数状态，不在 Matrix 实现中写特例。
+
+### StringScanner follow-up（2026-07-19）
+
+- [x] `vendor/ruby/spec/library/stringscanner` 已从 `28 pass / 16 nonzero_failures`、`249 examples / 52 failures` 收敛为 `44/44 files`、`249 examples / 0 failures`。
+  - 补齐 `match?`、`skip`、`scan_full`、`rest_size`、`size`、`charpos`、`captures`、`unscan`、`string=`、`inspect` 和 `must_C_version`。
+  - 修复字符类内 `\s` 的 regexp 转译、`fixed_anchor` 的 `^`/`\A` 语义、search/full consumed substring、EUC-JP `getch`、native payload `dup` 深拷贝，以及 scanner 与原 String 的原地同步。
