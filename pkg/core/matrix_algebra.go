@@ -381,6 +381,13 @@ func matrixImaginaryGeneric(receiver *object.EmeraldValue, args ...*object.Emera
 	})
 }
 
+func matrixRectangularGeneric(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return matrixArray([]*object.EmeraldValue{
+		matrixRealGeneric(receiver),
+		matrixImaginaryGeneric(receiver),
+	})
+}
+
 func matrixRealPredicate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := matrixDataFrom(receiver)
 	complexClass := R.Classes["Complex"]

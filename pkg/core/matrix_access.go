@@ -151,6 +151,26 @@ func matrixEqualGeneric(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	return R.TrueVal
 }
 
+func matrixEqlGeneric(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	left := matrixDataFrom(receiver)
+	if len(args) != 1 {
+		return R.FalseVal
+	}
+	right := matrixDataFrom(args[0])
+	if left == nil || right == nil || left.rowCount != right.rowCount || left.colCount != right.colCount {
+		return R.FalseVal
+	}
+	leftRows, rightRows := matrixObjectRows(left), matrixObjectRows(right)
+	for row := 0; row < left.rowCount; row++ {
+		for column := 0; column < left.colCount; column++ {
+			if CallMethod == nil || CallMethod(leftRows[row][column], "eql?", rightRows[row][column]) != R.TrueVal {
+				return R.FalseVal
+			}
+		}
+	}
+	return R.TrueVal
+}
+
 func vectorEqualGeneric(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	left := vectorDataFrom(receiver)
 	if left == nil || len(args) != 1 {

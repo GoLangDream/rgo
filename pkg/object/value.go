@@ -547,8 +547,13 @@ type ConstantLocation struct {
 type Function struct {
 	Name                  string
 	SourcePath            string
+	SourceAbsolutePath    string
 	EvalSource            bool
+	EvalInheritedLocals   int
 	SourceEncoding        string
+	StringLiteralModeSet  bool
+	FreezeStringLiterals  bool
+	ChillStringLiterals   bool
 	DefinitionLine        int64
 	Params                []string
 	ParamLocalIndices     []int
@@ -583,6 +588,9 @@ type Function struct {
 	TrailingCommaParam    bool
 	DefinedByDefineMethod bool
 	ForLoopCollectAsPair  bool
+	FlipFlopStates        map[int]bool
+	ImplicitItParameter   bool
+	NumberedParameters    bool
 }
 
 type BuiltinFunction struct {
@@ -609,6 +617,7 @@ type Method struct {
 }
 
 type Proc struct {
+	Origin           *Proc
 	Fn               *Function
 	Env              []*EmeraldValue
 	Block            *EmeraldValue
@@ -624,6 +633,7 @@ type Proc struct {
 	IsLambda         bool
 	BreakOwnerID     int
 	ReturnOwnerID    int
+	FlipFlopStates   map[int]bool
 	CurryTarget      *EmeraldValue
 	CurryArgs        []*EmeraldValue
 	CurryArity       int
@@ -646,7 +656,9 @@ type Closure struct {
 	Refinements      []*EmeraldValue
 	RefinementsFixed bool
 	AutoSplat        bool
+	BreakOwnerID     int
 	ReturnOwnerID    int
+	FlipFlopStates   map[int]bool
 }
 
 type RInteger struct {
@@ -731,10 +743,11 @@ type RException struct {
 }
 
 type RBacktraceLocation struct {
-	Path       string
-	Line       int64
-	Label      string
-	EvalSource bool
+	Path         string
+	AbsolutePath string
+	Line         int64
+	Label        string
+	EvalSource   bool
 }
 
 type RBinding struct {
@@ -750,6 +763,7 @@ type RBinding struct {
 	InstanceVars            map[string]*EmeraldValue
 	ClassStack              []*EmeraldValue
 	ClassVarScope           *EmeraldValue
+	Refinements             []*EmeraldValue
 	Path                    string
 	Line                    int64
 	ShareAllLocals          bool

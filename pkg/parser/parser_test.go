@@ -34,6 +34,41 @@ func parseExpr(t *testing.T, input string) ast.Expression {
 	return stmt.Expression
 }
 
+func TestParseBareRescueInsideBlock(t *testing.T) {
+	parse(t, `module Example
+  def self.clear
+    [1].each do |value|
+      begin
+        puts value
+      rescue
+      end
+    end
+  end
+end`)
+}
+
+func TestSplitPercentWordsPreservesOrdinaryBackslash(t *testing.T) {
+	words := splitPercentLiteralWords(`special/\a escaped\ space`)
+	if len(words) != 2 || words[0] != `special/\a` || words[1] != "escaped space" {
+		t.Fatalf("unexpected words: %#v", words)
+	}
+}
+
+func TestParseBareArrayArgumentDotChain(t *testing.T) {
+	expr := parseExpr(t, `Marshal.load [args].pack("H*")`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "load" || len(call.Args) != 1 {
+		t.Fatalf("expected Marshal.load with one argument, got %T %#v", expr, expr)
+	}
+	pack, ok := call.Args[0].(*ast.MethodCall)
+	if !ok || pack.Method == nil || pack.Method.Value != "pack" {
+		t.Fatalf("expected array pack call as argument, got %T %#v", call.Args[0], call.Args[0])
+	}
+	if _, ok := pack.Receiver.(*ast.ArrayLiteral); !ok {
+		t.Fatalf("expected pack receiver to be an array, got %T", pack.Receiver)
+	}
+}
+
 func parseWithErrors(input string) []string {
 	l := lexer.New(input)
 	p := New(l)
@@ -50,6 +85,45 @@ func TestPercentWordsDecodeEscapedBackslash(t *testing.T) {
 	word, ok := array.Elements[0].(*ast.StringLiteral)
 	if !ok || word.Value != `\` {
 		t.Fatalf("expected one backslash word, got %T (%v)", array.Elements[0], array.Elements[0])
+	}
+}
+
+func TestArrayLiteralCombinesAdjacentUnbracedLabelPairs(t *testing.T) {
+	expr := parseExpr(t, `[args: [1, 2, 3], kw: {a: "b"}]`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 1 {
+		t.Fatalf("expected one-element ArrayLiteral, got %T (%v)", expr, expr)
+	}
+	hash, ok := array.Elements[0].(*ast.HashLiteral)
+	if !ok || len(hash.Order) != 2 {
+		t.Fatalf("expected one HashLiteral with two ordered pairs, got %T (%v)", array.Elements[0], array.Elements[0])
+	}
+}
+
+func TestArrayLiteralCombinesAdjacentMixedUnbracedHashPairs(t *testing.T) {
+	expr := parseExpr(t, `[1, "foo" => :bar, baz: 42, 3 => 6]`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 2 {
+		t.Fatalf("expected scalar and one HashLiteral, got %T (%v)", expr, expr)
+	}
+	hash, ok := array.Elements[1].(*ast.HashLiteral)
+	if !ok || len(hash.Order) != 3 {
+		t.Fatalf("expected one HashLiteral with three ordered pairs, got %T (%v)", array.Elements[1], array.Elements[1])
+	}
+}
+
+func TestPercentCapitalWordsPreserveInterpolationAndEscapedWhitespace(t *testing.T) {
+	expr := parseExpr(t, `%W(a\  b\tc #{value})`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 3 {
+		t.Fatalf("expected three words, got %T (%v)", expr, expr)
+	}
+	wants := []string{"a ", "b\tc", "#{value}"}
+	for index, want := range wants {
+		word, ok := array.Elements[index].(*ast.StringLiteral)
+		if !ok || word.Value != want || !word.Interpolates {
+			t.Fatalf("word %d: expected interpolating %q, got %T (%v)", index, want, array.Elements[index], array.Elements[index])
+		}
 	}
 }
 
@@ -395,6 +469,10 @@ func TestParseChainedCallAfterBraceBlock(t *testing.T) {
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d: %s", len(program.Statements), program.String())
 	}
+}
+
+func TestParsePostfixUntilConditionWithBraceBlockAndBooleanTail(t *testing.T) {
+	parse(t, `Thread.pass until t.backtrace && t.backtrace.any? { |call| call.include? 'require' } && t.stop?`)
 }
 
 func TestParseCatchWithBraceBlockAndThrowCallChainCompletes(t *testing.T) {
@@ -2382,6 +2460,35 @@ func TestRangeBindsBeforeTernary(t *testing.T) {
 	}
 }
 
+func TestRangeBindsBeforeKeywordOr(t *testing.T) {
+	expr := parseExpr(t, "(a == 1)...(a == 2) or (a == 3)...(a == 4)")
+	logical, ok := expr.(*ast.InfixExpression)
+	if !ok || logical.Operator != "or" {
+		t.Fatalf("expected keyword or outside both ranges, got %T (%v)", expr, expr)
+	}
+	if _, ok := logical.Left.(*ast.RangeExpression); !ok {
+		t.Fatalf("expected left range, got %T", logical.Left)
+	}
+	if _, ok := logical.Right.(*ast.RangeExpression); !ok {
+		t.Fatalf("expected right range, got %T", logical.Right)
+	}
+}
+
+func TestChainedDefaultParameterStopsBeforeNextParameter(t *testing.T) {
+	program := parse(t, `def bar(a=b=c=1, d=2); [a, b, c, d]; end`)
+	statement, ok := program.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected expression statement, got %T", program.Statements[0])
+	}
+	definition, ok := statement.Expression.(*ast.DefExpression)
+	if !ok {
+		t.Fatalf("expected method definition, got %T", statement.Expression)
+	}
+	if len(definition.Params) != 2 || len(definition.ParamDefaults) != 2 {
+		t.Fatalf("expected two parameters with defaults, got %d/%d", len(definition.Params), len(definition.ParamDefaults))
+	}
+}
+
 func TestParseBitwiseOperatorsBelowArithmeticWithRubyPrecedence(t *testing.T) {
 	expr := parseExpr(t, "1 | 2 ^ 3 & 4 + 5")
 	bitOr, ok := expr.(*ast.InfixExpression)
@@ -2620,6 +2727,21 @@ func TestParseIndexArgumentArrayLiteralMethodCall(t *testing.T) {
 	}
 }
 
+func TestParseMethodCallOnIndexInsideArrayLiteral(t *testing.T) {
+	expr := parseExpr(t, `[value[-1].to_s]`)
+	array, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 1 {
+		t.Fatalf("expected one-element ArrayLiteral, got %T (%v)", expr, expr)
+	}
+	call, ok := array.Elements[0].(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "to_s" {
+		t.Fatalf("expected to_s MethodCall element, got %T (%v)", array.Elements[0], array.Elements[0])
+	}
+	if _, ok := call.Receiver.(*ast.IndexExpression); !ok {
+		t.Fatalf("expected IndexExpression receiver, got %T", call.Receiver)
+	}
+}
+
 // === helpers ===
 
 func assertIntLit(t *testing.T, expr ast.Expression, expected int64) {
@@ -2704,6 +2826,18 @@ func TestParseKeywordLogicalOr(t *testing.T) {
 	}
 	if infix.Operator != "or" {
 		t.Errorf("expected or, got %s", infix.Operator)
+	}
+}
+
+func TestKeywordNotParenthesizedArgumentEndsBeforeCallChain(t *testing.T) {
+	expr := parseExpr(t, "not(true).should be_false")
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "should" {
+		t.Fatalf("expected should call, got %T (%v)", expr, expr)
+	}
+	prefix, ok := call.Receiver.(*ast.PrefixExpression)
+	if !ok || prefix.Operator != "not" {
+		t.Fatalf("expected not result as receiver, got %T", call.Receiver)
 	}
 }
 

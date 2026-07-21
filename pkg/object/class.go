@@ -14,6 +14,7 @@ type Class struct {
 	ConstantLocations   map[string]ConstantLocation
 	AutoloadLocations   map[string]ConstantLocation
 	ClassVars           map[string]*EmeraldValue
+	ClassVarOrder       []string
 	ClassMethods        map[string]*Method
 	InstanceVars        map[string]*EmeraldValue
 	IsSingleton         bool

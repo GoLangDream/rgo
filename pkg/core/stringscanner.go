@@ -70,6 +70,25 @@ func stringScannerRestSize(receiver *object.EmeraldValue, args ...*object.Emeral
 	return newInt(int64(len(data.str)) - data.pos)
 }
 
+func stringScannerRestQ(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := stringScannerDataFrom(receiver)
+	if data != nil && data.pos < int64(len(data.str)) {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func stringScannerBeginningOfLine(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := stringScannerDataFrom(receiver)
+	if data == nil || data.pos == 0 {
+		return R.TrueVal
+	}
+	if data.pos <= int64(len(data.str)) && data.pos > 0 && data.str[data.pos-1] == '\n' {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
 func stringScannerSize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := stringScannerDataFrom(receiver)
 	if data == nil || data.lastMatches == nil {

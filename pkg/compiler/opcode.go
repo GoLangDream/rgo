@@ -33,15 +33,19 @@ const (
 	OpJumpNotTruthy
 	OpJumpNotNil
 	OpJumpTruthy
+	OpFlipFlopGet
+	OpFlipFlopSet
 
 	OpArray
 	OpArrayAppend
 	OpHash
+	OpMarkKeywordHash
 
 	OpIndex
 	OpSliceIndex
 	OpIndexAssign
 	OpIndexCompoundAssign
+	OpIndexSplatCompoundAssign
 
 	OpGetGlobal
 	OpSetGlobal
@@ -122,6 +126,7 @@ const (
 
 	OpToAry
 	OpMultiAssignPrepare
+	OpMultiAssignExtract
 	OpMultiAssignCheckToAry
 
 	OpDup
@@ -190,6 +195,7 @@ const (
 	OpBlockGiven
 	OpRationalNew
 	OpPatternCheck
+	OpPatternCacheClear
 
 	OpDebug
 	OpJumpLocalPresent
@@ -241,15 +247,19 @@ var definitions = map[Opcode]Definition{
 	OpJumpNotTruthy: {"OpJumpNotTruthy", []int{2}},
 	OpJumpNotNil:    {"OpJumpNotNil", []int{2}},
 	OpJumpTruthy:    {"OpJumpTruthy", []int{2}},
+	OpFlipFlopGet:   {"OpFlipFlopGet", []int{2}},
+	OpFlipFlopSet:   {"OpFlipFlopSet", []int{2, 1}},
 
-	OpArray:       {"OpArray", []int{2}},
-	OpArrayAppend: {"OpArrayAppend", []int{1}},
-	OpHash:        {"OpHash", []int{2}},
+	OpArray:           {"OpArray", []int{2}},
+	OpArrayAppend:     {"OpArrayAppend", []int{1}},
+	OpHash:            {"OpHash", []int{2}},
+	OpMarkKeywordHash: {"OpMarkKeywordHash", []int{}},
 
-	OpIndex:               {"OpIndex", []int{}},
-	OpSliceIndex:          {"OpSliceIndex", []int{}},
-	OpIndexAssign:         {"OpIndexAssign", []int{}},
-	OpIndexCompoundAssign: {"OpIndexCompoundAssign", []int{2}},
+	OpIndex:                    {"OpIndex", []int{}},
+	OpSliceIndex:               {"OpSliceIndex", []int{}},
+	OpIndexAssign:              {"OpIndexAssign", []int{}},
+	OpIndexCompoundAssign:      {"OpIndexCompoundAssign", []int{2}},
+	OpIndexSplatCompoundAssign: {"OpIndexSplatCompoundAssign", []int{2}},
 
 	OpGetGlobal: {"OpGetGlobal", []int{2}},
 	OpSetGlobal: {"OpSetGlobal", []int{2}},
@@ -329,6 +339,7 @@ var definitions = map[Opcode]Definition{
 
 	OpToAry:                 {"OpToAry", []int{}},
 	OpMultiAssignPrepare:    {"OpMultiAssignPrepare", []int{}},
+	OpMultiAssignExtract:    {"OpMultiAssignExtract", []int{1, 1, 1, 1}},
 	OpMultiAssignCheckToAry: {"OpMultiAssignCheckToAry", []int{}},
 	OpDup:                   {"OpDup", []int{}},
 	OpSwap:                  {"OpSwap", []int{}},
@@ -386,6 +397,7 @@ var definitions = map[Opcode]Definition{
 	OpBlockGiven:             {"OpBlockGiven", []int{}},
 	OpRationalNew:            {"OpRationalNew", []int{}},
 	OpPatternCheck:           {"OpPatternCheck", []int{2}},
+	OpPatternCacheClear:      {"OpPatternCacheClear", []int{1}},
 	OpDebug:                  {"OpDebug", []int{}},
 	OpJumpLocalPresent:       {"OpJumpLocalPresent", []int{1, 2}},
 	OpLogicalSendAssignment:  {"OpLogicalSendAssignment", []int{2, 2, 1, 1}},

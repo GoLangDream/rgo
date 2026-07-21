@@ -15,6 +15,9 @@ func matrixValueIsOne(value *object.EmeraldValue) bool {
 }
 
 func matrixEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
 	data := matrixDataFrom(receiver)
 	return boolValue(data == nil || data.rowCount == 0 || data.colCount == 0)
 }

@@ -114,6 +114,13 @@ static int rgo_onig_search(const unsigned char* pattern, int pattern_len,
     *ends = (int*)malloc(sizeof(int) * region->num_regs);
     memcpy(*begins, region->beg, sizeof(int) * region->num_regs);
     memcpy(*ends, region->end, sizeof(int) * region->num_regs);
+  } else if (rc >= 0) {
+    // Some libonig builds omit the region for a successful zero-width match.
+    *count = 1;
+    *begins = (int*)malloc(sizeof(int));
+    *ends = (int*)malloc(sizeof(int));
+    (*begins)[0] = rc;
+    (*ends)[0] = rc;
   }
   if (region != NULL) rgo_onig.region_free(region, 1);
   rgo_onig.free_regex(regex);

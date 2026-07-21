@@ -98,9 +98,13 @@ func installOpenSSLX509(openssl *object.Module) {
 	certificateClass.DefineMethod("serial=", &object.Method{Name: "serial=", Fn: opensslX509CertificateSetSerial, Arity: 1})
 	certificateClass.DefineMethod("subject=", &object.Method{Name: "subject=", Fn: opensslX509CertificateSetSubject, Arity: 1})
 	certificateClass.DefineMethod("issuer=", &object.Method{Name: "issuer=", Fn: opensslX509CertificateSetIssuer, Arity: 1})
+	certificateClass.DefineMethod("subject", &object.Method{Name: "subject", Fn: opensslX509CertificateSubject, Arity: 0})
+	certificateClass.DefineMethod("issuer", &object.Method{Name: "issuer", Fn: opensslX509CertificateIssuer, Arity: 0})
 	certificateClass.DefineMethod("public_key=", &object.Method{Name: "public_key=", Fn: opensslX509CertificateSetPublicKey, Arity: 1})
 	certificateClass.DefineMethod("not_before=", &object.Method{Name: "not_before=", Fn: opensslX509CertificateSetNotBefore, Arity: 1})
 	certificateClass.DefineMethod("not_after=", &object.Method{Name: "not_after=", Fn: opensslX509CertificateSetNotAfter, Arity: 1})
+	certificateClass.DefineMethod("not_before", &object.Method{Name: "not_before", Fn: opensslX509CertificateNotBefore, Arity: 0})
+	certificateClass.DefineMethod("not_after", &object.Method{Name: "not_after", Fn: opensslX509CertificateNotAfter, Arity: 0})
 	certificateClass.DefineMethod("sign", &object.Method{Name: "sign", Fn: opensslX509CertificateSign, Arity: 2})
 	certificateClass.DefineMethod("add_extension", &object.Method{Name: "add_extension", Fn: opensslX509CertificateAddExtension, Arity: 1})
 	x509Module.Constants["Certificate"] = &object.EmeraldValue{Type: object.ValueClass, Data: certificateClass, Class: R.Classes["Class"]}
@@ -277,6 +281,18 @@ func opensslX509CertificateSetIssuer(receiver *object.EmeraldValue, args ...*obj
 	opensslX509CertificateDataFrom(receiver).issuer = args[0]
 	return args[0]
 }
+func opensslX509CertificateSubject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := opensslX509CertificateDataFrom(receiver).subject; value != nil {
+		return value
+	}
+	return R.NilVal
+}
+func opensslX509CertificateIssuer(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := opensslX509CertificateDataFrom(receiver).issuer; value != nil {
+		return value
+	}
+	return R.NilVal
+}
 func opensslX509CertificateSetPublicKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	opensslX509CertificateDataFrom(receiver).publicKey = args[0]
 	return args[0]
@@ -288,6 +304,20 @@ func opensslX509CertificateSetNotBefore(receiver *object.EmeraldValue, args ...*
 func opensslX509CertificateSetNotAfter(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	opensslX509CertificateDataFrom(receiver).notAfter = args[0]
 	return args[0]
+}
+
+func opensslX509CertificateNotBefore(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := opensslX509CertificateDataFrom(receiver).notBefore; value != nil {
+		return value
+	}
+	return R.NilVal
+}
+
+func opensslX509CertificateNotAfter(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := opensslX509CertificateDataFrom(receiver).notAfter; value != nil {
+		return value
+	}
+	return R.NilVal
 }
 
 func opensslX509CertificateSign(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

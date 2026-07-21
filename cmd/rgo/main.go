@@ -122,6 +122,10 @@ func main() {
 	case "-v", "--version":
 		fmt.Printf("ruby 3.3.0 (rgo) [%s-%s]\n", runtime.GOOS, runtime.GOARCH)
 	default:
+		if strings.HasSuffix(command, ".rb") {
+			runRubyFile(command, args[1:])
+			return
+		}
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
 		os.Exit(1)
@@ -344,6 +348,17 @@ func runRubyFileWithRequired(args []string) {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+	for i := 1; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-r") || len(args[i]) <= 2 {
+			continue
+		}
+		extraSource, _, extraErr := readRequiredSource(args[i][2:])
+		if extraErr != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", extraErr)
+			os.Exit(1)
+		}
+		requiredSource += extraSource
+	}
 	if len(args) == 1 {
 		mainSource, readErr := io.ReadAll(os.Stdin)
 		if readErr != nil {
@@ -354,16 +369,30 @@ func runRubyFileWithRequired(args []string) {
 		runRubySourceWithEncodingAndPreload(mainText, "-", nil, core.SourceEncoding(mainText), requiredSource, requiredFile)
 		return
 	}
-	if args[1] == "-e" {
-		if len(args) < 3 {
+	evalIndex := -1
+	for i := 1; i < len(args); i++ {
+		if args[i] == "-e" {
+			evalIndex = i
+			break
+		}
+	}
+	if evalIndex >= 0 {
+		if evalIndex+1 >= len(args) {
 			fmt.Fprintln(os.Stderr, "Usage: rgo -r <file> -e <code>")
 			os.Exit(1)
 		}
-		mainText := args[2]
-		runRubySourceWithEncodingAndPreload(mainText, "-e", args[3:], core.SourceEncoding(mainText), requiredSource, requiredFile)
+		mainText := args[evalIndex+1]
+		runRubySourceWithEncodingAndPreload(mainText, "-e", args[evalIndex+2:], core.SourceEncoding(mainText), requiredSource, requiredFile)
 		return
 	}
 	scriptIndex := 1
+	for scriptIndex < len(args) && strings.HasPrefix(args[scriptIndex], "-r") && len(args[scriptIndex]) > 2 {
+		scriptIndex++
+	}
+	if scriptIndex >= len(args) {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -r <file> <script.rb>\n")
+		os.Exit(1)
+	}
 	if args[scriptIndex] == "run" {
 		scriptIndex++
 	}
@@ -394,6 +423,10 @@ func readRequiredSource(path string) (string, string, error) {
 			abs, _ := filepath.Abs(candidate)
 			return string(content), abs, nil
 		}
+	}
+	if path == "mkmf" || path == "mkmf.rb" || path == "objspace" || path == "objspace.rb" || path == "tempfile" || path == "tempfile.rb" {
+		feature := strings.TrimSuffix(path, ".rb")
+		return "require \"" + feature + "\"\n", feature + ".rb", nil
 	}
 	return "", "", fmt.Errorf("cannot load such file -- %s", path)
 }

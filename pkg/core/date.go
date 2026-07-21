@@ -352,6 +352,7 @@ func installDateMethods(klass *object.Class) {
 	klass.DefineClassMethod("julian_leap?", &object.Method{Name: "julian_leap?", Fn: dateClassJulianLeap, Arity: 1})
 	klass.DefineClassMethod("valid_civil?", &object.Method{Name: "valid_civil?", Fn: dateClassValidCivil, Arity: -1})
 	klass.DefineClassMethod("valid_date?", &object.Method{Name: "valid_date?", Fn: dateClassValidCivil, Arity: -1})
+	klass.DefineClassMethod("valid_jd?", &object.Method{Name: "valid_jd?", Fn: dateClassValidJD, Arity: 1})
 	klass.DefineClassMethod("valid_ordinal?", &object.Method{Name: "valid_ordinal?", Fn: dateClassValidOrdinal, Arity: -1})
 	klass.DefineClassMethod("valid_commercial?", &object.Method{Name: "valid_commercial?", Fn: dateClassValidCommercial, Arity: -1})
 	klass.DefineClassMethod("today", &object.Method{Name: "today", Fn: dateClassToday, Arity: -1})
@@ -2116,8 +2117,40 @@ func dateClassValidCivil(_ *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if !yok || !mok || !dok || !sok {
 		return boolValue(false)
 	}
+	if m < 0 {
+		m += 13
+	}
+	if m < 1 || m > 12 {
+		return R.FalseVal
+	}
+	if d < 0 {
+		lastJD := int64(0)
+		found := false
+		for candidate := int64(31); candidate >= 1; candidate-- {
+			if jd, valid := dateCivilToJD(y, m, candidate, start); valid {
+				lastJD, found = jd, true
+				break
+			}
+		}
+		if !found {
+			return R.FalseVal
+		}
+		targetYear, targetMonth, _ := dateJDToCivil(lastJD+d+1, start)
+		return boolValue(targetYear == y && targetMonth == m)
+	}
 	_, ok := dateCivilToJD(y, m, d, start)
 	return boolValue(ok)
+}
+
+func dateClassValidJD(_ *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 || args[0] == nil {
+		return R.FalseVal
+	}
+	if args[0].Type == object.ValueInteger || args[0].Type == object.ValueFloat {
+		return R.TrueVal
+	}
+	_, rational := rationalValueData(args[0])
+	return boolValue(rational)
 }
 func dateClassValidOrdinal(_ *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 2 || len(args) > 3 {

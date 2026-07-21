@@ -116,10 +116,13 @@ func (vm *VM) matchArrayPattern(target *object.EmeraldValue, body string, frame 
 		parts = parts[:len(parts)-1]
 	}
 	splat := -1
+	lastSplat := -1
 	for i, part := range parts {
 		if strings.HasPrefix(strings.TrimSpace(part), "*") {
-			splat = i
-			break
+			if splat < 0 {
+				splat = i
+			}
+			lastSplat = i
 		}
 	}
 	if splat < 0 {
@@ -133,6 +136,56 @@ func (vm *VM) matchArrayPattern(target *object.EmeraldValue, body string, frame 
 			}
 		}
 		return true, nil
+	}
+	if lastSplat > splat {
+		prefixCount := splat
+		middleCount := lastSplat - splat - 1
+		suffixCount := len(parts) - lastSplat - 1
+		if len(values) < prefixCount+middleCount+suffixCount {
+			return false, nil
+		}
+		for i := 0; i < prefixCount; i++ {
+			matched, errVal := vm.matchPatternValue(values[i], parts[i], frame, bindings)
+			if errVal != nil || !matched {
+				return matched, errVal
+			}
+		}
+		for i := 0; i < suffixCount; i++ {
+			matched, errVal := vm.matchPatternValue(values[len(values)-suffixCount+i], parts[lastSplat+1+i], frame, bindings)
+			if errVal != nil || !matched {
+				return matched, errVal
+			}
+		}
+		for middleStart := prefixCount; middleStart+middleCount <= len(values)-suffixCount; middleStart++ {
+			trial := clonePatternBindings(bindings)
+			matched := true
+			for i := 0; i < middleCount; i++ {
+				itemMatched, errVal := vm.matchPatternValue(values[middleStart+i], parts[splat+1+i], frame, trial)
+				if errVal != nil {
+					return false, errVal
+				}
+				if !itemMatched {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			preName := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[splat]), "*"))
+			postName := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[lastSplat]), "*"))
+			if preName != "" {
+				bindPatternName(trial, preName, vm.arrayValue(values[prefixCount:middleStart]...))
+			}
+			if postName != "" {
+				bindPatternName(trial, postName, vm.arrayValue(values[middleStart+middleCount:len(values)-suffixCount]...))
+			}
+			for name, value := range trial {
+				bindings[name] = value
+			}
+			return true, nil
+		}
+		return false, nil
 	}
 	prefixCount := splat
 	suffixCount := len(parts) - splat - 1
@@ -160,13 +213,15 @@ func (vm *VM) matchArrayPattern(target *object.EmeraldValue, body string, frame 
 }
 
 func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *Frame, bindings map[string]*object.EmeraldValue) (bool, *object.EmeraldValue) {
-	hash, errVal := vm.patternHashValue(target)
+	hash, errVal := vm.patternHashValue(target, body)
 	if errVal != nil || hash == nil {
 		return false, errVal
 	}
 	parts := splitPatternTopLevel(body, ',')
 	required := 0
 	exact := false
+	restName := ""
+	requiredNames := map[string]bool{}
 	for _, raw := range parts {
 		part := strings.TrimSpace(raw)
 		if part == "" || part == "**" {
@@ -178,6 +233,7 @@ func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *
 			continue
 		}
 		if strings.HasPrefix(compactPart, "**") {
+			restName = strings.TrimPrefix(compactPart, "**")
 			continue
 		}
 		keyText, valuePattern, ok := splitPatternOperator(part, ":")
@@ -190,6 +246,7 @@ func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *
 			return false, nil
 		}
 		required++
+		requiredNames[keyName] = true
 		valuePattern = strings.TrimSpace(valuePattern)
 		if valuePattern == "" {
 			valuePattern = keyName
@@ -201,6 +258,19 @@ func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *
 	}
 	if (exact || strings.TrimSpace(body) == "") && len(hash) != required {
 		return false, nil
+	}
+	if restName != "" && restName != "nil" {
+		rest := make(map[*object.EmeraldValue]*object.EmeraldValue)
+		for key, value := range hash {
+			if key != nil && key.Type == object.ValueSymbol {
+				keyName, _ := key.Data.(string)
+				if requiredNames[strings.TrimPrefix(keyName, ":")] {
+					continue
+				}
+			}
+			rest[key] = value
+		}
+		bindPatternName(bindings, restName, &object.EmeraldValue{Type: object.ValueHash, Data: rest, Class: core.R.Classes["Hash"]})
 	}
 	return true, nil
 }
@@ -253,6 +323,11 @@ func (vm *VM) matchPatternAtom(target *object.EmeraldValue, pattern string, fram
 }
 
 func (vm *VM) patternArrayValues(target *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	if cached := vm.patternArrayCache[target]; cached != nil {
+		if cached.Type == object.ValueArray {
+			return cached.Data.([]*object.EmeraldValue), nil
+		}
+	}
 	if !vm.patternRespondsTo(target, "deconstruct") {
 		return nil, nil
 	}
@@ -264,12 +339,15 @@ func (vm *VM) patternArrayValues(target *object.EmeraldValue) ([]*object.Emerald
 		return nil, core.NewTypeError("deconstruct must return Array")
 	}
 	if result.Type == object.ValueArray {
+		if vm.patternArrayCache != nil {
+			vm.patternArrayCache[target] = result
+		}
 		return result.Data.([]*object.EmeraldValue), nil
 	}
 	return nil, nil
 }
 
-func (vm *VM) patternHashValue(target *object.EmeraldValue) (map[*object.EmeraldValue]*object.EmeraldValue, *object.EmeraldValue) {
+func (vm *VM) patternHashValue(target *object.EmeraldValue, body string) (map[*object.EmeraldValue]*object.EmeraldValue, *object.EmeraldValue) {
 	_, refined := vm.lookupActiveRefinedMethod(target, "deconstruct_keys")
 	if target != nil && target.Type == object.ValueHash && !refined {
 		return executorHashToMap(target), nil
@@ -277,7 +355,8 @@ func (vm *VM) patternHashValue(target *object.EmeraldValue) (map[*object.Emerald
 	if !vm.patternRespondsTo(target, "deconstruct_keys") {
 		return nil, nil
 	}
-	result := vm.send(target, "deconstruct_keys", []*object.EmeraldValue{core.R.NilVal})
+	keysArg := vm.patternDeconstructKeysArgument(body)
+	result := vm.send(target, "deconstruct_keys", []*object.EmeraldValue{keysArg})
 	if result != nil && result.Type == object.ValueException {
 		return nil, result
 	}
@@ -287,12 +366,42 @@ func (vm *VM) patternHashValue(target *object.EmeraldValue) (map[*object.Emerald
 	return executorHashToMap(result), nil
 }
 
+func (vm *VM) patternDeconstructKeysArgument(body string) *object.EmeraldValue {
+	parts := splitPatternTopLevel(body, ',')
+	keys := make([]*object.EmeraldValue, 0, len(parts))
+	for _, raw := range parts {
+		part := strings.TrimSpace(raw)
+		compact := strings.ReplaceAll(part, " ", "")
+		if strings.HasPrefix(compact, "**") {
+			if len(compact) > 2 && compact != "**nil" {
+				return core.R.NilVal
+			}
+			continue
+		}
+		keyText, _, ok := splitPatternOperator(part, ":")
+		if !ok {
+			continue
+		}
+		name := strings.Trim(strings.TrimSpace(keyText), "'\"")
+		keys = append(keys, &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: core.R.Classes["Symbol"]})
+	}
+	return vm.arrayValue(keys...)
+}
+
 func (vm *VM) bindPatternLocal(frame *Frame, name string, value *object.EmeraldValue) {
 	if frame == nil || frame.Fn == nil || name == "" || name == "_" {
 		return
 	}
 	index, ok := frame.Fn.LocalNames[name]
 	if !ok {
+		if frame.Closure != nil {
+			for index, freeName := range frame.Fn.FreeVarNames {
+				if freeName == name && index < len(frame.Closure.Free) {
+					setClosureValue(&frame.Closure.Free[index], value)
+					return
+				}
+			}
+		}
 		return
 	}
 	slot := frame.Bp + index + 1

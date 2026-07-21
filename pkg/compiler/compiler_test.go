@@ -52,6 +52,52 @@ func hasOpcode(instructions Instructions, op Opcode) bool {
 	return false
 }
 
+func flipFlopStateIDs(instructions Instructions) []int {
+	var ids []int
+	for i := 0; i < len(instructions); {
+		op := Opcode(instructions[i])
+		def, ok := Lookup(instructions[i])
+		if !ok {
+			i++
+			continue
+		}
+		if op == OpFlipFlopGet && i+2 < len(instructions) {
+			ids = append(ids, int(instructions[i+1])<<8|int(instructions[i+2]))
+		}
+		width := 1
+		for _, operandWidth := range def.OperandWidths {
+			width += operandWidth
+		}
+		i += width
+	}
+	return ids
+}
+
+func TestCompileCombinedFlipFlopsWithDistinctState(t *testing.T) {
+	bc := compile(t, `10.times { |i| i if (i == 4)...(i == 5) or (i == 7)...(i == 8) }`)
+	for _, constant := range bc.Constants {
+		fn, ok := constant.Data.(*object.Function)
+		if !ok {
+			continue
+		}
+		ids := flipFlopStateIDs(fn.Instructions)
+		if len(ids) == 2 {
+			if ids[0] == ids[1] {
+				t.Fatalf("expected distinct flip-flop states, got %v", ids)
+			}
+			return
+		}
+	}
+	t.Fatal("expected a block containing two flip-flops")
+}
+
+func TestCompileSplatIndexCompoundAssignmentUsesSingleCoercionOpcode(t *testing.T) {
+	bc := compile(t, `target[*key] += 1`)
+	if !hasOpcode(bc.Instructions, OpIndexSplatCompoundAssign) {
+		t.Fatal("expected splat index compound assignment opcode")
+	}
+}
+
 func TestCompileMultipleSplatsAsSingleExpandableArray(t *testing.T) {
 	bc := compile(t, `f(*[:a], *[:b], *[:c], 10)`)
 	if !hasOpcode(bc.Instructions, OpSplatToArray) {
@@ -87,6 +133,60 @@ end`)
 	}
 	if hasOpcode(bc.Instructions, OpSplat) {
 		t.Fatal("rescue splat should be expanded by OpRescueMatch, not OpSplat")
+	}
+}
+
+func TestCompileQualifiedRescueClassInBlock(t *testing.T) {
+	bc := compile(t, `Thread.new do
+  begin
+    raise IO::EAGAINWaitReadable
+  rescue IO::WaitReadable
+    :rescued
+  end
+end`)
+	var block *object.Function
+	for _, candidate := range functionConstants(bc) {
+		if candidate.Name == "__block__" {
+			block = candidate
+			break
+		}
+	}
+	if block == nil {
+		t.Fatal("expected block function")
+	}
+	foundHandler := false
+	for i := 0; i < len(block.Instructions); {
+		op := Opcode(block.Instructions[i])
+		if op == OpBeginRescue {
+			foundHandler = true
+			rescueOffset := int(block.Instructions[i+1])<<8 | int(block.Instructions[i+2])
+			if rescueOffset >= len(block.Instructions) || Opcode(block.Instructions[rescueOffset]) != OpGetConstant {
+				t.Fatalf("expected rescue target %d to load IO, got %v", rescueOffset, block.Instructions[rescueOffset])
+			}
+			nameIndex := int(block.Instructions[rescueOffset+1])<<8 | int(block.Instructions[rescueOffset+2])
+			if got := bc.Constants[nameIndex].Data; got != "IO" {
+				t.Fatalf("expected rescue target to load IO, got %v", got)
+			}
+		}
+		if op == OpGetConstant {
+			nameIndex := int(block.Instructions[i+1])<<8 | int(block.Instructions[i+2])
+			if got := bc.Constants[nameIndex].Data; got == "WaitReadable" {
+				t.Fatal("qualified rescue class leaked into body as bare WaitReadable")
+			}
+		}
+		def, ok := Lookup(byte(block.Instructions[i]))
+		if !ok {
+			i++
+			continue
+		}
+		width := 1
+		for _, operandWidth := range def.OperandWidths {
+			width += operandWidth
+		}
+		i += width
+	}
+	if !foundHandler {
+		t.Fatal("expected rescue handler")
 	}
 }
 

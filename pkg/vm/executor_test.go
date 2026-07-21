@@ -22,6 +22,19 @@ func init() {
 	core.Init()
 }
 
+func TestBreakSplatReturnsOneArrayValue(t *testing.T) {
+	result, _ := runRuby(t, `[
+  (while true; break *[1, 2]; end),
+  (while true; break *nil; end),
+  (while true; break *[nil]; end),
+  (while true; break *[[]]; end),
+  (while true; break *1; end)
+]`)
+	if result.Inspect() != "[[1, 2], [], [nil], [[]], [1]]" {
+		t.Fatalf("unexpected splatted break values: %s", result.Inspect())
+	}
+}
+
 func TestNewVMUsesCurrentSourceEncoding(t *testing.T) {
 	previous := core.CurrentEvalSourceEncoding
 	core.CurrentEvalSourceEncoding = "US-ASCII"
@@ -61,6 +74,140 @@ func TestFrozenStringLiteralIsInternedAcrossRequiredFiles(t *testing.T) {
 eval("# frozen_string_literal: true\n'shared'").equal?(REQUIRED_FROZEN_LITERAL)`, path)
 	result, _ := runRuby(t, source)
 	assertBoolResult(t, result, true)
+}
+
+func TestRequiredMethodRetainsFrozenStringLiteralMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "frozen_method_literal.rb")
+	if err := os.WriteFile(path, []byte("# frozen_string_literal: true\ndef required_frozen_literal\n  proc { |value| value }[\"shared\"]\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _ := runRuby(t, fmt.Sprintf("require %q\nrequired_frozen_literal.frozen?", path))
+	assertBoolResult(t, result, true)
+}
+
+func TestRequireCoercesToPathResultAndLoadPathEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "coerced_require.rb")
+	if err := os.WriteFile(path, []byte("COERCED_REQUIRE_LOADED = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loadPathFile := filepath.Join(dir, "load_path_require.rb")
+	if err := os.WriteFile(loadPathFile, []byte("LOAD_PATH_REQUIRE_LOADED = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	source := fmt.Sprintf(`
+class RequireStringValue
+  def initialize(value); @value = value; end
+  def to_str; @value; end
+end
+
+class RequirePathValue
+  def initialize(value); @value = value; end
+  def to_path; RequireStringValue.new(@value); end
+end
+
+class RequireLoadPathValue
+  def initialize(value); @value = value; end
+  def to_path; @value; end
+end
+
+first = require(RequirePathValue.new(%q))
+$LOAD_PATH.unshift(RequireLoadPathValue.new(%q))
+second = require("load_path_require")
+[first, second, COERCED_REQUIRE_LOADED, LOAD_PATH_REQUIRE_LOADED]
+`, path, dir)
+	result, _ := runRuby(t, source)
+	expected := `[true, true, true, true]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestLoadResolvesExactFileFromLoadPathWithoutAddingExtension(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "exact_load")
+	if err := os.WriteFile(path, []byte("EXACT_LOAD_VALUE = 42\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _ := runRuby(t, fmt.Sprintf("$LOAD_PATH.unshift(%q)\n[load('exact_load'), EXACT_LOAD_VALUE]", dir))
+	expected := `[true, 42]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestRequireTracksLoadPathFeatureAliasButIgnoresBareLoadedFeatureEntry(t *testing.T) {
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+	for _, dir := range []string{firstDir, secondDir} {
+		if err := os.WriteFile(filepath.Join(dir, "aliased_feature.rb"), []byte("ALIASED_FEATURE_COUNT = (defined?(ALIASED_FEATURE_COUNT) ? ALIASED_FEATURE_COUNT + 1 : 1)\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(secondDir, "bare_feature.rb"), []byte("BARE_FEATURE_LOADED = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	source := fmt.Sprintf(`
+$LOADED_FEATURES << "bare_feature"
+$LOAD_PATH.replace([%q])
+first = require("aliased_feature")
+$LOAD_PATH.replace([%q])
+second = require("aliased_feature")
+third = require("bare_feature")
+[first, second, third, ALIASED_FEATURE_COUNT, BARE_FEATURE_LOADED]
+`, firstDir, secondDir)
+	result, _ := runRuby(t, source)
+	expected := `[true, false, true, 1, true]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestLoadedFeaturesStartsWithCoreProvidedFeatures(t *testing.T) {
+	result, _ := runRuby(t, `%w[complex.rb enumerator.so fiber.so rational.rb thread.so ruby2_keywords.rb set.rb pathname.so monitor.so].all? do |feature|
+  $LOADED_FEATURES.include?(feature)
+end`)
+	assertBoolResult(t, result, true)
+}
+
+func TestRequireRelativeUsesRealPathAndSyntheticFilenameRules(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(realDir, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "nested", "value.rb"), []byte("REQUIRE_RELATIVE_REALPATH = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "synthetic_value.rb"), []byte("REQUIRE_RELATIVE_SYNTHETIC = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(realDir, "entry.rb")
+	if err := os.WriteFile(entry, []byte("require_relative 'nested/value'\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(dir, "entry_link.rb")
+	if err := os.Symlink(entry, symlink); err != nil {
+		t.Fatal(err)
+	}
+
+	source := fmt.Sprintf(`
+first = require(%q)
+Dir.chdir(%q) do
+  Object.new.instance_eval("require_relative('synthetic_value')", "synthetic\\name.rb")
+end
+[first, REQUIRE_RELATIVE_REALPATH, REQUIRE_RELATIVE_SYNTHETIC]
+`, symlink, realDir)
+	result, _ := runRuby(t, source)
+	expected := `[true, true, true]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
 }
 
 func TestMutableStringLiteralProducesANewObjectOnEachEvaluation(t *testing.T) {
@@ -2674,6 +2821,86 @@ func TestMultiAssignmentFromNilAssignsNilValues(t *testing.T) {
 	assertNilResult(t, arr[1])
 }
 
+func TestMultiAssignmentRestAndPostTargets(t *testing.T) {
+	result, _ := runRuby(t, `a, *rest, z = [1, 2, 3, 4]
+b, *empty, c = [5]
+[a, rest, z, b, empty, c]`)
+	values := result.Data.([]*object.EmeraldValue)
+	assertIntResult(t, values[0], 1)
+	rest := values[1].Data.([]*object.EmeraldValue)
+	assertIntResult(t, rest[0], 2)
+	assertIntResult(t, rest[1], 3)
+	assertIntResult(t, values[2], 4)
+	assertIntResult(t, values[3], 5)
+	if len(values[4].Data.([]*object.EmeraldValue)) != 0 {
+		t.Fatalf("expected empty rest array, got %s", values[4].Inspect())
+	}
+	assertNilResult(t, values[5])
+}
+
+func TestOptionalParametersReserveMandatoryPostArguments(t *testing.T) {
+	result, _ := runRuby(t, `def optional_post(a=1, b=2, c); [a, b, c]; end
+[optional_post(9), optional_post(8, 9), optional_post(7, 8, 9)]`)
+	rows := result.Data.([]*object.EmeraldValue)
+	expected := [][]int64{{1, 2, 9}, {8, 2, 9}, {7, 8, 9}}
+	for i, row := range rows {
+		values := row.Data.([]*object.EmeraldValue)
+		for j, want := range expected[i] {
+			assertIntResult(t, values[j], want)
+		}
+	}
+}
+
+func TestMethodSplatSnapshotsAndSetterPreservesSplatRHS(t *testing.T) {
+	result, _ := runRuby(t, `def collect(*args, &block); [args, block]; end
+args = [1, nil]
+snapshot = collect(*args, &args.pop)
+recorder = Object.new
+def recorder.[]=(*args); @args = args; end
+def recorder.args; @args; end
+indexes = [2, 3]
+rhs = [4, 5]
+assigned = (recorder[1, *indexes] = *rhs)
+[snapshot, assigned, recorder.args]`)
+	values := result.Data.([]*object.EmeraldValue)
+	snapshot := values[0].Data.([]*object.EmeraldValue)
+	args := snapshot[0].Data.([]*object.EmeraldValue)
+	assertIntResult(t, args[0], 1)
+	assertNilResult(t, args[1])
+	assertNilResult(t, snapshot[1])
+	assigned := values[1].Data.([]*object.EmeraldValue)
+	assertIntResult(t, assigned[0], 4)
+	assertIntResult(t, assigned[1], 5)
+	setterArgs := values[2].Data.([]*object.EmeraldValue)
+	if len(setterArgs) != 4 {
+		t.Fatalf("expected four setter args, got %s", values[2].Inspect())
+	}
+	assertIntResult(t, setterArgs[0], 1)
+	assertIntResult(t, setterArgs[1], 2)
+	assertIntResult(t, setterArgs[2], 3)
+	if setterArgs[3].Type != object.ValueArray {
+		t.Fatalf("expected splatted RHS to remain one array, got %s", setterArgs[3].Inspect())
+	}
+}
+
+func TestKeywordRestKeepsStringKeysAndPositionalHashVariables(t *testing.T) {
+	result, _ := runRuby(t, `def keyword_rest(a:, **rest); [a, rest]; end
+def positional_hash(a=nil, b={}, flag: false); [a, b, flag]; end
+h = {"key" => "value"}
+[keyword_rest("a" => 1, a: 2, b: 3), positional_hash(:a, h, flag: true)]`)
+	rows := result.Data.([]*object.EmeraldValue)
+	keywordRow := rows[0].Data.([]*object.EmeraldValue)
+	assertIntResult(t, keywordRow[0], 2)
+	if keywordRow[1].Type != object.ValueHash || len(executorHashToMap(keywordRow[1])) != 2 {
+		t.Fatalf("expected string and symbol keyword-rest entries, got %s", keywordRow[1].Inspect())
+	}
+	positionalRow := rows[1].Data.([]*object.EmeraldValue)
+	if positionalRow[1].Type != object.ValueHash {
+		t.Fatalf("expected positional hash variable, got %s", positionalRow[1].Inspect())
+	}
+	assertBoolResult(t, positionalRow[2], true)
+}
+
 func TestEvalIfConditionWithMultiAssignmentFromNil(t *testing.T) {
 	result, _ := runRuby(t, `ary = nil
 eval "if (a, b = ary); [a, b]; else [a, b]; end"`)
@@ -3164,6 +3391,25 @@ removed = a.slice!(1, 2)
 	}
 	assertIntResult(t, remaining[0], 1)
 	assertIntResult(t, remaining[1], 4)
+}
+
+func TestArraySliceHandlesCoercedIndexesBoundaryAndNilRanges(t *testing.T) {
+	result, _ := runRuby(t, `index = Object.new
+def index.to_int; 2; end
+a = [0, 1, 2, 3]
+[a[index, 2], a[4, 2], a[4..4], a[(nil...nil)]]`)
+	groups := result.Data.([]*object.EmeraldValue)
+	for position, expectedLength := range []int{2, 0, 0, 4} {
+		values, ok := groups[position].Data.([]*object.EmeraldValue)
+		if !ok || len(values) != expectedLength {
+			t.Fatalf("expected result %d to have length %d, got %v", position, expectedLength, groups[position])
+		}
+	}
+}
+
+func TestArrayBracketMergesTrailingUnbracedHashRocketPairs(t *testing.T) {
+	result, _ := runRuby(t, `Array[1, 2, 3 => 4, 5 => 6] == [1, 2, {3 => 4, 5 => 6}]`)
+	assertBoolResult(t, result, true)
 }
 
 func TestStringSliceBangRemovesSelectedSubstring(t *testing.T) {
@@ -6748,6 +6994,8 @@ ok`)
 func TestRbConfigRequireInstallsConfigSizeofAndLimits(t *testing.T) {
 	result, _ := runRuby(t, `require "rbconfig/sizeof"
 config_ok = RbConfig::CONFIG.values_at("MAJOR", "MINOR", "TEENY", "PATCHLEVEL") == ["3", "3", "0", "0"] &&
+  RbConfig::CONFIG["UNICODE_VERSION"] == "17.0.0" &&
+  RbConfig::CONFIG["UNICODE_EMOJI_VERSION"] == "17.0" &&
   RbConfig::CONFIG["host_cpu"].is_a?(String) &&
   RbConfig::CONFIG["host_os"].is_a?(String)
 sizeof_ok = RbConfig::SIZEOF["void*"] > 0 &&
@@ -6760,6 +7008,68 @@ limits_ok = RbConfig::LIMITS["FIXNUM_MIN"] < 0 &&
   RbConfig::LIMITS["SHRT_MAX"] == 32767
 config_ok && sizeof_ok && limits_ok && RUBY_DESCRIPTION.include?(RUBY_PLATFORM)`)
 	assertBoolResult(t, result, true)
+}
+
+func TestRandomFormatterAlphanumericUsesWholeConvertedChoices(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `require "random/formatter"
+source = Object.new
+source.extend(Random::Formatter)
+source.define_singleton_method(:bytes) { |n| "\x00".b * n }
+choice = Object.new
+choice.define_singleton_method(:to_s) { "[whole choice]" }
+source.alphanumeric(2, chars: [choice, "x"]).should == "[whole choice][whole choice]"`)
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestFindTraversesEnumeratesAndPrunes(t *testing.T) {
+	root := t.TempDir()
+	subdir := filepath.Join(root, "sub")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootFile := filepath.Join(root, "root.txt")
+	childFile := filepath.Join(subdir, "child.txt")
+	if err := os.WriteFile(rootFile, []byte("root"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childFile, []byte("child"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	core.RegisterMspec()
+	_, _ = runRuby(t, fmt.Sprintf(`require "find"
+root = %q
+Find.find(root).to_a.sort.should == [%q, %q, %q, %q].sort
+seen = []
+Find.find(root) do |path|
+  seen << path
+  Find.prune if path == %q
+end
+seen.sort.should == [%q, %q, %q].sort
+catch(:prune) { Find.prune }.should == nil`, root, root, rootFile, subdir, childFile, subdir, root, rootFile, subdir))
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestCSVGenerateParseAndLiberalQuoting(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `require "csv"
+CSV.generate_line(["a,b", nil, "c"]).should == "\"a,b\",,c\n"
+target = +"prefix\n"
+CSV.generate(target, col_sep: ";") { |csv| csv << [1, 2]; csv.add_row [3, nil] }.should equal(target)
+target.should == "prefix\n1;2\n3;\n"
+CSV.parse("\nfoo,,bar\n").should == [[], ["foo", nil, "bar"]]
+CSV.parse("\"a,b\",c").should == [["a,b", "c"]]
+-> { CSV.parse("\"quoted\" field") }.should raise_error(CSV::MalformedCSVError)
+CSV.parse(%q{"Johnson, Dwayne",Dwayne "The Rock" Johnson}, liberal_parsing: true).should == [["Johnson, Dwayne", %q{Dwayne "The Rock" Johnson}]]
+CSV.new("a,,b").readlines.should == [["a", nil, "b"]]
+CSV.new("", liberal_parsing: true).liberal_parsing?.should == true`)
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
 }
 
 func TestGetoptLongRequireInstallsClassAndConstants(t *testing.T) {
@@ -6937,6 +7247,358 @@ func TestBeAnInstanceOfMatcherArgumentForm(t *testing.T) {
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
+}
+
+func TestBareBooleanMatchersContinueSharedExamples(t *testing.T) {
+	_, _ = runRuby(t, `
+describe :boolean_matcher_continuation, shared: true do
+  before :each do
+    false.should be_false
+  end
+
+  it "continues after a bare matcher" do
+    true.should be_true
+    ScratchPad.record :continued
+    ScratchPad.recorded.should == :continued
+  end
+end
+
+describe "boolean matcher continuation" do
+  it_behaves_like :boolean_matcher_continuation
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 || runner.ExampleCount != 1 {
+		t.Fatalf("expected one passing shared example, got examples=%d failures=%d", runner.ExampleCount, runner.FailCount)
+	}
+}
+
+func TestRubyFalseResultRemainsFalseAcrossNativeTruthinessChecks(t *testing.T) {
+	result, _ := runRuby(t, `
+class RgoFalseRespondToTarget
+  def respond_to_missing?(*args)
+    false
+  end
+end
+!RgoFalseRespondToTarget.new.respond_to?(:missing)`)
+	assertBoolResult(t, result, true)
+}
+
+func TestOddAndRationalPredicates(t *testing.T) {
+	result, _ := runRuby(t, `[
+  (-1).odd?,
+  !(-2).odd?,
+  (987279**19).odd?,
+  Rational(0, 26).zero?,
+  !Rational(26).zero?,
+  !Rational(2, 1).integer?
+]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true, true, true})
+}
+
+func TestNegativeNumericLiteralKeepsReceiverAcrossMatcherChain(t *testing.T) {
+	_, _ = runRuby(t, `
+(-1).odd?.should be_true
+-1.negative?.should be_true
+-0.1.negative?.should be_true
+-1.positive?.should be_false
+-0.1.positive?.should be_false`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected negative literal matcher chains to pass, got %d failures", runner.FailCount)
+	}
+}
+
+func TestArrayEqualityAndCopySemantics(t *testing.T) {
+	result, _ := runRuby(t, `
+class RgoArrayLike
+  def respond_to?(name, include_private = false)
+    name == :to_ary || super
+  end
+  def ==(other)
+    other.is_a?(Array) && other.length == 1 && other[0] == 1
+  end
+end
+recursive = []
+recursive << recursive
+array = [1]
+def array.singleton_value
+  :ok
+end
+clone = array.clone
+duplicate = array.dup
+array_like_equal = [1] == RgoArrayLike.new
+recursive_equal = recursive.eql?([recursive])
+clone_has_method = clone.respond_to?(:singleton_value)
+duplicate_has_no_method = !duplicate.respond_to?(:singleton_value)
+[array_like_equal, recursive_equal, clone_has_method, duplicate_has_no_method]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true})
+}
+
+func TestSetEmptyAndZeroSizedIOBufferSlicePredicates(t *testing.T) {
+	result, _ := runRuby(t, `require "set"
+buffer = IO::Buffer.new(0)
+empty_set = Set.new.empty?
+nonempty_set = !Set[1].empty?
+null_slice = buffer.slice(0, 0).null?
+[empty_set, nonempty_set, null_slice]`)
+	assertArrayOfBools(t, result, []bool{true, true, true})
+}
+
+func TestMatchDataEqualityUsesSourcePatternAndOffsets(t *testing.T) {
+	result, _ := runRuby(t, `
+first = "haystack".match(/hay/)
+same = "haystack".match(/hay/)
+different_source = "hay".match(/hay/)
+different_pattern = "haystack".match(/h.y/)
+equal_value = first == same
+eql_value = first.eql?(same)
+source_differs = !(first == different_source)
+pattern_differs = !first.eql?(different_pattern)
+[equal_value, eql_value, source_differs, pattern_differs]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true})
+}
+
+func TestEncodingListsAliasesAndDummyPredicates(t *testing.T) {
+	result, _ := runRuby(t, `
+list_names = Encoding.list.map { |encoding| encoding.name }
+aliases_absent = Encoding.aliases.keys.none? { |name| Encoding.list.include?(name) }
+aliases_present = Encoding.aliases.all? { |name, target| Encoding.find(target).names.include?(name) }
+[
+  aliases_absent,
+  aliases_present,
+  list_names.include?("ASCII-8BIT"),
+  Encoding.name_list.include?("ASCII-8BIT"),
+  Encoding::CP50221.dummy?,
+  !Encoding::CP50221.ascii_compatible?
+]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true, true, true})
+}
+
+func TestSuperForwardsBlockToNativeHashEach(t *testing.T) {
+	result, _ := runRuby(t, `
+class HashEachWithSuper < Hash
+  attr_reader :seen
+
+  def each
+    super do |key, value|
+      @seen = [key, value]
+      yield key, value
+    end
+  end
+end
+
+hash = HashEachWithSuper.new
+hash["a"] = "b"
+[hash.map { |key, value| [key, value] }, hash.seen]
+`)
+
+	expected := `[[["a", "b"]], ["a", "b"]]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestHashSuperBlockPassAndAssocPreserveInsertionOrder(t *testing.T) {
+	result, _ := runRuby(t, `
+class HashInitializeWithBlockPass < Hash
+  def initialize(*args, &block)
+    self[:foo] = :bar
+    super(*args, &block)
+  end
+end
+
+
+identity = {}.compare_by_identity
+first = "pear".dup
+second = "pear".dup
+identity[first] = :red
+identity[second] = :green
+values = { apple: :green, grape: :green }
+
+[
+  HashInitializeWithBlockPass.new(:default).to_a,
+  identity.assoc("pear"),
+  values.rassoc(:green)
+]
+`)
+
+	expected := `[[[:foo, :bar]], ["pear", :red], [:apple, :green]]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestRegexpTruthinessPositionAndUnicodeEscapeEncoding(t *testing.T) {
+	result, _ := runRuby(t, `
+[
+  /abc/ === /abc/,
+  /str/i.match?("string", 1),
+  /needle \u{8768}/.fixed_encoding?
+]
+`)
+
+	expected := `[false, false, true]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestProcDupEqualityParametersAndCompositionBlock(t *testing.T) {
+	result, _ := runRuby(t, `
+events = []
+one = proc { |&block| block.call(:one) if block }
+two = proc { |&block| block.call(:two) if block }
+original = proc { :value }
+
+[
+  original == original.dup,
+  original.eql?(original.dup),
+  (-> * {}).parameters,
+  (-> ** {}).parameters,
+  (one << two).call { |value| events << value },
+  events
+]
+`)
+
+	expected := `[true, true, [[:rest, :*]], [[:keyrest, :"**"]], nil, [:two]]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestComplexIsFrozenAndRespondToUsesDynamicRespondToMissing(t *testing.T) {
+	result, _ := runRuby(t, `
+class DynamicResponder
+  private
+
+  def respond_to_missing?(name, include_private)
+    name == :dynamic && !include_private
+  end
+end
+
+[Complex(1.3, 3.1).frozen?, DynamicResponder.new.respond_to?(:dynamic)]
+`)
+
+	expected := `[true, true]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestRespondToWithoutRespondToMissingReturnsFalse(t *testing.T) {
+	result, _ := runRuby(t, `
+class NoRespondToMissing
+  undef_method :respond_to_missing?
+end
+NoRespondToMissing.new.respond_to?(:missing)
+`)
+	assertBoolResult(t, result, false)
+}
+
+func TestInstanceVariablesPreserveDeclarationOrder(t *testing.T) {
+	result, _ := runRuby(t, `
+object = Class.new do
+  def initialize
+    @c = 1
+    @a = 2
+    @b = 3
+  end
+end.new
+object.instance_variables
+`)
+
+	expected := `[:@c, :@a, :@b]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestVisibilityMethodsFalseSeparatesDirectMethodsAndClassSingletonChain(t *testing.T) {
+	result, _ := runRuby(t, `
+module VisibilityIncluded
+  private def included_private; end
+end
+
+class VisibilityParent
+  class << self
+    private def parent_singleton_private; end
+  end
+end
+
+class VisibilityChild < VisibilityParent
+  include VisibilityIncluded
+  private def child_private; end
+
+  class << self
+    private def child_singleton_private; end
+  end
+end
+
+
+[
+  VisibilityChild.new.private_methods(false),
+	VisibilityChild.new.private_methods(nil),
+  VisibilityChild.private_methods(false).grep(/singleton_private/).sort
+]
+`)
+
+	expected := `[[:child_private], [:child_private], [:child_singleton_private, :parent_singleton_private]]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestStringCloneFreezesAfterInitializeClone(t *testing.T) {
+	result, _ := runRuby(t, `
+source = "value".freeze
+copy = source.clone
+[copy, copy.frozen?, source.equal?(copy)]
+`)
+
+	expected := `["value", true, false]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestArrayAdjacentLabelsFormOneHash(t *testing.T) {
+	result, _ := runRuby(t, `[args: [1, 2, 3], kw: {a: "b"}]`)
+	expected := `[{:args => [1, 2, 3], :kw => {:a => "b"}}]`
+	if got := result.Inspect(); got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestDelegateForwardingMethodOperatorsAndClone(t *testing.T) {
+	result, _ := runRuby(t, `require "delegate"
+class RgoDelegateTarget
+  def pub
+    :pub
+  end
+  def secret
+    :secret
+  end
+  private :secret
+	define_method(:"!") { :negated }
+	define_method(:"!=") { |other| other == :different }
+end
+target = RgoDelegateTarget.new
+delegate = SimpleDelegator.new(target)
+private_blocked = begin
+  delegate.send(:secret)
+  false
+rescue NoMethodError
+  true
+end
+delegate.freeze
+[
+  delegate.method(:pub).call == :pub,
+  private_blocked,
+  !delegate == :negated,
+  delegate != :different,
+  delegate.clone.frozen?
+]`)
+	assertArrayOfBools(t, result, []bool{true, true, true, true, true})
 }
 
 func TestMonitorExitWithoutEnterRaisesThreadError(t *testing.T) {
@@ -8937,15 +9599,17 @@ a`)
 
 func TestForLoopBodyLocalVariablesExposeIterationVariableOnly(t *testing.T) {
 	result, _ := runRuby(t, `seen_in_body = false
+internal_local_hidden = false
 leaked_from_lambda = false
 for i in 1..2
   seen_in_body = seen_in_body || local_variables.include?(:i)
+  internal_local_hidden = internal_local_hidden || !local_variables.include?(:__rgo_for_value_0)
   -> {
     inside_proc = 42
   }.call
 end
 leaked_from_lambda = local_variables.include?(:inside_proc)
-[seen_in_body, leaked_from_lambda]`)
+[seen_in_body, internal_local_hidden, leaked_from_lambda]`)
 	if result == nil {
 		t.Fatal("expected result, got nil")
 	}
@@ -8953,11 +9617,77 @@ leaked_from_lambda = local_variables.include?(:inside_proc)
 		t.Fatalf("expected Array, got %s (%v)", result.TypeName(), result.Inspect())
 	}
 	elements := result.Data.([]*object.EmeraldValue)
-	if len(elements) != 2 {
-		t.Fatalf("expected 2 elements, got %d", len(elements))
+	if len(elements) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(elements))
 	}
 	assertBoolResult(t, elements[0], true)
-	assertBoolResult(t, elements[1], false)
+	assertBoolResult(t, elements[1], true)
+	assertBoolResult(t, elements[2], false)
+}
+
+func TestDoubleSplatNilSuppliesEmptyKeywords(t *testing.T) {
+	result, _ := runRuby(t, `insert = -> key, **kw { [key, kw] }
+insert.call(:foo, **nil)`)
+	values, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(values) != 2 {
+		t.Fatalf("expected key and keyword hash, got %v", result)
+	}
+	if values[0].Type != object.ValueSymbol || values[0].Data.(string) != "foo" {
+		t.Fatalf("expected :foo, got %v", values[0])
+	}
+	hash, ok := values[1].Data.(*object.RHash)
+	if !ok || len(hash.Keys) != 0 {
+		t.Fatalf("expected empty keyword hash, got %v", values[1])
+	}
+}
+
+func TestYieldSeparatesKeywordArgumentsFromRest(t *testing.T) {
+	result, _ := runRuby(t, `def keyword_yielder(*values)
+  yield(*values, enabled: true)
+end
+keyword_yielder { |*values, enabled:| [values, enabled] }`)
+	if result.Inspect() != "[[], true]" {
+		t.Fatalf("unexpected yield keyword result: %s", result.Inspect())
+	}
+}
+
+func TestAnonymousBlockParameterForwardsCurrentMethodBlock(t *testing.T) {
+	result, _ := runRuby(t, `class AnonymousBlockForwardTarget
+  def target(&block); block; end
+  def delegate(&); target(&); end
+end
+block = proc { 1 }
+AnonymousBlockForwardTarget.new.delegate(&block).equal?(block)`)
+	assertBoolResult(t, result, true)
+}
+
+func TestAccessorCompoundAssignmentEvaluatesReceiverOnce(t *testing.T) {
+	result, _ := runRuby(t, `class CompoundAccessorTarget
+  attr_accessor :value
+end
+target = CompoundAccessorTarget.new
+target.value = 1
+count = 0
+(count += 1; target).value += 2
+[count, target.value]`)
+	if result.Inspect() != "[1, 3]" {
+		t.Fatalf("unexpected compound accessor result: %s", result.Inspect())
+	}
+}
+
+func TestRegexpUnknownEscapeMatchesLiteralCharacter(t *testing.T) {
+	result, _ := runRuby(t, `/\y/.match("y").to_a`)
+	if result.Inspect() != `["y"]` {
+		t.Fatalf("unexpected escaped literal match: %s", result.Inspect())
+	}
+}
+
+func TestReturnSplatPreservesArrayValue(t *testing.T) {
+	result, _ := runRuby(t, `def splat_return(values); return *values; end
+[splat_return([]), splat_return([1]), splat_return([1, 2])]`)
+	if result.Inspect() != "[[], [1], [1, 2]]" {
+		t.Fatalf("unexpected return splat result: %s", result.Inspect())
+	}
 }
 
 func TestForLoopNestedAndCanShareLocalsFromInnerScopes(t *testing.T) {
@@ -9334,6 +10064,27 @@ end
 	assertBoolResult(t, values[1], true)
 }
 
+func TestLoadPathRelativeEntrySetsAbsoluteMagicFile(t *testing.T) {
+	dir := t.TempDir()
+	requirePath := filepath.Join(dir, "require_magic_file.rb")
+	loadPath := filepath.Join(dir, "load_magic_file.rb")
+	if err := os.WriteFile(requirePath, []byte(`$rgo_require_magic_file = __FILE__`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(loadPath, []byte(`$rgo_load_magic_file = __FILE__`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`Dir.chdir(%q) do
+  $LOAD_PATH << "."
+  require "require_magic_file.rb"
+  load "load_magic_file.rb"
+end
+[$rgo_require_magic_file, $rgo_load_magic_file]`, dir))
+	values := result.Data.([]*object.EmeraldValue)
+	assertStringResult(t, values[0], requirePath)
+	assertStringResult(t, values[1], loadPath)
+}
+
 func TestFileSeparatorConstantAlias(t *testing.T) {
 	result, _ := runRuby(t, `[File::SEPARATOR, File::Separator, File::PATH_SEPARATOR]`)
 	values := result.Data.([]*object.EmeraldValue)
@@ -9540,6 +10291,23 @@ func TestRedoInLambdaRestartsCurrentFrame(t *testing.T) {
 }.call
 $redo_count`)
 	assertIntResult(t, result, 12)
+}
+
+func TestRedoInBlockRunsEnsureBeforeRestart(t *testing.T) {
+	result, _ := runRuby(t, `values = []
+[1].each do |value|
+  values << value
+  begin
+    values << value * 10
+    redo if values.count(1) == 1
+  ensure
+    values << value * 100
+  end
+end
+values`)
+	if result.Inspect() != "[1, 10, 100, 1, 10, 100]" {
+		t.Fatalf("unexpected redo/ensure result: %s", result.Inspect())
+	}
 }
 
 func TestNextWithValueInLambdaReturnsWithoutLooping(t *testing.T) {
@@ -9762,6 +10530,12 @@ child.new.value`)
 	result, _ = runRuby(t, `klass = Class.new { def value; defined?(super); end }
 klass.new.value`)
 	assertNilResult(t, result)
+
+	result, _ = runRuby(t, `parent = Class.new { def value; 1; end }
+middle = Class.new(parent) { undef_method :value }
+child = Class.new(middle) { def value; defined?(super); end }
+child.new.value`)
+	assertNilResult(t, result)
 }
 
 func TestDefinedKeywordClassifiesSetterCompoundAssignmentWithoutEvaluation(t *testing.T) {
@@ -9955,6 +10729,25 @@ end`)
 	assertBoolResult(t, result, true)
 }
 
+func TestPatternMatchingFindAndHashRestBindings(t *testing.T) {
+	result, _ := runRuby(t, `outer = nil
+1.times do
+  [0, 1] => [outer, inner]
+end
+find = case [0, 1, 2, 3, 4]
+in [*pre, 2, *post]
+  [pre, post]
+end
+hash = case {a: 0, b: 1, c: 2}
+in {a:, **rest}
+  [a, rest]
+end
+[outer, defined?(inner), find, hash]`)
+	if result.Inspect() != "[0, nil, [[0, 1], [3, 4]], [0, {:b => 1, :c => 2}]]" {
+		t.Fatalf("unexpected pattern bindings: %s", result.Inspect())
+	}
+}
+
 func TestPatternMatchCaseGuards(t *testing.T) {
 	result, _ := runRuby(t, `case 0
 in 0 if false
@@ -10103,6 +10896,43 @@ func TestCatchReturnsThrownValue(t *testing.T) {
 	}
 }
 
+func TestThrowAcrossEvalRunsEnsureWithoutEnteringRescue(t *testing.T) {
+	result, _ := runRuby(t, `$throw_eval_events = []
+value = catch(:throw_eval_done) do
+  eval("class ThrowAcrossEvalEnsureExample\n$throw_eval_events << :body\nthrow :throw_eval_done, 7\nrescue\n$throw_eval_events << :rescue\nensure\n$throw_eval_events << :ensure\nend")
+  :missed
+end
+[value, $throw_eval_events]`)
+	if got := result.Inspect(); got != `[7, [:body, :ensure]]` {
+		t.Fatalf("unexpected cross-eval throw result: %s", got)
+	}
+}
+
+func TestMspecExamplesRestoreMainSingletonMethods(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `describe "main singleton isolation" do
+  it "defines a singleton helper" do
+    class << self
+      def isolated_keyword_method(*args)
+        [:old, args]
+      end
+    end
+  end
+
+  it "does not leak that helper" do
+    def isolated_keyword_method(a:, b:)
+      [a, b]
+    end
+    a = 1
+    b = 2
+    isolated_keyword_method(a:, b:).should == [1, 2]
+  end
+end`)
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected isolated main singleton methods, got %d failures", runner.FailCount)
+	}
+}
+
 func TestCatchWithDoBlockReturnsThrownValue(t *testing.T) {
 	result, _ := runRuby(t, `catch(:exit) do
   throw :exit, :msg
@@ -10115,6 +10945,59 @@ end`)
 	}
 	if result.Data.(string) != "msg" {
 		t.Fatalf("expected msg, got %s", result.Data)
+	}
+}
+
+func TestNestedCatchSkipsAllIntermediateBodies(t *testing.T) {
+	result, _ := runRuby(t, `ScratchPad.record []
+catch :one do
+  ScratchPad << 1
+  catch :two do
+    ScratchPad << 2
+    catch :three do
+      ScratchPad << 3
+      throw :one
+      ScratchPad << 4
+    end
+    ScratchPad << 5
+  end
+  ScratchPad << 6
+end
+ScratchPad.recorded`)
+	values, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(values) != 3 || values[0].Data.(int64) != 1 || values[1].Data.(int64) != 2 || values[2].Data.(int64) != 3 {
+		t.Fatalf("expected [1, 2, 3], got type=%s data=%T ok=%v len=%d", result.TypeName(), result.Data, ok, len(values))
+	}
+}
+
+func TestExclusiveFlipFlopPersistsAcrossBlockInvocations(t *testing.T) {
+	result, _ := runRuby(t, `values = []
+10.times { |i| values << i if (i == 4)...(i == 4) }
+inclusive = []
+7.times { |i| inclusive << i if (i == 2)..(i == 4) }
+[values, inclusive]`)
+	groups, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(groups) != 2 {
+		t.Fatalf("expected two flip-flop result groups, got %v", result)
+	}
+	result = groups[0]
+	values, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(values) != 6 {
+		t.Fatalf("expected six values, got %v", result)
+	}
+	for index, value := range values {
+		if value.Type != object.ValueInteger || value.Data.(int64) != int64(index+4) {
+			t.Fatalf("expected value %d at index %d, got %v", index+4, index, value)
+		}
+	}
+	inclusive, ok := groups[1].Data.([]*object.EmeraldValue)
+	if !ok || len(inclusive) != 3 {
+		t.Fatalf("expected [2, 3, 4], got %v", groups[1])
+	}
+	for index, value := range inclusive {
+		if value.Type != object.ValueInteger || value.Data.(int64) != int64(index+2) {
+			t.Fatalf("expected inclusive value %d at index %d, got %v", index+2, index, value)
+		}
 	}
 }
 
@@ -10629,7 +11512,8 @@ end
 }
 
 func TestForwardedBlockBreakReturnsFromOriginalReceivingMethod(t *testing.T) {
-	result, _ := runRuby(t, `class RGoForwardedBreak
+	result, _ := runRuby(t, `events = []
+class RGoForwardedBreak
   def self.inner(&block)
     yield
     :unreachable_inner
@@ -10639,8 +11523,89 @@ func TestForwardedBlockBreakReturnsFromOriginalReceivingMethod(t *testing.T) {
     :unreachable_outer
   end
 end
-RGoForwardedBreak.outer { break :done }`)
-	assertSymbolResult(t, result, "done")
+value = RGoForwardedBreak.outer { break :done }
+events << value
+events << :after
+events`)
+	if result.Inspect() != "[:done, :after]" {
+		t.Fatalf("unexpected forwarded break control: %s", result.Inspect())
+	}
+}
+
+func TestBlockBreakSkipsInterveningLambdaBody(t *testing.T) {
+	result, _ := runRuby(t, `$rgo_break_events = []
+def rgo_break_mid(&block)
+  -> {
+    $rgo_break_events << :before
+    block.call
+    $rgo_break_events << :unreachable
+  }.call
+end
+[1].each do
+  rgo_break_mid { break }
+  $rgo_break_events << :after
+end
+$rgo_break_events`)
+	if result.Inspect() != "[:before, :after]" {
+		t.Fatalf("unexpected break through lambda control: %s", result.Inspect())
+	}
+}
+
+func TestBreakRunsIntermediateAndLoopEnsures(t *testing.T) {
+	result, _ := runRuby(t, `$rgo_break_ensure_events = []
+class RGoBreakEnsure
+  def one
+    two { yield }
+  end
+  def two
+    yield
+  ensure
+    $rgo_break_ensure_events << :intermediate
+  end
+end
+RGoBreakEnsure.new.one { break }
+while true
+  begin
+    $rgo_break_ensure_events << :body
+    break
+  ensure
+    $rgo_break_ensure_events << :loop_ensure
+  end
+end
+$rgo_break_ensure_events`)
+	if result.Inspect() != "[:intermediate, :body, :loop_ensure]" {
+		t.Fatalf("unexpected break ensure control: %s", result.Inspect())
+	}
+}
+
+func TestNextRunsBlockAndLoopEnsures(t *testing.T) {
+	result, _ := runRuby(t, `events = []
+[1].each do
+  begin
+    events << :block_body
+    next
+  ensure
+    events << :block_ensure
+  end
+end
+i = 0
+while i < 1
+  begin
+    begin
+      events << :loop_body
+      i += 1
+      next
+    ensure
+      events << :inner_ensure
+    end
+  ensure
+    events << :outer_ensure
+  end
+end
+events`)
+	if result.Inspect() != "[:block_body, :block_ensure, :loop_body, :inner_ensure, :outer_ensure]" {
+		t.Fatalf("unexpected next ensure control: %s", result.Inspect())
+	}
 }
 
 func TestLambdaBreakDoesNotBreakCallingMethod(t *testing.T) {
@@ -12635,6 +13600,24 @@ end`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected $@ assignment matcher examples to pass, got %d failures", runner.FailCount)
+	}
+}
+
+func TestPredefinedVerboseBacktraceAndLoadPathState(t *testing.T) {
+	result, _ := runRuby(t, `verbose = [1, 0, [], ""].map { |value| $VERBOSE = value; $VERBOSE }
+backtrace = begin
+  raise
+rescue
+  $@ = []
+  $@
+end
+site_index = $LOAD_PATH.index(RbConfig::CONFIG["sitelibdir"])
+marked = !site_index.nil? &&
+  $LOAD_PATH[site_index..-1].all? { |path| path.instance_variable_defined?(:@gem_prelude_index) } &&
+  $LOAD_PATH[0...site_index].all? { |path| !path.instance_variable_defined?(:@gem_prelude_index) }
+[verbose, backtrace, marked]`)
+	if result.Inspect() != "[[true, true, true, true], [], true]" {
+		t.Fatalf("unexpected predefined global state: %s", result.Inspect())
 	}
 }
 
@@ -15405,6 +16388,19 @@ raised`)
 	assertBoolResult(t, result, true)
 }
 
+func TestProtectedMethodCanBeCalledOnPeerFromDefiningClass(t *testing.T) {
+	result, _ := runRuby(t, `klass = Class.new do
+  def compare(other); other.order; end
+  protected
+  attr_reader :order
+end
+left = klass.new
+right = klass.new
+right.instance_variable_set(:@order, 7)
+left.compare(right)`)
+	assertIntResult(t, result, 7)
+}
+
 func TestPrependedMethodCanSuperToPrivateMethod(t *testing.T) {
 	result, _ := runRuby(t, `wrapper = Module.new do
   def wrapped
@@ -15605,7 +16601,9 @@ pattern.should =~ 'fooT'
 pattern.should =~ 'F'
 pattern = /\A(?<word>foo)?(?(<word>)(T)|(F))\z/
 pattern.should =~ 'fooT'
-pattern.should =~ 'F'`)
+pattern.should =~ 'F'
+Regexp.new("(?<a>a)(?(<a>)a|b)").match("aa").to_a.should == ["aa", "a"]
+Regexp.new("(?<a>a)(?('a')a|b)").match("aa").to_a.should == ["aa", "a"]`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
@@ -15669,6 +16667,31 @@ func TestInvalidRetryMatchesSyntaxErrorMatcher(t *testing.T) {
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 	}
+}
+
+func TestRetryRestartsProtectedBody(t *testing.T) {
+	result, _ := runRuby(t, `attempts = 0
+begin
+  attempts += 1
+  raise "retry" if attempts < 2
+rescue RuntimeError
+  retry
+end
+attempts`)
+	if result.Type != object.ValueInteger || result.Data.(int64) != 2 {
+		t.Fatalf("expected 2, got %s", result.Inspect())
+	}
+}
+
+func TestQualifiedRescueClassInsideThreadBlock(t *testing.T) {
+	result, _ := runRuby(t, `Thread.new do
+  begin
+    raise IO::EAGAINWaitReadable
+  rescue IO::WaitReadable
+    :rescued
+  end
+end.value`)
+	assertSymbolResult(t, result, "rescued")
 }
 
 func TestThrowUnmatchedAndThreadExitRaiseExpectedErrors(t *testing.T) {
@@ -15850,6 +16873,15 @@ md = r.match("b")
 	assertIntResult(t, indices[0], 1)
 	assertIntResult(t, indices[1], 2)
 	assertStringResult(t, values[1], "b")
+}
+
+func TestRegexpNamedCapturesDisablePlainCapturingGroups(t *testing.T) {
+	result, _ := runRuby(t, `r = /(?<first>a)|(b)(?<second>c)/
+md = r.match("bc")
+[r.named_captures, md.to_a, md[:second]]`)
+	if got := result.Inspect(); got != `[{"first" => [1], "second" => [2]}, ["bc", nil, "c"], "c"]` {
+		t.Fatalf("unexpected named capture numbering: %s", got)
+	}
 }
 
 func TestLineKeywordCompilesToSourceLine(t *testing.T) {
@@ -16668,6 +17700,7 @@ m.find_index(3).should == [1, 0]
 m.inspect.should == "Matrix[[1, 2], [3, 4]]"
 Matrix.empty(3, 0).inspect.should == "Matrix.empty(3, 0)"
 Matrix.empty.empty?.should == true
+-> { Matrix.empty.empty?(1) }.should raise_error(ArgumentError)
 Matrix.empty.square?.should == true
 Matrix.zero(2).zero?.should == true
 Matrix.diagonal(1, 2).diagonal?.should == true
@@ -18291,6 +19324,32 @@ end
 	}
 }
 
+func TestFileOpenMergesKeywordModeAndExclusiveFlagsDeterministically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exclusive.txt")
+	if err := os.WriteFile(path, []byte("present"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`
+misses = 0
+100.times do
+  begin
+    File.open(%q, mode: "w", flags: File::EXCL) { }
+    misses += 1
+  rescue Errno::EEXIST
+  end
+  begin
+    File.new(%q, mode: "w", flags: File::EXCL)
+    misses += 1
+  rescue Errno::EEXIST
+  end
+end
+misses
+`, path, path))
+	if result.Type != object.ValueInteger || result.Data.(int64) != 0 {
+		t.Fatalf("expected every exclusive open to raise Errno::EEXIST, got %s misses", result.Inspect())
+	}
+}
+
 func TestFileSplitUsesRubyUnixPathSemantics(t *testing.T) {
 	result, _ := runRuby(t, `[
   File.split("/foo/bar/baz"),
@@ -18881,6 +19940,19 @@ dir.close
 value`, dir))
 	if result == nil || result.Type != object.ValueString {
 		t.Fatalf("expected String from send(:read), got %v", result)
+	}
+}
+
+func TestSubclassCanOverrideObjectSend(t *testing.T) {
+	result, _ := runRuby(t, `class Courier
+  def send(message, flags)
+    [message, flags]
+  end
+end
+Courier.new.send("hello", 0)`)
+	values, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(values) != 2 || values[0].Inspect() != `"hello"` || values[1].Inspect() != "0" {
+		t.Fatalf("expected overridden send result, got %v", result)
 	}
 }
 
@@ -25837,6 +26909,22 @@ func TestYAMLToSReportsPsych(t *testing.T) {
 	assertBoolResult(t, result, true)
 }
 
+func TestYAMLToYAMLParseDocumentAndStreams(t *testing.T) {
+	core.RegisterMspec()
+	_, _ = runRuby(t, `require "yaml"
+["a", "b"].to_yaml.should == YAML.dump(["a", "b"])
+{"a" => 1}.to_yaml.should == "---\na: 1\n"
+YAML.parse("foo".to_yaml).to_ruby.should == "foo"
+YAML.parse("").should == false
+documents = []
+YAML.load_stream("---\n- a\n---\n- b\n") { |doc| documents << doc }
+documents.should == [["a"], ["b"]]
+YAML.dump_stream("foo", 20, [], {}).should == "--- foo\n--- 20\n--- []\n\n--- {}\n\n"`)
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
 func TestYAMLLoadPsychVersionGuardDoesNotFail(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `
@@ -26139,6 +27227,27 @@ func TestPredefinedGlobalAssignmentValidation(t *testing.T) {
 				t.Fatalf("expected 0 failures, got %d", runner.FailCount)
 			}
 		})
+	}
+}
+
+func TestStdoutAcceptsBuiltinValueWithSingletonWriteInClosure(t *testing.T) {
+	result, _ := runRuby(t, `old_stdout = $stdout
+target = +""
+def target.write(value); self << value.to_s; end
+assigned = false
+begin
+  -> { $stdout = target }.call
+  assigned = $stdout.equal?(target)
+ensure
+  $stdout = old_stdout
+end
+[target.respond_to?(:write), assigned]`)
+	if result == nil || result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %v", result)
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 || values[0] != core.R.TrueVal || values[1] != core.R.TrueVal {
+		t.Fatalf("expected singleton writer to be accepted, got %v", result.Inspect())
 	}
 }
 
@@ -28602,9 +29711,41 @@ exception = (1 / 0 rescue $ERROR_INFO)
 	assertArrayOfBools(t, result, []bool{true, true, true})
 }
 
+func TestEnglishAliasesExposeInitializedCanonicalGlobals(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `require "English"
+$INPUT_LINE_NUMBER.should == $.
+$INPUT_LINE_NUMBER.should_not be_nil
+$DEFAULT_OUTPUT.should == $>
+$DEFAULT_OUTPUT.should_not be_nil
+$DEFAULT_INPUT.should == $<
+$DEFAULT_INPUT.should_not be_nil
+$PID.should == $$
+$PROCESS_ID.should == $$
+$ARGV.should == $*`)
+	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+}
+
 func TestAssigningLastMatchUpdatesDerivedGlobals(t *testing.T) {
 	result, _ := runRuby(t, "\"foo hello\" =~ /(foo)/\nsaved = $~\n\"bar\" =~ /(bar)/\n$~ = saved\n[$1, $&, $`, $']")
 	assertArrayOfStrings(t, result, []string{"foo", "foo", "", " hello"})
+}
+
+func TestRegexpBackReferencesAreThreadLocal(t *testing.T) {
+	result, _ := runRuby(t, `"foo" =~ /(o+)/
+before = [$~.to_a, $1]
+inside = nil
+Thread.new do
+  initial = [$~.nil?, $1]
+  "bar" =~ /(a)/
+  inside = [initial, $~.to_a, $1]
+end.join
+[before, inside, $~.to_a, $1]`)
+	if got := result.Inspect(); got != `[[["oo", "oo"], "oo"], [[true, nil], ["a", "a"], "a"], ["oo", "oo"], "oo"]` {
+		t.Fatalf("unexpected thread-local regexp captures: %s", got)
+	}
 }
 
 func TestStringIOGetsUsesDefaultRecordSeparator(t *testing.T) {
@@ -28647,6 +29788,23 @@ checks << $!.nil?
 checks
 `)
 	assertArrayOfBools(t, result, []bool{true, true, true, true})
+}
+
+func TestLastExceptionRestoresAfterRescueInsideBlock(t *testing.T) {
+	result, _ := runRuby(t, `
+checks = []
+1.times do
+  begin
+    raise "error"
+  rescue
+    checks << !$!.nil?
+  end
+  checks << $!.nil?
+  checks << $@.nil?
+end
+checks
+`)
+	assertArrayOfBools(t, result, []bool{true, true, true})
 }
 
 func TestLastExceptionRestoresBeforeEnsureAfterNestedRescue(t *testing.T) {

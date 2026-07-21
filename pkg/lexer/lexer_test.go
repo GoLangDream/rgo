@@ -271,6 +271,19 @@ func TestIndentedHeredocPreservesKeywordArgumentSuffix(t *testing.T) {
 	}
 }
 
+func TestHeredocMarkerSuffixPreservesDeclarationLine(t *testing.T) {
+	toks := tokenizeClean("\n\neval(<<-CODE, __FILE__, __LINE__ + 1)\n  value\nCODE\n")
+	for _, tok := range toks {
+		if tok.Literal == "__LINE__" {
+			if tok.Line != 3 {
+				t.Fatalf("expected __LINE__ on line 3, got line %d", tok.Line)
+			}
+			return
+		}
+	}
+	t.Fatal("expected __LINE__ token")
+}
+
 func TestHeredocMarkerSuffixIsSeparatedFromFollowingStatement(t *testing.T) {
 	toks := tokenize("ruby_exe(<<-CODE, args: \"2>&1\")\n  return 10\n  CODE\nnext_call\n")
 	for i := 0; i < len(toks)-2; i++ {
@@ -872,6 +885,13 @@ func TestSpecialGlobalVariableDot(t *testing.T) {
 	}
 }
 
+func TestSpecialGlobalVariableStar(t *testing.T) {
+	toks := tokenizeClean("$*")
+	if len(toks) != 1 || toks[0].Type != DOLLAR || toks[0].Literal != "$*" {
+		t.Fatalf("expected global $* token, got %v", toks)
+	}
+}
+
 func TestSpecialGlobalVariableDoubleQuote(t *testing.T) {
 	toks := tokenizeClean(`$" = []`)
 	expected := []TokenType{DOLLAR, ASSIGN, LBRACKET, RBRACKET}
@@ -1230,6 +1250,16 @@ func TestEscapedInterpolationInString(t *testing.T) {
 	}
 	if toks[0].Literal != "value of "+EscapedHashInterpolation+"{$DEBUG}" {
 		t.Errorf("expected literal with escaped interpolation marker, got %q", toks[0].Literal)
+	}
+}
+
+func TestEscapedOpeningBraceDoesNotInterpolate(t *testing.T) {
+	toks := tokenizeClean(`"!@#\{$\}%^&**()"`)
+	if len(toks) != 1 || toks[0].Type != STRING {
+		t.Fatalf("expected one STRING token, got %v", toks)
+	}
+	if toks[0].Literal != "!@"+EscapedHashInterpolation+`{$}%^&**()` {
+		t.Fatalf("expected escaped opening brace to suppress interpolation, got %q", toks[0].Literal)
 	}
 }
 

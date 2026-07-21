@@ -82,9 +82,12 @@ type Frame struct {
 	Returned       bool
 	TraceLine      int64
 	ExecutionLine  int64
+	RetryRescue    *ActiveRescue
 }
 
 type RescueHandler struct {
+	BodyOffset      int
+	StackTop        int
 	RescueOffset    int
 	EnsureOffset    int
 	EnsureEndOffset int
@@ -93,6 +96,9 @@ type RescueHandler struct {
 }
 
 type ActiveRescue struct {
+	BodyOffset        int
+	RescueOffset      int
+	StackTop          int
 	EndOffset         int
 	EnsureOffset      int
 	EnsureEndOffset   int
@@ -108,6 +114,12 @@ type PendingEnsure struct {
 	PreviousException *object.EmeraldValue
 	ReturnValue       *object.EmeraldValue
 	IsReturn          bool
+	IsBreak           bool
+	IsNext            bool
+	IsRedo            bool
+	IsThrow           bool
+	ThrowHandler      *CatchHandler
+	BreakTarget       int
 }
 
 type CatchHandler struct {
@@ -115,6 +127,7 @@ type CatchHandler struct {
 	EndOffset int
 	Frame     *Frame
 	StackTop  int
+	VM        *VM
 }
 
 type vmExecutionContext struct {
@@ -139,6 +152,8 @@ type vmExecutionContext struct {
 	pendingReturnValue        *object.EmeraldValue
 	pendingBreakTargetID      int
 	pendingBreakValue         *object.EmeraldValue
+	completedBreakValue       *object.EmeraldValue
+	patternArrayCache         map[*object.EmeraldValue]*object.EmeraldValue
 	ensureActive              bool
 	evalReturnMode            bool
 	evalReturnPending         bool
@@ -215,6 +230,8 @@ type VM struct {
 	pendingReturnValue    *object.EmeraldValue
 	pendingBreakTargetID  int
 	pendingBreakValue     *object.EmeraldValue
+	completedBreakValue   *object.EmeraldValue
+	patternArrayCache     map[*object.EmeraldValue]*object.EmeraldValue
 	ensureActive          bool
 	evalReturnMode        bool
 	evalReturnPending     bool
@@ -222,15 +239,21 @@ type VM struct {
 
 	catchStack []*CatchHandler
 
+	escapedThrowHandler        *CatchHandler
+	escapedThrowValue          *object.EmeraldValue
+	pendingEscapedThrowHandler *CatchHandler
+	pendingEscapedThrowValue   *object.EmeraldValue
+
 	nativeSingletonMethods map[interface{}]map[string]*object.Method
 
-	freezeStringLiterals bool
-	chillStringLiterals  bool
-	sourceEncoding       string
-	frozenStringCache    map[string]*object.EmeraldValue
-	threadCoroutines     map[*object.EmeraldValue]*threadCoroutine
-	fiberCoroutines      map[*object.EmeraldValue]*fiberCoroutine
-	threadSpecialGlobals map[string]*object.EmeraldValue
+	freezeStringLiterals  bool
+	chillStringLiterals   bool
+	sourceEncoding        string
+	frozenStringCache     map[string]*object.EmeraldValue
+	threadCoroutines      map[*object.EmeraldValue]*threadCoroutine
+	fiberCoroutines       map[*object.EmeraldValue]*fiberCoroutine
+	threadSpecialGlobals  map[string]*object.EmeraldValue
+	instructionExceptions map[*Frame]*object.EmeraldValue
 }
 
 type nativeBacktraceFrame struct {
@@ -286,16 +309,17 @@ func (vm *VM) PreloadSource(source, path string) *object.EmeraldValue {
 
 func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	mainFn := &object.Function{
-		Name:           "__main__",
-		SourcePath:     core.CurrentSpecFile,
-		EvalSource:     core.CurrentEvalSource,
-		SourceEncoding: core.CurrentEvalSourceEncoding,
-		Instructions:   bytecode.Instructions,
-		LineMap:        bytecode.LineMap,
-		Constants:      bytecode.Constants,
-		NumLocals:      bytecode.NumLocals,
-		GlobalNames:    bytecode.GlobalNames,
-		LocalNames:     bytecode.LocalNames,
+		Name:               "__main__",
+		SourcePath:         core.CurrentSpecFile,
+		SourceAbsolutePath: core.CurrentSpecFileAbsolute,
+		EvalSource:         core.CurrentEvalSource,
+		SourceEncoding:     core.CurrentEvalSourceEncoding,
+		Instructions:       bytecode.Instructions,
+		LineMap:            bytecode.LineMap,
+		Constants:          bytecode.Constants,
+		NumLocals:          bytecode.NumLocals,
+		GlobalNames:        bytecode.GlobalNames,
+		LocalNames:         bytecode.LocalNames,
 	}
 
 	mainFrame := &Frame{
@@ -327,6 +351,7 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		frozenStringCache:      make(map[string]*object.EmeraldValue),
 		threadCoroutines:       make(map[*object.EmeraldValue]*threadCoroutine),
 		fiberCoroutines:        make(map[*object.EmeraldValue]*fiberCoroutine),
+		instructionExceptions:  make(map[*Frame]*object.EmeraldValue),
 		isRoot:                 parent == nil,
 	}
 	vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
@@ -394,6 +419,9 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	enumerableModule.DefineMethod("each_with_object", &object.Method{Name: "each_with_object", Fn: core.EnumerableEachWithObject, Arity: 1})
 	enumerableModule.DefineMethod("flat_map", &object.Method{Name: "flat_map", Fn: core.EnumerableFlatMap, Arity: 0})
 	enumerableModule.DefineMethod("collect_concat", &object.Method{Name: "collect_concat", Fn: core.EnumerableFlatMap, Arity: 0})
+	enumerableModule.DefineMethod("filter_map", &object.Method{Name: "filter_map", Fn: core.EnumerableFilterMap, Arity: 0})
+	enumerableModule.DefineMethod("compact", &object.Method{Name: "compact", Fn: core.EnumerableCompact, Arity: 0})
+	enumerableModule.DefineMethod("chain", &object.Method{Name: "chain", Fn: core.EnumerableChain, Arity: -1})
 	enumerableModule.DefineMethod("uniq", &object.Method{Name: "uniq", Fn: core.EnumerableUniq, Arity: 0})
 	enumerableModule.DefineMethod("take_while", &object.Method{Name: "take_while", Fn: core.EnumerableTakeWhile, Arity: 0})
 	enumerableModule.DefineMethod("drop_while", &object.Method{Name: "drop_while", Fn: core.EnumerableDropWhile, Arity: 0})
@@ -421,7 +449,20 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		vm.frozenStringCache = parent.frozenStringCache
 	} else {
 		vm.SetTopLevelConstant("ARGF", vm.rubyConsts["ARGF"])
-		vm.SetTopLevelConstant("ARGV", &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]})
+		argv := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}
+		vm.SetTopLevelConstant("ARGV", argv)
+		preloadedFeatures := make([]*object.EmeraldValue, 0, 9)
+		for _, feature := range []string{"complex.rb", "enumerator.so", "fiber.so", "rational.rb", "thread.so", "ruby2_keywords.rb", "set.rb", "pathname.so", "monitor.so"} {
+			preloadedFeatures = append(preloadedFeatures, &object.EmeraldValue{Type: object.ValueString, Data: feature, Class: core.R.Classes["String"]})
+		}
+		vm.setGlobalByName("$\"", &object.EmeraldValue{Type: object.ValueArray, Data: preloadedFeatures, Class: core.R.Classes["Array"]})
+		vm.setGlobalByName("$.", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: core.R.Classes["Integer"]})
+		if objectClass := core.R.Classes["Object"]; objectClass != nil {
+			vm.setGlobalByName("$>", objectClass.Constants["STDOUT"])
+		}
+		vm.setGlobalByName("$<", vm.rubyConsts["ARGF"])
+		vm.setGlobalByName("$$", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(os.Getpid()), Class: core.R.Classes["Integer"]})
+		vm.setGlobalByName("$*", argv)
 	}
 	if comparableValue := vm.rubyConsts["Comparable"]; comparableValue != nil && comparableValue.Type == object.ValueModule {
 		if cls := core.R.Classes["Numeric"]; cls != nil {
@@ -450,6 +491,9 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 
 	vm.stack[0] = core.R.Main
 	vm.installCoreHooks()
+	if parent == nil {
+		vm.loadPathGlobal()
+	}
 	if parent == nil && vm.getGlobalByName("$VERBOSE") == nil {
 		vm.setGlobalByName("$VERBOSE", core.R.FalseVal)
 	}
@@ -479,7 +523,7 @@ func (vm *VM) includeEnumerableInCoreClasses() {
 		return
 	}
 	enumerable := moduleVal.Data.(*object.Module)
-	for _, name := range []string{"Array", "Hash", "Range", "StringIO", "Enumerator", "Struct", "Dir", "File", "IO", "ObjectSpace::WeakMap"} {
+	for _, name := range []string{"Array", "Hash", "Range", "StringIO", "Enumerator", "Struct", "Dir", "File", "IO", "Set", "ObjectSpace::WeakMap"} {
 		class := core.R.Classes[name]
 		if class == nil {
 			continue
@@ -529,6 +573,8 @@ func (vm *VM) captureExecutionContext() vmExecutionContext {
 		pendingReturnValue:        vm.pendingReturnValue,
 		pendingBreakTargetID:      vm.pendingBreakTargetID,
 		pendingBreakValue:         vm.pendingBreakValue,
+		completedBreakValue:       vm.completedBreakValue,
+		patternArrayCache:         vm.patternArrayCache,
 		ensureActive:              vm.ensureActive,
 		evalReturnMode:            vm.evalReturnMode,
 		evalReturnPending:         vm.evalReturnPending,
@@ -567,6 +613,8 @@ func (vm *VM) restoreExecutionContext(context vmExecutionContext) {
 	vm.pendingReturnValue = context.pendingReturnValue
 	vm.pendingBreakTargetID = context.pendingBreakTargetID
 	vm.pendingBreakValue = context.pendingBreakValue
+	vm.completedBreakValue = context.completedBreakValue
+	vm.patternArrayCache = context.patternArrayCache
 	vm.ensureActive = context.ensureActive
 	vm.evalReturnMode = context.evalReturnMode
 	vm.evalReturnPending = context.evalReturnPending
@@ -920,6 +968,34 @@ func (vm *VM) handlePendingNonLocalReturn(frame *Frame) bool {
 	return true
 }
 
+func (vm *VM) handlePendingNonLocalBreak(frame *Frame) bool {
+	if frame == nil || vm.pendingBreakTargetID <= 0 || vm.pendingBreakValue == nil {
+		return false
+	}
+	for i := len(vm.pendingEnsures) - 1; i >= 0; i-- {
+		pending := vm.pendingEnsures[i]
+		if pending.Frame == frame && pending.IsBreak {
+			return false
+		}
+	}
+	value := vm.pendingBreakValue
+	if frame.ID == vm.pendingBreakTargetID {
+		vm.pendingBreakTargetID = 0
+		vm.pendingBreakValue = nil
+		vm.completedBreakValue = value
+	} else if vm.routeBreakThroughEnsure(frame, value, -1) {
+		return false
+	}
+	base := frame.Bp + 1
+	if frame.Fn != nil {
+		base += frame.Fn.NumLocals
+	}
+	vm.sp = base
+	vm.push(value)
+	frame.Returned = true
+	return true
+}
+
 func (vm *VM) pendingBreakResultForFrame(frame *Frame) (*object.EmeraldValue, bool) {
 	if frame == nil || vm.pendingBreakTargetID <= 0 || vm.pendingBreakValue == nil {
 		return nil, false
@@ -928,9 +1004,54 @@ func (vm *VM) pendingBreakResultForFrame(frame *Frame) (*object.EmeraldValue, bo
 	if frame.ID == vm.pendingBreakTargetID {
 		vm.pendingBreakTargetID = 0
 		vm.pendingBreakValue = nil
-		core.LastBlockResult = nil
+		vm.completedBreakValue = value
 	}
 	return value, true
+}
+
+func (vm *VM) consumeCompletedBreakMarker() {
+	if vm.completedBreakValue == nil {
+		return
+	}
+	if core.LastBlockResult == vm.completedBreakValue {
+		core.LastBlockResult = nil
+	}
+	vm.completedBreakValue = nil
+}
+
+func setBlockBreakOwner(block *object.EmeraldValue, ownerID int) {
+	if block == nil || ownerID <= 0 {
+		return
+	}
+	switch block.Type {
+	case object.ValueClosure:
+		closure, _ := block.Data.(*object.Closure)
+		if closure != nil && closure.BreakOwnerID == 0 {
+			closure.BreakOwnerID = ownerID
+		}
+	case object.ValueProc:
+		proc, _ := block.Data.(*object.Proc)
+		if proc != nil && proc.BreakOwnerID == 0 {
+			proc.BreakOwnerID = ownerID
+		}
+	}
+}
+
+func cloneMethodMap(methods map[string]*object.Method) map[string]*object.Method {
+	copy := make(map[string]*object.Method, len(methods))
+	for name, method := range methods {
+		copy[name] = method
+	}
+	return copy
+}
+
+func restoreMethodMap(target, snapshot map[string]*object.Method) {
+	for name := range target {
+		delete(target, name)
+	}
+	for name, method := range snapshot {
+		target[name] = method
+	}
 }
 
 func (vm *VM) installCoreHooks() {
@@ -1076,6 +1197,25 @@ func (vm *VM) installCoreHooks() {
 	core.ActiveRefinedInstanceMethod = vm.lookupActiveRefinedInstanceMethod
 	core.ActivateCurrentRefinement = vm.activateCurrentRefinement
 	core.UsingReceiverAllowed = vm.usingReceiverAllowed
+	core.CurrentModuleNesting = func() []*object.EmeraldValue {
+		values := make([]*object.EmeraldValue, 0, len(vm.classStack))
+		for index := len(vm.classStack) - 1; index >= 0; index-- {
+			value := vm.classStack[index]
+			if value != nil && (value.Type == object.ValueClass || value.Type == object.ValueModule) {
+				if len(values) > 0 && values[len(values)-1] == value {
+					continue
+				}
+				values = append(values, value)
+			}
+		}
+		return values
+	}
+	core.CurrentUsedRefinements = func() []*object.EmeraldValue {
+		if refinements, fixed := vm.currentFixedRefinements(); fixed {
+			return append([]*object.EmeraldValue(nil), refinements...)
+		}
+		return nil
+	}
 	core.CurrentCalleeName = func() string {
 		if vm.fp < 0 || vm.fp >= len(vm.frames) || vm.frames[vm.fp] == nil || vm.frames[vm.fp].MethodName == "__main__" {
 			return ""
@@ -1135,6 +1275,13 @@ func (vm *VM) installCoreHooks() {
 		}
 		return vm.callBlockWithSelf(block, self, args...)
 	}
+	core.AbortCurrentBlock = func(value *object.EmeraldValue) {
+		if vm.fp < 0 || vm.fp >= len(vm.frames) || vm.frames[vm.fp] == nil {
+			return
+		}
+		vm.frames[vm.fp].BlockBreak = true
+		vm.frames[vm.fp].BlockBreakVal = value
+	}
 	core.ClearPendingBlockControl = func() {
 		vm.pendingBreakTargetID = 0
 		vm.pendingBreakValue = nil
@@ -1143,6 +1290,35 @@ func (vm *VM) installCoreHooks() {
 			if frame != nil {
 				frame.BlockBreak = false
 				frame.BlockBreakVal = nil
+			}
+		}
+	}
+	core.BeginSpecExampleIsolation = func() func() {
+		mainObj, ok := core.R.Main.Data.(*object.Object)
+		if !ok {
+			return nil
+		}
+		singletonMethods := cloneMethodMap(mainObj.SingletonMethods)
+		var singletonClassMethods map[string]*object.Method
+		if mainObj.SingletonClass != nil {
+			singletonClassMethods = cloneMethodMap(mainObj.SingletonClass.Methods)
+		}
+		key := nativeSingletonKey(core.R.Main)
+		nativeMethods := cloneMethodMap(vm.nativeSingletonMethods[key])
+		return func() {
+			restoreMethodMap(mainObj.SingletonMethods, singletonMethods)
+			if mainObj.SingletonClass != nil {
+				restoreMethodMap(mainObj.SingletonClass.Methods, singletonClassMethods)
+			}
+			if len(nativeMethods) == 0 {
+				delete(vm.nativeSingletonMethods, key)
+			} else {
+				methods := vm.nativeSingletonMethods[key]
+				if methods == nil {
+					methods = make(map[string]*object.Method)
+					vm.nativeSingletonMethods[key] = methods
+				}
+				restoreMethodMap(methods, nativeMethods)
 			}
 		}
 	}
@@ -1188,7 +1364,11 @@ func (vm *VM) installCoreHooks() {
 	core.RequirePath = func(path string) (string, *object.EmeraldValue) {
 		return vm.requirePath(path)
 	}
+	core.RequireTriggeredByAutoload = func() bool {
+		return len(vm.autoloading) > 0
+	}
 	core.ResolveRequirePath = vm.resolveRequirePath
+	core.ResolveLoadPath = vm.resolveLoadPath
 	core.InMethodScope = func() bool {
 		if vm.fp < 0 || vm.fp >= len(vm.frames) || vm.frames[vm.fp] == nil {
 			return false
@@ -1245,7 +1425,10 @@ func (vm *VM) getGlobalByName(name string) *object.EmeraldValue {
 }
 
 func isThreadSpecialGlobal(name string) bool {
-	return name == "$_" || name == "$?"
+	if name == "$_" || name == "$?" || name == "$~" || name == "$&" || name == "$`" || name == "$'" || name == "$+" {
+		return true
+	}
+	return len(name) == 2 && name[0] == '$' && name[1] >= '1' && name[1] <= '9'
 }
 
 func (vm *VM) resolveGlobalIndex(index int) int {
@@ -1386,6 +1569,11 @@ func (vm *VM) validateGlobalAssignmentForFrame(frame *Frame, rawIndex int, resol
 			return nil, errVal
 		}
 		updateLastExceptionBacktrace(value)
+	case "$VERBOSE":
+		if value == nil || value.Type == object.ValueNil || value == core.R.FalseVal || value.Type == object.ValueBool && !value.Data.(bool) {
+			return value, nil
+		}
+		return core.R.TrueVal, nil
 	case "$~":
 		if value == nil || value.Type == object.ValueNil || value.Type == object.ValueMatchData {
 			return value, nil
@@ -1455,12 +1643,16 @@ func updateLastExceptionBacktrace(value *object.EmeraldValue) {
 	}
 	if value == nil || value.Type == object.ValueNil {
 		exc.Backtrace = nil
+		exc.BacktraceValue = nil
 		exc.Locations = nil
+		exc.LocationsValue = nil
 		return
 	}
 	if value.Type == object.ValueString {
 		exc.Backtrace = []string{value.Data.(string)}
+		exc.BacktraceValue = &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{value}, Class: core.R.Classes["Array"]}
 		exc.Locations = nil
+		exc.LocationsValue = nil
 		return
 	}
 	if value.Type != object.ValueArray {
@@ -1480,7 +1672,9 @@ func updateLastExceptionBacktrace(value *object.EmeraldValue) {
 		}
 	}
 	exc.Backtrace = backtrace
+	exc.BacktraceValue = value
 	exc.Locations = locations
+	exc.LocationsValue = nil
 }
 
 func (vm *VM) coerceGlobalLineNumber(value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
@@ -1515,8 +1709,28 @@ func (vm *VM) receiverCanBeStdout(receiver *object.EmeraldValue) bool {
 		classInheritsFrom(receiver.Class, core.R.Classes["StringIO"]) {
 		return true
 	}
-	if obj, ok := receiver.Data.(*object.Object); ok && obj.SingletonClass != nil {
-		if _, ok := obj.SingletonClass.GetMethod("write"); ok {
+	if receiver.Class != nil {
+		if method, owner, ok := receiver.Class.GetMethodWithOwner("write"); ok && method != nil && owner != core.R.Classes["Object"] && method.Visibility != "private" {
+			return true
+		}
+	}
+	if obj, ok := receiver.Data.(*object.Object); ok && obj != nil {
+		if method := obj.SingletonMethods["write"]; method != nil && method.Visibility != "private" {
+			return true
+		}
+		if obj.SingletonClass != nil {
+			if method, ok := obj.SingletonClass.GetMethod("write"); ok && method != nil && method.Visibility != "private" {
+				return true
+			}
+		}
+	}
+	if methods := vm.nativeSingletonMethods[nativeSingletonKey(receiver)]; methods != nil {
+		if method := methods["write"]; method != nil && method.Visibility != "private" {
+			return true
+		}
+	}
+	if singletonClass := core.AttachedSingletonClass(receiver); singletonClass != nil {
+		if method, _, ok := singletonClass.GetMethodWithOwner("write"); ok && method != nil && method.Visibility != "private" {
 			return true
 		}
 	}
@@ -1546,21 +1760,47 @@ func (vm *VM) loadedFeaturesGlobal() *object.EmeraldValue {
 
 func (vm *VM) loadPathGlobal() *object.EmeraldValue {
 	if value := vm.getGlobalByName("$:"); value != nil && value.Type == object.ValueArray {
-		return value
+		return ensureDefaultLoadPathMetadata(value)
 	}
 	if value := vm.getGlobalByName("$LOAD_PATH"); value != nil && value.Type == object.ValueArray {
-		return value
+		return ensureDefaultLoadPathMetadata(value)
 	}
 	if value := vm.getGlobalByName("$-I"); value != nil && value.Type == object.ValueArray {
-		return value
+		return ensureDefaultLoadPathMetadata(value)
 	}
+	siteLib := &object.EmeraldValue{Type: object.ValueString, Data: "/tmp", Class: core.R.Classes["String"]}
+	core.SetDynamicInstanceVar(siteLib, "@gem_prelude_index", core.R.TrueVal)
 	entries := []*object.EmeraldValue{
 		{Type: object.ValueString, Data: "lib", Class: core.R.Classes["String"]},
+		siteLib,
 	}
 	value := &object.EmeraldValue{Type: object.ValueArray, Data: entries, Class: core.R.Classes["Array"]}
 	vm.setGlobalByName("$:", value)
 	vm.setGlobalByName("$LOAD_PATH", value)
 	vm.setGlobalByName("$-I", value)
+	return value
+}
+
+func ensureDefaultLoadPathMetadata(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value.Type != object.ValueArray {
+		return value
+	}
+	entries := value.Data.([]*object.EmeraldValue)
+	siteIndex := -1
+	for index, entry := range entries {
+		if entry != nil && entry.Type == object.ValueString && entry.Data == "/tmp" {
+			siteIndex = index
+			break
+		}
+	}
+	if siteIndex < 0 {
+		entries = append(entries, &object.EmeraldValue{Type: object.ValueString, Data: "/tmp", Class: core.R.Classes["String"]})
+		value.Data = entries
+		siteIndex = len(entries) - 1
+	}
+	for _, entry := range entries[siteIndex:] {
+		core.SetDynamicInstanceVar(entry, "@gem_prelude_index", core.R.TrueVal)
+	}
 	return value
 }
 
@@ -1584,6 +1824,9 @@ func (vm *VM) currentExceptionBacktraceGlobal() *object.EmeraldValue {
 	exc, ok := core.LastException.Data.(*object.RException)
 	if !ok || exc == nil {
 		return core.R.NilVal
+	}
+	if exc.BacktraceValue != nil {
+		return exc.BacktraceValue
 	}
 	if len(exc.Backtrace) == 0 && len(exc.Locations) == 0 {
 		exc.Locations = vm.currentBacktraceFrames()
@@ -1624,11 +1867,12 @@ func (vm *VM) Run() error {
 		op := compiler.Opcode(instructions[frame.Ip])
 		vm.fireTracePointLine(frame, op)
 
+		vm.instructionExceptions[frame] = core.LastException
 		err := vm.execute(op, frame)
 		if err != nil {
 			return err
 		}
-		if vm.handlePendingNonLocalReturn(frame) || frame.Returned {
+		if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
 			break
 		}
 		if vm.sp > frame.Bp {
@@ -1658,6 +1902,9 @@ func (vm *VM) endActiveRescue(frame *Frame) {
 		return
 	}
 	vm.activeRescues = vm.activeRescues[:len(vm.activeRescues)-1]
+	if frame.RetryRescue == active {
+		frame.RetryRescue = nil
+	}
 	core.LastException = active.PreviousException
 }
 
@@ -1670,6 +1917,9 @@ func (vm *VM) endInnermostActiveRescue(frame *Frame) {
 		return
 	}
 	vm.activeRescues = vm.activeRescues[:len(vm.activeRescues)-1]
+	if frame.RetryRescue == active {
+		frame.RetryRescue = nil
+	}
 	core.LastException = active.PreviousException
 }
 
@@ -1679,6 +1929,9 @@ func (vm *VM) endActiveRescuesForFrame(frame *Frame) {
 			continue
 		}
 		core.LastException = vm.activeRescues[i].PreviousException
+		if frame.RetryRescue == vm.activeRescues[i] {
+			frame.RetryRescue = nil
+		}
 		vm.activeRescues = append(vm.activeRescues[:i], vm.activeRescues[i+1:]...)
 	}
 }
@@ -1761,8 +2014,11 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 	core.FireTracePointScriptCompiled(vm.currentFrameBinding(), source)
 
 	parent := CurrentVM
-	child := newVM(c.Bytecode(), vm)
-	child.freezeStringLiterals, child.chillStringLiterals = evalSourceStringLiteralMode(source)
+	frozenStrings, chilledStrings := evalSourceStringLiteralMode(source)
+	bytecode := c.Bytecode()
+	annotateStringLiteralMode(bytecode.Constants, frozenStrings, chilledStrings)
+	child := newVM(bytecode, vm)
+	child.freezeStringLiterals, child.chillStringLiterals = frozenStrings, chilledStrings
 	child.sourceEncoding = childEncoding
 	previousSourceEncoding := core.CurrentEvalSourceEncoding
 	core.CurrentEvalSourceEncoding = childEncoding
@@ -1771,6 +2027,17 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 	runErr := child.Run()
 	core.SetCurrentMethodVisibility(visibilityTarget, previousVisibility)
 	core.CurrentEvalSourceEncoding = previousSourceEncoding
+	if child.escapedThrowHandler != nil {
+		if parent != nil {
+			parent.installCoreHooks()
+		}
+		vm.pendingEscapedThrowHandler = child.escapedThrowHandler
+		vm.pendingEscapedThrowValue = child.escapedThrowValue
+		if child.escapedThrowValue != nil {
+			return child.escapedThrowValue
+		}
+		return core.R.NilVal
+	}
 	if runErr != nil {
 		if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
 			fmt.Printf("RGO_DEBUG_REQUIRE eval runtime error=%v\n", runErr)
@@ -1903,11 +2170,22 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	}
 	core.FireTracePointScriptCompiled(binding, source)
 
-	child := newVM(c.Bytecode(), vm)
+	frozenStrings, chilledStrings := evalSourceStringLiteralMode(source)
+	bytecode := c.Bytecode()
+	annotateStringLiteralMode(bytecode.Constants, frozenStrings, chilledStrings)
+	child := newVM(bytecode, vm)
 	child.evalReturnMode = true
 	if binding != nil {
+		child.frames[0].Fn.EvalInheritedLocals = len(binding.LocalNames)
 		child.currentBlock = binding.Block
 		child.frames[0].LabelName = binding.BacktraceLabel
+		if len(binding.Refinements) > 0 {
+			child.frames[0].Closure = &object.Closure{
+				Fn:               child.frames[0].Fn,
+				Refinements:      append([]*object.EmeraldValue(nil), binding.Refinements...),
+				RefinementsFixed: true,
+			}
+		}
 	}
 	if binding != nil {
 		applyEvalLineOffset(child.frames[0].Fn, binding.Line)
@@ -1916,7 +2194,7 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	if binding != nil && binding.ClassVarScope != nil {
 		child.instanceExecClassVarScope = binding.ClassVarScope
 	}
-	child.freezeStringLiterals, child.chillStringLiterals = evalSourceStringLiteralMode(source)
+	child.freezeStringLiterals, child.chillStringLiterals = frozenStrings, chilledStrings
 	child.sourceEncoding = core.CurrentEvalSourceEncoding
 	localSlots := bindingLocalSlots(child)
 	child.stack[0] = childSelf
@@ -1929,6 +2207,14 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	previousVisibility := core.CurrentMethodVisibilityMode(visibilityTarget)
 	runErr := child.Run()
 	core.SetCurrentMethodVisibility(visibilityTarget, previousVisibility)
+	if child.escapedThrowHandler != nil {
+		vm.pendingEscapedThrowHandler = child.escapedThrowHandler
+		vm.pendingEscapedThrowValue = child.escapedThrowValue
+		if child.escapedThrowValue != nil {
+			return child.escapedThrowValue
+		}
+		return core.R.NilVal
+	}
 	if runErr == nil {
 		if child.sp > 0 {
 			top := child.stack[child.sp-1]
@@ -1975,33 +2261,35 @@ func definitionVisibilityTarget(classStack []*object.EmeraldValue) *object.Emera
 }
 
 func applyEvalLineOffset(fn *object.Function, startLine int64) {
-	if fn == nil || startLine <= 0 {
+	if fn == nil {
 		return
 	}
+	delta := int(startLine) - 1
+	offsetEvalFunctionLines(fn, delta, map[*object.Function]bool{})
+}
+
+func offsetEvalFunctionLines(fn *object.Function, delta int, seen map[*object.Function]bool) {
+	if fn == nil || seen[fn] {
+		return
+	}
+	seen[fn] = true
 	if len(fn.LineMap) == 0 {
-		fn.LineMap = map[int]int{0: int(startLine)}
-		return
-	}
-	minLine := 0
-	for _, line := range fn.LineMap {
-		if line <= 0 {
-			continue
-		}
-		if minLine == 0 || line < minLine {
-			minLine = line
-		}
-	}
-	if minLine == 0 {
-		fn.LineMap[0] = int(startLine)
-		return
-	}
-	delta := int(startLine) - minLine
-	if delta == 0 {
-		return
+		fn.LineMap = map[int]int{0: 1}
 	}
 	for pos, line := range fn.LineMap {
 		if line > 0 {
 			fn.LineMap[pos] = line + delta
+		}
+	}
+	if fn.DefinitionLine > 0 {
+		fn.DefinitionLine += int64(delta)
+	}
+	for _, constant := range fn.Constants {
+		if constant == nil || constant.Type != object.ValueFunction {
+			continue
+		}
+		if nested, ok := constant.Data.(*object.Function); ok {
+			offsetEvalFunctionLines(nested, delta, seen)
 		}
 	}
 }
@@ -2050,6 +2338,28 @@ func evalSourceStringLiteralMode(source string) (bool, bool) {
 		}
 	}
 	return false, true
+}
+
+func annotateStringLiteralMode(constants []*object.EmeraldValue, frozen, chilled bool) {
+	seen := make(map[*object.Function]bool)
+	var annotate func([]*object.EmeraldValue)
+	annotate = func(values []*object.EmeraldValue) {
+		for _, value := range values {
+			if value == nil || value.Type != object.ValueFunction {
+				continue
+			}
+			fn, ok := value.Data.(*object.Function)
+			if !ok || fn == nil || seen[fn] {
+				continue
+			}
+			seen[fn] = true
+			fn.StringLiteralModeSet = true
+			fn.FreezeStringLiterals = frozen
+			fn.ChillStringLiterals = chilled
+			annotate(fn.Constants)
+		}
+	}
+	annotate(constants)
 }
 
 type dynamicSyntaxContext struct {
@@ -3467,12 +3777,17 @@ func (vm *VM) resolveRequirePath(path string) string {
 		entries := core.GetGlobalVariable("$LOAD_PATH")
 		if entries != nil && entries.Type == object.ValueArray {
 			for _, entry := range entries.Data.([]*object.EmeraldValue) {
-				epath, ok := entry.Data.(string)
-				if !ok {
+				epath, errValue := core.CoercePathValue(entry)
+				if errValue != nil {
 					continue
 				}
 				if canonical, err := filepath.EvalSymlinks(epath); err == nil {
 					epath = canonical
+				}
+				if !filepath.IsAbs(epath) {
+					if absolute, err := filepath.Abs(epath); err == nil {
+						epath = absolute
+					}
 				}
 				addRequireCandidates(filepath.Join(epath, requestPath))
 			}
@@ -3490,6 +3805,52 @@ func (vm *VM) resolveRequirePath(path string) string {
 		return candidate
 	}
 
+	return ""
+}
+
+func (vm *VM) resolveLoadPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	requestPath := filepath.FromSlash(strings.ReplaceAll(path, "\\", "/"))
+	if requestPath == "~" || strings.HasPrefix(requestPath, "~"+string(filepath.Separator)) {
+		home, _ := core.EnvString("HOME")
+		if home == "" {
+			home = os.Getenv("HOME")
+		}
+		if home != "" {
+			if requestPath == "~" {
+				requestPath = home
+			} else {
+				requestPath = filepath.Join(home, strings.TrimPrefix(requestPath, "~"+string(filepath.Separator)))
+			}
+		}
+	}
+
+	candidates := make([]string, 0)
+	if !filepath.IsAbs(requestPath) && !strings.HasPrefix(requestPath, "."+string(filepath.Separator)) && !strings.HasPrefix(requestPath, ".."+string(filepath.Separator)) {
+		entries := core.GetGlobalVariable("$LOAD_PATH")
+		if entries != nil && entries.Type == object.ValueArray {
+			for _, entry := range entries.Data.([]*object.EmeraldValue) {
+				entryPath, errValue := core.CoercePathValue(entry)
+				if errValue == nil {
+					if !filepath.IsAbs(entryPath) {
+						if absolute, err := filepath.Abs(entryPath); err == nil {
+							entryPath = absolute
+						}
+					}
+					candidates = append(candidates, filepath.Join(entryPath, requestPath))
+				}
+			}
+		}
+	}
+	candidates = append(candidates, requestPath)
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
 	return ""
 }
 
@@ -3516,9 +3877,15 @@ func (vm *VM) requirePath(path string) (string, *object.EmeraldValue) {
 	}
 
 	previousSpecFile := core.CurrentSpecFile
+	previousSpecFileAbsolute := core.CurrentSpecFileAbsolute
 	core.CurrentSpecFile = candidate
+	core.CurrentSpecFileAbsolute = candidate
+	if realPath, err := filepath.EvalSymlinks(candidate); err == nil {
+		core.CurrentSpecFileAbsolute = realPath
+	}
 	defer func() {
 		core.CurrentSpecFile = previousSpecFile
+		core.CurrentSpecFileAbsolute = previousSpecFileAbsolute
 	}()
 	content, err := os.ReadFile(candidate)
 	if err != nil {
@@ -3539,6 +3906,12 @@ func (vm *VM) requirePath(path string) (string, *object.EmeraldValue) {
 
 func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.EmeraldValue {
 	if value != nil && (value.Type == object.ValueString || value.Type == object.ValueSymbol) {
+		freezeStringLiterals := vm.freezeStringLiterals
+		chillStringLiterals := vm.chillStringLiterals
+		if frame != nil && frame.Fn != nil && frame.Fn.StringLiteralModeSet {
+			freezeStringLiterals = frame.Fn.FreezeStringLiterals
+			chillStringLiterals = frame.Fn.ChillStringLiterals
+		}
 		encoding := vm.sourceEncoding
 		if frame != nil && frame.Fn != nil && frame.Fn.SourceEncoding != "" {
 			encoding = frame.Fn.SourceEncoding
@@ -3546,7 +3919,7 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 		if value.Encoding != "" {
 			encoding = value.Encoding
 		}
-		if value.Type == object.ValueString && vm.freezeStringLiterals {
+		if value.Type == object.ValueString && freezeStringLiterals {
 			if encoding != "" {
 				core.SetStringEncoding(value, encoding)
 			}
@@ -3561,7 +3934,7 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 		} else if value.Type == object.ValueString {
 			mutable := *value
 			mutable.Frozen = false
-			mutable.Chilled = vm.chillStringLiterals
+			mutable.Chilled = chillStringLiterals
 			mutable.Literal = true
 			result := &mutable
 			if encoding != "" {
@@ -3620,6 +3993,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		vm.push(boolValue(matched))
+
+	case compiler.OpPatternCacheClear:
+		if vm.readUint8() == 0 {
+			vm.patternArrayCache = nil
+		} else if vm.patternArrayCache == nil {
+			vm.patternArrayCache = make(map[*object.EmeraldValue]*object.EmeraldValue)
+		} else {
+			clear(vm.patternArrayCache)
+		}
 
 	case compiler.OpRaiseNoMatchingPattern:
 		target := vm.pop()
@@ -3731,6 +4113,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpBang:
 		val := vm.pop()
 		result := vm.bang(val)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
 		vm.push(result)
 
 	case compiler.OpEqual:
@@ -3749,12 +4134,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.push(result)
 			break
 		}
-		result := vm.equals(left, right)
-		if result.Type == object.ValueBool && result.Data == true {
-			vm.push(core.R.FalseVal)
-		} else {
-			vm.push(core.R.TrueVal)
+		result := vm.send(left, "!=", []*object.EmeraldValue{right})
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
 		}
+		vm.push(result)
 
 	case compiler.OpGreaterThan:
 		right := vm.pop()
@@ -3913,6 +4297,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			frame.Ip = pos - 1
 		}
 
+	case compiler.OpFlipFlopGet:
+		stateID := vm.readUint16()
+		vm.push(boolValue(vm.flipFlopState(frame, stateID)))
+
+	case compiler.OpFlipFlopSet:
+		stateID := vm.readUint16()
+		active := vm.readUint8() == 1
+		vm.setFlipFlopState(frame, stateID, active)
+
 	case compiler.OpJumpLocalPresent:
 		idx := vm.readUint8()
 		pos := vm.readUint16()
@@ -3937,12 +4330,18 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		})
 
 	case compiler.OpArrayAppend:
-		splat := vm.readUint8() == 1
+		splatMode := vm.readUint8()
 		value := vm.pop()
 		array := vm.pop()
 		elements := array.Data.([]*object.EmeraldValue)
-		if splat {
-			expanded, err := vm.toAryForSplat(value)
+		if splatMode != 0 {
+			var expanded []*object.EmeraldValue
+			var err *object.EmeraldValue
+			if splatMode == 2 {
+				expanded, err = vm.toAForAssignmentSplat(value)
+			} else {
+				expanded, err = vm.toAryForSplat(value)
+			}
 			if err != nil {
 				if vm.raiseException(frame, err) {
 					return nil
@@ -3979,6 +4378,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Data:  h,
 			Class: core.R.Classes["Hash"],
 		})
+
+	case compiler.OpMarkKeywordHash:
+		value := vm.pop()
+		core.MarkRuby2KeywordHash(value)
+		vm.push(value)
 
 	case compiler.OpIndex:
 		index := vm.pop()
@@ -4021,6 +4425,35 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		result := vm.indexAssign(left, index, assigned)
+		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
+			return nil
+		}
+		vm.push(assigned)
+
+	case compiler.OpIndexSplatCompoundAssign:
+		methodIdx := vm.readUint16()
+		method, _ := constants[methodIdx].Data.(string)
+		right := vm.pop()
+		splat := vm.pop()
+		left := vm.pop()
+		indexes, errVal := vm.toAryForSplat(splat)
+		if errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		current := vm.send(left, "[]", indexes)
+		if shouldPropagateExceptionValue(current) && vm.raiseException(frame, current) {
+			return nil
+		}
+		assigned := vm.send(current, method, []*object.EmeraldValue{right})
+		if shouldPropagateExceptionValue(assigned) && vm.raiseException(frame, assigned) {
+			return nil
+		}
+		setterArgs := append(append([]*object.EmeraldValue(nil), indexes...), assigned)
+		result := vm.send(left, "[]=", setterArgs)
 		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
@@ -4069,7 +4502,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		resolvedName := core.ResolveGlobalAlias(rawName)
 		threadSpecial := vm.threadSpecialGlobals != nil && isThreadSpecialGlobal(resolvedName)
 		var val *object.EmeraldValue
-		if threadSpecial {
+		if resolvedName == "$!" {
+			val = core.LastException
+		} else if resolvedName == "$@" {
+			val = vm.currentExceptionBacktraceGlobal()
+		} else if threadSpecial {
 			val = vm.threadSpecialGlobals[resolvedName]
 		} else {
 			val = vm.globals[idx]
@@ -4754,7 +5191,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		case 1:
 			block, blockErr = vm.normalizeBlockPass(derefClosureValue(vm.pop()))
 		case 2:
-			block = prevBlock
+			block = vm.yieldBlock()
 		}
 		if blockErr != nil {
 			if vm.raiseException(frame, blockErr) {
@@ -4782,7 +5219,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		if isKeywordSend && len(args) > 0 {
 			last := args[len(args)-1]
-			if last != nil && last.Type == object.ValueHash {
+			if last == nil || last.Type == object.ValueNil {
+				args = args[:len(args)-1]
+			} else if last.Type == object.ValueHash {
 				last = copyKeywordHash(last)
 				args[len(args)-1] = last
 				core.MarkRuby2KeywordHash(last)
@@ -4828,6 +5267,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			implicitIdentifierCause = core.LastException
 		}
 		result := vm.send(receiver, methodName, args)
+		if vm.pendingEscapedThrowHandler != nil {
+			handler := vm.pendingEscapedThrowHandler
+			value := vm.pendingEscapedThrowValue
+			vm.pendingEscapedThrowHandler = nil
+			vm.pendingEscapedThrowValue = nil
+			vm.currentBlock = prevBlock
+			if vm.routeThrowThroughEnsure(frame, handler, value) {
+				return nil
+			}
+			vm.completeThrow(frame, handler, value)
+			return nil
+		}
+		vm.consumeCompletedBreakMarker()
 		vm.currentBlock = prevBlock
 		if vm.threadDepth > 0 && core.IsThreadBlockedResult(result) {
 			vm.push(result)
@@ -4860,7 +5312,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpBreak:
 		val := core.R.NilVal
 		if frame.WhileEnd >= 0 {
+			if vm.routeBreakThroughEnsure(frame, val, frame.WhileEnd) {
+				return nil
+			}
 			frame.Ip = frame.WhileEnd - 1
+			return nil
+		}
+		if vm.routeBreakThroughEnsure(frame, val, 0) {
 			return nil
 		}
 		frame.BlockBreak = true
@@ -4876,13 +5334,22 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			val = vm.pop()
 		}
 		if target > 0 {
+			if vm.routeBreakThroughEnsure(frame, val, int(target)) {
+				return nil
+			}
 			vm.push(val)
 			frame.Ip = target - 1
 			return nil
 		}
 		if frame.WhileEnd >= 0 {
+			if vm.routeBreakThroughEnsure(frame, val, frame.WhileEnd) {
+				return nil
+			}
 			vm.push(val)
 			frame.Ip = frame.WhileEnd - 1
+			return nil
+		}
+		if vm.routeBreakThroughEnsure(frame, val, 0) {
 			return nil
 		}
 		frame.BlockBreak = true
@@ -4892,9 +5359,18 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		return nil
 
 	case compiler.OpNext:
+		target := int(vm.readUint16())
 		val := core.R.NilVal
 		if vm.sp > frame.Bp {
 			val = vm.pop()
+		}
+		if vm.routeNextThroughEnsure(frame, val, target) {
+			return nil
+		}
+		if target > 0 {
+			vm.push(val)
+			frame.Ip = target - 1
+			return nil
 		}
 		frame.BlockNextVal = val
 		frame.Ip = len(frame.Fn.Instructions) - 1
@@ -4914,6 +5390,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		frame.BlockBreakAddr = int(target)
 
 	case compiler.OpRedo:
+		if vm.routeRedoThroughEnsure(frame) {
+			return nil
+		}
 		frame.Ip = -1
 		vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
 
@@ -5272,15 +5751,29 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			class.SuperClass = core.R.Classes["Object"]
 			class.SuperClassSet = !hasExplicitSuperclass
 		}
+		if hasExplicitSuperclass && !class.SuperClassSet && vm.sp > 0 {
+			if superValue := vm.peek(0); superValue != nil && superValue.Type == object.ValueClass {
+				class.SuperClass = superValue.Data.(*object.Class)
+			}
+		}
 
 		classVal := &object.EmeraldValue{
 			Type:  object.ValueClass,
 			Data:  class,
 			Class: core.R.Classes["Class"],
 		}
-		if container := vm.currentConstantContainer(); !absolute && container != nil && !strings.Contains(name, "::") {
+		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); !absolute && ok {
+			qualifiedName := qualifiedConstantName(container, constName)
+			class.Name = qualifiedName
+			defineConstantOn(container, constName, classVal)
+			vm.rubyConsts[qualifiedName] = classVal
+		} else if container := vm.currentConstantContainer(); !absolute && container != nil && !strings.Contains(name, "::") {
+			qualifiedName := qualifiedConstantName(container, name)
+			if class.Name == "" || class.Name == name {
+				class.Name = qualifiedName
+			}
 			defineConstantOn(container, name, classVal)
-			vm.rubyConsts[qualifiedConstantName(container, name)] = classVal
+			vm.rubyConsts[qualifiedName] = classVal
 		} else if container, constName, ok := vm.lexicalQualifiedConstantContainer(name); !absolute && ok {
 			qualifiedName := qualifiedConstantName(container, constName)
 			if class.Name == "" || class.Name == name {
@@ -5294,9 +5787,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		} else if _, _, scoped := vm.scopedLocalConstantContainer(frame, name); !scoped {
 			vm.rubyConsts[name] = classVal
 			vm.SetTopLevelConstant(name, classVal)
-		}
-		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); !absolute && ok {
-			defineConstantOn(container, constName, classVal)
 		}
 		vm.classStack = append(vm.classStack, classVal)
 		vm.push(classVal)
@@ -5516,6 +6006,43 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.push(prepared)
 
+	case compiler.OpMultiAssignExtract:
+		kind := int(vm.readUint8())
+		index := int(vm.readUint8())
+		preCount := int(vm.readUint8())
+		postCount := int(vm.readUint8())
+		array := vm.pop()
+		values := array.Data.([]*object.EmeraldValue)
+		switch kind {
+		case 1:
+			start := preCount
+			if start > len(values) {
+				start = len(values)
+			}
+			end := len(values) - postCount
+			if end < start {
+				end = start
+			}
+			vm.push(vm.arrayValue(append([]*object.EmeraldValue(nil), values[start:end]...)...))
+		case 2:
+			start := len(values) - postCount
+			if start < preCount {
+				start = preCount
+			}
+			position := start + index
+			if position >= 0 && position < len(values) {
+				vm.push(values[position])
+			} else {
+				vm.push(core.R.NilVal)
+			}
+		default:
+			if index >= 0 && index < len(values) {
+				vm.push(values[index])
+			} else {
+				vm.push(core.R.NilVal)
+			}
+		}
+
 	case compiler.OpMultiAssignCheckToAry:
 		val := vm.pop()
 		if err := vm.checkMultiAssignToAry(val); err != nil {
@@ -5720,7 +6247,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		var block *object.EmeraldValue
 		if blockArg&1 != 0 {
-			block = derefClosureValue(vm.pop())
+			var blockErr *object.EmeraldValue
+			block, blockErr = vm.normalizeBlockPass(derefClosureValue(vm.pop()))
+			if blockErr != nil {
+				if vm.raiseException(frame, blockErr) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, blockErr)
+				return nil
+			}
+		}
+		forwardedBlock := block
+		if blockArg&1 == 0 {
+			forwardedBlock = superFrame.Block
 		}
 
 		args := make([]*object.EmeraldValue, int(numArgs))
@@ -5832,7 +6371,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 		if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+			prevBlock := vm.currentBlock
+			vm.currentBlock = forwardedBlock
 			result := fn(self, args...)
+			vm.currentBlock = prevBlock
 			vm.push(result)
 			return nil
 		}
@@ -5840,11 +6382,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if fn, ok := methodObj.Fn.(*object.Function); ok {
 			oldFrame := vm.frames[vm.fp]
 			prevBlock := vm.currentBlock
-			if blockArg&1 != 0 {
-				vm.currentBlock = block
-			} else {
-				vm.currentBlock = nil
-			}
+			vm.currentBlock = forwardedBlock
 			defer func() {
 				vm.currentBlock = prevBlock
 			}()
@@ -5891,6 +6429,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			if blockParamProc != nil && blockParamProc.BreakOwnerID == 0 {
 				blockParamProc.BreakOwnerID = newFrame.ID
 			}
+			setBlockBreakOwner(vm.currentBlock, newFrame.ID)
 			vm.frames = append(vm.frames, newFrame)
 			vm.fp++
 
@@ -5900,10 +6439,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				curFrame.Ip++
 				op := compiler.Opcode(instructions[curFrame.Ip])
 				vm.fireTracePointLine(curFrame, op)
+				vm.instructionExceptions[curFrame] = core.LastException
 				if err := vm.execute(op, curFrame); err != nil {
 					break
 				}
-				if vm.handlePendingNonLocalReturn(curFrame) || curFrame.Returned {
+				if vm.handlePendingNonLocalReturn(curFrame) || vm.handlePendingNonLocalBreak(curFrame) || curFrame.Returned {
 					break
 				}
 				curFrame = vm.frames[vm.fp]
@@ -5923,9 +6463,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			vm.sp = bp
 			vm.endActiveRescuesForFrame(curFrame)
+			delete(vm.instructionExceptions, curFrame)
 			vm.frames = vm.frames[:vm.fp]
 			vm.fp--
 			vm.frames[vm.fp] = oldFrame
+			vm.consumeCompletedBreakMarker()
 			vm.push(result)
 			return nil
 		}
@@ -6101,6 +6643,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		ensureEndOffset := vm.readUint16()
 
 		handler := &RescueHandler{
+			BodyOffset:      frame.Ip + 1,
+			StackTop:        vm.sp,
 			RescueOffset:    rescueOffset,
 			EnsureOffset:    ensureOffset,
 			EndOffset:       endOffset,
@@ -6108,6 +6652,34 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			Frame:           frame,
 		}
 		vm.rescueStack = append(vm.rescueStack, handler)
+
+	case compiler.OpRetry:
+		var active *ActiveRescue
+		if len(vm.activeRescues) > 0 {
+			active = vm.activeRescues[len(vm.activeRescues)-1]
+		}
+		if active == nil || active.Frame != frame {
+			active = frame.RetryRescue
+		}
+		if active == nil || active.Frame != frame {
+			return fmt.Errorf("Invalid retry")
+		}
+		if len(vm.activeRescues) > 0 && vm.activeRescues[len(vm.activeRescues)-1] == active {
+			vm.activeRescues = vm.activeRescues[:len(vm.activeRescues)-1]
+		}
+		frame.RetryRescue = nil
+		core.LastException = active.PreviousException
+		vm.sp = active.StackTop
+		vm.rescueStack = append(vm.rescueStack, &RescueHandler{
+			BodyOffset:      active.BodyOffset,
+			StackTop:        active.StackTop,
+			RescueOffset:    active.RescueOffset,
+			EnsureOffset:    active.EnsureOffset,
+			EnsureEndOffset: active.EnsureEndOffset,
+			EndOffset:       active.EndOffset,
+			Frame:           frame,
+		})
+		frame.Ip = active.BodyOffset - 1
 
 	case compiler.OpEndRescue:
 		vm.endActiveRescue(frame)
@@ -6127,6 +6699,61 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.pendingEnsures = vm.pendingEnsures[:len(vm.pendingEnsures)-1]
 		vm.ensureActive = false
 		core.LastException = pending.PreviousException
+		if pending.IsRedo {
+			if vm.routeRedoThroughEnsure(frame) {
+				return nil
+			}
+			frame.Ip = -1
+			vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+			return nil
+		}
+		if pending.IsThrow {
+			if vm.routeThrowThroughEnsure(frame, pending.ThrowHandler, pending.ReturnValue) {
+				return nil
+			}
+			vm.completeThrow(frame, pending.ThrowHandler, pending.ReturnValue)
+			return nil
+		}
+		if pending.IsNext {
+			if vm.routeNextThroughEnsure(frame, pending.ReturnValue, pending.BreakTarget) {
+				return nil
+			}
+			if pending.BreakTarget > 0 {
+				vm.push(pending.ReturnValue)
+				frame.Ip = pending.BreakTarget - 1
+				return nil
+			}
+			frame.BlockNextVal = pending.ReturnValue
+			frame.Ip = len(frame.Fn.Instructions) - 1
+			vm.sp = frame.Bp
+			core.ForEachMarkNext()
+			return nil
+		}
+		if pending.IsBreak {
+			if vm.routeBreakThroughEnsure(frame, pending.ReturnValue, pending.BreakTarget) {
+				return nil
+			}
+			if pending.BreakTarget < 0 {
+				base := frame.Bp + 1
+				if frame.Fn != nil {
+					base += frame.Fn.NumLocals
+				}
+				vm.sp = base
+				vm.push(pending.ReturnValue)
+				frame.Returned = true
+				return nil
+			}
+			if pending.BreakTarget > 0 {
+				vm.push(pending.ReturnValue)
+				frame.Ip = pending.BreakTarget - 1
+				return nil
+			}
+			frame.BlockBreak = true
+			frame.BlockBreakVal = pending.ReturnValue
+			vm.sp = frame.Bp
+			vm.push(pending.ReturnValue)
+			return nil
+		}
 		if pending.IsReturn {
 			if vm.routeReturnThroughEnsure(frame, pending.ReturnValue) {
 				return nil
@@ -6257,6 +6884,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			EndOffset: endOffset,
 			Frame:     frame,
 			StackTop:  vm.sp,
+			VM:        vm,
 		}
 		vm.catchStack = append(vm.catchStack, handler)
 
@@ -6270,29 +6898,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			label = vm.pop()
 		}
 
-		for i := len(vm.catchStack) - 1; i >= 0; i-- {
-			handler := vm.catchStack[i]
-			if handler.Label != nil && throwLabelsMatch(handler.Label, label) {
-				vm.catchStack = vm.catchStack[:i]
-				for rescueIndex := len(vm.activeRescues) - 1; rescueIndex >= 0; rescueIndex-- {
-					active := vm.activeRescues[rescueIndex]
-					if active.Frame == frame && frame.Ip < active.EndOffset && handler.EndOffset >= active.EndOffset {
-						vm.activeRescues = append(vm.activeRescues[:rescueIndex], vm.activeRescues[rescueIndex+1:]...)
-					}
-				}
-				core.LastException = nil
-				core.LastRaisedResult = nil
-				vm.sp = handler.StackTop
-				if value != nil {
-					vm.push(value)
-				}
-				handler.Frame.Ip = handler.EndOffset - 1
-				if handler.Frame != frame {
-					frame.BlockBreak = true
-					frame.BlockBreakVal = value
-				}
+		if handler := vm.matchingCatchHandler(label); handler != nil {
+			if vm.routeThrowThroughEnsure(frame, handler, value) {
 				return nil
 			}
+			vm.completeThrow(frame, handler, value)
+			return nil
 		}
 		exception := core.NewUncaughtThrowError(label, value)
 		if vm.raiseException(frame, exception) {
@@ -6788,14 +7399,10 @@ func (vm *VM) negate(val *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func (vm *VM) bang(val *object.EmeraldValue) *object.EmeraldValue {
-	switch v := val.Data.(type) {
-	case bool:
-		if v {
-			return core.R.FalseVal
-		}
-		return core.R.TrueVal
+	if val != nil && core.ReceiverHasCallableMethod(val, "!") {
+		return vm.send(val, "!", nil)
 	}
-	if val.Type == object.ValueNil {
+	if val == nil || !val.IsTruthy() {
 		return core.R.TrueVal
 	}
 	return core.R.FalseVal
@@ -6805,11 +7412,11 @@ func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
 	if left.Type == object.ValueNil && right.Type == object.ValueNil {
 		return core.R.TrueVal
 	}
-	if left.Type == object.ValueArray || right.Type == object.ValueArray {
-		if vm.arraysEqual(left, right) {
-			return core.R.TrueVal
-		}
-		return core.R.FalseVal
+	if left.Type == object.ValueArray && right.Type != object.ValueArray {
+		return vm.send(left, "==", []*object.EmeraldValue{right})
+	}
+	if left.Type == object.ValueArray && right.Type == object.ValueArray {
+		return vm.send(left, "==", []*object.EmeraldValue{right})
 	}
 	if left.Type == object.ValueHash || right.Type == object.ValueHash {
 		if core.HashValuesEqual(left, right) {
@@ -7531,6 +8138,12 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		core.PrependExceptionBacktraceLabel(err, "public_send")
 		return err
 	}
+	if method == "send" {
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, false)
+		if fallback == nil && methodObj != nil && methodOwner != core.R.Classes["Object"] && methodOwner != core.R.Classes["BasicObject"] {
+			return vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner)
+		}
+	}
 	if (method == "send" || method == "__send__" || method == "public_send") && len(args) > 0 {
 		methodName, ok, parseErr := core.MethodNameFromValueWithError(args[0])
 		if parseErr != nil {
@@ -7877,7 +8490,8 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 		if method, found := singletonClass.Methods[methodName]; found {
 			return method, singletonClass, true
 		}
-		for _, mod := range singletonClass.IncludedModules {
+		for index := len(singletonClass.IncludedModules) - 1; index >= 0; index-- {
+			mod := singletonClass.IncludedModules[index]
 			if method, found := mod.GetMethod(methodName); found {
 				return method, singletonClass, true
 			}
@@ -8028,7 +8642,7 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 		}
 	}
 
-	if !ok {
+	if !ok && receiver.Class != nil {
 		methodObj, methodOwner, ok = receiver.Class.GetMethodWithOwner(method)
 	}
 
@@ -8096,8 +8710,8 @@ afterInheritedClassMethodLookup:
 
 func (vm *VM) lookupActiveRefinedMethod(receiver *object.EmeraldValue, method string) (*object.Method, bool) {
 	if refinements, fixed := vm.currentFixedRefinements(); fixed {
-		for _, refinery := range refinements {
-			if refined, ok := core.RefinedMethod(refinery, receiver, method); ok {
+		for index := len(refinements) - 1; index >= 0; index-- {
+			if refined, ok := core.RefinedMethod(refinements[index], receiver, method); ok {
 				return refined, true
 			}
 		}
@@ -8126,8 +8740,8 @@ func (vm *VM) lookupActiveRefinedMethod(receiver *object.EmeraldValue, method st
 
 func (vm *VM) lookupActiveRefinedInstanceMethod(receiver *object.EmeraldValue, method string) (*object.Method, bool) {
 	if refinements, fixed := vm.currentFixedRefinements(); fixed {
-		for _, refinery := range refinements {
-			if refined, ok := core.RefinedInstanceMethod(refinery, receiver, method); ok {
+		for index := len(refinements) - 1; index >= 0; index-- {
+			if refined, ok := core.RefinedInstanceMethod(refinements[index], receiver, method); ok {
 				return refined, true
 			}
 		}
@@ -8241,7 +8855,7 @@ func resolveVisibilityAliasMethod(name string, methodObj *object.Method, methodO
 		return methodObj, methodOwner, methodObj != nil
 	}
 	actual, owner, _, ok := getMethodAfterClassWithOwner(methodObj.VisibilityAliasStart, name)
-	if !ok || actual == nil {
+	if !ok || actual == nil || actual.Visibility == "undefined" {
 		return nil, nil, false
 	}
 	resolved := *actual
@@ -8264,7 +8878,10 @@ func nativeSingletonKey(receiver *object.EmeraldValue) interface{} {
 }
 
 func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
-	oldFrame := vm.frames[vm.fp]
+	oldFrame := &Frame{Bp: -1}
+	if vm.fp >= 0 && vm.fp < len(vm.frames) && vm.frames[vm.fp] != nil {
+		oldFrame = vm.frames[vm.fp]
+	}
 	if methodObj == nil {
 		return core.NewNoMethodError("undefined method `" + method + "'")
 	}
@@ -8284,7 +8901,13 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		currentSelf = vm.stack[oldFrame.Bp]
 	}
 	privateReceiverAllowed := receiver == core.R.Main || (parentMethod != "public_send" && receiver == currentSelf)
-	if !vm.visibilityBypass && parentMethod != "public" && parentMethod != "private" && parentMethod != "protected" &&
+	if methodObj.Visibility == "protected" && parentMethod != "public_send" {
+		sameRuntimeClass := currentSelf != nil && receiver != nil && currentSelf.Class != nil && currentSelf.Class == receiver.Class
+		if sameRuntimeClass || methodOwner != nil && valueHasClassInAncestry(currentSelf, methodOwner) && valueHasClassInAncestry(receiver, methodOwner) {
+			privateReceiverAllowed = true
+		}
+	}
+	if !vm.visibilityBypass && parentMethod != "public" && parentMethod != "private" && parentMethod != "protected" && parentMethod != "bind" &&
 		parentMethod != "module_function" && parentMethod != "public_class_method" && parentMethod != "private_class_method" &&
 		parentMethod != "using" && parentMethod != "refine" &&
 		(methodObj.Visibility == "private" || methodObj.Visibility == "protected") && !privateReceiverAllowed {
@@ -8321,6 +8944,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		args = dropAnonymousKeywordRestNonSymbolHash(fn, args)
 		args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
 		args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, methodObj.Ruby2Keywords)
+		args = mergeKeywordRestOverflowHashes(fn, args)
 		if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
 			return errVal
 		}
@@ -8359,11 +8983,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			if fn.HasRestParam {
 				vm.bindRestParameterSlots(fn, positionalArgs, bp, methodObj.Ruby2Keywords)
 			} else {
-				normalCount := len(fn.Params)
-				for i := 0; i < normalCount; i++ {
-					vm.stack[vm.sp] = positionalArgOrDefault(fn, positionalArgs, i)
-					vm.sp++
-				}
+				vm.bindPositionalParameterSlots(fn, positionalArgs, bp)
 			}
 
 			for _, kp := range fn.KeywordParams {
@@ -8377,8 +8997,14 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 						val = core.R.NilVal
 					}
 				}
-				vm.stack[vm.sp] = val
-				vm.sp++
+				slot := vm.sp
+				if index, ok := fn.LocalNames[kp.Name]; ok {
+					slot = bp + 1 + index
+				}
+				vm.stack[slot] = val
+				if vm.sp <= slot {
+					vm.sp = slot + 1
+				}
 			}
 			if fn.KeywordRestParam != "" {
 				restHash := vm.keywordRestHash(kwargsHash, fn.KeywordParams)
@@ -8396,11 +9022,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		} else if fn.HasRestParam {
 			vm.bindRestParameterSlots(fn, args, bp, methodObj.Ruby2Keywords)
 		} else {
-			normalCount := len(fn.Params)
-			for i := 0; i < normalCount; i++ {
-				vm.stack[vm.sp] = positionalArgOrDefault(fn, args, i)
-				vm.sp++
-			}
+			vm.bindPositionalParameterSlots(fn, args, bp)
 		}
 
 		var blockParamProc *object.Proc
@@ -8420,7 +9042,9 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 					RefinementsFixed: closure.RefinementsFixed,
 					InstanceVars:     make(map[string]*object.EmeraldValue),
 					IsLambda:         false,
+					BreakOwnerID:     closure.BreakOwnerID,
 					ReturnOwnerID:    closure.ReturnOwnerID,
+					FlipFlopStates:   closure.FlipFlopStates,
 				}
 				blockParamProc = proc
 				blockVal = &object.EmeraldValue{
@@ -8472,10 +9096,18 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		if blockParamProc != nil && blockParamProc.BreakOwnerID == 0 {
 			blockParamProc.BreakOwnerID = newFrame.ID
 		}
-		if methodFromPrependedModule(receiver.Class, method, methodObj) {
-			newFrame.SuperStart = receiver.Class
-		} else if ownerModule := methodFromIncludedModule(receiver.Class, method, methodObj); ownerModule != nil {
-			newFrame.SuperStart = receiver.Class
+		setBlockBreakOwner(vm.currentBlock, newFrame.ID)
+		dispatchClass := receiver.Class
+		if methodObj.DispatchOwner != nil && methodObj.DispatchOwner.Type == object.ValueModule && receiver.Type == object.ValueClass {
+			if class, ok := receiver.Data.(*object.Class); ok && class.SingletonClass != nil {
+				dispatchClass = class.SingletonClass
+			}
+		}
+		if prependedOwner, prependedModule := methodFromPrependedModule(dispatchClass, method, methodObj); prependedModule != nil {
+			newFrame.SuperStart = prependedOwner
+			newFrame.SuperModule = prependedModule
+		} else if includedOwner, ownerModule := methodFromIncludedModule(dispatchClass, method, methodObj); ownerModule != nil {
+			newFrame.SuperStart = includedOwner
 			newFrame.SuperModule = ownerModule
 		} else if methodOwner == receiver.Class {
 			newFrame.SuperStart = receiver.Class
@@ -8506,6 +9138,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			frame.Ip++
 			op := compiler.Opcode(instructions[frame.Ip])
 			vm.fireTracePointLine(frame, op)
+			vm.instructionExceptions[frame] = core.LastException
 			err := vm.execute(op, frame)
 			if err != nil {
 				vm.currentBlock = prevBlock
@@ -8515,7 +9148,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 				}
 				return core.R.NilVal
 			}
-			if vm.handlePendingNonLocalReturn(frame) || frame.Returned {
+			if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
 				break
 			}
 			frame = vm.frames[vm.fp]
@@ -8548,14 +9181,29 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		vm.sp = bp
 
 		vm.endActiveRescuesForFrame(frame)
+		delete(vm.instructionExceptions, frame)
 		vm.frames = vm.frames[:vm.fp]
 		vm.fp--
-		vm.frames[vm.fp] = oldFrame
+		if vm.fp >= 0 {
+			vm.frames[vm.fp] = oldFrame
+		}
 
 		return result
 	}
 
 	return core.R.NilVal
+}
+
+func valueHasClassInAncestry(value *object.EmeraldValue, target *object.Class) bool {
+	if value == nil || target == nil {
+		return false
+	}
+	for class := value.Class; class != nil; class = class.SuperClass {
+		if class == target {
+			return true
+		}
+	}
+	return false
 }
 
 func backtraceMethodLabel(receiver *object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, fallback string) string {
@@ -8684,6 +9332,7 @@ func (vm *VM) detachedMethodClosure(method *object.Method) *object.Closure {
 		RefinementsFixed: closure.RefinementsFixed,
 		AutoSplat:        closure.AutoSplat,
 		ReturnOwnerID:    closure.ReturnOwnerID,
+		BreakOwnerID:     closure.BreakOwnerID,
 	}
 	method.Closure = detached
 	return detached
@@ -8723,29 +9372,63 @@ func (vm *VM) implicitSuperArgs(frame *Frame) []*object.EmeraldValue {
 	if frame == nil || frame.Fn == nil {
 		return nil
 	}
-	args := append([]*object.EmeraldValue(nil), frame.Args...)
 	fn := frame.Fn
-	nameCounts := make(map[string]int, len(fn.Params))
-	for _, name := range fn.Params {
-		nameCounts[name]++
-	}
-	for i, name := range fn.Params {
-		if i >= len(fn.ParamDefaults) || fn.ParamDefaults[i] == nil || nameCounts[name] != 1 {
-			continue
+	args := make([]*object.EmeraldValue, 0, len(frame.Args)+1)
+	appendRest := func() {
+		if !fn.HasRestParam || fn.AnonymousRestParam {
+			return
 		}
-		localIndex, ok := fn.LocalNames[name]
+		index, ok := fn.LocalNames[fn.RestParamName]
 		if !ok {
-			continue
+			return
 		}
-		slot := frame.Bp + 1 + localIndex
-		if slot < 0 || slot >= len(vm.stack) || vm.stack[slot] == nil {
-			continue
+		value := derefClosureValue(vm.stack[frame.Bp+1+index])
+		if value != nil && value.Type == object.ValueArray {
+			args = append(args, value.Data.([]*object.EmeraldValue)...)
+		} else if value != nil && value.Type != object.ValueNil {
+			args = append(args, value)
 		}
-		value := derefClosureValue(vm.stack[slot])
-		for len(args) <= i {
-			args = append(args, core.R.NilVal)
+	}
+	for i := 0; i < len(fn.Params); i++ {
+		if fn.HasRestParam && i == fn.RestParamIndex {
+			appendRest()
 		}
-		args[i] = value
+		index := functionParamLocalIndex(fn, i)
+		value := derefClosureValue(vm.stack[frame.Bp+1+index])
+		if value == nil {
+			value = core.R.NilVal
+		}
+		args = append(args, value)
+	}
+	if fn.HasRestParam && fn.RestParamIndex >= len(fn.Params) {
+		appendRest()
+	}
+
+	if len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		hash := &object.RHash{Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue), Keys: make([]*object.EmeraldValue, 0)}
+		for _, keyword := range fn.KeywordParams {
+			index, ok := fn.LocalNames[keyword.Name]
+			if !ok {
+				continue
+			}
+			key := &object.EmeraldValue{Type: object.ValueSymbol, Data: keyword.Name, Class: core.R.Classes["Symbol"]}
+			hash.Keys = append(hash.Keys, key)
+			hash.Pairs[key] = derefClosureValue(vm.stack[frame.Bp+1+index])
+		}
+		if fn.KeywordRestParam != "" {
+			if index, ok := fn.LocalNames[fn.KeywordRestParam]; ok {
+				value := derefClosureValue(vm.stack[frame.Bp+1+index])
+				for _, key := range orderedKeywordKeys(value) {
+					if hashLiteralExistingKey(hash, key) == nil {
+						hash.Keys = append(hash.Keys, key)
+						hash.Pairs[key] = executorHashValue(value, key)
+					}
+				}
+			}
+		}
+		keywordHash := &object.EmeraldValue{Type: object.ValueHash, Data: hash, Class: core.R.Classes["Hash"]}
+		core.MarkRuby2KeywordHash(keywordHash)
+		args = append(args, keywordHash)
 	}
 	return args
 }
@@ -8836,6 +9519,49 @@ func copyUnmarkedRuby2KeywordHashForPositionalFunction(fn *object.Function, args
 	return result
 }
 
+func mergeKeywordRestOverflowHashes(fn *object.Function, args []*object.EmeraldValue) []*object.EmeraldValue {
+	if fn == nil || fn.KeywordRestParam == "" || fn.HasRestParam || len(args) < 2 {
+		return args
+	}
+	last := args[len(args)-1]
+	if last == nil || last.Type != object.ValueHash || !core.Ruby2KeywordHash(last) {
+		return args
+	}
+	capacity := len(fn.Params)
+	if len(args)-1 <= capacity {
+		return args
+	}
+	for _, candidate := range args[capacity : len(args)-1] {
+		if candidate == nil || candidate.Type != object.ValueHash {
+			return args
+		}
+	}
+	combined := &object.RHash{Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue), Keys: make([]*object.EmeraldValue, 0)}
+	for _, source := range append(append([]*object.EmeraldValue(nil), args[capacity:len(args)-1]...), last) {
+		for _, key := range orderedKeywordKeys(source) {
+			targetKey := hashLiteralExistingKey(combined, key)
+			if targetKey == nil {
+				targetKey = key
+				combined.Keys = append(combined.Keys, key)
+			}
+			combined.Pairs[targetKey] = executorHashValue(source, key)
+		}
+	}
+	keywordHash := &object.EmeraldValue{Type: object.ValueHash, Data: combined, Class: core.R.Classes["Hash"]}
+	core.MarkRuby2KeywordHash(keywordHash)
+	result := append([]*object.EmeraldValue(nil), args[:capacity]...)
+	return append(result, keywordHash)
+}
+
+func executorHashValue(hash *object.EmeraldValue, key *object.EmeraldValue) *object.EmeraldValue {
+	for existing, value := range executorHashToMap(hash) {
+		if existing == key || existing.Equals(key) {
+			return value
+		}
+	}
+	return core.R.NilVal
+}
+
 func dropAnonymousKeywordRestNonSymbolHash(fn *object.Function, args []*object.EmeraldValue) []*object.EmeraldValue {
 	if fn == nil || !fn.KeywordRestOnly || len(args) < 2 {
 		return args
@@ -8896,37 +9622,63 @@ func methodNameFromValue(value *object.EmeraldValue) (string, bool) {
 	return "", false
 }
 
-func methodFromPrependedModule(class *object.Class, name string, method *object.Method) bool {
+func methodFromPrependedModule(class *object.Class, name string, method *object.Method) (*object.Class, *object.Module) {
 	if class == nil || method == nil {
-		return false
+		return nil, nil
 	}
-	for _, mod := range class.PrependedModules {
-		if modMethod, ok := mod.Methods[name]; ok && modMethod == method {
-			return true
-		}
-	}
-	return false
-}
-
-func methodFromIncludedModule(class *object.Class, name string, method *object.Method) *object.Module {
-	if class == nil || method == nil {
-		return nil
-	}
-	if method.Owner != nil && method.Owner.Type == object.ValueModule {
-		owner := method.Owner.Data.(*object.Module)
-		for _, included := range class.IncludedModules {
-			if moduleIncludes(included, owner) {
-				return owner
+	for current := class; current != nil; current = current.SuperClass {
+		for _, mod := range current.PrependedModules {
+			if owner := prependedModuleDefiningMethod(mod, name, method, map[*object.Module]bool{}); owner != nil {
+				return current, owner
 			}
 		}
 	}
-	for i := len(class.IncludedModules) - 1; i >= 0; i-- {
-		mod := class.IncludedModules[i]
-		if modMethod, ok := mod.GetMethod(name); ok && modMethod == method {
-			return mod
+	return nil, nil
+}
+
+func prependedModuleDefiningMethod(module *object.Module, name string, method *object.Method, path map[*object.Module]bool) *object.Module {
+	if module == nil || path[module] {
+		return nil
+	}
+	path[module] = true
+	defer delete(path, module)
+	for _, prepended := range module.PrependedModules {
+		if owner := prependedModuleDefiningMethod(prepended, name, method, path); owner != nil {
+			return owner
+		}
+	}
+	if candidate, ok := module.Methods[name]; ok && candidate == method {
+		return module
+	}
+	for index := len(module.IncludedModules) - 1; index >= 0; index-- {
+		if owner := prependedModuleDefiningMethod(module.IncludedModules[index], name, method, path); owner != nil {
+			return owner
 		}
 	}
 	return nil
+}
+
+func methodFromIncludedModule(class *object.Class, name string, method *object.Method) (*object.Class, *object.Module) {
+	if class == nil || method == nil {
+		return nil, nil
+	}
+	for current := class; current != nil; current = current.SuperClass {
+		if method.Owner != nil && method.Owner.Type == object.ValueModule {
+			owner := method.Owner.Data.(*object.Module)
+			for _, included := range current.IncludedModules {
+				if moduleIncludes(included, owner) {
+					return current, owner
+				}
+			}
+		}
+		for i := len(current.IncludedModules) - 1; i >= 0; i-- {
+			mod := current.IncludedModules[i]
+			if modMethod, ok := mod.GetMethod(name); ok && modMethod == method {
+				return current, mod
+			}
+		}
+	}
+	return nil, nil
 }
 
 func moduleIncludes(module, target *object.Module) bool {
@@ -8948,45 +9700,85 @@ func getIncludedMethodAfterModule(class *object.Class, current *object.Module, n
 	if class == nil || current == nil {
 		return nil, nil, nil, false
 	}
-	for i := len(current.IncludedModules) - 1; i >= 0; i-- {
-		included := current.IncludedModules[i]
-		if method, ok := included.GetMethod(name); ok {
-			return method, class, included, true
-		}
-	}
-	seenCurrent := false
-	for i := len(class.IncludedModules) - 1; i >= 0; i-- {
-		mod := class.IncludedModules[i]
-		if !seenCurrent {
-			if mod == current {
-				seenCurrent = true
+	entries := flattenedMethodAncestors(class)
+	foundCurrent := false
+	for _, entry := range entries {
+		if !foundCurrent {
+			if entry.module == current {
+				foundCurrent = true
 			}
 			continue
 		}
-		if method, ok := mod.GetMethod(name); ok {
-			return method, class, mod, true
+		if entry.module != nil {
+			if method, ok := entry.module.Methods[name]; ok && method != nil {
+				return method, entry.class, entry.module, true
+			}
+			continue
+		}
+		if entry.class != nil {
+			if method, ok := entry.class.Methods[name]; ok && method != nil {
+				return method, entry.class, nil, true
+			}
 		}
 	}
-	if class.SuperClass != nil {
-		method, owner, ok := class.SuperClass.GetMethodWithOwner(name)
-		return method, owner, nil, ok
-	}
 	return nil, nil, nil, false
+}
+
+type methodAncestorEntry struct {
+	class  *object.Class
+	module *object.Module
+}
+
+func flattenedMethodAncestors(class *object.Class) []methodAncestorEntry {
+	entries := make([]methodAncestorEntry, 0)
+	for current := class; current != nil; current = current.SuperClass {
+		for _, prepended := range current.PrependedModules {
+			appendModuleMethodAncestors(&entries, current, prepended, map[*object.Module]bool{})
+		}
+		entries = append(entries, methodAncestorEntry{class: current})
+		for index := len(current.IncludedModules) - 1; index >= 0; index-- {
+			appendModuleMethodAncestors(&entries, current, current.IncludedModules[index], map[*object.Module]bool{})
+		}
+	}
+	return entries
+}
+
+func appendModuleMethodAncestors(entries *[]methodAncestorEntry, owner *object.Class, module *object.Module, path map[*object.Module]bool) {
+	if module == nil || path[module] {
+		return
+	}
+	path[module] = true
+	defer delete(path, module)
+	for _, prepended := range module.PrependedModules {
+		appendModuleMethodAncestors(entries, owner, prepended, path)
+	}
+	*entries = append(*entries, methodAncestorEntry{class: owner, module: module})
+	for index := len(module.IncludedModules) - 1; index >= 0; index-- {
+		appendModuleMethodAncestors(entries, owner, module.IncludedModules[index], path)
+	}
 }
 
 func getMethodAfterClassWithOwner(class *object.Class, name string) (*object.Method, *object.Class, *object.Module, bool) {
 	if class == nil {
 		return nil, nil, nil, false
 	}
-	for i := len(class.IncludedModules) - 1; i >= 0; i-- {
-		mod := class.IncludedModules[i]
-		if method, ok := mod.GetMethod(name); ok {
-			return method, class, mod, true
+	foundClass := false
+	for _, entry := range flattenedMethodAncestors(class) {
+		if !foundClass {
+			if entry.module == nil && entry.class == class {
+				foundClass = true
+			}
+			continue
 		}
-	}
-	if class.SuperClass != nil {
-		method, owner, ok := class.SuperClass.GetMethodWithOwner(name)
-		return method, owner, nil, ok
+		if entry.module != nil {
+			if method, ok := entry.module.Methods[name]; ok && method != nil {
+				return method, entry.class, entry.module, true
+			}
+		} else if entry.class != nil {
+			if method, ok := entry.class.Methods[name]; ok && method != nil {
+				return method, entry.class, nil, true
+			}
+		}
 	}
 	return nil, nil, nil, false
 }
@@ -9074,6 +9866,9 @@ func (vm *VM) scopedLocalConstantContainer(frame *Frame, qualifiedName string) (
 	rootName := parts[0]
 	idx, ok := frame.Fn.LocalNames[rootName]
 	var container *object.EmeraldValue
+	if rootName == "self" && frame.Bp >= 0 && frame.Bp < len(vm.stack) {
+		container = vm.stack[frame.Bp]
+	}
 	if ok {
 		stackIdx := frame.Bp + idx + 1
 		if stackIdx >= 0 && stackIdx < len(vm.stack) {
@@ -9225,7 +10020,7 @@ func (vm *VM) definedAutoload(receiver *object.EmeraldValue, name string, inheri
 		return false
 	}
 	path, ok := core.AutoloadPath(receiver, name, inherit)
-	if !ok || core.FeatureLoading(path) || vm.autoloading[autoloadKey(receiver, name)] {
+	if !ok || core.FeatureLoadingByCurrentThread(path) || vm.autoloading[autoloadKey(receiver, name)] {
 		return false
 	}
 	return true
@@ -9488,7 +10283,7 @@ func (vm *VM) triggerLexicalAutoload(container *object.EmeraldValue, constName s
 	if !ok {
 		return nil, false, false
 	}
-	if core.FeatureLoading(path) {
+	if core.FeatureLoadingByCurrentThread(path) {
 		return nil, false, true
 	}
 	key := autoloadKey(container, constName)
@@ -9502,10 +10297,10 @@ func (vm *VM) triggerLexicalAutoload(container *object.EmeraldValue, constName s
 		return result, true, true
 	}
 	if value, ok := lexicalDirectConstantValue(container, constName); ok {
-		core.RemoveAutoload(container, constName)
+		core.CompleteAutoload(container, constName)
 		return value, true, true
 	}
-	core.RemoveAutoload(container, constName)
+	core.CompleteAutoload(container, constName)
 	return nil, false, true
 }
 
@@ -9702,19 +10497,47 @@ func throwLabelsMatch(catchLabel, throwLabel *object.EmeraldValue) bool {
 }
 
 func defineConstantOn(container *object.EmeraldValue, name string, value *object.EmeraldValue) {
+	alreadyDefined := false
+	core.ClearFormerAutoload(container, name)
+	if path, ok := core.DirectAutoloadPath(container, name); !ok || !core.FeatureLoadingByCurrentThread(path) {
+		core.RemoveAutoload(container, name)
+	}
 	switch container.Type {
 	case object.ValueClass:
-		container.Data.(*object.Class).DefineConstant(name, value)
+		class := container.Data.(*object.Class)
+		if existing, found := class.Constants[name]; found && sameConstantDefinitionValue(existing, value) {
+			alreadyDefined = true
+		}
+		class.DefineConstant(name, value)
 	case object.ValueModule:
 		module := container.Data.(*object.Module)
+		if existing, found := module.Constants[name]; found && sameConstantDefinitionValue(existing, value) {
+			alreadyDefined = true
+		}
 		module.DefineConstant(name, value)
 	}
 	core.AssignConstantName(container, name, value)
 	core.RecordConstantLocation(container, name, false)
-	if result := core.NotifyConstAdded(container, name); result != nil && result.Type == object.ValueException {
-		core.LastException = result
-		core.LastRaisedResult = result
+	if !alreadyDefined {
+		if result := core.NotifyConstAdded(container, name); result != nil && result.Type == object.ValueException {
+			core.LastException = result
+			core.LastRaisedResult = result
+		}
 	}
+}
+
+func sameConstantDefinitionValue(left, right *object.EmeraldValue) bool {
+	if left == right {
+		return true
+	}
+	if left == nil || right == nil || left.Type != right.Type {
+		return false
+	}
+	switch left.Type {
+	case object.ValueClass, object.ValueModule:
+		return left.Data == right.Data
+	}
+	return false
 }
 
 func (vm *VM) defineQualifiedConstant(name string, value *object.EmeraldValue) {
@@ -9871,6 +10694,139 @@ func (vm *VM) routeReturnThroughEnsure(frame *Frame, value *object.EmeraldValue)
 	return false
 }
 
+func (vm *VM) routeBreakThroughEnsure(frame *Frame, value *object.EmeraldValue, target int) bool {
+	return vm.routeControlThroughEnsure(frame, value, target, false, false)
+}
+
+func (vm *VM) routeNextThroughEnsure(frame *Frame, value *object.EmeraldValue, target int) bool {
+	return vm.routeControlThroughEnsure(frame, value, target, true, false)
+}
+
+func (vm *VM) routeRedoThroughEnsure(frame *Frame) bool {
+	return vm.routeControlThroughEnsure(frame, core.R.NilVal, 0, false, true)
+}
+
+func (vm *VM) matchingCatchHandler(label *object.EmeraldValue) *CatchHandler {
+	for current := vm; current != nil; current = current.parent {
+		for index := len(current.catchStack) - 1; index >= 0; index-- {
+			handler := current.catchStack[index]
+			if handler.Label != nil && throwLabelsMatch(handler.Label, label) {
+				return handler
+			}
+		}
+	}
+	return nil
+}
+
+func (vm *VM) routeThrowThroughEnsure(frame *Frame, catch *CatchHandler, value *object.EmeraldValue) bool {
+	for i := len(vm.activeRescues) - 1; i >= 0; i-- {
+		active := vm.activeRescues[i]
+		if active.Frame != frame || active.EnsureOffset <= 0 || active.EnsureEndOffset <= 0 || frame.Ip >= active.EnsureOffset {
+			continue
+		}
+		vm.activeRescues = append(vm.activeRescues[:i], vm.activeRescues[i+1:]...)
+		vm.pendingEnsures = append(vm.pendingEnsures, &PendingEnsure{EnsureEndOffset: active.EnsureEndOffset, Frame: frame, PreviousException: active.PreviousException, ReturnValue: value, IsThrow: true, ThrowHandler: catch})
+		core.LastException = active.PreviousException
+		frame.Ip = active.EnsureOffset - 1
+		vm.ensureActive = true
+		return true
+	}
+	for i := len(vm.rescueStack) - 1; i >= 0; i-- {
+		handler := vm.rescueStack[i]
+		if handler.Frame != frame || handler.EnsureOffset <= 0 || handler.EnsureEndOffset <= 0 || frame.Ip >= handler.EnsureOffset {
+			continue
+		}
+		vm.rescueStack = append(vm.rescueStack[:i], vm.rescueStack[i+1:]...)
+		vm.pendingEnsures = append(vm.pendingEnsures, &PendingEnsure{EnsureEndOffset: handler.EnsureEndOffset, Frame: frame, PreviousException: core.LastException, ReturnValue: value, IsThrow: true, ThrowHandler: catch})
+		frame.Ip = handler.EnsureOffset - 1
+		vm.ensureActive = true
+		return true
+	}
+	return false
+}
+
+func (vm *VM) completeThrow(frame *Frame, handler *CatchHandler, value *object.EmeraldValue) {
+	if handler == nil {
+		return
+	}
+	if handler.VM != nil && handler.VM != vm {
+		vm.escapedThrowHandler = handler
+		vm.escapedThrowValue = value
+		frame.Returned = true
+		return
+	}
+	for index := len(vm.catchStack) - 1; index >= 0; index-- {
+		if vm.catchStack[index] == handler {
+			vm.catchStack = vm.catchStack[:index]
+			break
+		}
+	}
+	for rescueIndex := len(vm.activeRescues) - 1; rescueIndex >= 0; rescueIndex-- {
+		active := vm.activeRescues[rescueIndex]
+		if active.Frame == frame && frame.Ip < active.EndOffset && handler.EndOffset >= active.EndOffset {
+			vm.activeRescues = append(vm.activeRescues[:rescueIndex], vm.activeRescues[rescueIndex+1:]...)
+		}
+	}
+	core.LastException = nil
+	core.LastRaisedResult = nil
+	vm.sp = handler.StackTop
+	if value != nil {
+		vm.push(value)
+	}
+	handler.Frame.Ip = handler.EndOffset - 1
+	if handler.Frame != frame {
+		frame.BlockBreak = true
+		frame.BlockBreakVal = value
+	}
+}
+
+func (vm *VM) routeControlThroughEnsure(frame *Frame, value *object.EmeraldValue, target int, isNext, isRedo bool) bool {
+	for i := len(vm.activeRescues) - 1; i >= 0; i-- {
+		active := vm.activeRescues[i]
+		if active.Frame != frame || active.EnsureOffset <= 0 || active.EnsureEndOffset <= 0 || frame.Ip >= active.EnsureOffset {
+			continue
+		}
+		vm.activeRescues = append(vm.activeRescues[:i], vm.activeRescues[i+1:]...)
+		vm.pendingEnsures = append(vm.pendingEnsures, &PendingEnsure{
+			EnsureEndOffset:   active.EnsureEndOffset,
+			Frame:             frame,
+			PreviousException: active.PreviousException,
+			ReturnValue:       value,
+			IsBreak:           !isNext && !isRedo,
+			IsNext:            isNext,
+			IsRedo:            isRedo,
+			BreakTarget:       target,
+		})
+		core.LastException = active.PreviousException
+		core.LastBlockResult = nil
+		frame.Ip = active.EnsureOffset - 1
+		vm.ensureActive = true
+		return true
+	}
+	for i := len(vm.rescueStack) - 1; i >= 0; i-- {
+		handler := vm.rescueStack[i]
+		if handler.Frame != frame || handler.EnsureOffset <= 0 || handler.EnsureEndOffset <= 0 || frame.Ip >= handler.EnsureOffset {
+			continue
+		}
+		vm.rescueStack = append(vm.rescueStack[:i], vm.rescueStack[i+1:]...)
+		vm.pendingEnsures = append(vm.pendingEnsures, &PendingEnsure{
+			EnsureEndOffset:   handler.EnsureEndOffset,
+			Frame:             frame,
+			PreviousException: core.LastException,
+			ReturnValue:       value,
+			IsBreak:           !isNext && !isRedo,
+			IsNext:            isNext,
+			IsRedo:            isRedo,
+			BreakTarget:       target,
+		})
+		core.LastBlockResult = nil
+		frame.Ip = handler.EnsureOffset - 1
+		vm.ensureActive = true
+		return true
+	}
+	return false
+}
+
 func inheritsFrom(cls *object.Class, name string) bool {
 	for current := cls; current != nil; current = current.SuperClass {
 		if current.Name == name {
@@ -9882,6 +10838,11 @@ func inheritsFrom(cls *object.Class, name string) bool {
 
 func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool {
 	previousException := core.LastException
+	if previousException == exception {
+		if before, ok := vm.instructionExceptions[frame]; ok {
+			previousException = before
+		}
+	}
 	termination := core.IsTerminationResult(exception)
 	if !termination {
 		core.LastException = exception
@@ -9950,14 +10911,19 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 	vm.rescueStack = vm.rescueStack[:len(vm.rescueStack)-1]
 	if handler.RescueOffset > 0 {
 		core.FireTracePointException("rescue", vm.currentFrameBinding(), exception)
-		vm.activeRescues = append(vm.activeRescues, &ActiveRescue{
+		activeRescue := &ActiveRescue{
+			BodyOffset:        handler.BodyOffset,
+			RescueOffset:      handler.RescueOffset,
+			StackTop:          handler.StackTop,
 			EndOffset:         handler.EndOffset,
 			EnsureOffset:      handler.EnsureOffset,
 			EnsureEndOffset:   handler.EnsureEndOffset,
 			Frame:             handler.Frame,
 			PreviousException: previousException,
 			RescueStackDepth:  len(vm.rescueStack),
-		})
+		}
+		vm.activeRescues = append(vm.activeRescues, activeRescue)
+		handler.Frame.RetryRescue = activeRescue
 		handler.Frame.Ip = handler.RescueOffset - 1
 	} else if handler.EnsureOffset > 0 {
 		vm.pendingEnsures = append(vm.pendingEnsures, &PendingEnsure{
@@ -10030,6 +10996,32 @@ func boolValue(value bool) *object.EmeraldValue {
 		return core.R.TrueVal
 	}
 	return core.R.FalseVal
+}
+
+func (vm *VM) flipFlopState(frame *Frame, stateID int) bool {
+	if frame != nil && frame.Closure != nil && frame.Closure.FlipFlopStates != nil {
+		return frame.Closure.FlipFlopStates[stateID]
+	}
+	return frame != nil && frame.Fn != nil && frame.Fn.FlipFlopStates != nil && frame.Fn.FlipFlopStates[stateID]
+}
+
+func (vm *VM) setFlipFlopState(frame *Frame, stateID int, active bool) {
+	if frame == nil {
+		return
+	}
+	if frame.Closure != nil {
+		if frame.Closure.FlipFlopStates == nil {
+			frame.Closure.FlipFlopStates = make(map[int]bool)
+		}
+		frame.Closure.FlipFlopStates[stateID] = active
+		return
+	}
+	if frame.Fn != nil {
+		if frame.Fn.FlipFlopStates == nil {
+			frame.Fn.FlipFlopStates = make(map[int]bool)
+		}
+		frame.Fn.FlipFlopStates[stateID] = active
+	}
 }
 
 func (vm *VM) rescueMatches(exception *object.EmeraldValue, classes []*object.EmeraldValue) (bool, *object.EmeraldValue) {
@@ -10376,6 +11368,7 @@ func isConstantNameRune(r rune) bool {
 func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldValue, prevBlock *object.EmeraldValue, markRuby2Keywords bool) int {
 	args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
 	args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, markRuby2Keywords)
+	args = mergeKeywordRestOverflowHashes(fn, args)
 	bp := vm.sp
 	for i := 0; i < fn.NumLocals; i++ {
 		vm.stack[bp+1+i] = core.R.NilVal
@@ -10394,14 +11387,7 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 		if fn.HasRestParam {
 			vm.bindRestParameterSlots(fn, positionalArgs, bp, markRuby2Keywords)
 		} else {
-			normalCount := len(fn.Params)
-			for i := 0; i < normalCount; i++ {
-				slot := bp + 1 + i
-				vm.stack[slot] = positionalArgOrDefault(fn, positionalArgs, i)
-				if vm.sp <= slot {
-					vm.sp = slot + 1
-				}
-			}
+			vm.bindPositionalParameterSlots(fn, positionalArgs, bp)
 		}
 
 		for _, kp := range fn.KeywordParams {
@@ -10414,6 +11400,9 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 					break
 				}
 				slot++
+			}
+			if index, ok := fn.LocalNames[kp.Name]; ok {
+				slot = bp + 1 + index
 			}
 			val := vm.lookupKwarg(kwargs, kp.Name)
 			if val == nil {
@@ -10442,14 +11431,7 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 	} else if fn.HasRestParam {
 		vm.bindRestParameterSlots(fn, args, bp, false)
 	} else {
-		normalCount := len(fn.Params)
-		for i := 0; i < normalCount; i++ {
-			slot := bp + 1 + i
-			vm.stack[slot] = positionalArgOrDefault(fn, args, i)
-			if vm.sp <= slot {
-				vm.sp = slot + 1
-			}
-		}
+		vm.bindPositionalParameterSlots(fn, args, bp)
 	}
 
 	if fn.HasBlockParam {
@@ -10470,7 +11452,9 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 					RefinementsFixed: closure.RefinementsFixed,
 					InstanceVars:     make(map[string]*object.EmeraldValue),
 					IsLambda:         false,
+					BreakOwnerID:     closure.BreakOwnerID,
 					ReturnOwnerID:    closure.ReturnOwnerID,
+					FlipFlopStates:   closure.FlipFlopStates,
 				},
 				Class: core.R.Classes["Proc"],
 			}
@@ -10488,6 +11472,66 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 	}
 
 	return bp
+}
+
+func (vm *VM) bindPositionalParameterSlots(fn *object.Function, args []*object.EmeraldValue, bp int) {
+	firstDefault := -1
+	lastDefault := -1
+	for i := 0; i < len(fn.Params) && i < len(fn.ParamDefaults); i++ {
+		if fn.ParamDefaults[i] != nil {
+			if firstDefault < 0 {
+				firstDefault = i
+			}
+			lastDefault = i
+		}
+	}
+	if firstDefault < 0 {
+		firstDefault = len(fn.Params)
+		lastDefault = len(fn.Params) - 1
+	}
+	requiredPre := firstDefault
+	optionalCount := lastDefault - firstDefault + 1
+	if optionalCount < 0 {
+		optionalCount = 0
+	}
+	postCount := len(fn.Params) - requiredPre - optionalCount
+	optionalAvailable := len(args) - requiredPre - postCount
+	if optionalAvailable < 0 {
+		optionalAvailable = 0
+	}
+	if optionalAvailable > optionalCount {
+		optionalAvailable = optionalCount
+	}
+	postStart := requiredPre + optionalAvailable
+
+	for i := 0; i < len(fn.Params); i++ {
+		value := core.R.NilVal
+		switch {
+		case i < requiredPre:
+			if i < len(args) && args[i] != nil {
+				value = args[i]
+			}
+		case i < requiredPre+optionalCount:
+			optionalIndex := i - requiredPre
+			if optionalIndex < optionalAvailable && requiredPre+optionalIndex < len(args) && args[requiredPre+optionalIndex] != nil {
+				value = args[requiredPre+optionalIndex]
+			} else if i < len(fn.ParamDefaults) && fn.ParamDefaults[i] != nil && !fn.EvaluateParamDefaults {
+				value = fn.ParamDefaults[i]
+			} else if i < len(fn.ParamDefaults) && fn.ParamDefaults[i] != nil && fn.EvaluateParamDefaults {
+				value = nil
+			}
+		default:
+			argIndex := postStart + i - requiredPre - optionalCount
+			if argIndex < len(args) && args[argIndex] != nil {
+				value = args[argIndex]
+			}
+		}
+		slot := bp + 1 + functionParamLocalIndex(fn, i)
+		vm.stack[slot] = value
+		if vm.sp <= slot {
+			vm.sp = slot + 1
+		}
+	}
 }
 
 func (vm *VM) bindParameterPatterns(fn *object.Function, bp int) *object.EmeraldValue {
@@ -10632,22 +11676,51 @@ func (vm *VM) bindRestParameterSlots(fn *object.Function, args []*object.Emerald
 		preCount = len(fn.Params)
 	}
 	postCount := len(fn.Params) - preCount
+	requiredPre := preCount
+	for i := 0; i < preCount && i < len(fn.ParamDefaults); i++ {
+		if fn.ParamDefaults[i] != nil {
+			requiredPre = i
+			break
+		}
+	}
+	preAvailable := requiredPre
+	if preAvailable > len(args) {
+		preAvailable = len(args)
+	}
+	optionalAvailable := len(args) - preAvailable - postCount
+	if optionalAvailable > 0 {
+		optionalCount := preCount - requiredPre
+		if optionalAvailable > optionalCount {
+			optionalAvailable = optionalCount
+		}
+		preAvailable += optionalAvailable
+	}
 
 	for i := 0; i < preCount; i++ {
 		slot := bp + 1 + functionParamLocalIndex(fn, i)
-		vm.stack[slot] = positionalArgOrDefault(fn, args, i)
+		if i < preAvailable && args[i] != nil {
+			vm.stack[slot] = args[i]
+		} else if i < len(fn.ParamDefaults) && fn.ParamDefaults[i] != nil {
+			if fn.EvaluateParamDefaults {
+				vm.stack[slot] = nil
+			} else {
+				vm.stack[slot] = fn.ParamDefaults[i]
+			}
+		} else {
+			vm.stack[slot] = core.R.NilVal
+		}
 		if vm.sp <= slot {
 			vm.sp = slot + 1
 		}
 	}
 
 	postStart := len(args) - postCount
-	if postStart < preCount {
-		postStart = preCount
+	if postStart < preAvailable {
+		postStart = preAvailable
 	}
 	restElems := make([]*object.EmeraldValue, 0)
-	if postStart > preCount && preCount < len(args) {
-		restElems = args[preCount:postStart]
+	if postStart > preAvailable && preAvailable < len(args) {
+		restElems = args[preAvailable:postStart]
 	}
 	if markRuby2Keywords && len(restElems) > 0 {
 		last := restElems[len(restElems)-1]
@@ -10988,6 +12061,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 			RefinementsFixed: proc.RefinementsFixed,
 			AutoSplat:        proc.AutoSplat,
 			ReturnOwnerID:    proc.ReturnOwnerID,
+			BreakOwnerID:     proc.BreakOwnerID,
+			FlipFlopStates:   proc.FlipFlopStates,
+		}
+		if proc.FlipFlopStates == nil {
+			proc.FlipFlopStates = make(map[int]bool)
+			closure.FlipFlopStates = proc.FlipFlopStates
 		}
 	default:
 		return core.R.NilVal
@@ -11078,10 +12157,11 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		frame.Ip++
 		op := compiler.Opcode(instructions[frame.Ip])
 		vm.fireTracePointLine(frame, op)
+		vm.instructionExceptions[frame] = core.LastException
 		if err := vm.execute(op, frame); err != nil {
 			break
 		}
-		if vm.handlePendingNonLocalReturn(frame) || frame.Returned {
+		if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
 			break
 		}
 		if vm.sp > frame.Bp {
@@ -11092,6 +12172,9 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		}
 		frame = vm.frames[vm.fp]
 		if frame.BlockBreak || frame.BlockNextVal != nil {
+			break
+		}
+		if core.LastBlockResult != nil {
 			break
 		}
 		instructions = frame.Fn.Instructions
@@ -11120,8 +12203,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 			result = core.NewLocalJumpError("unexpected break")
 			core.LastException = result
 		} else {
-			if procData != nil && procData.BreakOwnerID > 0 {
-				vm.pendingBreakTargetID = procData.BreakOwnerID
+			breakOwnerID := closure.BreakOwnerID
+			if procData != nil {
+				breakOwnerID = procData.BreakOwnerID
+			}
+			if breakOwnerID > 0 {
+				vm.pendingBreakTargetID = breakOwnerID
 				vm.pendingBreakValue = result
 			}
 			core.LastBlockResult = result
@@ -11135,6 +12222,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	}
 
 	vm.endActiveRescuesForFrame(frame)
+	for i := len(vm.rescueStack) - 1; i >= 0; i-- {
+		if vm.rescueStack[i].Frame == frame {
+			vm.rescueStack = append(vm.rescueStack[:i], vm.rescueStack[i+1:]...)
+		}
+	}
+	delete(vm.instructionExceptions, frame)
 	vm.frames = vm.frames[:vm.fp]
 	vm.fp--
 
@@ -11325,7 +12418,7 @@ func rejectedNonSymbolPositionalHashWithKeywords(fn *object.Function, args []*ob
 		return nil
 	}
 	for _, arg := range args[:len(args)-1] {
-		if hashHasNonSymbolKey(arg) {
+		if hashHasNonSymbolKey(arg) && core.Ruby2KeywordHash(arg) {
 			return core.NewArgumentError("wrong number of arguments")
 		}
 	}
@@ -11375,21 +12468,15 @@ func (vm *VM) keywordRestHash(kwargs map[*object.EmeraldValue]*object.EmeraldVal
 }
 
 func unknownKeywordArgument(fn *object.Function, args []*object.EmeraldValue) *object.EmeraldValue {
-	if fn == nil || fn.KeywordRestOnly || len(fn.KeywordParams) == 0 || len(args) == 0 {
+	if fn == nil || fn.KeywordRestOnly || fn.KeywordRestParam != "" || len(fn.KeywordParams) == 0 || len(args) == 0 {
 		return nil
 	}
 	last := args[len(args)-1]
-	if last == nil || last.Type != object.ValueHash {
+	if last == nil || last.Type != object.ValueHash || !core.Ruby2KeywordHash(last) {
 		return nil
 	}
 	unknown := make([]string, 0)
 	keywordHashes := []*object.EmeraldValue{last}
-	if len(args) > 1 {
-		prior := args[len(args)-2]
-		if prior != nil && prior.Type == object.ValueHash {
-			keywordHashes = append([]*object.EmeraldValue{prior}, keywordHashes...)
-		}
-	}
 	for _, hash := range keywordHashes {
 		for _, key := range orderedKeywordKeys(hash) {
 			if key == nil {
@@ -11445,10 +12532,6 @@ func keywordKeyMatchesName(key *object.EmeraldValue, name string) bool {
 	}
 	switch key.Type {
 	case object.ValueSymbol:
-		if s, ok := key.Data.(string); ok {
-			return strings.TrimPrefix(s, ":") == name
-		}
-	case object.ValueString:
 		if s, ok := key.Data.(string); ok {
 			return strings.TrimPrefix(s, ":") == name
 		}
@@ -11683,7 +12766,16 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 			sort.Slice(namedLocals, func(i, j int) bool {
 				return namedLocals[i].index < namedLocals[j].index
 			})
+			if inherited := frame.Fn.EvalInheritedLocals; inherited > 0 && inherited < len(namedLocals) {
+				namedLocals = append(append([]struct {
+					name  string
+					index int64
+				}{}, namedLocals[inherited:]...), namedLocals[:inherited]...)
+			}
 			for _, item := range namedLocals {
+				if frame.Fn.ImplicitItParameter && item.name == "it" || frame.Fn.NumberedParameters && numberedParameterMethodNamePattern.MatchString(item.name) {
+					continue
+				}
 				slot := frame.Bp + 1 + int(item.index)
 				if item.index >= 0 && int(item.index) < len(frame.Fn.Params) {
 					if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
@@ -11704,6 +12796,9 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 			}
 		} else {
 			for i, name := range frame.Fn.Params {
+				if frame.Fn.ImplicitItParameter && name == "it" || frame.Fn.NumberedParameters && numberedParameterMethodNamePattern.MatchString(name) {
+					continue
+				}
 				slot := frame.Bp + 1 + i
 				if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
 					locals[name] = vm.stack[slot]
@@ -11785,6 +12880,9 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 		Path:                    path,
 		Line:                    line,
 		InstanceVars:            map[string]*object.EmeraldValue{},
+	}
+	if refinements, fixed := vm.currentFixedRefinements(); fixed {
+		binding.Refinements = append([]*object.EmeraldValue(nil), refinements...)
 	}
 	if frame != nil && frame.Closure != nil && frame.Closure.Binding != nil &&
 		(frame.Fn == nil || !frame.Fn.MethodBody || frame.DefinedByDefineMethod) {
@@ -11875,6 +12973,18 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 			path = label
 		}
 		line := vm.sourceLineForFrame(frame)
+		absolutePath := frame.Fn.SourceAbsolutePath
+		if !frame.Fn.EvalSource && path != "" && !strings.HasPrefix(path, "<") {
+			if absolutePath == "" {
+				absolutePath = path
+				if abs, err := filepath.Abs(absolutePath); err == nil {
+					absolutePath = abs
+				}
+				if resolved, err := filepath.EvalSymlinks(absolutePath); err == nil {
+					absolutePath = resolved
+				}
+			}
+		}
 		if vm.ensureActive && i == ensureBlockIndex {
 			label = "block"
 			if ensureBlockLine > 0 {
@@ -11883,10 +12993,11 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 		}
 
 		frames = append(frames, object.RBacktraceLocation{
-			Path:       path,
-			Line:       line,
-			Label:      label,
-			EvalSource: frame.Fn.EvalSource,
+			Path:         path,
+			AbsolutePath: absolutePath,
+			Line:         line,
+			Label:        label,
+			EvalSource:   frame.Fn.EvalSource,
 		})
 	}
 	if vm.parent != nil {
@@ -12034,12 +13145,12 @@ func (vm *VM) sourceLineForFrame(frame *Frame) int64 {
 		bestPos := -1
 		bestLine := 0
 		for pos, line := range frame.Fn.LineMap {
-			if pos <= frame.Ip && pos > bestPos && line > 0 {
+			if pos <= frame.Ip && pos > bestPos {
 				bestPos = pos
 				bestLine = line
 			}
 		}
-		if bestLine > 0 {
+		if bestPos >= 0 {
 			return int64(bestLine)
 		}
 	}
@@ -12624,7 +13735,7 @@ func (vm *VM) triggerAutoload(receiver *object.EmeraldValue, constName string) (
 	if !ok {
 		return nil, false
 	}
-	if core.FeatureLoading(path) {
+	if core.FeatureLoadingByCurrentThread(path) {
 		return nil, false
 	}
 	key := autoloadKey(receiver, constName)
@@ -12641,17 +13752,17 @@ func (vm *VM) triggerAutoload(receiver *object.EmeraldValue, constName string) (
 	case object.ValueClass:
 		class := receiver.Data.(*object.Class)
 		if constant, ok := class.Constants[constName]; ok {
-			core.RemoveAutoload(receiver, constName)
+			core.CompleteAutoload(receiver, constName)
 			return constant, true
 		}
 	case object.ValueModule:
 		module := receiver.Data.(*object.Module)
 		if constant, ok := module.Constants[constName]; ok {
-			core.RemoveAutoload(receiver, constName)
+			core.CompleteAutoload(receiver, constName)
 			return constant, true
 		}
 	}
-	core.RemoveAutoload(receiver, constName)
+	core.CompleteAutoload(receiver, constName)
 	return core.NewNameError("uninitialized constant " + constName), true
 }
 

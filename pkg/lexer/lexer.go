@@ -559,7 +559,7 @@ func (l *Lexer) readGlobalVariable() Token {
 
 func isSpecialGlobalChar(ch rune) bool {
 	switch ch {
-	case '!', '@', '&', '`', '\'', '"', '+', '~', '=', '/', '\\', ',', ';', '.', '<', '>', '_', '0', '$', '?', ':':
+	case '!', '@', '&', '`', '\'', '"', '+', '*', '~', '=', '/', '\\', ',', ';', '.', '<', '>', '_', '0', '$', '?', ':':
 		return true
 	default:
 		return isDigit(ch)
@@ -839,6 +839,12 @@ func (l *Lexer) readDoubleQuotedString(position int, quote rune) Token {
 			l.readChar() // skip '\'
 			lit += l.readEscapeSequence()
 			position = l.position // skip past the escape in raw input
+		} else if l.ch == '#' && l.peekChar() == '\\' && l.peekCharN(2) == '{' {
+			lit += l.input[position:l.position]
+			lit += EscapedHashInterpolation
+			l.readChar() // skip '#'
+			l.readChar() // skip '\\', preserving the following '{'
+			position = l.position
 		} else if l.ch == '#' && l.peekChar() == '{' {
 			lit += l.input[position:l.position]
 			lit += l.readStringInterpolation()
@@ -1215,6 +1221,13 @@ func (l *Lexer) readPercentString() Token {
 				continue
 			}
 			if interpolates && kind != 'r' {
+				if kind == 'W' || kind == 'I' {
+					l.readChar()
+					if l.ch != 0 {
+						l.readChar()
+					}
+					continue
+				}
 				lit += l.input[position:l.position]
 				l.readChar()
 				lit += l.readEscapeSequence()
@@ -1564,7 +1577,7 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 	markerSuffix := l.input[suffixStart:l.position]
 	hasMarkerSuffix := strings.TrimSpace(markerSuffix) != ""
-	l.queueHeredocMarkerSuffix(markerSuffix)
+	l.queueHeredocMarkerSuffix(markerSuffix, line)
 	if l.ch == '\n' {
 		l.readChar()
 	}
@@ -1685,7 +1698,7 @@ func decodeHeredocEscapes(input string) string {
 	return out.String()
 }
 
-func (l *Lexer) queueHeredocMarkerSuffix(suffix string) {
+func (l *Lexer) queueHeredocMarkerSuffix(suffix string, line int) {
 	suffix = strings.TrimSpace(suffix)
 	if suffix == "" {
 		return
@@ -1697,6 +1710,7 @@ func (l *Lexer) queueHeredocMarkerSuffix(suffix string) {
 		if tok.Type == EOF {
 			return
 		}
+		tok.Line += line - 1
 		l.pendingTokens = append(l.pendingTokens, tok)
 	}
 }

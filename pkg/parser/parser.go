@@ -1118,7 +1118,7 @@ func (p *Parser) parseExpressionWithStopTokens(prec int, stopTokens ...lexer.Tok
 	}
 
 	leftExp := prefix()
-	for !p.curTokenIs(lexer.COMMA) && !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.SEMICOLON) && !p.curTokenIs(lexer.IF) && !p.curTokenIs(lexer.UNLESS) && !p.curTokenIs(lexer.WHILE) && !p.curTokenIs(lexer.UNTIL) && !p.curTokenIsAny(stopTokens...) && !((p.curTokenIs(lexer.RBRACE) || p.curTokenIs(lexer.END)) && isControlFlowExpression(leftExp)) && (!p.curTokenIs(lexer.RBRACE) || p.peekTokenIs(lexer.DOT) || p.peekTokenIs(lexer.ARROW) || p.peekTokenIs(lexer.IN) || p.peekTokenIs(lexer.LBRACKET) || isHashLiteral(leftExp) || isBlockMethodCall(leftExp)) && (!p.curTokenIs(lexer.END) || p.peekTokenIs(lexer.DOT) || isBlockMethodCall(leftExp)) && !p.shouldStopGroupedRParenDotChain(leftExp) && !(p.stopAtRParen && p.curTokenIs(lexer.RPAREN) && p.peekTokenIs(lexer.RESCUE)) && !(p.stopAtRBracket && p.curTokenIs(lexer.RBRACKET) && !(p.peekTokenIs(lexer.DOT) && isArrayLiteral(leftExp))) && !(p.stopAtHashRocket && p.peekTokenIs(lexer.ARROW)) && !p.peekTokenIs(lexer.NEWLINE) && !(p.stopAtColon && p.peekTokenIs(lexer.COLON)) && !p.peekTokenIsAny(stopTokens...) && prec < p.peekPrecedence() {
+	for !p.curTokenIs(lexer.COMMA) && !p.curTokenIs(lexer.NEWLINE) && !p.curTokenIs(lexer.SEMICOLON) && !p.curTokenIs(lexer.IF) && !p.curTokenIs(lexer.UNLESS) && !p.curTokenIs(lexer.WHILE) && !p.curTokenIs(lexer.UNTIL) && !p.curTokenIsAny(stopTokens...) && !((p.curTokenIs(lexer.RBRACE) || p.curTokenIs(lexer.END)) && isControlFlowExpression(leftExp)) && (!p.curTokenIs(lexer.RBRACE) || p.peekTokenIs(lexer.DOT) || p.peekTokenIs(lexer.ARROW) || p.peekTokenIs(lexer.IN) || p.peekTokenIs(lexer.LBRACKET) || isHashLiteral(leftExp) || isBlockMethodCall(leftExp) || expressionEndsWithBraceBlockCall(leftExp)) && (!p.curTokenIs(lexer.END) || p.peekTokenIs(lexer.DOT) || isBlockMethodCall(leftExp)) && !p.shouldStopGroupedRParenDotChain(leftExp) && !(p.stopAtRParen && p.curTokenIs(lexer.RPAREN) && p.peekTokenIs(lexer.RESCUE)) && !(p.stopAtRBracket && p.curTokenIs(lexer.RBRACKET) && !isBracketChainReceiver(leftExp)) && !(p.stopAtHashRocket && p.peekTokenIs(lexer.ARROW)) && !p.peekTokenIs(lexer.NEWLINE) && !(p.stopAtColon && p.peekTokenIs(lexer.COLON)) && !p.peekTokenIsAny(stopTokens...) && prec < p.peekPrecedence() {
 		infix := p.infixFns[p.peekToken.Type]
 		if infix == nil {
 			return leftExp
@@ -1131,6 +1131,15 @@ func (p *Parser) parseExpressionWithStopTokens(prec int, stopTokens ...lexer.Tok
 	}
 
 	return leftExp
+}
+
+func isBracketChainReceiver(expression ast.Expression) bool {
+	switch expression.(type) {
+	case *ast.IndexExpression, *ast.ArrayLiteral:
+		return true
+	default:
+		return false
+	}
 }
 
 func isControlFlowExpression(expr ast.Expression) bool {
@@ -1150,7 +1159,7 @@ func (p *Parser) shouldStopGroupedRParenDotChain(expr ast.Expression) bool {
 		return true
 	}
 	if isInfixExpression(expr) {
-		return true
+		return !p.currentTokenClosedChildGroup()
 	}
 	return !p.currentTokenClosedChildGroup() && (isRangeExpression(expr) || isPatternMatchExpression(expr) || isBlockMethodCall(expr))
 }
@@ -1183,6 +1192,17 @@ func isArrayLiteral(expr ast.Expression) bool {
 func isBlockMethodCall(expr ast.Expression) bool {
 	call, ok := expr.(*ast.MethodCall)
 	return ok && call.Block != nil
+}
+
+func expressionEndsWithBraceBlockCall(expr ast.Expression) bool {
+	switch value := expr.(type) {
+	case *ast.MethodCall:
+		return value.Block != nil && value.Block.Token.Type == lexer.LBRACE
+	case *ast.InfixExpression:
+		return expressionEndsWithBraceBlockCall(value.Right)
+	default:
+		return false
+	}
 }
 
 func isInfixExpression(expr ast.Expression) bool {
@@ -1295,6 +1315,12 @@ func (p *Parser) consumeExpectedGroupedRParen() bool {
 
 func (p *Parser) consumeRescueExceptionTerminator() {
 	if p.curTokenIs(lexer.RPAREN) || p.curTokenIs(lexer.RBRACKET) {
+		p.nextToken()
+		return
+	}
+	if p.peekTokenIs(lexer.NEWLINE) || p.peekTokenIs(lexer.SEMICOLON) || p.peekTokenIs(lexer.END) ||
+		p.peekTokenIs(lexer.ELSE) || p.peekTokenIs(lexer.ENSURE) || p.peekTokenIs(lexer.RESCUE) ||
+		p.peekTokenIs(lexer.RBRACE) || p.peekTokenIs(lexer.EOF) {
 		p.nextToken()
 	}
 }
@@ -1584,15 +1610,16 @@ func (p *Parser) parseStringLiteral() ast.Expression {
 }
 
 func (p *Parser) parseWordsLiteral() ast.Expression {
-	words := splitPercentLiteralWords(p.curToken.Literal)
+	words := splitPercentLiteralWords(p.curToken.Literal, p.curToken.AllowsInterpolation)
 	arr := &ast.ArrayLiteral{
 		Token:    p.curToken,
 		Elements: make([]ast.Expression, 0, len(words)),
 	}
 	for _, word := range words {
 		arr.Elements = append(arr.Elements, &ast.StringLiteral{
-			Token: lexer.Token{Type: lexer.STRING, Literal: word},
-			Value: word,
+			Token:        lexer.Token{Type: lexer.STRING, Literal: word, AllowsInterpolation: p.curToken.AllowsInterpolation},
+			Value:        word,
+			Interpolates: p.curToken.AllowsInterpolation,
 		})
 	}
 	return arr
@@ -1613,14 +1640,41 @@ func (p *Parser) parseSymbolsLiteral() ast.Expression {
 	return arr
 }
 
-func splitPercentLiteralWords(input string) []string {
+func splitPercentLiteralWords(input string, decodeEscapes ...bool) []string {
+	decode := len(decodeEscapes) > 0 && decodeEscapes[0]
 	words := []string{}
 	var current strings.Builder
 	hasContent := false
 	for i := 0; i < len(input); i++ {
 		if input[i] == '\\' && i+1 < len(input) {
+			next := input[i+1]
+			if decode {
+				decoded := byte(0)
+				switch next {
+				case 't':
+					decoded = '\t'
+				case 'n':
+					decoded = '\n'
+				case 'r':
+					decoded = '\r'
+				case 'f':
+					decoded = '\f'
+				case 'v':
+					decoded = '\v'
+				}
+				if decoded != 0 {
+					i++
+					current.WriteByte(decoded)
+					hasContent = true
+					continue
+				}
+			}
+			escapedSeparator := next == ' ' || next == '\t' || next == '\r' || next == '\n' || next == '\f'
+			if !escapedSeparator && !strings.ContainsRune(`\[]{}()<>`, rune(next)) {
+				current.WriteByte('\\')
+			}
 			i++
-			current.WriteByte(input[i])
+			current.WriteByte(next)
 			hasContent = true
 			continue
 		}
@@ -1730,7 +1784,7 @@ func (p *Parser) parseArrayLiteral() ast.Expression {
 	element := p.parseExpression(LOWEST)
 	p.stopAtRBracket = previousStopAtRBracket
 	if element != nil {
-		arr.Elements = append(arr.Elements, element)
+		appendArrayLiteralElement(arr, element)
 	}
 	for p.curTokenIs(lexer.COMMA) || p.peekTokenIs(lexer.COMMA) {
 		if !p.curTokenIs(lexer.COMMA) {
@@ -1748,7 +1802,7 @@ func (p *Parser) parseArrayLiteral() ast.Expression {
 		element := p.parseExpression(LOWEST)
 		p.stopAtRBracket = previousStopAtRBracket
 		if element != nil {
-			arr.Elements = append(arr.Elements, element)
+			appendArrayLiteralElement(arr, element)
 		}
 	}
 	for p.peekTokenIs(lexer.NEWLINE) {
@@ -1761,6 +1815,23 @@ func (p *Parser) parseArrayLiteral() ast.Expression {
 		return nil
 	}
 	return arr
+}
+
+func appendArrayLiteralElement(array *ast.ArrayLiteral, element ast.Expression) {
+	current, currentIsHash := element.(*ast.HashLiteral)
+	if !currentIsHash || (current.Token.Type != lexer.COLON && current.Token.Type != lexer.ARROW) || len(array.Elements) == 0 {
+		array.Elements = append(array.Elements, element)
+		return
+	}
+	previous, previousIsHash := array.Elements[len(array.Elements)-1].(*ast.HashLiteral)
+	if !previousIsHash || (previous.Token.Type != lexer.COLON && previous.Token.Type != lexer.ARROW) {
+		array.Elements = append(array.Elements, element)
+		return
+	}
+	for _, key := range current.Order {
+		previous.Pairs[key] = current.Pairs[key]
+		previous.Order = append(previous.Order, key)
+	}
 }
 
 func (p *Parser) parseHashLiteral() ast.Expression {
@@ -1996,6 +2067,7 @@ func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
 	if !(p.curTokenIs(lexer.RBRACKET) && !p.peekTokenIs(lexer.RBRACKET)) && !p.expectPeek(lexer.RBRACKET) {
 		return nil
 	}
+	args = mergeImplicitHashRocketArguments(args)
 
 	hasSplat := false
 	for _, arg := range args {
@@ -2037,6 +2109,10 @@ func (p *Parser) parsePrefixExpression() ast.Expression {
 
 	p.nextToken()
 
+	if expression.Operator == "not" && p.curTokenIs(lexer.LPAREN) {
+		expression.Right = p.parseGroupedExpression()
+		return expression
+	}
 	expression.Right = p.parseExpression(PREFIX)
 
 	return expression
@@ -2200,7 +2276,9 @@ func (p *Parser) parseRangeExpression(left ast.Expression) ast.Expression {
 		exp.EndMissing = true
 		return exp
 	}
-	exp.Right = p.parseExpression(TERNARY)
+	// Keyword `and`/`or` bind below a range, unlike `&&`/`||`. Keep them
+	// outside the endpoint so condition flip-flops can be combined.
+	exp.Right = p.parseExpressionWithStopTokens(TERNARY, lexer.AND2, lexer.OR2)
 
 	return exp
 }
@@ -2713,6 +2791,10 @@ func (p *Parser) parseMethodCall(left ast.Expression) ast.Expression {
 	if p.peekTokenIs(lexer.LBRACKET) && call.Method != nil && !call.ParenthesizedArgs && p.hasSpaceBetween(call.Method.Token, p.peekToken) {
 		p.nextToken()
 		if arg := p.parseArrayLiteral(); arg != nil {
+			for p.peekTokenIs(lexer.DOT) {
+				p.nextToken()
+				arg = p.parseMethodCall(arg)
+			}
 			call.Args = append(call.Args, arg)
 		}
 		for p.peekTokenIs(lexer.COMMA) {
@@ -3015,8 +3097,46 @@ func (p *Parser) parseOneCallArg(call *ast.MethodCall) {
 	}
 	arg := p.parseExpression(LOWEST)
 	if arg != nil {
-		call.Args = append(call.Args, arg)
+		appendCallArgument(call, arg)
 	}
+}
+
+func appendCallArgument(call *ast.MethodCall, argument ast.Expression) {
+	current, currentIsHash := argument.(*ast.HashLiteral)
+	if !currentIsHash || current.Token.Type != lexer.ARROW || len(call.Args) == 0 {
+		call.Args = append(call.Args, argument)
+		return
+	}
+	previous, previousIsHash := call.Args[len(call.Args)-1].(*ast.HashLiteral)
+	if !previousIsHash || previous.Token.Type != lexer.ARROW {
+		call.Args = append(call.Args, argument)
+		return
+	}
+	for _, key := range current.Order {
+		previous.Pairs[key] = current.Pairs[key]
+		previous.Order = append(previous.Order, key)
+	}
+}
+
+func mergeImplicitHashRocketArguments(arguments []ast.Expression) []ast.Expression {
+	merged := make([]ast.Expression, 0, len(arguments))
+	for _, argument := range arguments {
+		current, currentIsHash := argument.(*ast.HashLiteral)
+		if !currentIsHash || current.Token.Type != lexer.ARROW || len(merged) == 0 {
+			merged = append(merged, argument)
+			continue
+		}
+		previous, previousIsHash := merged[len(merged)-1].(*ast.HashLiteral)
+		if !previousIsHash || previous.Token.Type != lexer.ARROW {
+			merged = append(merged, argument)
+			continue
+		}
+		for _, key := range current.Order {
+			previous.Pairs[key] = current.Pairs[key]
+			previous.Order = append(previous.Order, key)
+		}
+	}
+	return merged
 }
 
 func (p *Parser) parseOneCallArgStoppingAtRParen(call *ast.MethodCall) {
@@ -4621,7 +4741,7 @@ func (p *Parser) parseOneDefParam(exp *ast.DefExpression) {
 		if p.peekTokenIs(lexer.ASSIGN) {
 			p.nextToken()
 			p.nextToken()
-			exp.ParamDefaults = append(exp.ParamDefaults, p.parseExpression(LOWEST))
+			exp.ParamDefaults = append(exp.ParamDefaults, p.parseParameterDefaultExpression(lexer.COMMA, lexer.RPAREN))
 		} else {
 			exp.ParamDefaults = append(exp.ParamDefaults, nil)
 		}
@@ -4960,7 +5080,7 @@ func (p *Parser) parseLambdaParam(lit *ast.ProcLiteral, seen map[string]struct{}
 	if p.peekTokenIs(lexer.ASSIGN) {
 		p.nextToken()
 		p.nextToken()
-		lit.ParamDefaults = append(lit.ParamDefaults, p.parseExpression(LOWEST))
+		lit.ParamDefaults = append(lit.ParamDefaults, p.parseParameterDefaultExpression(lexer.COMMA, lexer.RPAREN))
 		return
 	}
 	lit.ParamDefaults = append(lit.ParamDefaults, nil)
@@ -5154,7 +5274,7 @@ func (p *Parser) statementCanConsumeNestedEnd(stmt ast.Statement) bool {
 		return false
 	}
 	switch exprStmt.Expression.(type) {
-	case *ast.ClassExpression, *ast.ModuleExpression, *ast.DefExpression, *ast.IfExpression, *ast.BeginExpression:
+	case *ast.ClassExpression, *ast.ModuleExpression, *ast.DefExpression, *ast.IfExpression, *ast.BeginExpression, *ast.CatchExpression:
 		return true
 	default:
 		return false
@@ -5233,8 +5353,10 @@ func (p *Parser) parseBeginExpression() ast.Expression {
 			}
 		}
 
-		p.consumeRescueExceptionTerminator()
-		p.parseRescueVariableBinding(rescue)
+		if !hadSeparator {
+			p.consumeRescueExceptionTerminator()
+			p.parseRescueVariableBinding(rescue)
+		}
 		p.skipCurSeparators()
 		rescue.Body = &ast.BlockExpression{
 			Token: p.curToken,

@@ -16,6 +16,34 @@ import (
 	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
 
+func negateNumericLiteralCallReceiver(call *ast.MethodCall) (*ast.MethodCall, bool) {
+	if call == nil || call.Receiver == nil {
+		return nil, false
+	}
+	copyCall := *call
+	switch receiver := call.Receiver.(type) {
+	case *ast.IntegerLiteral:
+		copyReceiver := *receiver
+		copyReceiver.Value = -copyReceiver.Value
+		copyCall.Receiver = &copyReceiver
+		return &copyCall, true
+	case *ast.FloatLiteral:
+		copyReceiver := *receiver
+		copyReceiver.Value = -copyReceiver.Value
+		copyCall.Receiver = &copyReceiver
+		return &copyCall, true
+	case *ast.MethodCall:
+		negativeReceiver, ok := negateNumericLiteralCallReceiver(receiver)
+		if !ok {
+			return nil, false
+		}
+		copyCall.Receiver = negativeReceiver
+		return &copyCall, true
+	default:
+		return nil, false
+	}
+}
+
 const (
 	ScopeGlobal    = "global"
 	ScopeLocal     = "local"
@@ -717,19 +745,8 @@ func (c *Compiler) Compile(node interface{}) error {
 	case *ast.PrefixExpression:
 		if node.Operator == "-" {
 			if call, ok := node.Right.(*ast.MethodCall); ok && call.Receiver != nil {
-				switch receiver := call.Receiver.(type) {
-				case *ast.IntegerLiteral:
-					copyCall := *call
-					copyReceiver := *receiver
-					copyReceiver.Value = -copyReceiver.Value
-					copyCall.Receiver = &copyReceiver
-					return c.Compile(&copyCall)
-				case *ast.FloatLiteral:
-					copyCall := *call
-					copyReceiver := *receiver
-					copyReceiver.Value = -copyReceiver.Value
-					copyCall.Receiver = &copyReceiver
-					return c.Compile(&copyCall)
+				if negativeCall, ok := negateNumericLiteralCallReceiver(call); ok {
+					return c.Compile(negativeCall)
 				}
 			}
 		}
@@ -813,13 +830,23 @@ func (c *Compiler) Compile(node interface{}) error {
 			}
 		}
 	case *ast.CaseExpression:
+		patternCase := false
+		for _, clause := range node.Clauses {
+			for _, condition := range clause.Conditions {
+				if _, ok := condition.(*ast.PatternMatchExpression); ok {
+					patternCase = true
+				}
+			}
+		}
+		if patternCase {
+			c.emit(OpPatternCacheClear, 1)
+		}
 		if node.Expression != nil {
 			if err := c.Compile(node.Expression); err != nil {
 				return err
 			}
 		}
 		jumpToEndPositions := []int{}
-		patternCase := false
 		for _, clause := range node.Clauses {
 			for _, cond := range clause.Conditions {
 				if node.Expression != nil {
@@ -910,9 +937,17 @@ func (c *Compiler) Compile(node interface{}) error {
 				c.Emit(OpNil)
 			}
 		}
+		endTarget := len(c.currentInstructions())
+		if patternCase {
+			c.emit(OpPatternCacheClear, 0)
+		}
 		afterAll := len(c.currentInstructions())
 		for _, pos := range jumpToEndPositions {
-			c.changeOperand(pos, afterAll)
+			if patternCase {
+				c.changeOperand(pos, endTarget)
+			} else {
+				c.changeOperand(pos, afterAll)
+			}
 		}
 	case *ast.PatternMatchExpression:
 		if node.Left != nil {
@@ -1115,6 +1150,11 @@ func (c *Compiler) Compile(node interface{}) error {
 				return err
 			}
 			c.Emit(op)
+		} else if splat, ok := node.Value.(*ast.SplatExpression); ok {
+			if err := c.Compile(splat.Value); err != nil {
+				return err
+			}
+			c.Emit(OpSplatToArray)
 		} else if err := c.Compile(node.Value); err != nil {
 			return err
 		}
@@ -1199,71 +1239,103 @@ func (c *Compiler) Compile(node interface{}) error {
 				return err
 			}
 		}
-		if len(node.Values) == 1 && len(node.Names) > 0 {
-			if err := c.Compile(node.Values[0]); err != nil {
-				return err
+		if len(node.Values) == 1 {
+			if splat, ok := node.Values[0].(*ast.SplatExpression); ok {
+				if err := c.Compile(splat.Value); err != nil {
+					return err
+				}
+				c.Emit(OpSplatToArray)
+			} else {
+				if err := c.Compile(node.Values[0]); err != nil {
+					return err
+				}
 			}
 			c.Emit(OpDup)
 			c.Emit(OpMultiAssignPrepare)
-			for i := 0; i < len(node.Names); i++ {
-				c.Emit(OpDup)
-				c.EmitConstant(&object.EmeraldValue{
-					Type:  object.ValueInteger,
-					Data:  int64(i),
-					Class: core.R.Classes["Integer"],
-				})
-				c.Emit(OpIndex)
-				target := ast.Expression(node.Names[i])
-				if i < len(node.Targets) {
-					target = node.Targets[i]
-				}
-				if err := c.compileMultiAssignTarget(target, contexts); err != nil {
-					return err
-				}
-				c.Emit(OpPop)
-			}
-			c.Emit(OpPop)
 		} else {
-			hasNestedTarget := multiAssignHasNestedTarget(node)
-			for i, val := range node.Values {
+			c.emit(OpArray, 0)
+			for _, val := range node.Values {
+				splatMode := 0
 				if splat, ok := val.(*ast.SplatExpression); ok {
 					if err := c.Compile(splat.Value); err != nil {
 						return err
 					}
-					if hasNestedTarget {
-						c.Emit(OpDup)
-						c.Emit(OpMultiAssignCheckToAry)
-					}
-					c.Emit(OpSplatToA)
-					if len(node.Values) == 1 {
-						c.Emit(OpDup)
-					}
+					splatMode = 2
 				} else {
 					if err := c.Compile(val); err != nil {
 						return err
 					}
-					if len(node.Values) == 1 {
-						c.Emit(OpDup)
-					}
-					if i < len(node.Targets) && isNestedMultiAssignTarget(node.Targets[i]) {
-						c.Emit(OpMultiAssignPrepare)
-					} else if len(node.Values) == 1 && i < len(node.Targets) && isSplatMultiAssignTarget(node.Targets[i]) {
-						c.Emit(OpMultiAssignPrepare)
-					}
 				}
+				c.emit(OpArrayAppend, splatMode)
 			}
-			for i := len(node.Names) - 1; i >= 0; i-- {
-				target := ast.Expression(node.Names[i])
-				if i < len(node.Targets) {
-					target = node.Targets[i]
+			c.Emit(OpDup)
+		}
+		if err := c.compileMultiAssignTargets(node.Targets, contexts); err != nil {
+			return err
+		}
+		c.Emit(OpPop)
+	case *ast.MethodCall:
+		if node.Assignment && node.Receiver != nil && len(node.Args) >= 1 {
+			if compound, ok := node.Args[len(node.Args)-1].(*ast.InfixExpression); ok {
+				if getter, ok := compound.Left.(*ast.MethodCall); ok && getter.Receiver == node.Receiver && getter.Method != nil && getter.Method.Value == "[]" && len(getter.Args) == 1 {
+					if splat, ok := getter.Args[0].(*ast.SplatExpression); ok {
+						if err := c.Compile(node.Receiver); err != nil {
+							return err
+						}
+						jumpEnd := -1
+						if node.Safe {
+							c.Emit(OpDup)
+							jumpCall := c.emit(OpJumpNotNil, 9999)
+							jumpEnd = c.emit(OpJump, 9999)
+							c.changeOperand(jumpCall, len(c.currentInstructions()))
+						}
+						if err := c.Compile(splat.Value); err != nil {
+							return err
+						}
+						if err := c.Compile(compound.Right); err != nil {
+							return err
+						}
+						methodIdx := c.addConstant(&object.EmeraldValue{Type: object.ValueString, Data: compound.Operator, Class: core.R.Classes["String"]})
+						c.emit(OpIndexSplatCompoundAssign, methodIdx)
+						if jumpEnd >= 0 {
+							c.changeOperand(jumpEnd, len(c.currentInstructions()))
+						}
+						return nil
+					}
 				}
-				if err := c.compileMultiAssignTarget(target, contexts); err != nil {
-					return err
-				}
-				c.Emit(OpPop)
 			}
 		}
-	case *ast.MethodCall:
+		if node.Assignment && node.Receiver != nil && len(node.Args) == 1 {
+			if compound, ok := node.Args[0].(*ast.InfixExpression); ok {
+				if getter, ok := compound.Left.(*ast.MethodCall); ok && getter.Receiver == node.Receiver && len(getter.Args) == 0 && len(getter.KeywordArgs) == 0 {
+					if err := c.Compile(node.Receiver); err != nil {
+						return err
+					}
+					jumpEnd := -1
+					if node.Safe {
+						c.Emit(OpDup)
+						jumpCall := c.emit(OpJumpNotNil, 9999)
+						jumpEnd = c.emit(OpJump, 9999)
+						c.changeOperand(jumpCall, len(c.currentInstructions()))
+					}
+					c.Emit(OpDup)
+					getterIdx := c.addConstant(&object.EmeraldValue{Type: object.ValueString, Data: getter.Method.Value, Class: core.R.Classes["String"]})
+					c.emit(OpSend, getterIdx, 0, 0, 255)
+					if err := c.Compile(compound.Right); err != nil {
+						return err
+					}
+					if !c.emitCompoundOperator(compound.Operator) {
+						return fmt.Errorf("unsupported compound assignment operator %s", compound.Operator)
+					}
+					setterIdx := c.addConstant(&object.EmeraldValue{Type: object.ValueString, Data: node.Method.Value, Class: core.R.Classes["String"]})
+					c.emit(OpSendSetter, setterIdx, 0, 1, 255)
+					if jumpEnd >= 0 {
+						c.changeOperand(jumpEnd, len(c.currentInstructions()))
+					}
+					return nil
+				}
+			}
+		}
 		if (node.LogicalAssignment == lexer.OR_ASSIGN || node.LogicalAssignment == lexer.AND_ASSIGN) && len(node.Args) > 0 {
 			args := node.Args[:len(node.Args)-1]
 			if !expressionsContainSplat(args) {
@@ -1329,8 +1401,11 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		splatCount := 0
-		for _, arg := range args {
+		for i, arg := range args {
 			if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.MULTIPLY {
+				if node.Assignment && i == len(args)-1 {
+					continue
+				}
 				splatCount++
 			}
 		}
@@ -1343,6 +1418,9 @@ func (c *Compiler) Compile(node interface{}) error {
 						return err
 					}
 					c.Emit(OpSplatToArray)
+					if node.Assignment && i == len(args)-1 {
+						c.emit(OpArray, 1)
+					}
 				} else {
 					if err := c.Compile(arg); err != nil {
 						return err
@@ -1358,14 +1436,24 @@ func (c *Compiler) Compile(node interface{}) error {
 		} else {
 			for i, arg := range args {
 				compileArg := arg
+				assignmentSplat := false
 				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type != lexer.BIT_AND {
 					compileArg = splat.Value
-					if splat.Token.Type == lexer.MULTIPLY && splatIndex == 255 {
+					if splat.Token.Type == lexer.MULTIPLY && node.Assignment && i == len(args)-1 {
+						assignmentSplat = true
+					} else if splat.Token.Type == lexer.MULTIPLY && splatIndex == 255 {
 						splatIndex = i
+						assignmentSplat = true
 					}
 				}
 				if err := c.Compile(compileArg); err != nil {
 					return err
+				}
+				if hash, ok := arg.(*ast.HashLiteral); ok && hash.Token.Type == lexer.ARROW && len(node.KeywordArgs) > 0 {
+					c.Emit(OpMarkKeywordHash)
+				}
+				if assignmentSplat {
+					c.Emit(OpSplatToArray)
 				}
 			}
 		}
@@ -1486,7 +1574,12 @@ func (c *Compiler) Compile(node interface{}) error {
 			fmt.Fprintln(os.Stderr, "warning: argument of top-level return is ignored")
 		}
 		if node.ReturnValue != nil {
-			if err := c.Compile(node.ReturnValue); err != nil {
+			if splat, ok := node.ReturnValue.(*ast.SplatExpression); ok {
+				if err := c.Compile(splat.Value); err != nil {
+					return err
+				}
+				c.Emit(OpSplatToArray)
+			} else if err := c.Compile(node.ReturnValue); err != nil {
 				return err
 			}
 		} else {
@@ -1620,7 +1713,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 		if node.BlockParam != nil {
 			fnObj.HasBlockParam = true
-			fnObj.AnonymousBlockParam = node.BlockParam.Value == "_"
+			fnObj.AnonymousBlockParam = node.BlockParam.Value == "_" && node.BlockParam.Token.Literal == "&"
 			fnObj.BlockParamIndex = blockParamIndex
 		}
 
@@ -1946,7 +2039,12 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.BreakExpression:
 		if node.Value != nil {
-			if err := c.Compile(node.Value); err != nil {
+			if splat, ok := node.Value.(*ast.SplatExpression); ok {
+				if err := c.Compile(splat.Value); err != nil {
+					return err
+				}
+				c.Emit(OpSplatToArray)
+			} else if err := c.Compile(node.Value); err != nil {
 				return err
 			}
 			pos := c.emit(OpBreakValue, 0)
@@ -1966,7 +2064,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.emit(OpNext, 0)
 			return nil
 		}
-		pos := c.emit(OpJump, 0)
+		pos := c.emit(OpNext, 0)
 		if c.scopes[c.scopeIndex].nextPatchTarget >= 0 {
 			c.changeOperand(pos, c.scopes[c.scopeIndex].nextPatchTarget)
 		} else {
@@ -1991,12 +2089,15 @@ func (c *Compiler) Compile(node interface{}) error {
 				compileArg := arg
 				if splat, ok := arg.(*ast.SplatExpression); ok {
 					compileArg = splat.Value
-					if splatIndex < 0 {
+					if splat.Token.Type == lexer.MULTIPLY && splatIndex < 0 {
 						splatIndex = i
 					}
 				}
 				if err := c.Compile(compileArg); err != nil {
 					return err
+				}
+				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+					c.Emit(OpMarkKeywordHash)
 				}
 			}
 			argCount := len(node.Args)
@@ -2013,6 +2114,7 @@ func (c *Compiler) Compile(node interface{}) error {
 					})
 				}
 				c.emit(OpHash, len(node.KeywordArgs))
+				c.Emit(OpMarkKeywordHash)
 				argCount++
 			}
 			if splatIndex >= 0 {
@@ -2706,6 +2808,8 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 		FreeVarNames:          freeVarNames(free),
 		TrailingCommaParam:    block.TrailingComma,
 		ForLoopCollectAsPair:  forLoopCollectAsPair,
+		ImplicitItParameter:   implicitIt,
+		NumberedParameters:    numberedParamCount > 0,
 	}
 	if block.RestParam != nil {
 		fnObj.HasRestParam = true
@@ -2720,7 +2824,7 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 	}
 	if block.BlockParam != nil {
 		fnObj.HasBlockParam = true
-		fnObj.AnonymousBlockParam = block.BlockParam.Value == "_"
+		fnObj.AnonymousBlockParam = block.BlockParam.Value == "_" && block.BlockParam.Token.Literal == "&"
 		fnObj.BlockParamIndex = blockParamIndex
 	}
 
@@ -3299,6 +3403,26 @@ type namedRegexpCaptureBinding struct {
 }
 
 func (c *Compiler) compileCondition(condition ast.Expression) error {
+	if flipFlop, ok := condition.(*ast.RangeExpression); ok && !flipFlop.StartMissing && !flipFlop.EndMissing {
+		return c.compileFlipFlopCondition(flipFlop)
+	}
+	if logical, ok := condition.(*ast.InfixExpression); ok && (logical.Operator == "&&" || logical.Operator == "and" || logical.Operator == "||" || logical.Operator == "or") {
+		if err := c.compileCondition(logical.Left); err != nil {
+			return err
+		}
+		c.Emit(OpDup)
+		jumpOp := OpJumpNotTruthy
+		if logical.Operator == "||" || logical.Operator == "or" {
+			jumpOp = OpJumpTruthy
+		}
+		jumpPos := c.emit(jumpOp, 9999)
+		c.Emit(OpPop)
+		if err := c.compileCondition(logical.Right); err != nil {
+			return err
+		}
+		c.changeOperand(jumpPos, len(c.currentInstructions()))
+		return nil
+	}
 	if _, ok := condition.(*ast.RegexpLiteral); !ok {
 		return c.Compile(condition)
 	}
@@ -3314,6 +3438,72 @@ func (c *Compiler) compileCondition(condition ast.Expression) error {
 	})
 	c.emit(OpSend, methodNameIdx, 0, 1, 255)
 	return nil
+}
+
+func (c *Compiler) compileFlipFlopCondition(node *ast.RangeExpression) error {
+	stateID := c.tempCounter
+	c.tempCounter++
+
+	c.emit(OpFlipFlopGet, stateID)
+	jumpActive := c.emit(OpJumpTruthy, 9999)
+	if err := c.compileFlipFlopEndpoint(node.Left); err != nil {
+		return err
+	}
+	jumpFalse := c.emit(OpJumpNotTruthy, 9999)
+	c.emit(OpFlipFlopSet, stateID, 1)
+	if node.Exclusive {
+		c.Emit(OpTrue)
+		jumpEnd := c.emit(OpJump, 9999)
+		activePos := len(c.currentInstructions())
+		c.changeOperand(jumpActive, activePos)
+		if err := c.compileFlipFlopEndpoint(node.Right); err != nil {
+			return err
+		}
+		jumpKeepActive := c.emit(OpJumpNotTruthy, 9999)
+		c.emit(OpFlipFlopSet, stateID, 0)
+		truePos := len(c.currentInstructions())
+		c.changeOperand(jumpKeepActive, truePos)
+		c.Emit(OpTrue)
+		jumpAfterActive := c.emit(OpJump, 9999)
+		falsePos := len(c.currentInstructions())
+		c.changeOperand(jumpFalse, falsePos)
+		c.Emit(OpFalse)
+		endPos := len(c.currentInstructions())
+		c.changeOperand(jumpEnd, endPos)
+		c.changeOperand(jumpAfterActive, endPos)
+		return nil
+	}
+
+	activePos := len(c.currentInstructions())
+	c.changeOperand(jumpActive, activePos)
+	if err := c.compileFlipFlopEndpoint(node.Right); err != nil {
+		return err
+	}
+	jumpKeepActive := c.emit(OpJumpNotTruthy, 9999)
+	c.emit(OpFlipFlopSet, stateID, 0)
+	truePos := len(c.currentInstructions())
+	c.changeOperand(jumpKeepActive, truePos)
+	c.Emit(OpTrue)
+	jumpEnd := c.emit(OpJump, 9999)
+	falsePos := len(c.currentInstructions())
+	c.changeOperand(jumpFalse, falsePos)
+	c.Emit(OpFalse)
+	endPos := len(c.currentInstructions())
+	c.changeOperand(jumpEnd, endPos)
+	return nil
+}
+
+func (c *Compiler) compileFlipFlopEndpoint(expression ast.Expression) error {
+	if _, ok := expression.(*ast.IntegerLiteral); ok {
+		fmt.Fprintln(os.Stderr, "warning: integer literal in flip-flop")
+		c.emit(OpGetGlobal, c.globalSymbolIndex("$."))
+		if err := c.Compile(expression); err != nil {
+			return err
+		}
+		c.Emit(OpEqual)
+		return nil
+	}
+	return c.compileCondition(expression)
 }
 
 func (c *Compiler) prepareNamedRegexpCaptureBindings(node *ast.InfixExpression) []namedRegexpCaptureBinding {
@@ -3866,6 +4056,36 @@ func (c *Compiler) compileLogicalSendAssignment(receiver ast.Expression, getter,
 		c.changeOperand(jumpEnd, len(c.currentInstructions()))
 	}
 	return nil
+}
+
+func (c *Compiler) emitCompoundOperator(operator string) bool {
+	switch operator {
+	case "+":
+		c.Emit(OpAdd)
+	case "-":
+		c.Emit(OpSub)
+	case "*":
+		c.Emit(OpMul)
+	case "/":
+		c.Emit(OpDiv)
+	case "%":
+		c.Emit(OpMod)
+	case "**":
+		c.Emit(OpPow)
+	case "&":
+		c.Emit(OpBitAnd)
+	case "|":
+		c.Emit(OpBitOr)
+	case "^":
+		c.Emit(OpBitXor)
+	case "<<":
+		c.Emit(OpBitLeftShift)
+	case ">>":
+		c.Emit(OpBitRightShift)
+	default:
+		return false
+	}
+	return true
 }
 
 func (c *Compiler) emitVariableAssignmentStore(name *ast.Identifier) error {
@@ -4931,6 +5151,8 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		KeywordRestOnly:       node.KeywordRestOnly,
 		RejectBlock:           node.RejectBlock,
 		FreeVarNames:          freeVarNames(free),
+		ImplicitItParameter:   implicitIt,
+		NumberedParameters:    numberedParamCount > 0,
 	}
 	if node.KeywordRestParam != nil {
 		fnObj.KeywordRestParam = node.KeywordRestParam.Value
@@ -4945,7 +5167,7 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 	}
 	if node.BlockParam != nil {
 		fnObj.HasBlockParam = true
-		fnObj.AnonymousBlockParam = node.BlockParam.Value == "_"
+		fnObj.AnonymousBlockParam = node.BlockParam.Value == "_" && node.BlockParam.Token.Literal == "&"
 		fnObj.BlockParamIndex = blockParamIndex
 	}
 
@@ -5130,20 +5352,49 @@ func (c *Compiler) emitHiddenTemp(temp *Symbol) {
 	c.emit(OpGetLocal, temp.Index)
 }
 
+func multiAssignSplatLayout(targets []ast.Expression) (int, int, int) {
+	for i, target := range targets {
+		if _, ok := target.(*ast.SplatExpression); ok {
+			return i, i, len(targets) - i - 1
+		}
+	}
+	return -1, len(targets), 0
+}
+
+func (c *Compiler) emitMultiAssignExtract(position int, splatIndex int, preCount int, postCount int) {
+	kind := 0
+	index := position
+	if splatIndex >= 0 {
+		switch {
+		case position == splatIndex:
+			kind = 1
+			index = 0
+		case position > splatIndex:
+			kind = 2
+			index = position - splatIndex - 1
+		}
+	}
+	c.emit(OpMultiAssignExtract, kind, index, preCount, postCount)
+}
+
+func (c *Compiler) compileMultiAssignTargets(targets []ast.Expression, contexts map[ast.Expression]*multiAssignTargetContext) error {
+	splatIndex, preCount, postCount := multiAssignSplatLayout(targets)
+	for i, target := range targets {
+		c.Emit(OpDup)
+		c.emitMultiAssignExtract(i, splatIndex, preCount, postCount)
+		if err := c.compileMultiAssignTarget(target, contexts); err != nil {
+			return err
+		}
+		c.Emit(OpPop)
+	}
+	return nil
+}
+
 func (c *Compiler) compileMultiAssignTarget(target ast.Expression, contexts map[ast.Expression]*multiAssignTargetContext) error {
 	switch node := target.(type) {
 	case *ast.ArrayLiteral:
 		c.Emit(OpMultiAssignPrepare)
-		for i, child := range node.Elements {
-			c.Emit(OpDup)
-			c.EmitConstant(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(i), Class: core.R.Classes["Integer"]})
-			c.Emit(OpIndex)
-			if err := c.compileMultiAssignTarget(child, contexts); err != nil {
-				return err
-			}
-			c.Emit(OpPop)
-		}
-		return nil
+		return c.compileMultiAssignTargets(node.Elements, contexts)
 	case *ast.SplatExpression:
 		return c.compileMultiAssignTarget(node.Value, contexts)
 	case *ast.MethodCall:

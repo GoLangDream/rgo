@@ -680,3 +680,32 @@ func TestExceptionDupCallsInitializeDup(t *testing.T) {
 		t.Fatal("Exception#dup did not call initialize_dup")
 	}
 }
+
+func TestRegexpEmptyLookaheadQuantifierReturnsEmptyMatch(t *testing.T) {
+	pattern := &object.EmeraldValue{
+		Type:  object.ValueRegexp,
+		Data:  &object.RRegexp{Pattern: `(?:(?=a)|a)*`},
+		Class: R.Classes["Regexp"],
+	}
+	result := regexpMatchValue(pattern, true, mkStr("aaa"))
+	data, ok := matchDataPayload(result)
+	if !ok || len(data.Matches) != 1 || data.Matches[0] != "" {
+		indices, handled, errText := onigRegexpSearch(`(?:(?=a)|a)*`, "aaa", "")
+		t.Fatalf("expected one empty match, got %s (indices=%v handled=%v error=%q fallback=%v)", result.Inspect(), indices, handled, errText, regexpEmptyLookaheadFallbackIndices(`(?:(?=a)|a)*`, "aaa"))
+	}
+}
+
+func TestRegexpBinaryAndWindowsDotMatchOneByte(t *testing.T) {
+	for _, option := range []string{"n", "s"} {
+		pattern := &object.EmeraldValue{
+			Type:  object.ValueRegexp,
+			Data:  &object.RRegexp{Pattern: ".", Options: option},
+			Class: R.Classes["Regexp"],
+		}
+		result := regexpMatchValue(pattern, true, mkStr("\xc3\xa9"))
+		data, ok := matchDataPayload(result)
+		if !ok || len(data.Matches) != 1 || data.Matches[0] != "\xc3" {
+			t.Fatalf("/%s dot expected first byte, got %s", option, result.Inspect())
+		}
+	}
+}

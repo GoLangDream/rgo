@@ -15,6 +15,7 @@ type Module struct {
 	ConstantLocations   map[string]ConstantLocation
 	AutoloadLocations   map[string]ConstantLocation
 	ClassVars           map[string]*EmeraldValue
+	ClassVarOrder       []string
 	InstanceVars        map[string]*EmeraldValue
 	Parent              *Module
 	IncludedModules     []*Module
@@ -43,6 +44,11 @@ func (m *Module) DefineMethod(name string, method *Method) {
 }
 
 func (m *Module) GetMethod(name string) (*Method, bool) {
+	for _, prepended := range m.PrependedModules {
+		if method, ok := prepended.GetMethod(name); ok {
+			return method, true
+		}
+	}
 	method, ok := m.Methods[name]
 	if ok {
 		return method, true
