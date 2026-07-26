@@ -1,249 +1,115 @@
-# RGo - Go 语言的 Ruby 风格库
+# RGo
+
 [![Go](https://github.com/GoLangDream/rgo/actions/workflows/test.yml/badge.svg)](https://github.com/GoLangDream/rgo/actions/workflows/test.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/GoLangDream/rgo)](https://goreportcard.com/report/github.com/GoLangDream/rgo)
-[![Coverage Status](https://coveralls.io/repos/github/GoLangDream/rgo/badge.svg?branch=main)](https://coveralls.io/github/GoLangDream/rgo?branch=main)
 
-RGo 是一个 Go 语言库，提供了类似 Ruby 的编程体验。它包含了字符串、数组、哈希表、整数和类系统等常用数据类型的 Ruby 风格实现。
+RGo 是一个用 Go 实现的实验性 Ruby 运行时，当前以 Ruby 4.0.0 兼容性为目标。项目包含 Lexer、Parser、字节码编译器、虚拟机、核心类库、命令行工具，以及内置的 MSpec/RubySpec 测试支持。
 
-## 安装
+> RGo 仍处于开发阶段，适合语言实现研究、兼容性实验和项目贡献。目前不建议用于生产环境，也不能替代完整的 CRuby 标准库与原生扩展生态。
 
-```bash
-go get github.com/GoLangDream/rgo
-```
+## 当前状态
 
-## 特性
+截至 2026-07-25：
 
-- 类似 Ruby 的字符串操作
-- 类似 Ruby 的数组操作
-- 类似 Ruby 的哈希表操作
-- 类似 Ruby 的整数操作
-- 类似 Ruby 的类系统
+- Go 全仓测试通过：`./scripts/safe_go_test.sh ./...`
+- VM 完整测试通过，此前 13 个独立回归已清零
+- RubySpec Language：80/80 文件通过
+- RubySpec 全树：3,256 个文件通过、526 个文件被平台或版本 guard 跳过、25 个文件存在行为失败、2 个文件超时
+- RubySpec 已执行 31,639 个 examples，其中 53 个 failures
+- Rails 兼容性尚未建立可复现门禁；仓库当前不包含 Rails 源码树
 
-## 性能
+完整 RubySpec 报告见 [`reports/spec-status/ruby-spec-full.csv`](reports/spec-status/ruby-spec-full.csv)，具体开发缺口见 [`TODO.md`](TODO.md)。
 
-RGO 在基本操作上与原生 Go 对象保持接近的性能，同时提供 Ruby 风格的便利 API。
+## 构建
 
-### 性能总览
-
-| 组件 | 基本操作 | 复杂操作 | 推荐使用场景 |
-|------|----------|----------|-------------|
-| **RString** | 🟢 性能相当 | 🟡 轻微损失 | 字符串处理、文本操作 |
-| **RInteger** | 🟢 性能相当 | 🟡 轻微损失 | 数值计算、算术运算 |
-| **RHash** | 🟢 性能相当 | 🟠 中等损失 | 键值存储、配置管理 |
-| **RClass** | 🟠 中等损失 | 🔴 严重损失 | 原型开发、动态编程 |
-
-- 🟢 **性能相当** (< 10% 差异): 适合性能敏感的应用
-- 🟡 **轻微损失** (10-50% 差异): 大多数应用场景可接受
-- 🟠 **中等损失** (50-500% 差异): 需要权衡开发效率vs性能
-- 🔴 **严重损失** (> 500% 差异): 建议仅用于非性能关键场景
-
-### 运行性能测试
+需要 Go 1.24.3 或兼容版本。Linux 上启用 CGO 时，RGo 会在运行期尝试加载 `libonig` 以提高 Ruby 正则表达式兼容性；不可用时会使用内置回退路径。
 
 ```bash
-# 快速测试
-make benchmark-quick
-
-# 完整测试
-make benchmark
-
-# 详细测试
-make benchmark-detail
+make build
+./rgo --version
 ```
 
-📊 **详细性能分析**: [性能测试报告](docs/PERFORMANCE_ANALYSIS.md) | [性能测试指南](docs/BENCHMARK_GUIDE.md)
+预期版本输出：
 
-## 快速开始
-
-### RString
-
-```go
-import "github.com/GoLangDream/rgo"
-
-str := rgo.NewRString("hello")
-str.Upcase()           // 返回 "HELLO"
-str.Downcase()         // 返回 "hello"
-str.Capitalize()       // 返回 "Hello"
-str.Reverse()          // 返回 "olleh"
-str.Include("ell")     // 返回 true
-str.StartsWith("he")   // 返回 true
-str.EndsWith("lo")     // 返回 true
+```text
+ruby 4.0.0 (rgo) [linux-amd64]
 ```
 
-更多 RString 的详细文档请参考 [RString.md](docs/RString.md)
+## 使用
 
-### RArray
+运行一段 Ruby 代码：
 
-```go
-arr := rgo.NewRArray([]rgo.Object{
-    rgo.NewRString("a"),
-    rgo.NewRString("b"),
-    rgo.NewRString("c"),
-})
-
-// 数组操作
-arr.Push(rgo.NewRString("d"))
-arr.Pop()              // 返回 "d"
-arr.Reverse()          // 返回 ["c", "b", "a"]
-arr.Shuffle()          // 随机打乱数组
-arr.Sort()             // 排序数组
-arr.Uniq()             // 去重
-
-// 数组变换
-arr.Map(func(obj rgo.Object) rgo.Object {
-    return obj.(rgo.RString).Upcase()
-})
-
-// 数组查询
-arr.Include(rgo.NewRString("a"))  // 返回 true
-arr.Index(rgo.NewRString("b"))    // 返回 1
+```bash
+./rgo -e 'puts "hello from rgo"'
 ```
 
-更多 RArray 的详细文档请参考 [RArray.md](docs/RArray.md)
+运行 Ruby 文件：
 
-### RHash
-
-```go
-hash := rgo.NewHash()
-hash.Set("name", "John")
-hash.Set("age", 30)
-
-// 获取值
-name := hash.Get("name")  // 返回 "John"
-age := hash.Get("age")    // 返回 30
-
-// 删除键值对
-hash.Delete("age")
-
-// 检查键是否存在
-if hash.HasKey("name") {
-    // 键存在
-}
-
-// 获取所有键
-keys := hash.Keys()
-
-// 获取所有值
-values := hash.Values()
+```bash
+./rgo run example.rb
+# 也支持：
+./rgo example.rb
 ```
 
-更多 RHash 的详细文档请参考 [RHash.md](docs/RHash.md)
+运行一个 RubySpec/MSpec 文件：
 
-### RInteger
-
-```go
-i := rgo.NewRInteger(42)
-
-// 数学运算
-i.Add(8)                // 返回 50
-i.Sub(2)                // 返回 40
-i.Mul(2)                // 返回 80
-i.Div(4)                // 返回 20
-
-// 位运算
-i.BitAnd(0x0F)         // 按位与
-i.BitOr(0xF0)          // 按位或
-i.BitXor(0xFF)         // 按位异或
-i.LeftShift(2)         // 左移
-i.RightShift(1)        // 右移
-
-// 数学函数
-i.Abs()                // 绝对值
-i.Gcd(18)              // 最大公约数
-i.Lcm(18)              // 最小公倍数
-i.Pow(2)               // 幂运算
+```bash
+./rgo test vendor/ruby/spec/language/return_spec.rb
 ```
 
-更多 RInteger 的详细文档请参考 [RInteger.md](docs/RInteger.md)
+查看命令帮助：
 
-### RClass
-
-```go
-// 创建一个 Person 类
-Person := rgo.Class("Person").
-    AttrAccessor("name", "age").  // 定义 name 和 age 的读写属性
-    Define("initialize", func(name string, age int) *rgo.RClass {
-        p := rgo.Class("Person").New()
-        p.SetInstanceVar("name", name)
-        p.SetInstanceVar("age", age)
-        return p
-    }).
-    Define("introduce", func(self *rgo.RClass) string {
-        name := self.GetInstanceVar("name").(string)
-        age := self.GetInstanceVar("age").(int)
-        return fmt.Sprintf("Hi, I'm %s and I'm %d years old.", name, age)
-    })
-
-// 创建一个 Student 类，继承自 Person
-Student := rgo.Class("Student").
-    Inherit(Person).
-    AttrAccessor("grade").
-    Define("initialize", func(name string, age int, grade string) *rgo.RClass {
-        s := rgo.Class("Student").New()
-        s.SetInstanceVar("name", name)
-        s.SetInstanceVar("age", age)
-        s.SetInstanceVar("grade", grade)
-        return s
-    })
-
-// 创建实例
-person := Person.Call("initialize", "John", 30).(*rgo.RClass)
-student := Student.Call("initialize", "Alice", 15, "10th").(*rgo.RClass)
-
-// 使用属性访问器
-fmt.Println(person.Call("name"))  // 输出: John
-person.Call("name=", "Johnny")
-fmt.Println(person.Call("name"))  // 输出: Johnny
-
-// 调用方法
-fmt.Println(person.Call("introduce"))   // 输出: Hi, I'm Johnny and I'm 30 years old.
-
-// 类方法示例
-Math := rgo.Class("Math").
-    DefineClass("add", func(a, b int) int {
-        return a + b
-    }).
-    DefineClass("subtract", func(a, b int) int {
-        return a - b
-    })
-
-// 调用类方法
-sum := Math.Call("add", 2, 3).(int)           // 返回 5
-diff := Math.Call("subtract", 5, 3).(int)     // 返回 2
-
-// 方法缺失处理
-Dynamic := rgo.Class("Dynamic").
-    MethodMissing(func(name string, args ...any) any {
-        return fmt.Sprintf("Called %s with args: %v", name, args)
-    })
-
-// 调用未定义的方法
-result := Dynamic.New().Call("undefined_method", "arg1", "arg2").(string)
-fmt.Println(result)  // 输出: Called undefined_method with args: [arg1 arg2]
+```bash
+./rgo help
 ```
-
-RClass 提供了以下特性：
-1. 类定义和方法定义
-2. 实例方法和类方法
-3. 属性访问器（读写、只读、只写）
-4. 实例变量和类变量
-5. 继承和方法重写
-6. 父类方法调用（Super）
-7. 方法缺失处理
-8. 类型检查
-9. 线程安全
-
-更多 RClass 的详细文档请参考 [RClass.md](docs/RClass.md)
 
 ## 测试
 
+项目默认使用低并发测试脚本，避免 Go 编译和大量 spec 进程造成资源峰值：
+
 ```bash
-go test -v
+# 全部 Go 测试
+make test
+
+# 格式、vet 和 Go 测试
+make check
+
+# 完整 RubySpec，串行执行并生成 CSV 报告
+make full-ruby-spec
 ```
+
+也可以只检查单个 RubySpec 目录：
+
+```bash
+RGO_SPEC_TIMEOUT=5 \
+  ./scripts/spec_status.sh \
+  vendor/ruby/spec/language \
+  /tmp/rgo-language.csv
+```
+
+## 项目结构
+
+```text
+cmd/rgo/       命令行入口与 spec runner
+pkg/lexer/     Ruby 词法分析
+pkg/parser/    AST 与语法分析
+pkg/compiler/  字节码编译
+pkg/vm/        虚拟机与控制流
+pkg/core/      Ruby 核心类和标准库兼容层
+scripts/       低资源测试与兼容性门禁
+vendor/ruby/   上游 RubySpec/MSpec
+```
+
+## 已知边界
+
+- 标准库覆盖仍不完整，部分实现是面向当前 RubySpec 可观察行为的兼容层。
+- C 扩展、完整进程/线程语义、Marshal、Module、Delegate、部分 Thread 行为仍有缺口。
+- RubySpec 的 zero-example 文件表示被版本、平台或能力 guard 跳过，不能视为已实现。
+- `ruby_exe` 部分场景使用轻量模拟；需要真实子进程语义的兼容性仍需继续收敛。
 
 ## 贡献
 
-欢迎提交 Pull Request 和 Issue！
+提交修改前请先阅读 [`AGENTS.md`](AGENTS.md)，并至少运行与改动相关的聚焦测试及 `make test`。兼容性修复应尽量附带最小 Go 回归测试或对应 RubySpec 证据。
 
 ## 许可证
 
-MIT License
+Apache License 2.0，详见 [`LICENSE`](LICENSE)。

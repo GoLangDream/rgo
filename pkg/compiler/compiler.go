@@ -2265,14 +2265,17 @@ func (c *Compiler) compileDefinedExpression(node *ast.DefinedExpression) {
 		return
 	}
 	if c.voidContext {
-		result, ok := c.definedDescription(node.Expression)
-		if !ok {
-			c.Emit(OpNil)
+		call, explicitReceiverCall := node.Expression.(*ast.MethodCall)
+		if !explicitReceiverCall || call.Receiver == nil {
+			result, ok := c.definedDescription(node.Expression)
+			if !ok {
+				c.Emit(OpNil)
+				return
+			}
+			c.emitString(result)
+			c.Emit(OpFreeze)
 			return
 		}
-		c.emitString(result)
-		c.Emit(OpFreeze)
-		return
 	}
 	if identifier, ok := node.Expression.(*ast.Identifier); ok {
 		switch identifier.Value {
@@ -3161,13 +3164,6 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 	unmatchedReraiseStart := 0
 	if pendingNoMatchJump > 0 {
 		unmatchedReraiseStart = len(c.currentInstructions())
-		if hasEnsure {
-			c.Emit(OpEnsure)
-			if err := c.compileBlockAsValue(node.Ensure); err != nil {
-				return err
-			}
-			c.Emit(OpPop)
-		}
 		c.Emit(OpReraise)
 	}
 

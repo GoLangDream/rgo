@@ -254,6 +254,7 @@ type VM struct {
 	fiberCoroutines       map[*object.EmeraldValue]*fiberCoroutine
 	threadSpecialGlobals  map[string]*object.EmeraldValue
 	instructionExceptions map[*Frame]*object.EmeraldValue
+	unhandledException    *object.EmeraldValue
 }
 
 type nativeBacktraceFrame struct {
@@ -452,7 +453,7 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		argv := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}
 		vm.SetTopLevelConstant("ARGV", argv)
 		preloadedFeatures := make([]*object.EmeraldValue, 0, 9)
-		for _, feature := range []string{"complex.rb", "enumerator.so", "fiber.so", "rational.rb", "thread.so", "ruby2_keywords.rb", "set.rb", "pathname.so", "monitor.so"} {
+		for _, feature := range []string{"complex.rb", "enumerator.so", "fiber.so", "rational.rb", "thread.so", "ruby2_keywords.rb", "set.rb", "pathname.so"} {
 			preloadedFeatures = append(preloadedFeatures, &object.EmeraldValue{Type: object.ValueString, Data: feature, Class: core.R.Classes["String"]})
 		}
 		vm.setGlobalByName("$\"", &object.EmeraldValue{Type: object.ValueArray, Data: preloadedFeatures, Class: core.R.Classes["Array"]})
@@ -983,6 +984,19 @@ func (vm *VM) handlePendingNonLocalBreak(frame *Frame) bool {
 		vm.pendingBreakTargetID = 0
 		vm.pendingBreakValue = nil
 		vm.completedBreakValue = value
+		if frame.WhileEnd >= 0 {
+			if vm.routeBreakThroughEnsure(frame, value, frame.WhileEnd) {
+				return false
+			}
+			vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+			vm.push(value)
+			if value == nil || value.Type == object.ValueNil {
+				frame.Ip = frame.WhileEnd - 1
+			} else {
+				frame.Ip = frame.WhileEnd
+			}
+			return false
+		}
 	} else if vm.routeBreakThroughEnsure(frame, value, -1) {
 		return false
 	}
@@ -1888,8 +1902,18 @@ func (vm *VM) Run() error {
 			runtime.Gosched()
 		}
 	}
+	if vm.sp > frame.Bp {
+		top := vm.stack[vm.sp-1]
+		if shouldPropagateExceptionValue(top) && !vm.frameHasActiveRescue(frame) {
+			vm.unhandledException = top
+		}
+	}
 
 	return nil
+}
+
+func (vm *VM) UnhandledException() *object.EmeraldValue {
+	return vm.unhandledException
 }
 
 func (vm *VM) endActiveRescue(frame *Frame) {
@@ -5234,7 +5258,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 		receiver := vm.pop()
 		if methodName == "include" && receiver == core.R.Main && len(vm.classStack) == 0 {
-			receiver = &object.EmeraldValue{Type: object.ValueClass, Data: core.R.Classes["Object"], Class: core.R.Classes["Class"]}
+			if vm.nextInstructionIsExpectationSend(frame) {
+				methodName = "__mspec_include_matcher__"
+			} else {
+				receiver = &object.EmeraldValue{Type: object.ValueClass, Data: core.R.Classes["Object"], Class: core.R.Classes["Class"]}
+			}
 		}
 		if methodName == "alias_method" && len(args) == 2 {
 			left := ""
@@ -5299,7 +5327,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
-		if shouldPropagateExceptionValue(result) && (blockArg == 3 || core.EvaluatingRaiseErrorMatcher() || numberedParameterMethodNamePattern.MatchString(methodName)) {
+		if shouldPropagateExceptionValue(result) && (isSetterSend || blockArg == 3 || core.EvaluatingRaiseErrorMatcher() || numberedParameterMethodNamePattern.MatchString(methodName)) {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -6084,6 +6112,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		if fnCopy.Name == "__block__" || fnCopy.SingletonClassBody {
 			closure.ReturnOwnerID = vm.lexicalReturnOwnerID(frame)
+		}
+		if fnCopy.Name == "__scoped_const_rhs__" && frame.WhileEnd >= 0 {
+			closure.BreakOwnerID = frame.ID
 		}
 
 		vm.push(&object.EmeraldValue{
@@ -6964,6 +6995,28 @@ func (vm *VM) frameConstants(frame *Frame) []*object.EmeraldValue {
 		return frame.Fn.Constants
 	}
 	return vm.constants
+}
+
+func (vm *VM) nextInstructionIsExpectationSend(frame *Frame) bool {
+	if frame == nil || frame.Fn == nil {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	next := frame.Ip + 1
+	if next+2 >= len(instructions) {
+		return false
+	}
+	op := compiler.Opcode(instructions[next])
+	if op != compiler.OpSend && op != compiler.OpSendWithKeywords {
+		return false
+	}
+	methodIndex := int(instructions[next+1])<<8 | int(instructions[next+2])
+	constants := vm.frameConstants(frame)
+	if methodIndex < 0 || methodIndex >= len(constants) || constants[methodIndex] == nil {
+		return false
+	}
+	method, _ := constants[methodIndex].Data.(string)
+	return method == "should" || method == "should_not"
 }
 
 func (vm *VM) readUint16() int {
@@ -9128,7 +9181,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		prevBlock := vm.currentBlock
 		vm.currentBlock = nil
 		prevClassStack := vm.classStack
-		if methodClosure != nil && len(methodClosure.ClassStack) > 0 {
+		if methodClosure != nil {
 			vm.classStack = append([]*object.EmeraldValue(nil), methodClosure.ClassStack...)
 		}
 		frame := vm.frames[vm.fp]
@@ -10955,6 +11008,9 @@ func (vm *VM) returnUnhandledException(frame *Frame, exception *object.EmeraldVa
 	core.LastRaisedResult = exception
 	vm.attachExceptionLocations(exception)
 	markExceptionRaised(exception)
+	if vm.isRoot && frame == vm.frames[0] {
+		vm.unhandledException = exception
+	}
 	vm.sp = frame.Bp
 	vm.push(exception)
 	frame.Ip = len(frame.Fn.Instructions) - 1

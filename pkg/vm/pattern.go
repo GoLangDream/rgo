@@ -213,7 +213,7 @@ func (vm *VM) matchArrayPattern(target *object.EmeraldValue, body string, frame 
 }
 
 func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *Frame, bindings map[string]*object.EmeraldValue) (bool, *object.EmeraldValue) {
-	hash, errVal := vm.patternHashValue(target, body)
+	hash, keys, errVal := vm.patternHashValue(target, body)
 	if errVal != nil || hash == nil {
 		return false, errVal
 	}
@@ -260,15 +260,24 @@ func (vm *VM) matchHashPattern(target *object.EmeraldValue, body string, frame *
 		return false, nil
 	}
 	if restName != "" && restName != "nil" {
-		rest := make(map[*object.EmeraldValue]*object.EmeraldValue)
-		for key, value := range hash {
+		rest := &object.RHash{
+			Pairs:  make(map[*object.EmeraldValue]*object.EmeraldValue),
+			Keys:   make([]*object.EmeraldValue, 0, len(hash)),
+			Hashes: make(map[*object.EmeraldValue]int64),
+		}
+		for _, key := range keys {
+			value, found := hash[key]
+			if !found {
+				continue
+			}
 			if key != nil && key.Type == object.ValueSymbol {
 				keyName, _ := key.Data.(string)
 				if requiredNames[strings.TrimPrefix(keyName, ":")] {
 					continue
 				}
 			}
-			rest[key] = value
+			rest.Keys = append(rest.Keys, key)
+			rest.Pairs[key] = value
 		}
 		bindPatternName(bindings, restName, &object.EmeraldValue{Type: object.ValueHash, Data: rest, Class: core.R.Classes["Hash"]})
 	}
@@ -347,23 +356,38 @@ func (vm *VM) patternArrayValues(target *object.EmeraldValue) ([]*object.Emerald
 	return nil, nil
 }
 
-func (vm *VM) patternHashValue(target *object.EmeraldValue, body string) (map[*object.EmeraldValue]*object.EmeraldValue, *object.EmeraldValue) {
+func (vm *VM) patternHashValue(target *object.EmeraldValue, body string) (map[*object.EmeraldValue]*object.EmeraldValue, []*object.EmeraldValue, *object.EmeraldValue) {
 	_, refined := vm.lookupActiveRefinedMethod(target, "deconstruct_keys")
 	if target != nil && target.Type == object.ValueHash && !refined {
-		return executorHashToMap(target), nil
+		return executorHashToMap(target), executorHashKeys(target), nil
 	}
 	if !vm.patternRespondsTo(target, "deconstruct_keys") {
-		return nil, nil
+		return nil, nil, nil
 	}
 	keysArg := vm.patternDeconstructKeysArgument(body)
 	result := vm.send(target, "deconstruct_keys", []*object.EmeraldValue{keysArg})
 	if result != nil && result.Type == object.ValueException {
-		return nil, result
+		return nil, nil, result
 	}
 	if !patternValueIsHash(result) {
-		return nil, core.NewTypeError("deconstruct_keys must return Hash")
+		return nil, nil, core.NewTypeError("deconstruct_keys must return Hash")
 	}
-	return executorHashToMap(result), nil
+	return executorHashToMap(result), executorHashKeys(result), nil
+}
+
+func executorHashKeys(value *object.EmeraldValue) []*object.EmeraldValue {
+	if value == nil || value.Type != object.ValueHash {
+		return nil
+	}
+	if hash, ok := value.Data.(*object.RHash); ok {
+		return append([]*object.EmeraldValue(nil), hash.Keys...)
+	}
+	pairs := executorHashToMap(value)
+	keys := make([]*object.EmeraldValue, 0, len(pairs))
+	for key := range pairs {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (vm *VM) patternDeconstructKeysArgument(body string) *object.EmeraldValue {

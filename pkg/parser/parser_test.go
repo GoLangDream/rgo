@@ -2895,24 +2895,32 @@ func TestParseAssignmentAsRightHandSideOfBooleanOr(t *testing.T) {
 
 func TestParseKeywordAssignmentValueOr(t *testing.T) {
 	expr := parseExpr(t, "x = true or false or y = 1")
-	assign, ok := expr.(*ast.AssignExpression)
+	top, ok := expr.(*ast.InfixExpression)
 	if !ok {
-		t.Fatalf("expected AssignExpression, got %T", expr)
+		t.Fatalf("expected low-precedence or at the root, got %T", expr)
 	}
-	if assign.Name.Value != "x" {
-		t.Fatalf("expected assignment to x, got %s", assign.Name.Value)
+	if top.Operator != "or" {
+		t.Fatalf("expected or at the root, got %s", top.Operator)
 	}
-	infix, ok := assign.Value.(*ast.InfixExpression)
+	left, ok := top.Left.(*ast.InfixExpression)
 	if !ok {
-		t.Fatalf("expected assignment value to be InfixExpression, got %T", assign.Value)
+		t.Fatalf("expected left-associated or expression, got %T", top.Left)
 	}
-	if infix.Operator != "or" {
-		t.Errorf("expected or at top, got %s", infix.Operator)
+	assign, ok := left.Left.(*ast.AssignExpression)
+	if !ok || assign.Name.Value != "x" {
+		t.Fatalf("expected assignment to x on the left, got %T", left.Left)
 	}
-
-	assignExpr, ok := infix.Right.(*ast.AssignExpression)
+	assignedValue, ok := assign.Value.(*ast.Boolean)
+	if !ok || !assignedValue.Value {
+		t.Fatalf("expected x to receive true, got %T", assign.Value)
+	}
+	leftRight, ok := left.Right.(*ast.Boolean)
+	if !ok || leftRight.Value {
+		t.Fatalf("expected false as the middle operand, got %T", left.Right)
+	}
+	assignExpr, ok := top.Right.(*ast.AssignExpression)
 	if !ok {
-		t.Fatalf("expected right side assignment, got %T", infix.Right)
+		t.Fatalf("expected right side assignment, got %T", top.Right)
 	}
 	if assignExpr.Name.Value != "y" {
 		t.Fatalf("expected assignment to y, got %s", assignExpr.Name.Value)

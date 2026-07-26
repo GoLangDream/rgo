@@ -354,6 +354,8 @@ var forEachContextStack []struct {
 var LastException *object.EmeraldValue
 var LastRaisedResult *object.EmeraldValue
 
+const RubyCompatibilityVersion = "4.0.0"
+
 var processHashSalt = time.Now().UnixNano() ^ int64(os.Getpid())<<32
 var LastMatcherException *object.EmeraldValue
 
@@ -4751,6 +4753,8 @@ func (rt *Runtime) defineMethods() {
 	encodingClass.DefineConstant("ISO8859_9", newEncodingValue("ISO-8859-9"))
 	encodingClass.DefineConstant("ISO_8859_15", newEncodingValue("ISO-8859-15"))
 	encodingClass.DefineConstant("ISO8859_15", newEncodingValue("ISO-8859-15"))
+	encodingClass.DefineConstant("ISO_8859_16", newEncodingValue("ISO-8859-16"))
+	encodingClass.DefineConstant("ISO8859_16", newEncodingValue("ISO-8859-16"))
 	encodingClass.DefineConstant("UTF_16", newEncodingValue("UTF-16"))
 	encodingClass.DefineConstant("CP1251", newEncodingValue("CP1251"))
 	encodingClass.DefineConstant("Windows_1250", newEncodingValue("Windows-1250"))
@@ -6001,12 +6005,12 @@ func (rt *Runtime) defineMethods() {
 func defineRubyBuiltinConstants(objectClass *object.Class) {
 	defineCoreClassConstants(objectClass)
 
-	version := frozenRubyConstantString("3.3.0")
+	version := frozenRubyConstantString(RubyCompatibilityVersion)
 	platform := runtime.GOOS + "-" + runtime.GOARCH
 	objectClass.DefineConstant("RUBY_VERSION", version)
 	objectClass.DefineConstant("RUBY_PATCHLEVEL", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]})
 	objectClass.DefineConstant("RUBY_COPYRIGHT", frozenRubyConstantString("ruby - Copyright (C) 1993-2026 ruby core team"))
-	objectClass.DefineConstant("RUBY_DESCRIPTION", frozenRubyConstantString("ruby 3.3.0 (rgo) ["+platform+"]"))
+	objectClass.DefineConstant("RUBY_DESCRIPTION", frozenRubyConstantString("ruby "+RubyCompatibilityVersion+" (rgo) ["+platform+"]"))
 	objectClass.DefineConstant("RUBY_ENGINE", frozenRubyConstantString("ruby"))
 	objectClass.DefineConstant("RUBY_ENGINE_VERSION", version)
 	objectClass.DefineConstant("RUBY_PLATFORM", frozenRubyConstantString(platform))
@@ -10166,9 +10170,6 @@ func collectClassVariableNamesOrdered(class *object.Class, inherit bool, seen ma
 		if !cls.IsSingleton && cls.SingletonClass != nil {
 			appendOrderedClassVariableNames(cls.SingletonClass.ClassVarOrder, cls.SingletonClass.ClassVars, seen, names)
 		}
-		for _, mod := range cls.IncludedModules {
-			collectModuleClassVariableNamesOrdered(mod, true, seen, names)
-		}
 		if !inherit {
 			break
 		}
@@ -10180,9 +10181,6 @@ func collectModuleClassVariableNamesOrdered(module *object.Module, inherit bool,
 		return
 	}
 	appendOrderedClassVariableNames(module.ClassVarOrder, module.ClassVars, seen, names)
-	for _, included := range module.IncludedModules {
-		collectModuleClassVariableNamesOrdered(included, true, seen, names)
-	}
 	if inherit && module.Parent != nil {
 		collectModuleClassVariableNamesOrdered(module.Parent, true, seen, names)
 	}
@@ -18228,7 +18226,7 @@ func isInsideRange(start, end int, ranges [][]int) bool {
 
 func executeRubyExeMainRuntimeError(source string, state *rubyExeLifecycleState) string {
 	withoutHandlers := rubyExeHandlerRe.ReplaceAllString(source, "")
-	raiseRe := regexp.MustCompile(`(?m)^\s*raise\s+['"]([^'"]+)['"]\s*(?:#.*)?$`)
+	raiseRe := regexp.MustCompile(`(?m)(?:^|;)\s*raise\s+['"]([^'"]+)['"]\s*(?:#.*)?$`)
 	matches := raiseRe.FindAllStringSubmatch(withoutHandlers, -1)
 	if len(matches) == 0 {
 		return ""
@@ -28973,7 +28971,7 @@ func encodingCanonicalList() []string {
 	return []string{
 		"UTF-8", "UTF-7", "UTF-16BE", "UTF-16LE", "UTF-16", "UTF-32BE", "UTF-32LE", "UTF-32",
 		"US-ASCII", "BINARY", "CESU-8", "IBM037", "IBM775", "IBM866", "IBM437", "EUC-JP", "ISO-2022-JP", "CP50221",
-		"stateless-ISO-2022-JP", "ISO-8859-1", "ISO-8859-2", "ISO-8859-5", "ISO-8859-9", "ISO-8859-15", "TIS-620",
+		"stateless-ISO-2022-JP", "ISO-8859-1", "ISO-8859-2", "ISO-8859-5", "ISO-8859-9", "ISO-8859-15", "ISO-8859-16", "TIS-620",
 		"Windows-1250", "CP1251", "Windows-1251", "Windows-1252", "Shift_JIS", "Windows-31J", "Big5",
 		"Emacs-Mule", "UTF-8-MAC",
 	}
@@ -60569,7 +60567,7 @@ func builtinRequire(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if errVal != nil {
 		return errVal
 	}
-	return requireFeature(path)
+	return raiseRequireResult(requireFeature(path))
 }
 
 func builtinRequireRelative(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -60610,7 +60608,19 @@ func builtinRequireRelative(receiver *object.EmeraldValue, args ...*object.Emera
 	if os.Getenv("RGO_DEBUG_REQUIRE") == "1" {
 		fmt.Printf("RGO_DEBUG_REQUIRE relative base=%q arg=%q resolved=%q\n", basePath, path, resolvedPath)
 	}
-	return requireFeature(resolvedPath)
+	return raiseRequireResult(requireFeature(resolvedPath))
+}
+
+func raiseRequireResult(result *object.EmeraldValue) *object.EmeraldValue {
+	if result == nil || result.Type != object.ValueException {
+		return result
+	}
+	if exception, ok := result.Data.(*object.RException); ok && exception != nil {
+		exception.Raised = true
+	}
+	LastException = result
+	LastRaisedResult = result
+	return result
 }
 
 func requireFeature(path string) *object.EmeraldValue {
@@ -60707,6 +60717,13 @@ func requireFeature(path string) *object.EmeraldValue {
 		}
 		markFeatureRequired("io/nonblock")
 		markFeatureRequired("io/nonblock.rb")
+		return R.TrueVal
+	case "expect", "expect.rb":
+		if featureRequired("expect") || featureRequired("expect.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		markFeatureRequired("expect")
+		markFeatureRequired("expect.rb")
 		return R.TrueVal
 	case "fcntl", "fcntl.rb":
 		if featureRequired("fcntl") || featureRequired("fcntl.rb") || loadingFeatures[path] {
@@ -77918,9 +77935,7 @@ func dirScanPath(path string) *object.EmeraldValue {
 		return newRuntimeException(R.Classes["Errno::ENOENT"], "No such file or directory")
 	}
 	values := make([]*object.EmeraldValue, 0, len(entries)+2)
-	for _, entry := range entries {
-		name := entry.Name()
-		entryType := dirEntryType(filepath.Join(path, name))
+	appendEntry := func(name, entryType string) *object.EmeraldValue {
 		pair := &object.EmeraldValue{
 			Type:  object.ValueArray,
 			Data:  []*object.EmeraldValue{rubyString(name), rubySymbol(entryType)},
@@ -77933,6 +77948,20 @@ func dirScanPath(path string) *object.EmeraldValue {
 			}
 		}
 		values = append(values, pair)
+		return nil
+	}
+	if result := appendEntry(".", "directory"); result != nil {
+		return result
+	}
+	if result := appendEntry("..", "directory"); result != nil {
+		return result
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		entryType := dirEntryType(filepath.Join(path, name))
+		if result := appendEntry(name, entryType); result != nil {
+			return result
+		}
 	}
 	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
 }
@@ -82707,13 +82736,20 @@ func stringUnpack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		if signed {
 			decode = unpackSLEB128Integer
 		}
+		appendDecoded := func(value int64) {
+			if !signed && value < 0 {
+				result = append(result, NewIntegerFromBigInt(new(big.Int).SetUint64(uint64(value))))
+				return
+			}
+			appendInteger(value)
+		}
 		if count < 0 {
 			for readOffset < len(bytesValue) {
 				value, ok := decode(bytesValue, &readOffset)
 				if !ok {
 					break
 				}
-				appendInteger(value)
+				appendDecoded(value)
 			}
 			return
 		}
@@ -82727,7 +82763,7 @@ func stringUnpack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 				result = append(result, R.NilVal)
 				continue
 			}
-			appendInteger(value)
+			appendDecoded(value)
 		}
 	}
 	appendDecodedWholeString := func(pos *int, decode func([]byte) (*object.EmeraldValue, []byte)) *object.EmeraldValue {
@@ -86189,6 +86225,25 @@ func isExpectationComparableNumber(value *object.EmeraldValue) bool {
 func RegisterMspec() {
 	specRunner = InitSpecRunner()
 
+	specEvaluateClass := object.NewClass("SpecEvaluate")
+	R.Classes["SpecEvaluate"] = specEvaluateClass
+	var specEvaluateDescription *object.EmeraldValue = R.NilVal
+	specEvaluateClass.DefineClassMethod("desc=", &object.Method{
+		Name:  "desc=",
+		Arity: 1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			specEvaluateDescription = args[0]
+			return args[0]
+		},
+	})
+	specEvaluateClass.DefineClassMethod("desc", &object.Method{
+		Name:  "desc",
+		Arity: 0,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return specEvaluateDescription
+		},
+	})
+
 	expectationClass := object.NewClass("Expectation")
 	R.Classes["Expectation"] = expectationClass
 
@@ -86724,6 +86779,18 @@ func RegisterMspec() {
 				objectValue := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Object"], Class: R.Classes["Class"]}
 				return moduleInclude(objectValue, args...)
 			}
+			return &object.EmeraldValue{
+				Type:  object.ValueObject,
+				Data:  &includeMatcher{Expected: args},
+				Class: R.Classes["Expectation"],
+			}
+		},
+	})
+	objClass.DefineMethod("__mspec_include_matcher__", &object.Method{
+		Name:       "__mspec_include_matcher__",
+		Arity:      -1,
+		Visibility: "private",
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
 				Data:  &includeMatcher{Expected: args},
@@ -87489,13 +87556,13 @@ func rubyVersionIsMatches(args ...*object.EmeraldValue) bool {
 	}
 	switch args[0].Type {
 	case object.ValueRange:
-		return versionIsMatches(rubyString("4.1"), args[0])
+		return versionIsMatches(rubyString(RubyCompatibilityVersion), args[0])
 	case object.ValueString:
 		version := args[0].Data.(string)
 		if version == "" {
 			return false
 		}
-		return compareVersionStrings("4.1", version) >= 0
+		return compareVersionStrings(RubyCompatibilityVersion, version) >= 0
 	default:
 		return false
 	}

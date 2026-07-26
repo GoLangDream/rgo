@@ -169,7 +169,7 @@ third = require("bare_feature")
 }
 
 func TestLoadedFeaturesStartsWithCoreProvidedFeatures(t *testing.T) {
-	result, _ := runRuby(t, `%w[complex.rb enumerator.so fiber.so rational.rb thread.so ruby2_keywords.rb set.rb pathname.so monitor.so].all? do |feature|
+	result, _ := runRuby(t, `%w[complex.rb enumerator.so fiber.so rational.rb thread.so ruby2_keywords.rb set.rb pathname.so].all? do |feature|
   $LOADED_FEATURES.include?(feature)
 end`)
 	assertBoolResult(t, result, true)
@@ -2029,6 +2029,9 @@ full < sv.new("2.7")
 func runRubyExpectError(t *testing.T, source string) error {
 	t.Helper()
 
+	currentSpecFile := core.CurrentSpecFile
+	core.Init()
+	core.CurrentSpecFile = currentSpecFile
 	core.LastException = nil
 	core.LastBlockResult = nil
 	core.LastRaisedResult = nil
@@ -5183,7 +5186,7 @@ func TestCaseWhenMultipleConditions(t *testing.T) {
 }
 
 func TestLambdaWithBareParameterInsideBlock(t *testing.T) {
-	result, _ := runRuby(t, "m { -> _ { true } }")
+	result, _ := runRuby(t, "def m; nil; end; m { -> _ { true } }")
 	if result != core.R.NilVal {
 		t.Fatalf("expected nil, got %s", result.Inspect())
 	}
@@ -5347,7 +5350,7 @@ func TestMspecShouldRegexpMatchCountsPass(t *testing.T) {
 func TestMspecShouldRegexpMatchLineEndingDollar(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `"success\n".should =~ /success$/
-"success\r\n".should =~ /success$/`)
+"success\r\n".should_not =~ /success$/`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
@@ -9948,16 +9951,52 @@ func TestRequireRelativeReturnsLastErrorWhenFileMissing(t *testing.T) {
 	dir := t.TempDir()
 	specFile := filepath.Join(dir, "spec.rb")
 
-	result, _ := runRubyWithCurrentSpecFile(t, `
+	_, _ = runRubyWithCurrentSpecFile(t, `
 require_relative "missing_fixture"
 `, specFile)
 
+	result := core.LastRaisedResult
 	if result == nil || result.Type != object.ValueException {
-		t.Fatalf("expected require_relative to return exception for missing file, got %#v", result)
+		t.Fatalf("expected require_relative to raise for missing file, got %#v", result)
 	}
 	exc := result.Data.(*object.RException)
 	if !strings.Contains(exc.Message, "cannot load such file --") {
 		t.Fatalf("expected LoadError message to be visible, got %q", exc.Message)
+	}
+}
+
+func TestRequireMissingFeatureCanBeRescuedAndExecutionContinues(t *testing.T) {
+	result, _ := runRuby(t, `
+events = []
+begin
+  require "definitely_missing_rgo_feature"
+rescue LoadError
+  events << :rescued
+end
+events << :after
+events
+`)
+
+	if got := result.Inspect(); got != "[:rescued, :after]" {
+		t.Fatalf("expected rescued require to continue, got %s", got)
+	}
+}
+
+func TestRequireMissingFeatureStopsAtUnhandledLoadError(t *testing.T) {
+	_, output := runRuby(t, `
+require "definitely_missing_rgo_feature"
+puts "after"
+`)
+
+	if output != "" {
+		t.Fatalf("expected execution to stop before output, got %q", output)
+	}
+	result := core.LastRaisedResult
+	if result == nil || result.Type != object.ValueException || result.Class != core.R.Classes["LoadError"] {
+		t.Fatalf("expected unhandled LoadError, got %#v", result)
+	}
+	if core.LastRaisedResult != result {
+		t.Fatalf("expected LoadError to remain the last raised result")
 	}
 }
 
@@ -10742,7 +10781,7 @@ hash = case {a: 0, b: 1, c: 2}
 in {a:, **rest}
   [a, rest]
 end
-[outer, defined?(inner), find, hash]`)
+	[outer, defined?(inner), find, hash]`)
 	if result.Inspect() != "[0, nil, [[0, 1], [3, 4]], [0, {:b => 1, :c => 2}]]" {
 		t.Fatalf("unexpected pattern bindings: %s", result.Inspect())
 	}
@@ -12144,7 +12183,7 @@ func TestRubyExeSetsProcessStatusForBitOperators(t *testing.T) {
 }
 
 func TestProcessSpawnWaitAndLastStatus(t *testing.T) {
-	result, _ := runRuby(t, `pid = Process.spawn("ruby -e exit")
+	result, _ := runRuby(t, `pid = Process.spawn("true")
 waited = Process.wait
 [pid, waited, $?.pid, $?.exitstatus]`)
 	if result == nil || result.Type != object.ValueArray {
@@ -12164,8 +12203,8 @@ waited = Process.wait
 }
 
 func TestProcessWait2AndWaitallUsePendingChildren(t *testing.T) {
-	result, _ := runRuby(t, `pid1 = Process.spawn("ruby -e exit")
-pid2 = Process.spawn("ruby -e exit")
+	result, _ := runRuby(t, `pid1 = Process.spawn("true")
+pid2 = Process.spawn("true")
 one = Process.wait2(pid2)
 all = Process.waitall
 pair = all.first
@@ -12187,7 +12226,7 @@ pair = all.first
 }
 
 func TestProcessStatusWaitDoesNotUpdateLastStatus(t *testing.T) {
-	result, _ := runRuby(t, `pid = Process.spawn("ruby -e exit")
+	result, _ := runRuby(t, `pid = Process.spawn("true")
 status = Process::Status.wait
 [status.pid, $?.nil?]`)
 	if result == nil || result.Type != object.ValueArray {
@@ -12349,6 +12388,9 @@ stderr_order = ruby_exe("END { STDERR.puts 'last' }; END { exit 43 }; END { STDE
   stderr_order == "first\nlast\n",
   $?.exitstatus == 43,
 ]`)
+	if got := result.Inspect(); got != `[true, true, true, true, true]` {
+		t.Fatalf("unexpected END exception scenario result: %s", got)
+	}
 	assertArrayOfBools(t, result, []bool{true, true, true, true, true})
 }
 
@@ -12679,7 +12721,7 @@ begin
 rescue Errno::ECHILD
   raised_wait = true
 end
-pid = Process.spawn("ruby -e exit")
+pid = Process.spawn("true")
 Process.wait
 raised_kill = false
 begin
@@ -12703,7 +12745,7 @@ func TestMspecProcessWaitLastStatusMatchesBeKindOf(t *testing.T) {
 	core.RegisterMspec()
 	_, _ = runRuby(t, `describe "Process.wait" do
   it "stores a Process::Status in $?" do
-    pid = Process.spawn("ruby -e exit")
+    pid = Process.spawn("true")
     Process.wait
     $?.should be_kind_of(Process::Status)
   end
@@ -12721,8 +12763,8 @@ end`)
 }
 
 func TestProcessWaitZeroSkipsPgroupChildren(t *testing.T) {
-	result, _ := runRuby(t, `pid1 = Process.spawn("ruby -e exit", pgroup: true)
-pid2 = Process.spawn("ruby -e exit")
+	result, _ := runRuby(t, `pid1 = Process.spawn("true", pgroup: true)
+pid2 = Process.spawn("true")
 [Process.wait(0), Process.wait]`)
 	if result == nil || result.Type != object.ValueArray {
 		t.Fatalf("expected Array, got %v", result)
@@ -14600,14 +14642,18 @@ func TestTimeNowSupportsFloatPrecisionAndUtcOffsetOption(t *testing.T) {
 	result, _ := runRuby(t, `plain = Time.now
 plus = Time.now(in: "+05:30")
 minus = Time.now(in: "-09:00:01")
-invalid = Time.now(in: "+24:00")
+invalid_class = begin
+  Time.now(in: "+24:00")
+rescue ArgumentError => error
+  error.class.to_s
+end
 [
   plain.to_f > 0,
   plain.nsec.is_a?(Integer),
   plus.utc_offset,
   plus.zone,
   minus.utc_offset,
-  invalid.class.to_s
+  invalid_class
 ]`)
 	if result == nil || result.Type != object.ValueArray {
 		t.Fatalf("expected Array, got %v", result)
@@ -14701,6 +14747,11 @@ end
 
 func TestTimeAtSupportsSubsecondsFormatsOffsetsAndSubclass(t *testing.T) {
 	result, _ := runRuby(t, `sub = Class.new(Time)
+nil_subsecond_class = begin
+  Time.at(0, nil)
+rescue TypeError => error
+  error.class.to_s
+end
 [
   Time.at(10, 500000).tv_sec,
   Time.at(10, 500000).tv_usec,
@@ -14709,7 +14760,7 @@ func TestTimeAtSupportsSubsecondsFormatsOffsetsAndSubclass(t *testing.T) {
   Time.at(0, 123, :millisecond).tv_nsec,
   Time.at(100, in: "+05:30").utc_offset,
   sub.at(0).is_a?(sub),
-  Time.at(0, nil).class.to_s
+  nil_subsecond_class
 ]`)
 	if result == nil || result.Type != object.ValueArray {
 		t.Fatalf("expected Array, got %v", result)
@@ -15816,8 +15867,16 @@ raised`)
 
 func TestThreadRaiseRecordsTargetExceptionForPendingThread(t *testing.T) {
 	result, _ := runRuby(t, `ScratchPad.clear
-th = Thread.new { sleep }
+th = Thread.new do
+  begin
+    sleep
+  rescue Object => error
+    ScratchPad.record error
+  end
+end
+Thread.pass until th.stop?
 th.raise Exception, "get to work"
+Thread.pass while th.status
 [ScratchPad.recorded.is_a?(Exception), ScratchPad.recorded.message]`)
 	if result == nil || result.Type != object.ValueArray {
 		t.Fatalf("expected Array, got %v", result)
@@ -17143,7 +17202,7 @@ func TestThreadNativeThreadIDIsIntegerForCurrentThread(t *testing.T) {
 
 func TestMspecRubyVersionIsSkipsFutureMajor(t *testing.T) {
 	result, _ := runRuby(t, `ran = false
-ruby_version_is "4.0" do
+ruby_version_is "4.1" do
   ran = true
 end
 ran`)
@@ -17152,7 +17211,7 @@ ran`)
 
 func TestMspecRubyVersionIsRunsCurrentMinor(t *testing.T) {
 	result, _ := runRuby(t, `ran = false
-ruby_version_is "3.4" do
+ruby_version_is "4.0" do
   ran = true
 end
 ran`)
@@ -17161,7 +17220,7 @@ ran`)
 
 func TestMspecRubyVersionIsRunsBeginlessRangeBeforeFutureMajor(t *testing.T) {
 	result, _ := runRuby(t, `ran = false
-ruby_version_is ""..."4.0" do
+ruby_version_is ""..."4.1" do
   ran = true
 end
 ran`)
@@ -17169,7 +17228,7 @@ ran`)
 }
 
 func TestMspecRubyVersionIsReturnsBooleanWithoutBlock(t *testing.T) {
-	result, _ := runRuby(t, `ruby_version_is("3.4") && !ruby_version_is("4.0") && ruby_version_is(""..."4.0")`)
+	result, _ := runRuby(t, `ruby_version_is("4.0") && !ruby_version_is("4.1") && ruby_version_is(""..."4.1")`)
 	assertBoolResult(t, result, true)
 }
 
@@ -17406,11 +17465,12 @@ rgo_each_caller_break_outer
 }
 
 func TestEachCallerLocationProducesLocationInMspecExample(t *testing.T) {
+	t.Setenv("MSPEC_RUNNER", "1")
 	previousSpecFile := core.CurrentSpecFile
 	core.CurrentSpecFile = filepath.Join("vendor", "ruby", "spec", "core", "thread", "each_caller_location_spec.rb")
 	defer func() { core.CurrentSpecFile = previousSpecFile }()
 	core.RegisterMspec()
-	_, _ = runRuby(t, `
+	_, output := runRuby(t, `
 describe "each caller location" do
   it "matches caller_locations and yields a location" do
     locations = []
@@ -17424,11 +17484,11 @@ describe "each caller location" do
 	end
 	count.should == 2
 	value.should be_kind_of(Thread::Backtrace::Location)
-  end
+	end
 end
 `)
 	if failures := core.GetSpecRunner().FailCount; failures != 0 {
-		t.Fatalf("expected no each_caller_location failures, got %d", failures)
+		t.Fatalf("expected no each_caller_location failures, got %d\n%s", failures, output)
 	}
 }
 
@@ -17848,9 +17908,9 @@ s.pos.should == 0`)
 
 func TestStringScannerCapturesAndUnscanState(t *testing.T) {
 	core.RegisterMspec()
-	_, _ = runRuby(t, `require "strscan"
+	_, output := runRuby(t, `require "strscan"
 s = StringScanner.new("abc123")
-s.scan(/(?<letters>[a-z]+)(\d+)/).should == "abc123"
+s.scan(/(?<letters>[a-z]+)(?<digits>\d+)/).should == "abc123"
 s[0].should == "abc123"
 s[1].should == "abc"
 s[2].should == "123"
@@ -17859,9 +17919,9 @@ s.captures.should == ["abc", "123"]
 s.values_at(0, 2).should == ["abc123", "123"]
 s.unscan.should == s
 s.pos.should == 0
--> { s.unscan }.should raise_error(StringScanner::Error)`)
+	-> { s.unscan }.should raise_error(StringScanner::Error)`)
 	if failures := core.GetSpecRunner().FailCount; failures != 0 {
-		t.Fatalf("expected 0 failures, got %d", failures)
+		t.Fatalf("expected 0 failures, got %d\n%s", failures, output)
 	}
 }
 
@@ -18939,7 +18999,11 @@ f.puts("test")
 f.close
 read_back = File.read(%q)
 readonly = File.new(%q)
-readonly_write = readonly.puts("no")
+readonly_write = begin
+  readonly.puts("no")
+rescue IOError => error
+  error
+end
 readonly_read = readonly.read
 readonly.close
 created = File.new(File.join(%q, "created.txt"), File::WRONLY | File::CREAT | File::TRUNC, 0755)
@@ -18947,9 +19011,22 @@ created.close
 fd_source = File.new(%q)
 fd_copy = File.new(fd_source.fileno)
 fd_copy.autoclose = false
-fd_mode_error = File.new(fd_source.fileno, File::CREAT | File::TRUNC | File::WRONLY)
-too_many_args = File.new(%q, "w", 0755, {flags: File::CREAT})
+fd_mode_error = begin
+  File.new(fd_source.fileno, File::CREAT | File::TRUNC | File::WRONLY)
+rescue Errno::EINVAL => error
+  error
+end
+too_many_args = begin
+  File.new(%q, "w", 0755, {flags: File::CREAT})
+rescue ArgumentError => error
+  error
+end
 block_result = File.new(%q) { raise "should not run" }
+bad_fd = begin
+  File.new(-1)
+rescue Errno::EBADF => error
+  error
+end
 fd_source.close
 [
   File::CREAT, File::TRUNC, File::WRONLY, File::EXCL, File::APPEND, File::RDONLY,
@@ -18958,7 +19035,7 @@ fd_source.close
   readonly_read,
   File.exist?(File.join(%q, "created.txt")),
   fd_copy.class.to_s,
-  File.new(-1).class.to_s,
+  bad_fd.class.to_s,
   fd_mode_error.class.to_s,
   too_many_args.class.to_s,
   block_result.class.to_s,
@@ -19665,11 +19742,11 @@ func TestFileChmodAppliesPermissionsAndCoercesMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	core.RegisterMspec()
-	_, _ = runRuby(t, fmt.Sprintf(`File.chmod(0222, %q).should == 1
+	_, output := runRuby(t, fmt.Sprintf(`f = File.open(%q)
+File.chmod(0222, %q).should == 1
 File.readable?(%q).should == false
 File.writable?(%q).should == true
 File.executable?(%q).should == false
-f = File.open(%q)
 f.chmod(0111).should == 0
 File.readable?(%q).should == false
 File.writable?(%q).should == false
@@ -19683,7 +19760,7 @@ File.stat(%q).mode.should == mode
 -> { File.chmod(0644, %q) }.should raise_error(Errno::ENOENT)`, file, file, file, file, file, file, file, file, file, file, file, file, filepath.Join(dir, "missing")))
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
-		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
 	}
 }
 
@@ -19734,7 +19811,7 @@ func TestFileSizeEmptyAndInstanceStateHelpers(t *testing.T) {
 		t.Fatal(err)
 	}
 	core.RegisterMspec()
-	_, _ = runRuby(t, fmt.Sprintf(`File.empty?(%q).should == true
+	_, output := runRuby(t, fmt.Sprintf(`File.empty?(%q).should == true
 File.empty?(%q).should == false
 File.empty?(%q).should == false
 File.size?(%q).should == nil
@@ -19751,14 +19828,15 @@ file.closed?.should == true
 cached = File.new(%q)
 rm_r %q
 cached.size.should == 8
+File.write(%q, "rubinius")
 File.open(%q, "a") { |f| f.write "!" }
 File.size(%q).should == 9
 File.symlink(%q, %q).should == 0
 linked = File.new(%q)
-linked.size.should == 9`, empty, nonempty, missing, empty, nonempty, missing, nonempty, nonempty, nonempty, nonempty, nonempty, nonempty, nonempty, link, link))
+linked.size.should == 9`, empty, nonempty, missing, empty, nonempty, missing, nonempty, nonempty, nonempty, nonempty, nonempty, nonempty, nonempty, nonempty, link, link))
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
-		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
 	}
 }
 
@@ -21386,7 +21464,6 @@ positional_options(key: 42)
 
 func TestMethodSplatUsesMockToAReturnValue(t *testing.T) {
 	result, _ := runRuby(t, `
-require_relative "../../vendor/ruby/spec/spec_helper"
 def one_argument(value)
   value
 end
@@ -21749,7 +21826,7 @@ eval <<~'RUBY'
 RUBY
 RGoBinaryLiteralMethod.key.encoding.name
 `)
-	assertStringResult(t, result, "BINARY")
+	assertStringResult(t, result, "ASCII-8BIT")
 }
 
 func TestPatternMatchingUsesLexicallyActiveRefinement(t *testing.T) {
@@ -22143,7 +22220,7 @@ hook = Module.new do
   def self.extend_object(obj)
     ScratchPad.record :extended
   end
-  private :extend_object
+  private_class_method :extend_object
 end
 Object.new.extend hook
 hook_called = ScratchPad.recorded == :extended
@@ -25115,16 +25192,12 @@ c::VALUE
 
 func TestRemoveConstFallsBackToIncludedModuleConstant(t *testing.T) {
 	result, _ := runRuby(t, `
-m = Module.new { VALUE = :included }
-c = Class.new do
-  include m
-  VALUE = :direct
-  def self.value
-    VALUE
-  end
-end
+m = Module.new
+m.const_set(:VALUE, :included)
+c = Class.new { include m }
+c.const_set(:VALUE, :direct)
 c.send(:remove_const, :VALUE)
-c.value
+c::VALUE
 `)
 	assertSymbolResult(t, result, "included")
 }
@@ -25227,13 +25300,12 @@ c = Class.new { include m }
 
 func TestModuleConstantsIncludesIncludedModuleConstants(t *testing.T) {
 	result, _ := runRuby(t, `
-a = Module.new do
-  VALUE_A = :a
-end
+a = Module.new
+a.const_set(:VALUE_A, :a)
 b = Module.new do
-  VALUE_B = :b
   include a
 end
+b.const_set(:VALUE_B, :b)
 c = Class.new { include b }
 [
   b.constants.include?(:VALUE_A),
@@ -25947,7 +26019,7 @@ $added_names.include?("RGoConstAddedAssignment")`)
 func TestRubyBugGuardExecutesMatchingBlock(t *testing.T) {
 	result, _ := runRuby(t, `
 ran = false
-ruby_bug "#21094", ""..."4.0" do
+ruby_bug "#21094", ""..."4.1" do
   ran = true
 end
 ran`)
@@ -25999,15 +26071,15 @@ func TestNetHTTPResponseValueRaisesExpectedErrors(t *testing.T) {
 	result, _ := runRuby(t, `
 require "net/http"
 cases = [
-  [Net::HTTPUnknownResponse, Net::HTTPError],
-  [Net::HTTPInformation, Net::HTTPError],
-  [Net::HTTPRedirection, Net::HTTPRetriableError],
-  [Net::HTTPClientError, Net::HTTPClientException],
-  [Net::HTTPServerError, Net::HTTPFatalError],
+  [Net::HTTPUnknownResponse, "xxx", Net::HTTPError],
+  [Net::HTTPInformation, "1xx", Net::HTTPError],
+  [Net::HTTPRedirection, "3xx", Net::HTTPRetriableError],
+  [Net::HTTPClientError, "4xx", Net::HTTPClientException],
+  [Net::HTTPServerError, "5xx", Net::HTTPFatalError],
 ]
-errors_ok = cases.all? do |klass, error_class|
+errors_ok = cases.all? do |klass, code, error_class|
   begin
-    klass.new("1.0", klass.name, "message").value
+    klass.new("1.0", code, "message").value
     false
   rescue => e
     e.is_a?(error_class)
@@ -26312,7 +26384,7 @@ a = IPAddr.new("3ffe:505:2::/48")
 
 func TestMultipleAssignmentCoercionTypeErrors(t *testing.T) {
 	core.RegisterMspec()
-	_, _ = runRuby(t, `describe "multiassign coercion" do
+	_, output := runRuby(t, `describe "multiassign coercion" do
   it "raises when to_ary returns non-array for simple MLHS" do
     x = Object.new
     def x.to_ary; 1; end
@@ -26321,7 +26393,7 @@ func TestMultipleAssignmentCoercionTypeErrors(t *testing.T) {
 
   it "raises when to_ary returns non-array for nested MLHS" do
     x = Object.new
-    def x.to_ary; x; end
+    def x.to_ary; self; end
     -> { a, (b, c), d = 1, x, 3, 4 }.should raise_error(TypeError)
   end
 
@@ -26340,13 +26412,13 @@ func TestMultipleAssignmentCoercionTypeErrors(t *testing.T) {
 
   it "raises when to_ary returns non-array for a splatted value assigned to nested MLHS" do
     x = Object.new
-    def x.to_ary; x; end
+    def x.to_ary; self; end
     -> { a, *b, (c, d) = 1, 2, 3, *x }.should raise_error(TypeError)
   end
 
 end`)
 	if runner := core.GetSpecRunner(); runner.FailCount != 0 {
-		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
 	}
 }
 
@@ -27406,7 +27478,10 @@ func TestProcReturnAfterDefiningMethodRaisesLocalJumpError(t *testing.T) {
 def rgo_proc_return_fixture
   Proc.new { return 42 }
 end
-e = rgo_proc_return_fixture.call
+begin
+  rgo_proc_return_fixture.call
+rescue LocalJumpError => e
+end
 [e.class, e.reason, e.exit_value]
 `)
 	if result == nil || result.Type != object.ValueArray {
@@ -28439,6 +28514,27 @@ method(:public_send).arity.should < 0`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)
+	}
+}
+
+func TestMspecEvaluateSupportsSpecEvaluateDescription(t *testing.T) {
+	core.RegisterMspec()
+	_, output := runRuby(t, `
+SpecEvaluate.desc = "for definition"
+SpecEvaluate.desc.should == "for definition"
+evaluate <<-RUBY do
+  def mspec_evaluated_method(value)
+    value * 2
+  end
+RUBY
+  mspec_evaluated_method(21).should == 42
+end`)
+	runner := core.GetSpecRunner()
+	if runner.FailCount != 0 {
+		t.Fatalf("expected 0 failures, got %d\n%s", runner.FailCount, output)
+	}
+	if runner.ExampleCount != 1 {
+		t.Fatalf("expected 1 evaluated example, got %d\n%s", runner.ExampleCount, output)
 	}
 }
 

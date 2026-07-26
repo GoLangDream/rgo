@@ -120,7 +120,7 @@ func main() {
 	case "-h", "-help", "--help", "help":
 		printUsage()
 	case "-v", "--version":
-		fmt.Printf("ruby 3.3.0 (rgo) [%s-%s]\n", runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("ruby %s (rgo) [%s-%s]\n", core.RubyCompatibilityVersion, runtime.GOOS, runtime.GOARCH)
 	default:
 		if strings.HasSuffix(command, ".rb") {
 			runRubyFile(command, args[1:])
@@ -281,6 +281,7 @@ func runRubySourceWithEncodingAndPreload(source string, filename string, argv []
 		os.Exit(1)
 	}
 	exitIfSystemExit()
+	exitIfUnhandledRuntimeException(v.UnhandledException())
 }
 
 func mainDataOffset(source, filename string) (int64, bool) {
@@ -548,6 +549,7 @@ func runRubyFile(filename string, argv []string) {
 		os.Exit(1)
 	}
 	exitIfSystemExit()
+	exitIfUnhandledRuntimeException(v.UnhandledException())
 }
 
 func exitIfSystemExit() {
@@ -559,6 +561,39 @@ func exitIfSystemExit() {
 		os.Exit(int(*data.Status))
 	}
 	os.Exit(0)
+}
+
+func exitIfUnhandledRuntimeException(exception *object.EmeraldValue) {
+	exception = unhandledRuntimeException(exception)
+	if exception == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Runtime Error: %s\n", runtimeExceptionDescription(exception))
+	os.Exit(1)
+}
+
+func unhandledRuntimeException(exception *object.EmeraldValue) *object.EmeraldValue {
+	if exception == nil || exception.Type != object.ValueException || exception.Class == nil || exception.Class.Name == "SystemExit" {
+		return nil
+	}
+	data, ok := exception.Data.(*object.RException)
+	if !ok || data == nil || !data.Raised {
+		return nil
+	}
+	return exception
+}
+
+func runtimeExceptionDescription(exception *object.EmeraldValue) string {
+	className := "Exception"
+	if exception != nil && exception.Class != nil && exception.Class.Name != "" {
+		className = exception.Class.Name
+	}
+	if exception != nil {
+		if data, ok := exception.Data.(*object.RException); ok && data != nil && data.Message != "" {
+			return fmt.Sprintf("%s (%s)", data.Message, className)
+		}
+	}
+	return className
 }
 
 func setARGV(v *vm.VM, argv []string) {

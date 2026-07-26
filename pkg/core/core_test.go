@@ -300,13 +300,13 @@ func TestStringAdd(t *testing.T) {
 	assertStr(t, callMethod(t, mkStr("hello"), "+", mkStr(" world")), "hello world")
 }
 
-func TestStringConcatWithNonStringDoesNotPanic(t *testing.T) {
+func TestStringConcatWithNonStringRaisesTypeErrorWithoutPanicking(t *testing.T) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			t.Fatalf("String#concat should not panic for non-string argument: %v", recovered)
 		}
 	}()
-	assertNil(t, callMethod(t, mkStr("hello"), "concat", R.NilVal))
+	assertExceptionType(t, callMethod(t, mkStr("hello"), "concat", R.NilVal), R.Classes["TypeError"])
 }
 
 func TestStringMul(t *testing.T) {
