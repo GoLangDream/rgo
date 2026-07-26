@@ -210,6 +210,12 @@ func runRubyWithFeatureFlagWarning(command string, args []string) {
 			return
 		}
 	}
+	for i, arg := range args {
+		if strings.HasSuffix(arg, ".rb") {
+			runRubyFile(arg, args[i+1:])
+			return
+		}
+	}
 }
 
 func runRubySource(source string, filename string, argv []string) {
@@ -425,7 +431,7 @@ func readRequiredSource(path string) (string, string, error) {
 			return string(content), abs, nil
 		}
 	}
-	if path == "mkmf" || path == "mkmf.rb" || path == "objspace" || path == "objspace.rb" || path == "tempfile" || path == "tempfile.rb" {
+	if path == "mkmf" || path == "mkmf.rb" || path == "objspace" || path == "objspace.rb" || path == "tempfile" || path == "tempfile.rb" || path == "rubygems" || path == "rubygems.rb" {
 		feature := strings.TrimSuffix(path, ".rb")
 		return "require \"" + feature + "\"\n", feature + ".rb", nil
 	}
@@ -567,6 +573,10 @@ func exitIfUnhandledRuntimeException(exception *object.EmeraldValue) {
 	exception = unhandledRuntimeException(exception)
 	if exception == nil {
 		return
+	}
+	if signalNumber, ok := core.SignalExceptionNumber(exception); ok {
+		signal.Reset(syscall.Signal(signalNumber))
+		_ = syscall.Kill(os.Getpid(), syscall.Signal(signalNumber))
 	}
 	fmt.Fprintf(os.Stderr, "Runtime Error: %s\n", runtimeExceptionDescription(exception))
 	os.Exit(1)

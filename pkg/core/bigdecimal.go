@@ -36,6 +36,7 @@ func installBigDecimalClass(objectClass *object.Class) {
 		return
 	}
 	if existing := objectClass.Constants["BigDecimal"]; existing != nil && existing.Type == object.ValueClass {
+		installBigMathModule(objectClass)
 		return
 	}
 
@@ -99,6 +100,7 @@ func installBigDecimalClass(objectClass *object.Class) {
 	objectClass.DefineConstant("BigDecimal", classValue)
 	R.Classes["BigDecimal"] = class
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "BigDecimal", classValue)
+	installBigMathModule(objectClass)
 
 	constants := map[string]int64{
 		"BASE": 1_000_000_000, "EXCEPTION_ALL": 0xff, "EXCEPTION_INFINITY": 0x01,
@@ -122,6 +124,15 @@ func installBigDecimalClass(objectClass *object.Class) {
 		kernel.DefineMethod("BigDecimal", method)
 		kernel.DefineClassMethod("BigDecimal", &object.Method{Name: "BigDecimal", Fn: bigDecimalKernel, Arity: -1})
 	}
+}
+
+func installBigMathModule(objectClass *object.Class) {
+	if objectClass == nil || objectClass.Constants["BigMath"] != nil {
+		return
+	}
+	bigMath := object.NewModule("BigMath")
+	bigMath.DefineMethod("log", &object.Method{Name: "log", Fn: bigMathLog, Arity: 2})
+	objectClass.DefineConstant("BigMath", &object.EmeraldValue{Type: object.ValueModule, Data: bigMath, Class: R.Classes["Module"]})
 }
 
 func bigDecimalKernel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -176,6 +187,63 @@ func bigDecimalFromRat(value *big.Rat, precision int) *bigDecimalData {
 	text := float.Text('e', precision-1)
 	data, _ := parseBigDecimal(text)
 	return data
+}
+
+func bigMathLog(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	precisionValue, ok := valueToInteger(args[1])
+	if !ok || precisionValue <= 0 {
+		return NewArgumentError("precision must be positive")
+	}
+	data, ok := bigDecimalNumericFromValue(args[0])
+	if !ok || data.special != bigDecimalFinite {
+		return NewTypeError("can't convert into BigDecimal")
+	}
+	rational := bigDecimalToRat(data)
+	if rational == nil || rational.Sign() <= 0 {
+		return mathDomainError("log")
+	}
+	precision := int(precisionValue)
+	bits := uint(precision*4 + 128)
+	value := new(big.Float).SetPrec(bits).SetMode(big.ToNearestEven).SetRat(rational)
+	mantissa := new(big.Float).SetPrec(bits)
+	exponent := value.MantExp(mantissa)
+	result := bigFloatNaturalLogSeries(mantissa, bits)
+	if exponent != 0 {
+		two := new(big.Float).SetPrec(bits).SetInt64(2)
+		logTwo := bigFloatNaturalLogSeries(two, bits)
+		scale := new(big.Float).SetPrec(bits).SetInt64(int64(exponent))
+		result.Add(result, scale.Mul(scale, logTwo))
+	}
+	parsed, valid := parseBigDecimal(result.Text('e', precision+8))
+	if !valid {
+		return NewArgumentError("invalid value for BigDecimal")
+	}
+	return bigDecimalValue(parsed)
+}
+
+func bigFloatNaturalLogSeries(value *big.Float, bits uint) *big.Float {
+	one := new(big.Float).SetPrec(bits).SetInt64(1)
+	numerator := new(big.Float).SetPrec(bits).Sub(value, one)
+	denominator := new(big.Float).SetPrec(bits).Add(value, one)
+	z := new(big.Float).SetPrec(bits).Quo(numerator, denominator)
+	zSquared := new(big.Float).SetPrec(bits).Mul(z, z)
+	term := new(big.Float).SetPrec(bits).Set(z)
+	sum := new(big.Float).SetPrec(bits).Set(z)
+	threshold := new(big.Float).SetPrec(bits).SetMantExp(one, -int(bits))
+	absolute := new(big.Float).SetPrec(bits)
+	for divisor := int64(3); ; divisor += 2 {
+		term.Mul(term, zSquared)
+		addend := new(big.Float).SetPrec(bits).Quo(term, new(big.Float).SetPrec(bits).SetInt64(divisor))
+		sum.Add(sum, addend)
+		absolute.Abs(addend)
+		if absolute.Cmp(threshold) <= 0 {
+			break
+		}
+	}
+	return sum.Mul(sum, new(big.Float).SetPrec(bits).SetInt64(2))
 }
 
 func bigDecimalNumericToD(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

@@ -6996,7 +6996,7 @@ ok`)
 
 func TestRbConfigRequireInstallsConfigSizeofAndLimits(t *testing.T) {
 	result, _ := runRuby(t, `require "rbconfig/sizeof"
-config_ok = RbConfig::CONFIG.values_at("MAJOR", "MINOR", "TEENY", "PATCHLEVEL") == ["3", "3", "0", "0"] &&
+config_ok = RbConfig::CONFIG.values_at("MAJOR", "MINOR", "TEENY", "PATCHLEVEL") == ["4", "0", "0", "0"] &&
   RbConfig::CONFIG["UNICODE_VERSION"] == "17.0.0" &&
   RbConfig::CONFIG["UNICODE_EMOJI_VERSION"] == "17.0" &&
   RbConfig::CONFIG["host_cpu"].is_a?(String) &&
@@ -8026,9 +8026,14 @@ eval("('z'..)").size.should == nil
 }
 
 func TestRangeToSetRaisesForBeginlessRangeAndPositionalArguments(t *testing.T) {
-	_, _ = runRuby(t, `(1..3).to_set
+	_, _ = runRuby(t, `subclass = Class.new(Set)
+(1..3).to_set
 -> { (..0).to_set }.should raise_error(TypeError, "can't iterate from NilClass")
--> { (1..3).to_set(Object) }.should raise_error(ArgumentError, "wrong number of arguments (given 1, expected 0)")`)
+-> {
+  set = (1..3).to_set(subclass)
+  set.class.should == subclass
+  set.to_a.should == [1, 2, 3]
+}.should complain(/passing arguments to Enumerable#to_set is deprecated/)`)
 	runner := core.GetSpecRunner()
 	if runner.FailCount != 0 {
 		t.Fatalf("expected 0 failures, got %d", runner.FailCount)

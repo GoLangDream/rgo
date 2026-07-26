@@ -509,8 +509,9 @@ func (c *Compiler) Compile(node interface{}) error {
 				Pattern: strings.ReplaceAll(node.Pattern, lexer.EscapedHashInterpolation, "#"),
 				Options: node.Options,
 			},
-			Class:  core.R.Classes["Regexp"],
-			Frozen: true,
+			Class:   core.R.Classes["Regexp"],
+			Frozen:  true,
+			Literal: true,
 		})
 	case *ast.Boolean:
 		if node.Value {

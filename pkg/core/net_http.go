@@ -307,7 +307,7 @@ func httpClientResponse(method, path, body string, headers *object.EmeraldValue)
 		pairs := []string{}
 		if headers != nil && headers.Type == object.ValueHash {
 			hashForEach(headers, func(k, v *object.EmeraldValue) {
-				pairs = append(pairs, fmt.Sprintf("\"%s\"=>\"%s\"", canonicalHTTPHeader(valueStringForHTTP(k)), valueStringForHTTP(v)))
+				pairs = append(pairs, fmt.Sprintf("\"%s\" => \"%s\"", canonicalHTTPHeader(valueStringForHTTP(k)), valueStringForHTTP(v)))
 			})
 		}
 		responseBody = strings.Join(pairs, ", ")
