@@ -533,6 +533,239 @@ obj.instance_variable_set(:@test, :value)
 	if values[1] != core.R.TrueVal {
 		t.Fatalf("expected respond_to?(:hash) true, got %s", values[1].Inspect())
 	}
+	if core.LastRaisedResult != nil {
+		t.Fatalf("including Kernel left a raised exception: %s", core.LastRaisedResult.Inspect())
+	}
+}
+
+func TestAbbrevLibraryProvidesModuleAndArrayAPIs(t *testing.T) {
+	result, _ := runRuby(t, `
+require "abbrev"
+[
+  Abbrev.abbrev(["ruby", "rules"]) == {
+    "rub" => "ruby", "ruby" => "ruby", "rul" => "rules",
+    "rule" => "rules", "rules" => "rules"
+  },
+  ["car", "cone"].abbrev("c") == {
+    "ca" => "car", "car" => "car", "co" => "cone",
+    "con" => "cone", "cone" => "cone"
+  }
+]
+`)
+	if got := result.Inspect(); got != `[true, true]` {
+		t.Fatalf("unexpected abbreviations: %s", got)
+	}
+}
+
+func TestPPLibraryWritesInspectOutput(t *testing.T) {
+	result, _ := runRuby(t, `
+require "pp"
+out = IOStub.new
+PP.pp({"key" => 42}, out)
+out.to_s
+`)
+	if got := result.Inspect(); got != `"{\"key\" => 42}\n"` {
+		t.Fatalf("unexpected PP output: %s", got)
+	}
+}
+
+func TestFiddleHandleRaisesDLErrorForMissingLibrary(t *testing.T) {
+	result, _ := runRuby(t, `
+require "fiddle"
+begin
+  Fiddle::Handle.new("doesnotexist.doesnotexist")
+  false
+rescue Fiddle::DLError
+  true
+end
+`)
+	if result != core.R.TrueVal {
+		t.Fatalf("expected Fiddle::DLError, got %s", result.Inspect())
+	}
+}
+
+func TestOptionParserOrderStoresParsedOptions(t *testing.T) {
+	result, _ := runRuby(t, `
+require "optparse"
+options = {}
+parser = OptionParser.new do |opts|
+  opts.on("-v", "--[no-]verbose", "Run verbosely")
+  opts.on("-r", "--require LIBRARY", "Require a library")
+end
+parser.order(%w[--verbose --require optparse], into: options)
+options == { verbose: true, require: "optparse" }
+`)
+	if result != core.R.TrueVal {
+		t.Fatalf("expected parsed options, got %s", result.Inspect())
+	}
+}
+
+func TestMSpecFeatureGuardsRunOnlyEnabledFeatures(t *testing.T) {
+	_, _ = runRuby(t, `
+MSpec.enable_feature :available
+with_feature :available do
+  it("runs enabled feature") { 1.should == 1 }
+end
+with_feature :missing do
+  it("skips missing feature") { 1.should == 2 }
+end
+`)
+	runner := core.GetSpecRunner()
+	if runner.ExampleCount != 1 || runner.FailCount != 0 {
+		t.Fatalf("expected one enabled passing example, got examples=%d failures=%d", runner.ExampleCount, runner.FailCount)
+	}
+}
+
+func TestUDPSocketInvalidFamilyRaisesSpecificErrno(t *testing.T) {
+	result, _ := runRuby(t, `
+require "socket"
+begin
+  UDPSocket.new(666)
+  false
+rescue Errno::EAFNOSUPPORT, Errno::EPROTONOSUPPORT
+  true
+end
+`)
+	if result != core.R.TrueVal {
+		t.Fatalf("expected a supported address-family errno, got %s", result.Inspect())
+	}
+}
+
+func TestNetFTPInitialStateAndErrors(t *testing.T) {
+	result, _ := runRuby(t, `
+require "net/ftp"
+ftp = Net::FTP.new
+[
+  Net::FTPPermError < Net::FTPError,
+  Net::FTPError < Exception,
+  ftp.binary,
+  ftp.passive,
+  ftp.debug_mode,
+  ftp.resume,
+  ftp.read_timeout,
+  ftp.closed?
+]
+`)
+	if got := result.Inspect(); got != `[true, true, true, true, false, false, 60, true]` {
+		t.Fatalf("unexpected Net::FTP initial state: %s", got)
+	}
+}
+
+func TestNetFTPControlConnectionAndResponseClassification(t *testing.T) {
+	result, _ := runRuby(t, `
+require "net/ftp"
+require "socket"
+server = TCPServer.new("127.0.0.1", 0)
+thread = Thread.new do
+  socket = server.accept
+  socket.puts "220 ready"
+  while command = socket.gets
+    case command.chomp
+    when "HELP"
+      socket.puts "211 help"
+    when "QUIT"
+      socket.puts "221 bye"
+      break
+    end
+  end
+  socket.close
+end
+ftp = Net::FTP.new
+ftp.connect("127.0.0.1", server.addr[1])
+response = ftp.sendcmd("HELP")
+ftp.quit
+ftp.close
+server.close
+thread.join
+[response, ftp.last_response, ftp.closed?]
+`)
+	if got := result.Inspect(); got != `["211 help\n", "221 bye\n", true]` {
+		t.Fatalf("unexpected Net::FTP control connection result: %s", got)
+	}
+}
+
+func TestRubyGemsSecurityHelpersSanitizeTerminalControlCharacters(t *testing.T) {
+	result, _ := runRuby(t, `
+require "rubygems/user_interaction"
+require "rubygems/command_manager"
+class RubyGemsSecurityUISpec
+  include Gem::UserInteraction
+  attr_reader :messages
+  def initialize
+    @messages = []
+  end
+  def say(message)
+    @messages << message
+  end
+  def alert_error(message)
+    @messages << message
+  end
+end
+Gem.configuration.verbose = true
+ui = RubyGemsSecurityUISpec.new
+ui.verbose("\e]2;nyan\a")
+manager = Gem::CommandManager.new
+def manager.alert_error(message)
+  @message = message
+end
+manager.process_args(["--\e]2;nyan\a"], nil)
+[ui.messages, manager.instance_variable_get(:@message)]
+`)
+	if got := result.Inspect(); got != `[[".]2;nyan."], "Invalid option: --.]2;nyan.. See 'gem --help'."]` {
+		t.Fatalf("unexpected RubyGems sanitization result: %s", got)
+	}
+}
+
+func TestTopLevelVisibilityCanChangeMultipleObjectMethods(t *testing.T) {
+	result, _ := runRuby(t, `
+def first_top_level_private
+end
+private :first_top_level_private
+def second_top_level_private
+end
+private :second_top_level_private
+[
+  Object.private_instance_methods(false).include?(:first_top_level_private),
+  Object.private_instance_methods(false).include?(:second_top_level_private)
+]
+`)
+	if got := result.Inspect(); got != `[true, true]` {
+		t.Fatalf("expected both top-level methods to be private, got %s", got)
+	}
+	if core.LastRaisedResult != nil {
+		t.Fatalf("top-level private left a raised exception: %s", core.LastRaisedResult.Inspect())
+	}
+}
+
+func TestWrappedLoadIncludesModuleOnlyInWrapper(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wrapped_include.rb")
+	if err := os.WriteFile(path, []byte("include ::WrappedLoadIncludeSpec\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`
+module WrappedLoadIncludeSpec
+end
+load(%q, true)
+!Object.ancestors.include?(WrappedLoadIncludeSpec)
+`, path))
+	if result != core.R.TrueVal {
+		t.Fatalf("expected wrapped load include to stay isolated, got %s", result.Inspect())
+	}
+}
+
+func TestDirMagicValueIsLexicalInsideLoadedBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lexical_dir.rb")
+	if err := os.WriteFile(path, []byte("$rgo_lexical_dir = -> { __dir__ }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runRuby(t, fmt.Sprintf(`
+load %q
+$rgo_lexical_dir.call
+`, path))
+	if got := result.Inspect(); got != fmt.Sprintf("%q", dir) {
+		t.Fatalf("expected lexical __dir__ %q, got %s", dir, got)
+	}
 }
 
 func TestAbsoluteConstantLookupInsideBasicObjectSubclassBody(t *testing.T) {

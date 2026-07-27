@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -532,6 +533,22 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.EmitConstant(&object.EmeraldValue{
 				Type:     object.ValueString,
 				Data:     core.CurrentSpecFile,
+				Class:    core.R.Classes["String"],
+				Encoding: c.sourceEncoding,
+			})
+			return nil
+		}
+		if node.Value == "__dir__" {
+			path := core.CurrentSpecFile
+			if core.CurrentSpecFileAbsolute != "" {
+				path = core.CurrentSpecFileAbsolute
+			}
+			if abs, err := filepath.Abs(path); err == nil {
+				path = abs
+			}
+			c.EmitConstant(&object.EmeraldValue{
+				Type:     object.ValueString,
+				Data:     filepath.Dir(path),
 				Class:    core.R.Classes["String"],
 				Encoding: c.sourceEncoding,
 			})

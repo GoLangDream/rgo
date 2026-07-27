@@ -869,6 +869,10 @@ func TestParseTernaryWithNewlineAlternative(t *testing.T) {
 	parse(t, "true ? 1 :\n 2")
 }
 
+func TestParseTernaryWithNewlineConsequent(t *testing.T) {
+	parse(t, "true ?\n [1, 2] : [3]")
+}
+
 func TestParseCaseWhenThenInsideBlock(t *testing.T) {
 	input := `a.fill do |i|
   case i
@@ -5277,4 +5281,17 @@ func TestParsePrefixMinusExpression(t *testing.T) {
 		t.Errorf("expected -, got %s", prefix.Operator)
 	}
 	assertIntLit(t, prefix.Right, 5)
+}
+
+func TestNestedWhileInLambdaMatcherDoesNotLeaveOuterEnd(t *testing.T) {
+	program := parse(t, `
+describe "outer" do
+  argf [] do
+    -> { while source.readchar; end }.should raise_error(EOFError)
+  end
+end
+	`)
+	if len(program.Statements) != 1 {
+		t.Fatalf("expected one outer describe statement, got %d", len(program.Statements))
+	}
 }

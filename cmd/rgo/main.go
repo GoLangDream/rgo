@@ -750,6 +750,9 @@ func executeSpecFile(filename string) error {
 	if err != nil {
 		return fmt.Errorf("Runtime Error: %v", err)
 	}
+	if exception := unhandledRuntimeException(v.UnhandledException()); exception != nil {
+		return fmt.Errorf("Runtime Error: %s", runtimeExceptionDescription(exception))
+	}
 	return nil
 }
 

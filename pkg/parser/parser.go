@@ -2225,6 +2225,7 @@ func (p *Parser) parseTernaryExpression(condition ast.Expression) ast.Expression
 	}
 
 	p.nextToken()
+	p.skipCurNewlines()
 	previousStopAtColon := p.stopAtColon
 	p.stopAtColon = true
 	exp.Consequent = p.parseExpression(LOWEST)
@@ -5274,7 +5275,8 @@ func (p *Parser) statementCanConsumeNestedEnd(stmt ast.Statement) bool {
 		return false
 	}
 	switch exprStmt.Expression.(type) {
-	case *ast.ClassExpression, *ast.ModuleExpression, *ast.DefExpression, *ast.IfExpression, *ast.BeginExpression, *ast.CatchExpression:
+	case *ast.ClassExpression, *ast.ModuleExpression, *ast.DefExpression, *ast.IfExpression, *ast.BeginExpression, *ast.CatchExpression,
+		*ast.WhileExpression, *ast.UntilExpression, *ast.ForExpression, *ast.CaseExpression:
 		return true
 	default:
 		return false

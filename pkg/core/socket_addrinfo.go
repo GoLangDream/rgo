@@ -494,7 +494,7 @@ func udpSocketNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 			return e
 		}
 		if family != 2 && family != 10 {
-			return newRuntimeException(R.Classes["SystemCallError"], "Address family not supported")
+			return newRuntimeException(R.Classes["Errno::EAFNOSUPPORT"], "Address family not supported")
 		}
 	}
 	klass, _ := receiver.Data.(*object.Class)

@@ -11176,6 +11176,7 @@ func isUndefinedMethod(method *object.Method) bool {
 }
 
 func setMethodVisibility(receiver *object.EmeraldValue, visibility string, args ...*object.EmeraldValue) *object.EmeraldValue {
+	receiver = methodVisibilityTarget(receiver)
 	if len(args) == 0 {
 		setCurrentMethodVisibility(receiver, visibility)
 		return R.NilVal
@@ -11201,7 +11202,15 @@ func setMethodVisibility(receiver *object.EmeraldValue, visibility string, args 
 	return symbolArray(names...)
 }
 
+func methodVisibilityTarget(receiver *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver != R.Main || receiver.Type != object.ValueObject || receiver.Class == nil {
+		return receiver
+	}
+	return &object.EmeraldValue{Type: object.ValueClass, Data: receiver.Class, Class: R.Classes["Class"]}
+}
+
 func setCurrentMethodVisibility(receiver *object.EmeraldValue, visibility string) {
+	receiver = methodVisibilityTarget(receiver)
 	if receiver == nil {
 		return
 	}
@@ -54148,6 +54157,219 @@ func installBase64Module(objectClass *object.Class) {
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Base64", modValue)
 }
 
+func installAbbrevModule(objectClass *object.Class) {
+	if objectClass == nil {
+		return
+	}
+	if existing := objectClass.Constants["Abbrev"]; existing != nil && existing.Type == object.ValueModule {
+		return
+	}
+	mod := object.NewModule("Abbrev")
+	mod.DefineMethod("abbrev", &object.Method{Name: "abbrev", Fn: abbrevModuleAbbrev, Arity: -1})
+	modValue := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
+	objectClass.DefineConstant("Abbrev", modValue)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Abbrev", modValue)
+	if arrayClass := R.Classes["Array"]; arrayClass != nil {
+		arrayClass.DefineMethod("abbrev", &object.Method{Name: "abbrev", Fn: abbrevArrayAbbrev, Arity: -1})
+	}
+}
+
+func abbrevModuleAbbrev(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if args[0] == nil || args[0].Type != object.ValueArray {
+		return typeError("wrong argument type")
+	}
+	var pattern *object.EmeraldValue
+	if len(args) == 2 {
+		pattern = args[1]
+	}
+	return buildAbbreviations(args[0].Data.([]*object.EmeraldValue), pattern)
+}
+
+func abbrevArrayAbbrev(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	var pattern *object.EmeraldValue
+	if len(args) == 1 {
+		pattern = args[0]
+	}
+	return buildAbbreviations(receiver.Data.([]*object.EmeraldValue), pattern)
+}
+
+func buildAbbreviations(values []*object.EmeraldValue, pattern *object.EmeraldValue) *object.EmeraldValue {
+	words := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == nil || value.Type != object.ValueString {
+			return typeError("no implicit conversion into String")
+		}
+		words = append(words, stringRawValue(value))
+	}
+
+	candidates := map[string]string{}
+	ambiguous := map[string]bool{}
+	for _, word := range words {
+		runes := []rune(word)
+		for length := 1; length < len(runes); length++ {
+			prefix := string(runes[:length])
+			if !abbrevPatternMatches(pattern, prefix) {
+				continue
+			}
+			if previous, exists := candidates[prefix]; exists && previous != word {
+				delete(candidates, prefix)
+				ambiguous[prefix] = true
+			} else if !ambiguous[prefix] {
+				candidates[prefix] = word
+			}
+		}
+	}
+	for _, word := range words {
+		if abbrevPatternMatches(pattern, word) {
+			candidates[word] = word
+		}
+	}
+	return rubyStringHash(candidates)
+}
+
+func abbrevPatternMatches(pattern *object.EmeraldValue, value string) bool {
+	if pattern == nil || pattern == R.NilVal {
+		return true
+	}
+	if pattern.Type == object.ValueString {
+		return strings.HasPrefix(value, stringRawValue(pattern))
+	}
+	if CallMethod != nil {
+		return isTruthy(CallMethod(pattern, "===", rubyString(value)))
+	}
+	return false
+}
+
+func installPPModule(objectClass *object.Class) {
+	if objectClass == nil || objectClass.Constants["PP"] != nil {
+		return
+	}
+	mod := object.NewModule("PP")
+	mod.DefineMethod("pp", &object.Method{Name: "pp", Fn: ppPrint, Arity: -1})
+	value := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
+	objectClass.DefineConstant("PP", value)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "PP", value)
+}
+
+func ppPrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	out := (*object.EmeraldValue)(nil)
+	if len(args) == 2 {
+		out = args[1]
+	} else if GetGlobalVariable != nil {
+		out = GetGlobalVariable("$stdout")
+	}
+	if out == nil || CallMethod == nil {
+		return R.NilVal
+	}
+	result := CallMethod(out, "write", rubyString(args[0].Inspect()+"\n"))
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return R.NilVal
+}
+
+func installFiddleModule(objectClass *object.Class) {
+	if objectClass == nil || objectClass.Constants["Fiddle"] != nil {
+		return
+	}
+	mod := object.NewModule("Fiddle")
+	dlError := object.NewClass("Fiddle::DLError")
+	dlError.SuperClass = R.Classes["StandardError"]
+	handle := object.NewClass("Fiddle::Handle")
+	handle.SuperClass = objectClass
+	handle.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: fiddleHandleInitialize, Arity: -1, Visibility: "private"})
+	mod.DefineConstant("DLError", &object.EmeraldValue{Type: object.ValueClass, Data: dlError, Class: R.Classes["Class"]})
+	mod.DefineConstant("Handle", &object.EmeraldValue{Type: object.ValueClass, Data: handle, Class: R.Classes["Class"]})
+	R.Classes["Fiddle::DLError"] = dlError
+	R.Classes["Fiddle::Handle"] = handle
+	value := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
+	objectClass.DefineConstant("Fiddle", value)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Fiddle", value)
+}
+
+func fiddleHandleInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
+		if _, err := os.Stat(stringRawValue(args[0])); err != nil {
+			return newRuntimeException(R.Classes["Fiddle::DLError"], "cannot open shared object file")
+		}
+	}
+	return R.NilVal
+}
+
+func installOptionParserClass(objectClass *object.Class) {
+	if objectClass == nil || objectClass.Constants["OptionParser"] != nil {
+		return
+	}
+	klass := object.NewClass("OptionParser")
+	klass.SuperClass = objectClass
+	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: optionParserInitialize, Arity: -1, Visibility: "private"})
+	klass.DefineMethod("on", &object.Method{Name: "on", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("order", &object.Method{Name: "order", Fn: optionParserOrder, Arity: -1})
+	klass.DefineMethod("order!", &object.Method{Name: "order!", Fn: optionParserOrder, Arity: -1})
+	R.Classes["OptionParser"] = klass
+	value := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
+	objectClass.DefineConstant("OptionParser", value)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "OptionParser", value)
+}
+
+func optionParserInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		if result := CallBlockWithArgs(CurrentBlockValue(), receiver); result != nil && result.Type == object.ValueException {
+			return result
+		}
+	}
+	return R.NilVal
+}
+
+func optionParserOn(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
+func optionParserOrder(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 || args[0] == nil || args[0].Type != object.ValueArray {
+		return NewArgumentError("wrong number of arguments")
+	}
+	var into *object.EmeraldValue
+	if len(args) > 1 && args[len(args)-1] != nil && args[len(args)-1].Type == object.ValueHash {
+		for key, value := range valueToHashMap(args[len(args)-1]) {
+			if specName(key) == "into" {
+				into = value
+				break
+			}
+		}
+	}
+	if into == nil || into.Type != object.ValueHash {
+		into = emptyHashValue()
+	}
+	values := args[0].Data.([]*object.EmeraldValue)
+	for index := 0; index < len(values); index++ {
+		if values[index] == nil || values[index].Type != object.ValueString {
+			continue
+		}
+		switch stringRawValue(values[index]) {
+		case "--verbose", "-v":
+			hashIndexSet(into, rubySymbol("verbose"), R.TrueVal)
+		case "--no-verbose":
+			hashIndexSet(into, rubySymbol("verbose"), R.FalseVal)
+		case "--require", "-r":
+			if index+1 < len(values) {
+				index++
+				hashIndexSet(into, rubySymbol("require"), values[index])
+			}
+		}
+	}
+	return args[0]
+}
+
 func installFcntlModule(objectClass *object.Class) {
 	if objectClass == nil {
 		return
@@ -60808,6 +61030,17 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("rubygems")
 		markFeatureRequired("rubygems.rb")
 		return R.TrueVal
+	case "rubygems/user_interaction", "rubygems/user_interaction.rb",
+		"rubygems/safe_yaml", "rubygems/safe_yaml.rb",
+		"rubygems/gemcutter_utilities", "rubygems/gemcutter_utilities.rb",
+		"rubygems/command_manager", "rubygems/command_manager.rb",
+		"rubygems/commands/owner_command", "rubygems/commands/owner_command.rb":
+		if featureRequired(path) || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installRubyGemsModule(R.Classes["Object"])
+		markFeatureRequired(path)
+		return R.TrueVal
 	case "mkmf", "mkmf.rb":
 		if featureRequired("mkmf") || featureRequired("mkmf.rb") || loadingFeatures[path] {
 			return R.FalseVal
@@ -60970,6 +61203,38 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("base64")
 		markFeatureRequired("base64.rb")
 		return R.TrueVal
+	case "abbrev", "abbrev.rb":
+		if featureRequired("abbrev") || featureRequired("abbrev.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installAbbrevModule(R.Classes["Object"])
+		markFeatureRequired("abbrev")
+		markFeatureRequired("abbrev.rb")
+		return R.TrueVal
+	case "pp", "pp.rb":
+		if featureRequired("pp") || featureRequired("pp.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installPPModule(R.Classes["Object"])
+		markFeatureRequired("pp")
+		markFeatureRequired("pp.rb")
+		return R.TrueVal
+	case "fiddle", "fiddle.rb":
+		if featureRequired("fiddle") || featureRequired("fiddle.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installFiddleModule(R.Classes["Object"])
+		markFeatureRequired("fiddle")
+		markFeatureRequired("fiddle.rb")
+		return R.TrueVal
+	case "optparse", "optparse.rb":
+		if featureRequired("optparse") || featureRequired("optparse.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installOptionParserClass(R.Classes["Object"])
+		markFeatureRequired("optparse")
+		markFeatureRequired("optparse.rb")
+		return R.TrueVal
 	case "cgi", "cgi.rb", "cgi/escape", "cgi/escape.rb":
 		if featureRequired(path) || loadingFeatures[path] {
 			return R.FalseVal
@@ -61003,6 +61268,14 @@ func requireFeature(path string) *object.EmeraldValue {
 		installNetHTTP(R.Classes["Object"])
 		markFeatureRequired("net/http")
 		markFeatureRequired("net/http.rb")
+		return R.TrueVal
+	case "net/ftp", "net/ftp.rb":
+		if featureRequired("net/ftp") || featureRequired("net/ftp.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installNetFTP(R.Classes["Object"])
+		markFeatureRequired("net/ftp")
+		markFeatureRequired("net/ftp.rb")
 		return R.TrueVal
 	case "matrix", "matrix.rb":
 		if featureRequired("matrix") || featureRequired("matrix.rb") || loadingFeatures[path] {
@@ -61381,14 +61654,21 @@ func requireFeature(path string) *object.EmeraldValue {
 }
 
 func installRubyGemsModule(objectClass *object.Class) {
-	if objectClass == nil || objectClass.Constants["Gem"] != nil {
+	if objectClass == nil {
 		return
 	}
-	gem := object.NewModule("Gem")
-	gem.DefineMethod("load_path_insert_index", &object.Method{Name: "load_path_insert_index", Fn: gemLoadPathInsertIndex, Arity: 0})
-	value := &object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}
-	objectClass.DefineConstant("Gem", value)
-	AssignConstantName(classEmeraldValue(objectClass), "Gem", value)
+	var gem *object.Module
+	if value := objectClass.Constants["Gem"]; value != nil && value.Type == object.ValueModule {
+		gem, _ = value.Data.(*object.Module)
+	}
+	if gem == nil {
+		gem = object.NewModule("Gem")
+		gem.DefineMethod("load_path_insert_index", &object.Method{Name: "load_path_insert_index", Fn: gemLoadPathInsertIndex, Arity: 0})
+		value := &object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}
+		objectClass.DefineConstant("Gem", value)
+		AssignConstantName(classEmeraldValue(objectClass), "Gem", value)
+	}
+	installRubyGemsSecurity(gem)
 }
 
 func gemLoadPathInsertIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -85857,6 +86137,7 @@ func absFixturePath(path string) string {
 }
 
 var specRunner *SpecRunner
+var specFeatures map[string]bool
 var mockRestores []func()
 var mockExpectations map[*object.EmeraldValue]map[string][]*mockExpectationData
 var lastMockToAryReturn *object.EmeraldValue
@@ -85874,6 +86155,7 @@ func InitSpecRunner() *SpecRunner {
 	mockRestores = nil
 	mockExpectations = make(map[*object.EmeraldValue]map[string][]*mockExpectationData)
 	lastMockToAryReturn = nil
+	specFeatures = make(map[string]bool)
 	return specRunner
 }
 
@@ -86400,6 +86682,23 @@ func isExpectationComparableNumber(value *object.EmeraldValue) bool {
 
 func RegisterMspec() {
 	specRunner = InitSpecRunner()
+
+	mspecModule := object.NewModule("MSpec")
+	mspecModule.DefineMethod("enable_feature", &object.Method{
+		Name:  "enable_feature",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			for _, arg := range args {
+				if name := specName(arg); name != "" {
+					specFeatures[name] = true
+				}
+			}
+			return R.NilVal
+		},
+	})
+	mspecValue := &object.EmeraldValue{Type: object.ValueModule, Data: mspecModule, Class: R.Classes["Module"]}
+	R.Classes["Object"].DefineConstant("MSpec", mspecValue)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Object"], Class: R.Classes["Class"]}, "MSpec", mspecValue)
 
 	specEvaluateClass := object.NewClass("SpecEvaluate")
 	R.Classes["SpecEvaluate"] = specEvaluateClass
@@ -86952,8 +87251,18 @@ func RegisterMspec() {
 				}
 			}
 			if allModules {
-				objectValue := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Object"], Class: R.Classes["Class"]}
-				return moduleInclude(objectValue, args...)
+				target := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Object"], Class: R.Classes["Class"]}
+				if receiver != nil && receiver != R.Main && receiver.Type == object.ValueObject {
+					if obj, ok := receiver.Data.(*object.Object); ok && obj.SingletonClass != nil {
+						for i := len(obj.SingletonClass.IncludedModules) - 1; i >= 0; i-- {
+							if wrapper := obj.SingletonClass.IncludedModules[i]; wrapper != nil && wrapper.Name == "" {
+								target = &object.EmeraldValue{Type: object.ValueModule, Data: wrapper, Class: R.Classes["Module"]}
+								break
+							}
+						}
+					}
+				}
+				return moduleInclude(target, args...)
 			}
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
@@ -87303,6 +87612,21 @@ func RegisterMspec() {
 				return R.TrueVal
 			}
 			return R.FalseVal
+		},
+	})
+	objClass.DefineMethod("with_feature", &object.Method{
+		Name:  "with_feature",
+		Arity: -1,
+		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			for _, arg := range args {
+				if !specFeatures[specName(arg)] {
+					return R.NilVal
+				}
+			}
+			if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+				return callGuardBlock()
+			}
+			return R.NilVal
 		},
 	})
 	objClass.DefineMethod("platform_is", &object.Method{
@@ -91645,6 +91969,13 @@ func classInclude(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 
 func callIncludedHook(mixin *object.EmeraldValue, target *object.EmeraldValue) *object.EmeraldValue {
 	if CallMethod == nil {
+		return nil
+	}
+	// Kernel is represented internally by a Class plus kernelModuleView so
+	// BasicObject can include it like Ruby's Kernel module. Unlike ordinary
+	// Module values, that compatibility Class does not inherit the default
+	// private Module#included hook.
+	if mixin != nil && mixin.Type == object.ValueClass && mixin.Data == R.Classes["Kernel"] {
 		return nil
 	}
 	hook := CallMethod(mixin, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "included", Class: R.Classes["Symbol"]}, target)

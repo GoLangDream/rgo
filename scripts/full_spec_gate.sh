@@ -17,6 +17,7 @@ Environment variables:
   RGO_SPEC_CPU_SECONDS        per-file CPU cap for rgo test (optional)
   RGO_SPEC_LOG_DIR            directory to store non-pass spec logs (optional)
   RGO_RUBY_SPEC_TARGET        ruby-spec root to scan (default: vendor/ruby/spec)
+  RGO_INCLUDE_OPTIONAL_CAPI   run MRI C-extension ABI specs when set to 1 (default: unsupported_capi)
 
   RGO_GO_TEST_TIMEOUT         timeout for each go test invocation (default: 60)
   RGO_GO_TEST_CPU_SECONDS     CPU cap for go test via safe_go_test.sh (optional)

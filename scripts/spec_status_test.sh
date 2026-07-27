@@ -6,6 +6,7 @@ WORK=$(mktemp -d /tmp/rgo_spec_status_test_XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/specs"
+mkdir -p "$WORK/specs/optional/capi"
 OUT="$WORK/spec_status.csv"
 
 cat >"$WORK/specs/pass_spec.rb" <<'RUBY'
@@ -41,11 +42,16 @@ describe "binary output" do
 end
 RUBY
 
+cat >"$WORK/specs/optional/capi/native_spec.rb" <<'RUBY'
+raise "native ABI spec should not run by default"
+RUBY
+
 RGO_SPEC_TIMEOUT=1 "$ROOT/scripts/spec_status.sh" "$WORK/specs" "$OUT" >/dev/null
 
 grep -q '^file,status,examples,failures,error_kind,duration_ms$' "$OUT"
 grep -q "$WORK/specs/binary_output_spec.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/minitest_test.rb,pass,1,0,," "$OUT"
+grep -q "$WORK/specs/optional/capi/native_spec.rb,unsupported_capi,0,0,unsupported_capi,0" "$OUT"
 grep -q "$WORK/specs/parse_error_spec.rb,parse_error,0,0,parse_error," "$OUT"
 grep -q "$WORK/specs/pass_spec.rb,pass,1,0,," "$OUT"
 grep -q "$WORK/specs/timeout_spec.rb,timeout,0,0,timeout," "$OUT"

@@ -32,6 +32,7 @@ func installOpenSSLModule(objectClass *object.Class) {
 	randomModule.DefineMethod("random_bytes", &object.Method{Name: "random_bytes", Fn: opensslRandomBytes, Arity: -1})
 	randomModule.DefineMethod("pseudo_bytes", &object.Method{Name: "pseudo_bytes", Fn: opensslRandomBytes, Arity: -1})
 	openssl.Constants["Random"] = &object.EmeraldValue{Type: object.ValueModule, Data: randomModule, Class: R.Classes["Module"]}
+	installOpenSSLSSL(openssl)
 	installOpenSSLDigest(openssl)
 	installOpenSSLKDF(openssl)
 	installOpenSSLX509(openssl)
@@ -39,6 +40,27 @@ func installOpenSSLModule(objectClass *object.Class) {
 	value := &object.EmeraldValue{Type: object.ValueModule, Data: openssl, Class: R.Classes["Module"]}
 	objectClass.DefineConstant("OpenSSL", value)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "OpenSSL", value)
+}
+
+func installOpenSSLSSL(openssl *object.Module) {
+	sslModule := object.NewModule("OpenSSL::SSL")
+	contextClass := object.NewClass("OpenSSL::SSL::SSLContext")
+	contextClass.SuperClass = R.Classes["Object"]
+	contextClass.DefineMethod("set_params", &object.Method{Name: "set_params", Fn: opensslSSLContextSetParams, Arity: -1})
+	contextValue := classEmeraldValue(contextClass)
+	sslModule.Constants["SSLContext"] = contextValue
+	openssl.Constants["SSL"] = &object.EmeraldValue{Type: object.ValueModule, Data: sslModule, Class: R.Classes["Module"]}
+	R.Classes["OpenSSL::SSL::SSLContext"] = contextClass
+}
+
+func opensslSSLContextSetParams(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0..1)", len(args)))
+	}
+	if len(args) == 1 {
+		receiverInstanceVarMap(receiver)["@params"] = args[0]
+	}
+	return receiver
 }
 
 func installOpenSSLDigest(openssl *object.Module) {

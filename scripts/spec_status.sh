@@ -11,6 +11,7 @@ OUT=$2
 TIMEOUT_SECONDS=${RGO_SPEC_TIMEOUT:-30}
 MEMORY_KB=${RGO_TEST_MEMORY_KB:-}
 CPU_SECONDS=${RGO_SPEC_CPU_SECONDS:-}
+INCLUDE_OPTIONAL_CAPI=${RGO_INCLUDE_OPTIONAL_CAPI:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LOG_DIR=${RGO_SPEC_LOG_DIR:-}
 
@@ -62,6 +63,10 @@ else
 fi
 
 for spec in "${FILES[@]}"; do
+  if [[ "$spec" == */optional/capi/* ]] && [ "$INCLUDE_OPTIONAL_CAPI" != "1" ]; then
+    printf '%s,unsupported_capi,0,0,unsupported_capi,0\n' "$spec" >> "$OUT"
+    continue
+  fi
   start=$(date +%s%3N)
   tmp=$(mktemp "$TMPDIR/spec_XXXXXX")
   set +e
