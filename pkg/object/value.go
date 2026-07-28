@@ -681,6 +681,8 @@ type RHash struct {
 	Pairs             map[*EmeraldValue]*EmeraldValue
 	Keys              []*EmeraldValue
 	Hashes            map[*EmeraldValue]int64
+	Buckets           map[int64][]*EmeraldValue
+	BucketSize        int
 	Default           *EmeraldValue
 	DefaultProc       *EmeraldValue
 	CompareByIdentity bool

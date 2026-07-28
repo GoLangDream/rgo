@@ -227,7 +227,16 @@ func parseURIString(raw string) *object.EmeraldValue {
 	}
 	if data.scheme != nil && !strings.HasPrefix(rest, "//") && !strings.HasPrefix(rest, "/") {
 		data.opaque = uriStringPointer(rest)
-		return uriValue(data, "Generic")
+		className := "Generic"
+		switch scheme {
+		case "http":
+			className = "HTTP"
+		case "https":
+			className = "HTTPS"
+		case "ftp":
+			className = "FTP"
+		}
+		return uriValue(data, className)
 	}
 	if strings.HasPrefix(rest, "//") {
 		rest = rest[2:]
@@ -1000,6 +1009,10 @@ func uriRoute(receiver, otherValue *object.EmeraldValue, reverse bool) *object.E
 	t := target.Data.(*uriData)
 	if !strings.EqualFold(uriPointerString(s.scheme), uriPointerString(t.scheme)) {
 		return target
+	}
+	if t.opaque != nil {
+		copyData := *t
+		return uriValue(&copyData, "Generic")
 	}
 	if strings.EqualFold(uriPointerString(s.scheme), "mailto") {
 		relative := &uriData{}

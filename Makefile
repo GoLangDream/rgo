@@ -4,7 +4,7 @@ GOCACHE ?= /tmp/rgo-go-build-cache
 GOMODCACHE ?= /tmp/rgo-go-mod-cache
 GOENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
 
-.PHONY: help test clean build fmt lint check
+.PHONY: help test clean build fmt lint check bench
 .PHONY: full-spec full-ruby-spec full-rails-spec
 
 help:
@@ -16,6 +16,7 @@ help:
 	@echo "  make fmt     Format code"
 	@echo "  make lint    Run go vet"
 	@echo "  make check   Format + lint + test"
+	@echo "  make bench   Compare RGo with MRI Ruby"
 	@echo "  make clean   Remove build artifacts"
 
 build:
@@ -31,6 +32,9 @@ lint:
 	$(GOENV) go vet ./...
 
 check: fmt lint test
+
+bench: build
+	python3 scripts/benchmark_ruby.py
 
 clean:
 	rm -f rgo

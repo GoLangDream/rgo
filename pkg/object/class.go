@@ -47,6 +47,7 @@ func NewClass(name string) *Class {
 
 func (c *Class) DefineMethod(name string, method *Method) {
 	c.Methods[name] = method
+	BumpMethodGeneration()
 }
 
 func (c *Class) DefineClassMethod(name string, method *Method) {
@@ -60,6 +61,7 @@ func (c *Class) DefineClassMethod(name string, method *Method) {
 		}
 		c.SingletonClass.Methods[name] = method
 	}
+	BumpMethodGeneration()
 }
 
 func (c *Class) GetMethod(name string) (*Method, bool) {
@@ -120,6 +122,7 @@ func (c *Class) GetInstanceVar(name string) *EmeraldValue {
 
 func (c *Class) Include(module *Module) {
 	c.IncludedModules = append(c.IncludedModules, module)
+	BumpMethodGeneration()
 }
 
 func (c *Class) Extend(module *Module) {
@@ -130,6 +133,7 @@ func (c *Class) Extend(module *Module) {
 
 func (c *Class) Prepend(module *Module) {
 	c.PrependedModules = append([]*Module{module}, c.PrependedModules...)
+	BumpMethodGeneration()
 }
 
 func (c *Class) NewInstance() *EmeraldValue {

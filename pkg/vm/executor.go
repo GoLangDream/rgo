@@ -30,6 +30,8 @@ var DevMode = os.Getenv("RGO_DEV") == "1"
 
 var CurrentVM *VM
 var sendTraceDepth int64
+var debugSendTraceEnabled = os.Getenv("RGO_DEBUG_SEND_TRACE") == "1"
+var debugForLoopEnabled = os.Getenv("RGO_DEBUG_FOR_LOOP") == "1"
 
 type closureCell struct {
 	slot  **object.EmeraldValue
@@ -56,22 +58,24 @@ type Frame struct {
 	Bp      int
 	Closure *object.Closure
 
-	MethodName            string
-	OriginalMethodName    string
-	LabelName             string
-	SuperStart            *object.Class
-	SuperModule           *object.Module
-	SuperAfterClass       bool
-	Args                  []*object.EmeraldValue
-	Block                 *object.EmeraldValue
-	DefinedByDefineMethod bool
-	IsLambda              bool
-	CapturedBindings      []*object.RBinding
-	TraceSelf             *object.EmeraldValue
-	TraceDefinedClass     *object.EmeraldValue
-	TraceMethodID         string
-	TraceCalleeID         string
-	TraceParameters       *object.EmeraldValue
+	MethodName             string
+	OriginalMethodName     string
+	LabelName              string
+	SuperStart             *object.Class
+	SuperModule            *object.Module
+	SuperAfterClass        bool
+	Args                   []*object.EmeraldValue
+	Block                  *object.EmeraldValue
+	DefinedByDefineMethod  bool
+	IsLambda               bool
+	CapturedBindings       []*object.RBinding
+	TraceSelf              *object.EmeraldValue
+	TraceDefinedClass      *object.EmeraldValue
+	TraceMethodID          string
+	TraceCalleeID          string
+	TraceParameters        *object.EmeraldValue
+	InstructionException   *object.EmeraldValue
+	InstructionSnapshotSet bool
 
 	BlockBreakAddr int
 	WhileStart     int
@@ -193,6 +197,54 @@ type fiberCoroutine struct {
 	caller  vmExecutionContext
 }
 
+type methodCacheKey struct {
+	class *object.Class
+	name  string
+}
+
+type methodCacheEntry struct {
+	generation uint64
+	method     *object.Method
+	owner      *object.Class
+}
+
+type invocationMetadata struct {
+	superStart        *object.Class
+	superModule       *object.Module
+	superAfterClass   bool
+	label             string
+	traceDefinedClass *object.EmeraldValue
+	traceMethodID     string
+}
+
+type integerFunctionStep struct {
+	op    compiler.Opcode
+	value int64
+	param int
+}
+
+type integerFunctionPlan struct {
+	steps   []integerFunctionStep
+	usesAdd bool
+}
+
+type integerFunctionCacheEntry struct {
+	plan      *integerFunctionPlan
+	supported bool
+}
+
+type integerLocalUpdatePlan struct {
+	local int
+	steps []integerFunctionStep
+}
+
+type integerLoopStep struct {
+	op    compiler.Opcode
+	local int
+	value int64
+	fn    *object.Function
+}
+
 type VM struct {
 	parent              *VM
 	constants           []*object.EmeraldValue
@@ -211,7 +263,9 @@ type VM struct {
 
 	instructions compiler.Instructions
 
-	poppedValues []*object.EmeraldValue
+	poppedValues     []*object.EmeraldValue
+	instructionLimit uint64
+	instructionCount uint64
 
 	currentBlock              *object.EmeraldValue
 	visibilityBypass          bool
@@ -245,16 +299,19 @@ type VM struct {
 	pendingEscapedThrowValue   *object.EmeraldValue
 
 	nativeSingletonMethods map[interface{}]map[string]*object.Method
+	methodCache            map[methodCacheKey]methodCacheEntry
+	fusedIntegerGeneration uint64
+	fusedIntegerOps        bool
+	integerFunctionCache   map[*object.Function]integerFunctionCacheEntry
 
-	freezeStringLiterals  bool
-	chillStringLiterals   bool
-	sourceEncoding        string
-	frozenStringCache     map[string]*object.EmeraldValue
-	threadCoroutines      map[*object.EmeraldValue]*threadCoroutine
-	fiberCoroutines       map[*object.EmeraldValue]*fiberCoroutine
-	threadSpecialGlobals  map[string]*object.EmeraldValue
-	instructionExceptions map[*Frame]*object.EmeraldValue
-	unhandledException    *object.EmeraldValue
+	freezeStringLiterals bool
+	chillStringLiterals  bool
+	sourceEncoding       string
+	frozenStringCache    map[string]*object.EmeraldValue
+	threadCoroutines     map[*object.EmeraldValue]*threadCoroutine
+	fiberCoroutines      map[*object.EmeraldValue]*fiberCoroutine
+	threadSpecialGlobals map[string]*object.EmeraldValue
+	unhandledException   *object.EmeraldValue
 }
 
 type nativeBacktraceFrame struct {
@@ -266,6 +323,12 @@ func New(bytecode *compiler.Bytecode) *VM {
 	currentSpecFile := core.CurrentSpecFile
 	core.CurrentSpecFile = currentSpecFile
 	return newVM(bytecode, nil)
+}
+
+// SetInstructionLimit bounds the number of bytecode instructions executed by
+// one Run call. A zero limit, the production default, means unlimited.
+func (vm *VM) SetInstructionLimit(limit uint64) {
+	vm.instructionLimit = limit
 }
 
 func (vm *VM) SetFreezeStringLiterals(enabled bool) {
@@ -349,98 +412,36 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		sourceEncoding:         core.CurrentEvalSourceEncoding,
 		autoloading:            make(map[string]bool),
 		nativeSingletonMethods: make(map[interface{}]map[string]*object.Method),
+		methodCache:            make(map[methodCacheKey]methodCacheEntry),
+		integerFunctionCache:   make(map[*object.Function]integerFunctionCacheEntry),
 		frozenStringCache:      make(map[string]*object.EmeraldValue),
 		threadCoroutines:       make(map[*object.EmeraldValue]*threadCoroutine),
 		fiberCoroutines:        make(map[*object.EmeraldValue]*fiberCoroutine),
-		instructionExceptions:  make(map[*Frame]*object.EmeraldValue),
 		isRoot:                 parent == nil,
 	}
-	vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
-	vm.rubyConsts["TOPLEVEL_BINDING"] = &object.EmeraldValue{
-		Type: object.ValueBinding,
-		Data: &object.RBinding{
-			Self:         core.R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			Path:         core.CurrentSpecFile,
-			Line:         1,
-		},
-		Class: core.R.Classes["Binding"],
+	if parent != nil {
+		vm.instructionLimit = parent.instructionLimit
 	}
-	enumerableModule := object.NewModule("Enumerable")
-	enumerableModule.DefineMethod("select", &object.Method{Name: "select", Fn: core.EnumerableSelect, Arity: 0})
-	enumerableModule.DefineMethod("find_all", &object.Method{Name: "find_all", Fn: core.EnumerableSelect, Arity: 0})
-	enumerableModule.DefineMethod("filter", &object.Method{Name: "filter", Fn: core.EnumerableSelect, Arity: 0})
-	enumerableModule.DefineMethod("map", &object.Method{Name: "map", Fn: core.EnumerableMap, Arity: -1})
-	enumerableModule.DefineMethod("collect", &object.Method{Name: "collect", Fn: core.EnumerableMap, Arity: -1})
-	enumerableModule.DefineMethod("to_a", &object.Method{Name: "to_a", Fn: core.EnumerableToA, Arity: -1})
-	enumerableModule.DefineMethod("entries", &object.Method{Name: "entries", Fn: core.EnumerableToA, Arity: -1})
-	enumerableModule.DefineMethod("first", &object.Method{Name: "first", Fn: core.EnumerableFirst, Arity: -1})
-	enumerableModule.DefineMethod("take", &object.Method{Name: "take", Fn: core.EnumerableTake, Arity: -1})
-	enumerableModule.DefineMethod("drop", &object.Method{Name: "drop", Fn: core.EnumerableDrop, Arity: -1})
-	enumerableModule.DefineMethod("each_entry", &object.Method{Name: "each_entry", Fn: core.EnumerableEachEntry, Arity: -1})
-	enumerableModule.DefineMethod("each_cons", &object.Method{Name: "each_cons", Fn: core.EnumerableEachCons, Arity: -1})
-	enumerableModule.DefineMethod("each_slice", &object.Method{Name: "each_slice", Fn: core.EnumerableEachSlice, Arity: -1})
-	enumerableModule.DefineMethod("cycle", &object.Method{Name: "cycle", Fn: core.EnumerableCycle, Arity: -1})
-	enumerableModule.DefineMethod("all?", &object.Method{Name: "all?", Fn: core.EnumerableAll, Arity: -1})
-	enumerableModule.DefineMethod("any?", &object.Method{Name: "any?", Fn: core.EnumerableAny, Arity: -1})
-	enumerableModule.DefineMethod("none?", &object.Method{Name: "none?", Fn: core.EnumerableNone, Arity: -1})
-	enumerableModule.DefineMethod("one?", &object.Method{Name: "one?", Fn: core.EnumerableOne, Arity: -1})
-	enumerableModule.DefineMethod("min_by", &object.Method{Name: "min_by", Fn: core.EnumerableMinBy, Arity: -1})
-	enumerableModule.DefineMethod("max_by", &object.Method{Name: "max_by", Fn: core.EnumerableMaxBy, Arity: -1})
-	enumerableModule.DefineMethod("min", &object.Method{Name: "min", Fn: core.EnumerableMin, Arity: -1})
-	enumerableModule.DefineMethod("max", &object.Method{Name: "max", Fn: core.EnumerableMax, Arity: -1})
-	enumerableModule.DefineMethod("minmax", &object.Method{Name: "minmax", Fn: core.EnumerableMinmax, Arity: -1})
-	enumerableModule.DefineMethod("sort", &object.Method{Name: "sort", Fn: core.EnumerableSort, Arity: -1})
-	enumerableModule.DefineMethod("inject", &object.Method{Name: "inject", Fn: core.EnumerableInject, Arity: -1})
-	enumerableModule.DefineMethod("reduce", &object.Method{Name: "reduce", Fn: core.EnumerableInject, Arity: -1})
-	enumerableModule.DefineMethod("grep", &object.Method{Name: "grep", Fn: core.EnumerableGrep, Arity: -1})
-	enumerableModule.DefineMethod("grep_v", &object.Method{Name: "grep_v", Fn: core.EnumerableGrepV, Arity: -1})
-	enumerableModule.DefineMethod("zip", &object.Method{Name: "zip", Fn: core.EnumerableZip, Arity: -1})
-	enumerableModule.DefineMethod("tally", &object.Method{Name: "tally", Fn: core.EnumerableTally, Arity: -1})
-	enumerableModule.DefineMethod("to_h", &object.Method{Name: "to_h", Fn: core.EnumerableToH, Arity: -1})
-	enumerableModule.DefineMethod("chunk_while", &object.Method{Name: "chunk_while", Fn: core.EnumerableChunkWhile, Arity: -1})
-	enumerableModule.DefineMethod("slice_when", &object.Method{Name: "slice_when", Fn: core.EnumerableSliceWhen, Arity: -1})
-	enumerableModule.DefineMethod("slice_before", &object.Method{Name: "slice_before", Fn: core.EnumerableSliceBefore, Arity: -1})
-	enumerableModule.DefineMethod("slice_after", &object.Method{Name: "slice_after", Fn: core.EnumerableSliceAfter, Arity: -1})
-	enumerableModule.DefineMethod("chunk", &object.Method{Name: "chunk", Fn: core.EnumerableChunk, Arity: -1})
-	enumerableModule.DefineMethod("count", &object.Method{Name: "count", Fn: core.EnumerableCount, Arity: -1})
-	enumerableModule.DefineMethod("find", &object.Method{Name: "find", Fn: core.EnumerableFind, Arity: -1})
-	enumerableModule.DefineMethod("detect", &object.Method{Name: "detect", Fn: core.EnumerableFind, Arity: -1})
-	enumerableModule.DefineMethod("find_index", &object.Method{Name: "find_index", Fn: core.EnumerableFindIndex, Arity: -1})
-	enumerableModule.DefineMethod("include?", &object.Method{Name: "include?", Fn: core.EnumerableInclude, Arity: 1})
-	enumerableModule.DefineMethod("member?", &object.Method{Name: "member?", Fn: core.EnumerableInclude, Arity: 1})
-	enumerableModule.DefineMethod("group_by", &object.Method{Name: "group_by", Fn: core.EnumerableGroupBy, Arity: 0})
-	enumerableModule.DefineMethod("partition", &object.Method{Name: "partition", Fn: core.EnumerablePartition, Arity: 0})
-	enumerableModule.DefineMethod("reject", &object.Method{Name: "reject", Fn: core.EnumerableReject, Arity: 0})
-	enumerableModule.DefineMethod("each_with_index", &object.Method{Name: "each_with_index", Fn: core.EnumerableEachWithIndex, Arity: -1})
-	enumerableModule.DefineMethod("each_with_object", &object.Method{Name: "each_with_object", Fn: core.EnumerableEachWithObject, Arity: 1})
-	enumerableModule.DefineMethod("flat_map", &object.Method{Name: "flat_map", Fn: core.EnumerableFlatMap, Arity: 0})
-	enumerableModule.DefineMethod("collect_concat", &object.Method{Name: "collect_concat", Fn: core.EnumerableFlatMap, Arity: 0})
-	enumerableModule.DefineMethod("filter_map", &object.Method{Name: "filter_map", Fn: core.EnumerableFilterMap, Arity: 0})
-	enumerableModule.DefineMethod("compact", &object.Method{Name: "compact", Fn: core.EnumerableCompact, Arity: 0})
-	enumerableModule.DefineMethod("chain", &object.Method{Name: "chain", Fn: core.EnumerableChain, Arity: -1})
-	enumerableModule.DefineMethod("uniq", &object.Method{Name: "uniq", Fn: core.EnumerableUniq, Arity: 0})
-	enumerableModule.DefineMethod("take_while", &object.Method{Name: "take_while", Fn: core.EnumerableTakeWhile, Arity: 0})
-	enumerableModule.DefineMethod("drop_while", &object.Method{Name: "drop_while", Fn: core.EnumerableDropWhile, Arity: 0})
-	enumerableModule.DefineMethod("reverse_each", &object.Method{Name: "reverse_each", Fn: core.EnumerableReverseEach, Arity: 0})
-	enumerableModule.DefineMethod("sum", &object.Method{Name: "sum", Fn: core.EnumerableSum, Arity: -1})
-	enumerableModule.DefineMethod("sort_by", &object.Method{Name: "sort_by", Fn: core.EnumerableSortBy, Arity: 0})
-	enumerableModule.DefineMethod("minmax_by", &object.Method{Name: "minmax_by", Fn: core.EnumerableMinmaxBy, Arity: -1})
-	vm.SetTopLevelConstant("Enumerable", &object.EmeraldValue{Type: object.ValueModule, Data: enumerableModule, Class: core.R.Classes["Module"]})
-	comparableModule := object.NewModule("Comparable")
-	comparableModule.DefineMethod("==", &object.Method{Name: "==", Fn: core.ComparableEqual, Arity: 1})
-	comparableModule.DefineMethod("<", &object.Method{Name: "<", Fn: core.ComparableLess, Arity: 1})
-	comparableModule.DefineMethod("<=", &object.Method{Name: "<=", Fn: core.ComparableLessEqual, Arity: 1})
-	comparableModule.DefineMethod(">", &object.Method{Name: ">", Fn: core.ComparableGreater, Arity: 1})
-	comparableModule.DefineMethod(">=", &object.Method{Name: ">=", Fn: core.ComparableGreaterEqual, Arity: 1})
-	comparableModule.DefineMethod("between?", &object.Method{Name: "between?", Fn: core.ComparableBetween, Arity: 2})
-	comparableModule.DefineMethod("clamp", &object.Method{Name: "clamp", Fn: core.ComparableClamp, Arity: -1})
-	core.R.Classes["Time"].Include(comparableModule)
-	vm.SetTopLevelConstant("Comparable", &object.EmeraldValue{Type: object.ValueModule, Data: comparableModule, Class: core.R.Classes["Module"]})
+	if parent == nil {
+		core.InitializeRuntimeModules()
+		vm.rubyConsts["ARGF"] = core.NewArgfValue(nil)
+		vm.rubyConsts["TOPLEVEL_BINDING"] = &object.EmeraldValue{
+			Type: object.ValueBinding,
+			Data: &object.RBinding{
+				Self:         core.R.Main,
+				Locals:       map[string]*object.EmeraldValue{},
+				LocalNames:   nil,
+				Constants:    map[string]*object.EmeraldValue{},
+				Method:       "",
+				InstanceVars: map[string]*object.EmeraldValue{},
+				Path:         core.CurrentSpecFile,
+				Line:         1,
+			},
+			Class: core.R.Classes["Binding"],
+		}
+		vm.rubyConsts["Enumerable"] = core.R.Enumerable
+		vm.rubyConsts["Comparable"] = core.R.Comparable
+	}
 	if parent != nil {
 		vm.globals = parent.globals
 		vm.globalNames = parent.globalNames
@@ -465,31 +466,6 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		vm.setGlobalByName("$$", &object.EmeraldValue{Type: object.ValueInteger, Data: int64(os.Getpid()), Class: core.R.Classes["Integer"]})
 		vm.setGlobalByName("$*", argv)
 	}
-	if comparableValue := vm.rubyConsts["Comparable"]; comparableValue != nil && comparableValue.Type == object.ValueModule {
-		if cls := core.R.Classes["Numeric"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["Integer"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["Float"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["Rational"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["String"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["Symbol"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-		if cls := core.R.Classes["File::Stat"]; cls != nil {
-			cls.Include(comparableValue.Data.(*object.Module))
-		}
-	}
-	vm.includeEnumerableInCoreClasses()
-
 	vm.stack[0] = core.R.Main
 	vm.installCoreHooks()
 	if parent == nil {
@@ -516,30 +492,6 @@ func (vm *VM) SetTopLevelConstant(name string, value *object.EmeraldValue) {
 
 func (vm *VM) SetProgramName(name string) {
 	vm.setGlobalByName("$0", &object.EmeraldValue{Type: object.ValueString, Data: name, Class: core.R.Classes["String"]})
-}
-
-func (vm *VM) includeEnumerableInCoreClasses() {
-	moduleVal := vm.rubyConsts["Enumerable"]
-	if moduleVal == nil || moduleVal.Type != object.ValueModule {
-		return
-	}
-	enumerable := moduleVal.Data.(*object.Module)
-	for _, name := range []string{"Array", "Hash", "Range", "StringIO", "Enumerator", "Struct", "Dir", "File", "IO", "Set", "ObjectSpace::WeakMap"} {
-		class := core.R.Classes[name]
-		if class == nil {
-			continue
-		}
-		alreadyIncluded := false
-		for _, included := range class.IncludedModules {
-			if included == enumerable || (included != nil && included.Name == enumerable.Name) {
-				alreadyIncluded = true
-				break
-			}
-		}
-		if !alreadyIncluded {
-			class.Include(enumerable)
-		}
-	}
 }
 
 func (vm *VM) allocateFrameID() int {
@@ -1859,19 +1811,15 @@ func (vm *VM) Run() error {
 	if vm.isRoot {
 		defer core.RunAtExitHooks()
 	}
+	vm.instructionCount = 0
 
 	frame := vm.frames[vm.fp]
 	vm.initializeTopLevelBindingLocals(frame)
 	instructions := frame.Fn.Instructions
 
-	count := 0
 	for frame.Ip < len(instructions)-1 {
-		count++
 		if frame.Ip >= len(instructions) {
 			return fmt.Errorf("invalid instruction pointer: %d", frame.Ip)
-		}
-		if count > 1000000 {
-			return fmt.Errorf("infinite loop detected at ip=%d, op=%v", frame.Ip, instructions[frame.Ip])
 		}
 		frame.Ip++
 		if frame.Ip >= len(instructions) {
@@ -1881,7 +1829,8 @@ func (vm *VM) Run() error {
 		op := compiler.Opcode(instructions[frame.Ip])
 		vm.fireTracePointLine(frame, op)
 
-		vm.instructionExceptions[frame] = core.LastException
+		frame.InstructionException = core.LastException
+		frame.InstructionSnapshotSet = true
 		err := vm.execute(op, frame)
 		if err != nil {
 			return err
@@ -1898,7 +1847,7 @@ func (vm *VM) Run() error {
 		frame = vm.frames[vm.fp]
 		instructions = frame.Fn.Instructions
 
-		if DevMode && count%100 == 0 {
+		if DevMode && vm.instructionCount%100 == 0 {
 			runtime.Gosched()
 		}
 	}
@@ -3973,6 +3922,10 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 }
 
 func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
+	vm.instructionCount++
+	if vm.instructionLimit > 0 && vm.instructionCount > vm.instructionLimit {
+		return fmt.Errorf("instruction limit exceeded at ip=%d, op=%v", frame.Ip, op)
+	}
 	constants := vm.frameConstants(frame)
 	switch op {
 	case compiler.OpConstant:
@@ -4298,6 +4251,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpJump:
 		pos := vm.readUint16()
+		if pos < frame.Ip-2 {
+			if vm.tryExecuteCountedIntegerLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteCollectionFillLoop(frame, pos, frame.Ip-2) ||
+				vm.tryExecuteArraySumLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteASCIIStringLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteIntegerBytecodeLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+		}
 		frame.Ip = pos - 1
 
 	case compiler.OpJumpNotTruthy:
@@ -4334,15 +4302,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		idx := vm.readUint8()
 		pos := vm.readUint16()
 		stackIdx := frame.Bp + int(idx) + 1
-		if stackIdx >= 0 && stackIdx < StackSize && localSlotPresent(vm.stack[stackIdx]) {
+		if stackIdx >= 0 && stackIdx < len(vm.stack) && localSlotPresent(vm.stack[stackIdx]) {
 			frame.Ip = pos - 1
 		}
 
 	case compiler.OpArray:
 		n := vm.readUint16()
-		if n > StackSize {
-			return fmt.Errorf("OpArray: too many elements: %d", n)
-		}
 		elems := make([]*object.EmeraldValue, n)
 		for i := n - 1; i >= 0; i-- {
 			elems[i] = vm.pop()
@@ -4798,13 +4763,16 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		vm.push(result)
 
 	case compiler.OpGetLocal:
+		if vm.tryFusedIntegerLocalExpression(frame, constants) {
+			break
+		}
 		idx := vm.readUint8()
 		basePtr := frame.Bp
 		// In Ruby, Bp points to self (index 0), parameters start at index 1
 		// But compiler generates indices starting from 0 for first param
 		// So we need to add 1 to skip self
 		stackIdx := basePtr + int(idx) + 1
-		if stackIdx < 0 || stackIdx >= StackSize {
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
 			return fmt.Errorf("OpGetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", basePtr, idx, stackIdx, vm.sp)
 		}
 		if name, ok := vm.topLevelLocalName(frame, idx); ok {
@@ -4821,7 +4789,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		basePtr := frame.Bp
 		// Add 1 to skip self
 		stackIdx := basePtr + int(idx) + 1
-		if stackIdx < 0 || stackIdx >= StackSize {
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
 			return fmt.Errorf("OpSetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", basePtr, idx, stackIdx, vm.sp)
 		}
 		if current := vm.stack[stackIdx]; current != nil {
@@ -4846,7 +4814,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpGetLocalCell:
 		idx := vm.readUint8()
 		stackIdx := frame.Bp + int(idx) + 1
-		if stackIdx >= 0 && stackIdx < StackSize {
+		if stackIdx >= 0 && stackIdx < len(vm.stack) {
 			var cellValue *object.EmeraldValue
 			if current := vm.stack[stackIdx]; current != nil {
 				if _, ok := current.Data.(*closureCell); ok {
@@ -5069,7 +5037,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			outer = vm.frames[vm.fp-1]
 		}
 		stackIdx := outer.Bp + 1 + idx
-		if stackIdx >= 0 && stackIdx < StackSize {
+		if stackIdx >= 0 && stackIdx < len(vm.stack) {
 			if current := vm.stack[stackIdx]; current != nil {
 				if _, ok := current.Data.(*closureCell); ok {
 					vm.push(current)
@@ -5586,7 +5554,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 							mod.SingletonClass.Methods = map[string]*object.Method{}
 						}
 						copy.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: mod.SingletonClass, Class: core.R.Classes["Class"]}
-						mod.SingletonClass.Methods[name] = &copy
+						mod.SingletonClass.DefineMethod(name, &copy)
 					}
 				}
 			} else {
@@ -5595,9 +5563,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 		} else {
 			mainObj := core.R.Main.Data.(*object.Object)
+			method.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: mainObj.Class, Class: core.R.Classes["Class"]}
 			mainObj.Class.DefineMethod(name, method)
-			objectClass := &object.EmeraldValue{Type: object.ValueClass, Data: mainObj.Class, Class: core.R.Classes["Class"]}
-			if errVal := core.NotifyMethodAdded(objectClass, name); errVal != nil && errVal.Type == object.ValueException {
+			if errVal := core.NotifyMethodAdded(method.Owner, name); errVal != nil && errVal.Type == object.ValueException {
 				if vm.raiseException(frame, errVal) {
 					return nil
 				}
@@ -6386,12 +6354,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			methodObj, owner, ok = superClass.GetMethodWithOwner(superMethodName)
 		}
 		if !ok || methodObj == nil || methodObj.Visibility == "undefined" {
-			missingArgs := make([]*object.EmeraldValue, 0, len(args)+1)
-			missingArgs = append(missingArgs, &object.EmeraldValue{Type: object.ValueSymbol, Data: superMethodName, Class: core.R.Classes["Symbol"]})
-			missingArgs = append(missingArgs, args...)
-			if missing := vm.send(self, "method_missing", missingArgs); missing != nil && missing.Type != object.ValueException {
-				vm.push(missing)
-				return nil
+			if superMethodName != "method_missing" {
+				missingArgs := make([]*object.EmeraldValue, 0, len(args)+1)
+				missingArgs = append(missingArgs, &object.EmeraldValue{Type: object.ValueSymbol, Data: superMethodName, Class: core.R.Classes["Symbol"]})
+				missingArgs = append(missingArgs, args...)
+				if missing := vm.send(self, "method_missing", missingArgs); missing != nil && missing.Type != object.ValueException {
+					vm.push(missing)
+					return nil
+				}
 			}
 			result := core.NewNoMethodError("super: no superclass method `" + superMethodName + "'")
 			if vm.raiseException(frame, result) {
@@ -6441,7 +6411,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					blockParamProc, _ = blockVal.Data.(*object.Proc)
 				}
 			}
-			newFrame := &Frame{
+			newFrame := vm.pushReusableFrame(Frame{
 				ID:                    vm.allocateFrameID(),
 				Fn:                    fn,
 				Ip:                    -1,
@@ -6453,7 +6423,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				Args:                  args,
 				Block:                 vm.currentBlock,
 				DefinedByDefineMethod: methodObj.DefinedByDefineMethod,
-			}
+			})
 			if ownerModule != nil {
 				newFrame.SuperStart = owner
 			}
@@ -6461,8 +6431,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				blockParamProc.BreakOwnerID = newFrame.ID
 			}
 			setBlockBreakOwner(vm.currentBlock, newFrame.ID)
-			vm.frames = append(vm.frames, newFrame)
-			vm.fp++
 
 			curFrame := vm.frames[vm.fp]
 			instructions := curFrame.Fn.Instructions
@@ -6470,9 +6438,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				curFrame.Ip++
 				op := compiler.Opcode(instructions[curFrame.Ip])
 				vm.fireTracePointLine(curFrame, op)
-				vm.instructionExceptions[curFrame] = core.LastException
+				curFrame.InstructionException = core.LastException
+				curFrame.InstructionSnapshotSet = true
 				if err := vm.execute(op, curFrame); err != nil {
-					break
+					return err
 				}
 				if vm.handlePendingNonLocalReturn(curFrame) || vm.handlePendingNonLocalBreak(curFrame) || curFrame.Returned {
 					break
@@ -6494,7 +6463,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			vm.sp = bp
 			vm.endActiveRescuesForFrame(curFrame)
-			delete(vm.instructionExceptions, curFrame)
+			curFrame.InstructionException = nil
+			curFrame.InstructionSnapshotSet = false
 			vm.frames = vm.frames[:vm.fp]
 			vm.fp--
 			vm.frames[vm.fp] = oldFrame
@@ -6950,11 +6920,23 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 }
 
 func (vm *VM) push(val *object.EmeraldValue) {
-	if vm.sp >= StackSize {
-		return
+	if vm.sp >= len(vm.stack) {
+		nextSize := len(vm.stack) * 2
+		if nextSize == 0 {
+			nextSize = StackSize
+		}
+		vm.stack = append(vm.stack, make([]*object.EmeraldValue, nextSize-len(vm.stack))...)
 	}
 	vm.stack[vm.sp] = val
 	vm.sp++
+}
+
+func (vm *VM) recordPoppedValue(val *object.EmeraldValue) {
+	if len(vm.poppedValues) == 0 {
+		vm.poppedValues = append(vm.poppedValues, val)
+		return
+	}
+	vm.poppedValues[0] = val
 }
 
 func (vm *VM) pop() *object.EmeraldValue {
@@ -6966,7 +6948,7 @@ func (vm *VM) pop() *object.EmeraldValue {
 	if val == nil {
 		val = core.R.NilVal
 	}
-	vm.poppedValues = append(vm.poppedValues, val)
+	vm.recordPoppedValue(val)
 	return val
 }
 
@@ -6977,7 +6959,7 @@ func (vm *VM) popFrameValue(frame *Frame) *object.EmeraldValue {
 	}
 	if vm.sp <= minSp {
 		val := core.R.NilVal
-		vm.poppedValues = append(vm.poppedValues, val)
+		vm.recordPoppedValue(val)
 		return val
 	}
 	return vm.pop()
@@ -7065,7 +7047,7 @@ func (vm *VM) add(left, right *object.EmeraldValue) *object.EmeraldValue {
 	case int64:
 		switch r := right.Data.(type) {
 		case int64:
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: l + r, Class: core.R.Classes["Integer"]}
+			return core.NewIntegerValue(l + r)
 		case float64:
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) + r, Class: core.R.Classes["Float"]}
 		}
@@ -7122,7 +7104,7 @@ func (vm *VM) sub(left, right *object.EmeraldValue) *object.EmeraldValue {
 	case int64:
 		switch r := right.Data.(type) {
 		case int64:
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: l - r, Class: core.R.Classes["Integer"]}
+			return core.NewIntegerValue(l - r)
 		case float64:
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) - r, Class: core.R.Classes["Float"]}
 		}
@@ -7175,11 +7157,14 @@ func (vm *VM) mul(left, right *object.EmeraldValue) *object.EmeraldValue {
 	case int64:
 		switch r := right.Data.(type) {
 		case int64:
-			product := new(big.Int).Mul(big.NewInt(l), big.NewInt(r))
-			if !product.IsInt64() {
-				return core.NewIntegerFromBigInt(product)
+			product := l * r
+			overflows := l == -1 && r == math.MinInt64 ||
+				r == -1 && l == math.MinInt64 ||
+				l != 0 && product/l != r
+			if overflows {
+				return core.NewIntegerFromBigInt(new(big.Int).Mul(big.NewInt(l), big.NewInt(r)))
 			}
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: l * r, Class: core.R.Classes["Integer"]}
+			return core.NewIntegerValue(product)
 		case float64:
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(l) * r, Class: core.R.Classes["Float"]}
 		}
@@ -7237,7 +7222,7 @@ func (vm *VM) div(left, right *object.EmeraldValue) *object.EmeraldValue {
 					Class: core.R.Classes["ZeroDivisionError"],
 				}
 			}
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: l / r, Class: core.R.Classes["Integer"]}
+			return core.NewIntegerValue(l / r)
 		case float64:
 			if r == 0 {
 				if l == 0 {
@@ -7275,8 +7260,26 @@ func (vm *VM) div(left, right *object.EmeraldValue) *object.EmeraldValue {
 
 func (vm *VM) mod(left, right *object.EmeraldValue) *object.EmeraldValue {
 	if left != nil && right != nil && left.Type == object.ValueInteger && right.Type == object.ValueInteger {
-		leftBig, _ := integerAsBigInt(left)
-		rightBig, _ := integerAsBigInt(right)
+		leftBig, leftIsBig := core.NumericBigIntOverride(left)
+		rightBig, rightIsBig := core.NumericBigIntOverride(right)
+		if !leftIsBig && !rightIsBig {
+			l := left.Data.(int64)
+			r := right.Data.(int64)
+			if r == 0 {
+				return core.NewException("ZeroDivisionError", "divided by 0")
+			}
+			result := l % r
+			if result != 0 && (result < 0) != (r < 0) {
+				result += r
+			}
+			return core.NewIntegerValue(result)
+		}
+		if !leftIsBig {
+			leftBig = big.NewInt(left.Data.(int64))
+		}
+		if !rightIsBig {
+			rightBig = big.NewInt(right.Data.(int64))
+		}
 		if rightBig.Sign() == 0 {
 			return core.NewException("ZeroDivisionError", "divided by 0")
 		}
@@ -7297,16 +7300,6 @@ func (vm *VM) mod(left, right *object.EmeraldValue) *object.EmeraldValue {
 			result += rightFloat
 		}
 		return &object.EmeraldValue{Type: object.ValueFloat, Data: result, Class: core.R.Classes["Float"]}
-	}
-	switch l := left.Data.(type) {
-	case int64:
-		switch r := right.Data.(type) {
-		case int64:
-			if r == 0 {
-				return core.R.NilVal
-			}
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: l % r, Class: core.R.Classes["Integer"]}
-		}
 	}
 	if left != nil && left.Class != nil {
 		return vm.send(left, "%", []*object.EmeraldValue{right})
@@ -7343,7 +7336,7 @@ func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
 				if r < 0 {
 					return &object.EmeraldValue{Type: object.ValueFloat, Data: float64(result), Class: core.R.Classes["Float"]}
 				}
-				return &object.EmeraldValue{Type: object.ValueInteger, Data: result, Class: core.R.Classes["Integer"]}
+				return core.NewIntegerValue(result)
 			}
 			if r < 0 {
 				if l == 0 {
@@ -7367,7 +7360,7 @@ func (vm *VM) pow(left, right *object.EmeraldValue) *object.EmeraldValue {
 				}
 				return value
 			}
-			return &object.EmeraldValue{Type: object.ValueInteger, Data: vm.powInt(l, int(r)), Class: core.R.Classes["Integer"]}
+			return core.NewIntegerValue(vm.powInt(l, int(r)))
 		case float64:
 			return &object.EmeraldValue{Type: object.ValueFloat, Data: vm.mathPow(float64(l), r), Class: core.R.Classes["Float"]}
 		}
@@ -7441,7 +7434,7 @@ func (vm *VM) negate(val *object.EmeraldValue) *object.EmeraldValue {
 	}
 	switch v := val.Data.(type) {
 	case int64:
-		return &object.EmeraldValue{Type: object.ValueInteger, Data: -v, Class: core.R.Classes["Integer"]}
+		return core.NewIntegerValue(-v)
 	case float64:
 		return &object.EmeraldValue{Type: object.ValueFloat, Data: -v, Class: core.R.Classes["Float"]}
 	}
@@ -7835,6 +7828,26 @@ func integerAsBigInt(value *object.EmeraldValue) (*big.Int, bool) {
 }
 
 func integerBitOperation(left, right *object.EmeraldValue, operation string) (*object.EmeraldValue, bool) {
+	if left != nil && right != nil && left.Type == object.ValueInteger && right.Type == object.ValueInteger {
+		_, leftIsBig := core.NumericBigIntOverride(left)
+		_, rightIsBig := core.NumericBigIntOverride(right)
+		if !leftIsBig && !rightIsBig {
+			l := left.Data.(int64)
+			r := right.Data.(int64)
+			var result int64
+			switch operation {
+			case "&":
+				result = l & r
+			case "|":
+				result = l | r
+			case "^":
+				result = l ^ r
+			default:
+				return nil, false
+			}
+			return core.NewIntegerValue(result), true
+		}
+	}
 	l, lok := integerAsBigInt(left)
 	r, rok := integerAsBigInt(right)
 	if !lok || !rok {
@@ -7855,8 +7868,7 @@ func integerBitOperation(left, right *object.EmeraldValue, operation string) (*o
 }
 
 func integerShift(left, right *object.EmeraldValue, shiftLeft bool) (*object.EmeraldValue, bool) {
-	value, valueOK := integerAsBigInt(left)
-	if !valueOK || right == nil {
+	if left == nil || left.Type != object.ValueInteger || right == nil {
 		return nil, false
 	}
 	if right.Type != object.ValueInteger && core.CallMethod != nil && core.ReceiverHasCallableMethod(right, "to_int") {
@@ -7868,8 +7880,13 @@ func integerShift(left, right *object.EmeraldValue, shiftLeft bool) (*object.Eme
 	if right == nil || right.Type != object.ValueInteger {
 		return core.NewTypeError("no implicit conversion into Integer"), true
 	}
+	leftBig, leftIsBig := core.NumericBigIntOverride(left)
 	count, countIsBig := core.NumericBigIntOverride(right)
 	if countIsBig {
+		value := leftBig
+		if !leftIsBig {
+			value = big.NewInt(left.Data.(int64))
+		}
 		effectiveLeft := shiftLeft
 		if count.Sign() < 0 {
 			effectiveLeft = !effectiveLeft
@@ -7886,6 +7903,46 @@ func integerShift(left, right *object.EmeraldValue, shiftLeft bool) (*object.Eme
 		return core.NewIntegerFromBigInt(big.NewInt(0)), true
 	}
 	shift := right.Data.(int64)
+	if !leftIsBig {
+		value := left.Data.(int64)
+		if shift == math.MinInt64 {
+			effectiveLeft := !shiftLeft
+			if effectiveLeft {
+				if value == 0 {
+					return core.NewIntegerValue(0), true
+				}
+				return core.NewRangeError("shift width too big"), true
+			}
+			if value < 0 {
+				return core.NewIntegerValue(-1), true
+			}
+			return core.NewIntegerValue(0), true
+		}
+		effectiveLeft := shiftLeft
+		if shift < 0 {
+			effectiveLeft = !effectiveLeft
+			shift = -shift
+		}
+		if !effectiveLeft {
+			result := int64(0)
+			if shift < 64 {
+				result = value >> uint(shift)
+			} else if value < 0 {
+				result = -1
+			}
+			return core.NewIntegerValue(result), true
+		}
+		if shift < 64 {
+			result := value << uint(shift)
+			if result>>uint(shift) == value {
+				return core.NewIntegerValue(result), true
+			}
+		}
+	}
+	value := leftBig
+	if !leftIsBig {
+		value = big.NewInt(left.Data.(int64))
+	}
 	if shift < 0 {
 		shiftLeft = !shiftLeft
 		shift = -shift
@@ -8166,7 +8223,7 @@ func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.Emera
 }
 
 func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
-	if os.Getenv("RGO_DEBUG_SEND_TRACE") == "1" {
+	if debugSendTraceEnabled {
 		depth := atomic.AddInt64(&sendTraceDepth, 1)
 		if depth <= 40 {
 			fmt.Printf("send depth=%d method=%q receiverType=%s\n", depth, method, receiver.TypeName())
@@ -8526,6 +8583,12 @@ func (vm *VM) normalizeBlockPass(block *object.EmeraldValue) (*object.EmeraldVal
 }
 
 func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, missingAsNameError bool) (*object.Method, *object.Class, *object.EmeraldValue) {
+	if cached, owner, ok := vm.cachedPlainMethod(receiver, method); ok {
+		cached, owner, ok = resolveVisibilityAliasMethod(method, cached, owner)
+		if ok {
+			return cached, owner, nil
+		}
+	}
 	var methodObj *object.Method
 	var methodOwner *object.Class
 	var ok bool
@@ -8696,7 +8759,22 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 	}
 
 	if !ok && receiver.Class != nil {
-		methodObj, methodOwner, ok = receiver.Class.GetMethodWithOwner(method)
+		key := methodCacheKey{class: receiver.Class, name: method}
+		generation := object.CurrentMethodGeneration()
+		if cached, found := vm.methodCache[key]; found && cached.generation == generation {
+			methodObj = cached.method
+			methodOwner = cached.owner
+			ok = methodObj != nil
+		} else {
+			methodObj, methodOwner, ok = receiver.Class.GetMethodWithOwner(method)
+			if ok {
+				vm.methodCache[key] = methodCacheEntry{
+					generation: generation,
+					method:     methodObj,
+					owner:      methodOwner,
+				}
+			}
+		}
 	}
 
 	if !ok && receiver.Type == object.ValueClass {
@@ -8759,6 +8837,50 @@ afterInheritedClassMethodLookup:
 		return nil, nil, core.NewNoMethodErrorWithDetails(receiver, method, args)
 	}
 	return methodObj, methodOwner, nil
+}
+
+func (vm *VM) cachedPlainMethod(receiver *object.EmeraldValue, method string) (*object.Method, *object.Class, bool) {
+	if receiver == nil || receiver.Class == nil ||
+		receiver.Type == object.ValueClass || receiver.Type == object.ValueModule || receiver.Type == object.ValueException {
+		return nil, nil, false
+	}
+	if refinements, fixed := vm.currentFixedRefinements(); fixed && len(refinements) > 0 {
+		return nil, nil, false
+	}
+	for _, scope := range vm.classStack {
+		if scope == nil {
+			continue
+		}
+		switch scope.Type {
+		case object.ValueClass:
+			if len(scope.Data.(*object.Class).UsedRefinements) > 0 {
+				return nil, nil, false
+			}
+		case object.ValueModule:
+			if len(scope.Data.(*object.Module).UsedRefinements) > 0 {
+				return nil, nil, false
+			}
+		}
+	}
+	if receiver.Type == object.ValueObject {
+		if instance, ok := receiver.Data.(*object.Object); ok {
+			if len(instance.SingletonMethods) > 0 || instance.SingletonClass != nil {
+				return nil, nil, false
+			}
+		}
+	}
+	if core.AttachedSingletonClass(receiver) != nil {
+		return nil, nil, false
+	}
+	if methods := vm.nativeSingletonMethods[nativeSingletonKey(receiver)]; len(methods) > 0 {
+		return nil, nil, false
+	}
+	key := methodCacheKey{class: receiver.Class, name: method}
+	cached, found := vm.methodCache[key]
+	if !found || cached.generation != object.CurrentMethodGeneration() || cached.method == nil {
+		return nil, nil, false
+	}
+	return cached.method, cached.owner, true
 }
 
 func (vm *VM) lookupActiveRefinedMethod(receiver *object.EmeraldValue, method string) (*object.Method, bool) {
@@ -8931,7 +9053,7 @@ func nativeSingletonKey(receiver *object.EmeraldValue) interface{} {
 }
 
 func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
-	oldFrame := &Frame{Bp: -1}
+	var oldFrame *Frame
 	if vm.fp >= 0 && vm.fp < len(vm.frames) && vm.frames[vm.fp] != nil {
 		oldFrame = vm.frames[vm.fp]
 	}
@@ -8950,7 +9072,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		return core.NewNoMethodError("undefined method `" + method + "'")
 	}
 	currentSelf := core.R.Main
-	if oldFrame.Bp >= 0 && oldFrame.Bp < len(vm.stack) && vm.stack[oldFrame.Bp] != nil {
+	if oldFrame != nil && oldFrame.Bp >= 0 && oldFrame.Bp < len(vm.stack) && vm.stack[oldFrame.Bp] != nil {
 		currentSelf = vm.stack[oldFrame.Bp]
 	}
 	privateReceiverAllowed := receiver == core.R.Main || (parentMethod != "public_send" && receiver == currentSelf)
@@ -8967,10 +9089,19 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		return core.NewNoMethodErrorForVisibility(receiver, method, methodObj.Visibility, args)
 	}
 	if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
-		binding := vm.currentFrameBinding()
-		methodID := traceMethodID(methodObj, method)
-		definedClass := traceDefinedClass(methodObj, methodOwner)
+		var binding *object.RBinding
+		var methodID string
+		var definedClass *object.EmeraldValue
+		prepareTraceContext := func() {
+			if binding != nil {
+				return
+			}
+			binding = vm.currentFrameBinding()
+			methodID = traceMethodID(methodObj, method)
+			definedClass = traceDefinedClass(methodObj, methodOwner)
+		}
 		if core.TracePointEventActive("c_call") {
+			prepareTraceContext()
 			core.FireTracePointCall("c_call", binding, receiver, definedClass, methodID, method, nil)
 		}
 		invoke := func() *object.EmeraldValue { return fn(receiver, args...) }
@@ -8985,6 +9116,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		}
 		result := invoke()
 		if core.TracePointEventActive("c_return") {
+			prepareTraceContext()
 			core.FireTracePointReturn("c_return", binding, receiver, definedClass, methodID, method, nil, result)
 		}
 		return result
@@ -9016,7 +9148,6 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		if errVal := unknownKeywordArgument(fn, args); errVal != nil {
 			return errVal
 		}
-
 		bp := vm.sp
 
 		vm.stack[vm.sp] = receiver
@@ -9124,8 +9255,13 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			return errVal
 		}
 
-		methodClosure := vm.detachedMethodClosure(methodObj)
-		newFrame := &Frame{
+		methodClosure := methodObj.Closure
+		var traceParameters *object.EmeraldValue
+		if core.TracePointEventActive("call") || core.TracePointEventActive("return") {
+			traceParameters = core.TracePointParameters(fn, true)
+		}
+		invocation := vm.buildInvocationMetadata(receiver, method, methodObj, methodOwner)
+		newFrame := vm.pushReusableFrame(Frame{
 			ID:                    vm.allocateFrameID(),
 			Fn:                    fn,
 			Ip:                    -1,
@@ -9133,7 +9269,10 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			Closure:               methodClosure,
 			MethodName:            method,
 			OriginalMethodName:    methodObj.OriginalName,
-			LabelName:             backtraceMethodLabel(receiver, methodObj, methodOwner, method),
+			LabelName:             invocation.label,
+			SuperStart:            invocation.superStart,
+			SuperModule:           invocation.superModule,
+			SuperAfterClass:       invocation.superAfterClass,
 			Args:                  args,
 			Block:                 vm.currentBlock,
 			DefinedByDefineMethod: methodObj.DefinedByDefineMethod,
@@ -9141,37 +9280,15 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			WhileStart:            -1,
 			WhileEnd:              -1,
 			TraceSelf:             receiver,
-			TraceDefinedClass:     traceDefinedClass(methodObj, methodOwner),
-			TraceMethodID:         traceMethodID(methodObj, method),
+			TraceDefinedClass:     invocation.traceDefinedClass,
+			TraceMethodID:         invocation.traceMethodID,
 			TraceCalleeID:         method,
-			TraceParameters:       core.TracePointParameters(fn, true),
-		}
+			TraceParameters:       traceParameters,
+		})
 		if blockParamProc != nil && blockParamProc.BreakOwnerID == 0 {
 			blockParamProc.BreakOwnerID = newFrame.ID
 		}
 		setBlockBreakOwner(vm.currentBlock, newFrame.ID)
-		dispatchClass := receiver.Class
-		if methodObj.DispatchOwner != nil && methodObj.DispatchOwner.Type == object.ValueModule && receiver.Type == object.ValueClass {
-			if class, ok := receiver.Data.(*object.Class); ok && class.SingletonClass != nil {
-				dispatchClass = class.SingletonClass
-			}
-		}
-		if prependedOwner, prependedModule := methodFromPrependedModule(dispatchClass, method, methodObj); prependedModule != nil {
-			newFrame.SuperStart = prependedOwner
-			newFrame.SuperModule = prependedModule
-		} else if includedOwner, ownerModule := methodFromIncludedModule(dispatchClass, method, methodObj); ownerModule != nil {
-			newFrame.SuperStart = includedOwner
-			newFrame.SuperModule = ownerModule
-		} else if methodOwner == receiver.Class {
-			newFrame.SuperStart = receiver.Class
-			newFrame.SuperAfterClass = true
-		} else if methodOwner == nil {
-			newFrame.SuperStart = receiver.Class
-		} else {
-			newFrame.SuperStart = methodOwner.SuperClass
-		}
-		vm.frames = append(vm.frames, newFrame)
-		vm.fp++
 		if core.TracePointEventActive("call") {
 			binding := vm.currentFrameBinding()
 			binding.Line = fn.DefinitionLine
@@ -9191,7 +9308,8 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			frame.Ip++
 			op := compiler.Opcode(instructions[frame.Ip])
 			vm.fireTracePointLine(frame, op)
-			vm.instructionExceptions[frame] = core.LastException
+			frame.InstructionException = core.LastException
+			frame.InstructionSnapshotSet = true
 			err := vm.execute(op, frame)
 			if err != nil {
 				vm.currentBlock = prevBlock
@@ -9199,7 +9317,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 				if core.LastException != nil && core.LastException.Type == object.ValueException {
 					return core.LastException
 				}
-				return core.R.NilVal
+				return core.NewRuntimeError(err.Error())
 			}
 			if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
 				break
@@ -9234,10 +9352,11 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		vm.sp = bp
 
 		vm.endActiveRescuesForFrame(frame)
-		delete(vm.instructionExceptions, frame)
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
 		vm.frames = vm.frames[:vm.fp]
 		vm.fp--
-		if vm.fp >= 0 {
+		if vm.fp >= 0 && oldFrame != nil {
 			vm.frames[vm.fp] = oldFrame
 		}
 
@@ -9245,6 +9364,1320 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 	}
 
 	return core.R.NilVal
+}
+
+func (vm *VM) pushReusableFrame(initial Frame) *Frame {
+	next := vm.fp + 1
+	if next < cap(vm.frames) {
+		vm.frames = vm.frames[:next+1]
+	} else {
+		vm.frames = append(vm.frames, nil)
+	}
+	frame := &initial
+	vm.frames[next] = frame
+	vm.fp = next
+	return frame
+}
+
+func (vm *VM) tryFusedIntegerLocalExpression(frame *Frame, constants []*object.EmeraldValue) bool {
+	if frame == nil || frame.Fn == nil || vm.instructionLimit != 0 || core.AnyTracePointActive() {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	start := frame.Ip
+	if start < 0 || start+5 >= len(instructions) {
+		return false
+	}
+	localIndex := int(instructions[start+1])
+	writePosition := start + 2
+	operations := 0
+	for writePosition+3 < len(instructions) && compiler.Opcode(instructions[writePosition]) == compiler.OpConstant {
+		switch compiler.Opcode(instructions[writePosition+3]) {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
+			compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor:
+			operations++
+			writePosition += 4
+		default:
+			goto structureScanned
+		}
+	}
+
+structureScanned:
+	if operations == 0 || writePosition+1 >= len(instructions) ||
+		compiler.Opcode(instructions[writePosition]) != compiler.OpSetLocal ||
+		int(instructions[writePosition+1]) != localIndex {
+		return false
+	}
+	stackIndex := frame.Bp + localIndex + 1
+	if stackIndex < 0 || stackIndex >= len(vm.stack) {
+		return false
+	}
+	local := vm.stack[stackIndex]
+	if local == nil || local.Type != object.ValueInteger {
+		return false
+	}
+	if _, isCell := local.Data.(*closureCell); isCell {
+		return false
+	}
+	if _, isBig := core.NumericBigIntOverride(local); isBig {
+		return false
+	}
+
+	position := start + 2
+	result := local.Data.(int64)
+	for position < writePosition {
+		constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if constantIndex < 0 || constantIndex >= len(constants) {
+			return false
+		}
+		constant := constants[constantIndex]
+		if constant == nil || constant.Type != object.ValueInteger {
+			return false
+		}
+		if _, isBig := core.NumericBigIntOverride(constant); isBig {
+			return false
+		}
+		right := constant.Data.(int64)
+		switch compiler.Opcode(instructions[position+3]) {
+		case compiler.OpAdd:
+			if !vm.fusedIntegerBuiltinsAvailable() ||
+				(right > 0 && result > math.MaxInt64-right) ||
+				(right < 0 && result < math.MinInt64-right) {
+				return false
+			}
+			result += right
+		case compiler.OpSub:
+			if (right < 0 && result > math.MaxInt64+right) ||
+				(right > 0 && result < math.MinInt64+right) {
+				return false
+			}
+			result -= right
+		case compiler.OpMul:
+			product := result * right
+			if result == -1 && right == math.MinInt64 ||
+				right == -1 && result == math.MinInt64 ||
+				result != 0 && product/result != right {
+				return false
+			}
+			result = product
+		case compiler.OpMod:
+			if right == 0 {
+				return false
+			}
+			result %= right
+			if result != 0 && (result < 0) != (right < 0) {
+				result += right
+			}
+		case compiler.OpBitAnd:
+			result &= right
+		case compiler.OpBitOr:
+			result |= right
+		case compiler.OpBitXor:
+			result ^= right
+		}
+		position += 4
+	}
+
+	value := core.NewIntegerValue(result)
+	vm.stack[stackIndex] = value
+	if name, ok := vm.topLevelLocalName(frame, localIndex); ok {
+		if binding := vm.topLevelBindingData(); binding != nil {
+			binding.Locals[name] = value
+		}
+	}
+	vm.updateCapturedBindingLocal(frame, localIndex, value)
+
+	frame.Ip = writePosition + 1
+	if frame.Ip+1 < len(instructions) && compiler.Opcode(instructions[frame.Ip+1]) == compiler.OpPop {
+		frame.Ip++
+		vm.recordPoppedValue(value)
+	} else {
+		vm.push(value)
+	}
+	return true
+}
+
+func loopLocalAt(instructions compiler.Instructions, position, end int) (int, int, bool) {
+	if position+1 >= end || compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+		return 0, position, false
+	}
+	return int(instructions[position+1]), position + 2, true
+}
+
+func loopIntegerConstantAt(frame *Frame, position, end int) (int64, int, bool) {
+	if position+2 >= end || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpConstant {
+		return 0, position, false
+	}
+	index := int(frame.Fn.Instructions[position+1])<<8 | int(frame.Fn.Instructions[position+2])
+	if index < 0 || index >= len(frame.Fn.Constants) {
+		return 0, position, false
+	}
+	value := frame.Fn.Constants[index]
+	if value == nil || value.Type != object.ValueInteger {
+		return 0, position, false
+	}
+	if _, big := core.NumericBigIntOverride(value); big {
+		return 0, position, false
+	}
+	return value.Data.(int64), position + 3, true
+}
+
+func simpleIntegerLoopHeader(frame *Frame, target, jumpPosition int) (counterLocal, limitLocal, exitPosition, bodyPosition int, ok bool) {
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return
+	}
+	limitLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+	if !ok || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		ok = false
+		return
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		ok = false
+		return
+	}
+	exitPosition = int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		ok = false
+		return
+	}
+	bodyPosition = position + 3
+	ok = true
+	return
+}
+
+func (vm *VM) commitIntegerLoopLocal(frame *Frame, local int, value int64) *object.EmeraldValue {
+	result := core.NewIntegerValue(value)
+	vm.stack[frame.Bp+local+1] = result
+	if name, ok := vm.topLevelLocalName(frame, local); ok {
+		if binding := vm.topLevelBindingData(); binding != nil {
+			binding.Locals[name] = result
+		}
+	}
+	vm.updateCapturedBindingLocal(frame, local, result)
+	return result
+}
+
+func (vm *VM) tryExecuteCollectionFillLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		!core.CollectionLoopBuiltinsAvailable() {
+		return false
+	}
+	counterLocal, limitLocal, exitPosition, position, ok := simpleIntegerLoopHeader(frame, target, jumpPosition)
+	if !ok {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	expressionLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || expressionLocal != counterLocal {
+		return false
+	}
+	factor, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMul {
+		return false
+	}
+	position++
+	valueModulus, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || valueModulus == 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal {
+		return false
+	}
+	valueLocal := int(instructions[position+1])
+	if compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+		return false
+	}
+	position += 3
+	arrayLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	appendedLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || appendedLocal != valueLocal || position+1 >= jumpPosition ||
+		compiler.Opcode(instructions[position]) != compiler.OpBitLeftShift ||
+		compiler.Opcode(instructions[position+1]) != compiler.OpPop {
+		return false
+	}
+	position += 2
+	hashLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	keyLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || keyLocal != counterLocal {
+		return false
+	}
+	keyModulus, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || keyModulus == 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	storedLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || storedLocal != valueLocal || position+1 >= jumpPosition ||
+		compiler.Opcode(instructions[position]) != compiler.OpIndexAssign ||
+		compiler.Opcode(instructions[position+1]) != compiler.OpPop {
+		return false
+	}
+	position += 2
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal ||
+		compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	counterValue := vm.stack[frame.Bp+counterLocal+1]
+	limitValue := vm.stack[frame.Bp+limitLocal+1]
+	arrayValue := vm.stack[frame.Bp+arrayLocal+1]
+	hashValue := vm.stack[frame.Bp+hashLocal+1]
+	if counterValue == nil || counterValue.Type != object.ValueInteger ||
+		limitValue == nil || limitValue.Type != object.ValueInteger ||
+		arrayValue == nil || arrayValue.Type != object.ValueArray || arrayValue.Class != core.R.Classes["Array"] || arrayValue.Frozen ||
+		hashValue == nil || hashValue.Type != object.ValueHash || hashValue.Class != core.R.Classes["Hash"] || hashValue.Frozen {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	limit := limitValue.Data.(int64)
+	values := make([]*object.EmeraldValue, 0, 1024)
+	keys := make([]*object.EmeraldValue, 0, 1024)
+	var lastValue int64
+	for iterations := 0; counter < limit && iterations < 1_000_000; iterations++ {
+		product, valid := applyIntegerBinary(compiler.OpMul, counter, factor)
+		if !valid {
+			return false
+		}
+		computed, valid := applyIntegerBinary(compiler.OpMod, product, valueModulus)
+		if !valid {
+			return false
+		}
+		key, valid := applyIntegerBinary(compiler.OpMod, counter, keyModulus)
+		if !valid {
+			return false
+		}
+		values = append(values, core.NewIntegerValue(computed))
+		keys = append(keys, core.NewIntegerValue(key))
+		lastValue = computed
+		next, valid := applyIntegerBinary(compiler.OpAdd, counter, step)
+		if !valid {
+			return false
+		}
+		counter = next
+	}
+	if !core.AppendArrayValues(arrayValue, values) {
+		return false
+	}
+	for index, key := range keys {
+		if !core.StoreHashValue(hashValue, key, values[index]) {
+			return false
+		}
+	}
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	if len(values) > 0 {
+		last = vm.commitIntegerLoopLocal(frame, valueLocal, lastValue)
+	}
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if counter >= limit {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+func (vm *VM) tryExecuteArraySumLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		!core.CollectionLoopBuiltinsAvailable() {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	arrayLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || position+5 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSend {
+		return false
+	}
+	methodIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if methodIndex < 0 || methodIndex >= len(frame.Fn.Constants) ||
+		frame.Fn.Constants[methodIndex].Data != "length" ||
+		instructions[position+3] != 0 || instructions[position+4] != 0 || instructions[position+5] != 255 {
+		return false
+	}
+	position += 6
+	if compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return false
+	}
+	position += 3
+	sumLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	indexedArray, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || indexedArray != arrayLocal {
+		return false
+	}
+	indexLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || indexLocal != counterLocal || compiler.Opcode(instructions[position]) != compiler.OpIndex ||
+		compiler.Opcode(instructions[position+1]) != compiler.OpAdd ||
+		compiler.Opcode(instructions[position+2]) != compiler.OpSetLocal ||
+		int(instructions[position+3]) != sumLocal ||
+		compiler.Opcode(instructions[position+4]) != compiler.OpPop {
+		return false
+	}
+	position += 5
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || compiler.Opcode(instructions[position]) != compiler.OpAdd ||
+		compiler.Opcode(instructions[position+1]) != compiler.OpSetLocal ||
+		int(instructions[position+2]) != counterLocal ||
+		compiler.Opcode(instructions[position+3]) != compiler.OpPop ||
+		position+4 != jumpPosition {
+		return false
+	}
+	arrayValue := vm.stack[frame.Bp+arrayLocal+1]
+	counterValue := vm.stack[frame.Bp+counterLocal+1]
+	sumValue := vm.stack[frame.Bp+sumLocal+1]
+	if arrayValue == nil || arrayValue.Type != object.ValueArray || arrayValue.Class != core.R.Classes["Array"] ||
+		counterValue == nil || counterValue.Type != object.ValueInteger ||
+		sumValue == nil || sumValue.Type != object.ValueInteger {
+		return false
+	}
+	elements := arrayValue.Data.([]*object.EmeraldValue)
+	counter := counterValue.Data.(int64)
+	sum := sumValue.Data.(int64)
+	for iterations := 0; counter < int64(len(elements)) && iterations < 1_000_000; iterations++ {
+		if counter < 0 || counter >= int64(len(elements)) {
+			return false
+		}
+		element := elements[counter]
+		if element == nil || element.Type != object.ValueInteger {
+			return false
+		}
+		nextSum, valid := applyIntegerBinary(compiler.OpAdd, sum, element.Data.(int64))
+		if !valid {
+			return false
+		}
+		nextCounter, valid := applyIntegerBinary(compiler.OpAdd, counter, step)
+		if !valid {
+			return false
+		}
+		sum, counter = nextSum, nextCounter
+	}
+	last := vm.commitIntegerLoopLocal(frame, sumLocal, sum)
+	vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if counter >= int64(len(elements)) {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+func (vm *VM) tryExecuteASCIIStringLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		!core.ASCIIStringLoopBuiltinsAvailable() || target < 0 || jumpPosition+2 >= len(frame.Fn.Instructions) {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	readLocal := func() (int, bool) {
+		if position+1 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+			return 0, false
+		}
+		local := int(instructions[position+1])
+		position += 2
+		return local, true
+	}
+	readIntegerConstant := func() (int64, bool) {
+		if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return 0, false
+		}
+		index := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if index < 0 || index >= len(frame.Fn.Constants) {
+			return 0, false
+		}
+		value := frame.Fn.Constants[index]
+		if value == nil || value.Type != object.ValueInteger {
+			return 0, false
+		}
+		if _, big := core.NumericBigIntOverride(value); big {
+			return 0, false
+		}
+		position += 3
+		return value.Data.(int64), true
+	}
+	readSend := func(expected string, arguments byte) bool {
+		if position+5 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSend {
+			return false
+		}
+		index := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if index < 0 || index >= len(frame.Fn.Constants) {
+			return false
+		}
+		name, ok := frame.Fn.Constants[index].Data.(string)
+		if !ok || name != expected || instructions[position+3] != 0 ||
+			instructions[position+4] != arguments || instructions[position+5] != 255 {
+			return false
+		}
+		position += 6
+		return true
+	}
+
+	counterLocal, ok := readLocal()
+	if !ok {
+		return false
+	}
+	limitLocal, ok := readLocal()
+	if !ok || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return false
+	}
+	position += 3
+	stringLocal, ok := readLocal()
+	if !ok {
+		return false
+	}
+	base, ok := readIntegerConstant()
+	if !ok {
+		return false
+	}
+	expressionLocal, ok := readLocal()
+	if !ok || expressionLocal != counterLocal {
+		return false
+	}
+	modulus, ok := readIntegerConstant()
+	if !ok || modulus <= 0 || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	if compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if !readSend("chr", 0) || compiler.Opcode(instructions[position]) != compiler.OpBitLeftShift {
+		return false
+	}
+	position++
+	if compiler.Opcode(instructions[position]) != compiler.OpPop {
+		return false
+	}
+	position++
+	updateLocal, ok := readLocal()
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, ok := readIntegerConstant()
+	if !ok || step <= 0 || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal ||
+		compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+	if base < 0 || base > 127 || modulus > 128 || base > 128-modulus {
+		return false
+	}
+
+	counterValue := vm.stack[frame.Bp+counterLocal+1]
+	limitValue := vm.stack[frame.Bp+limitLocal+1]
+	stringValue := vm.stack[frame.Bp+stringLocal+1]
+	if counterValue == nil || counterValue.Type != object.ValueInteger ||
+		limitValue == nil || limitValue.Type != object.ValueInteger ||
+		stringValue == nil || stringValue.Type != object.ValueString {
+		return false
+	}
+	if _, big := core.NumericBigIntOverride(counterValue); big {
+		return false
+	}
+	if _, big := core.NumericBigIntOverride(limitValue); big {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	limit := limitValue.Data.(int64)
+	remaining := int64(0)
+	if counter < limit {
+		remaining = (limit - counter + step - 1) / step
+	}
+	if remaining > 1_000_000 {
+		remaining = 1_000_000
+	}
+	raw := make([]byte, 0, remaining)
+	for iterations := int64(0); iterations < remaining; iterations++ {
+		mod := counter % modulus
+		if mod < 0 {
+			mod += modulus
+		}
+		raw = append(raw, byte(base+mod))
+		if counter > math.MaxInt64-step {
+			return false
+		}
+		counter += step
+	}
+	if errValue := core.AppendASCIIBytes(stringValue, string(raw)); errValue != nil {
+		return false
+	}
+	updatedCounter := core.NewIntegerValue(counter)
+	vm.stack[frame.Bp+counterLocal+1] = updatedCounter
+	if name, ok := vm.topLevelLocalName(frame, counterLocal); ok {
+		if binding := vm.topLevelBindingData(); binding != nil {
+			binding.Locals[name] = updatedCounter
+		}
+	}
+	vm.updateCapturedBindingLocal(frame, counterLocal, updatedCounter)
+	vm.recordPoppedValue(updatedCounter)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if counter >= limit {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		target < 0 || target+11 >= jumpPosition || jumpPosition+2 >= len(frame.Fn.Instructions) {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+		return false
+	}
+	counterLocal := int(instructions[position+1])
+	position += 2
+	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+		return false
+	}
+	limitLocal := int(instructions[position+1])
+	position += 2
+	if compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd {
+		return false
+	}
+	whileEnd := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if whileEnd != exitPosition {
+		return false
+	}
+	position += 3
+
+	steps := make([]integerLoopStep, 0, 24)
+	var used [256]bool
+	used[counterLocal], used[limitLocal] = true, true
+	var stackKinds [32]bool
+	stackDepth := 0
+	receiver := vm.stack[frame.Bp]
+	for position < jumpPosition {
+		op := compiler.Opcode(instructions[position])
+		step := integerLoopStep{op: op}
+		switch op {
+		case compiler.OpGetLocal:
+			if position+1 >= jumpPosition || stackDepth >= len(stackKinds) {
+				return false
+			}
+			step.local = int(instructions[position+1])
+			used[step.local] = true
+			stackKinds[stackDepth] = false
+			stackDepth++
+			position += 2
+		case compiler.OpConstant:
+			if position+2 >= jumpPosition || stackDepth >= len(stackKinds) {
+				return false
+			}
+			index := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if index < 0 || index >= len(frame.Fn.Constants) {
+				return false
+			}
+			value := frame.Fn.Constants[index]
+			if value == nil || value.Type != object.ValueInteger {
+				return false
+			}
+			if _, big := core.NumericBigIntOverride(value); big {
+				return false
+			}
+			step.value = value.Data.(int64)
+			stackKinds[stackDepth] = false
+			stackDepth++
+			position += 3
+		case compiler.OpSelf:
+			if stackDepth >= len(stackKinds) {
+				return false
+			}
+			stackKinds[stackDepth] = true
+			stackDepth++
+			position++
+		case compiler.OpSend:
+			if position+5 >= jumpPosition || stackDepth < 2 ||
+				!stackKinds[stackDepth-2] || stackKinds[stackDepth-1] ||
+				instructions[position+3] != 0 || instructions[position+4] != 1 || instructions[position+5] != 255 {
+				return false
+			}
+			index := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if index < 0 || index >= len(frame.Fn.Constants) {
+				return false
+			}
+			name, ok := frame.Fn.Constants[index].Data.(string)
+			if !ok {
+				return false
+			}
+			methodObj, _, fallback := vm.lookupMethodForSend(receiver, name, nil, false)
+			if fallback != nil || methodObj == nil || methodObj.Visibility == "undefined" ||
+				(methodObj.Visibility == "private" && receiver != core.R.Main) ||
+				methodObj.Visibility == "protected" {
+				return false
+			}
+			fn, ok := methodObj.Fn.(*object.Function)
+			if !ok || len(fn.ParamLocalIndices) != 1 {
+				return false
+			}
+			plan, ok := vm.cachedIntegerFunctionPlan(fn)
+			if !ok || plan == nil {
+				return false
+			}
+			step.fn = fn
+			stackDepth--
+			stackKinds[stackDepth-1] = false
+			position += 6
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
+			compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor,
+			compiler.OpBitLeftShift, compiler.OpBitRightShift:
+			if stackDepth < 2 || stackKinds[stackDepth-1] || stackKinds[stackDepth-2] {
+				return false
+			}
+			stackDepth--
+			position++
+		case compiler.OpNeg, compiler.OpNegate:
+			if stackDepth < 1 || stackKinds[stackDepth-1] {
+				return false
+			}
+			position++
+		case compiler.OpSetLocal:
+			if position+1 >= jumpPosition || stackDepth < 1 || stackKinds[stackDepth-1] {
+				return false
+			}
+			step.local = int(instructions[position+1])
+			used[step.local] = true
+			position += 2
+		case compiler.OpPop:
+			if stackDepth < 1 {
+				return false
+			}
+			stackDepth--
+			position++
+		default:
+			return false
+		}
+		steps = append(steps, step)
+	}
+	if stackDepth != 0 || len(steps) == 0 {
+		return false
+	}
+
+	var locals [256]int64
+	usedLocals := make([]int, 0, 8)
+	for local, inUse := range used {
+		if !inUse {
+			continue
+		}
+		stackIndex := frame.Bp + local + 1
+		if stackIndex < 0 || stackIndex >= len(vm.stack) {
+			return false
+		}
+		value := vm.stack[stackIndex]
+		if value == nil || value.Type != object.ValueInteger {
+			return false
+		}
+		if _, cell := value.Data.(*closureCell); cell {
+			return false
+		}
+		if _, big := core.NumericBigIntOverride(value); big {
+			return false
+		}
+		locals[local] = value.Data.(int64)
+		usedLocals = append(usedLocals, local)
+	}
+	if !vm.fusedIntegerBuiltinsAvailable() {
+		return false
+	}
+
+	var values [32]int64
+	var selfValues [32]bool
+	var before [256]int64
+	completed := true
+	for iterations := 0; locals[counterLocal] < locals[limitLocal]; iterations++ {
+		if iterations == 1_000_000 {
+			completed = false
+			break
+		}
+		for _, local := range usedLocals {
+			before[local] = locals[local]
+		}
+		stackPointer := 0
+		failed := false
+		for _, step := range steps {
+			switch step.op {
+			case compiler.OpGetLocal:
+				values[stackPointer] = locals[step.local]
+				selfValues[stackPointer] = false
+				stackPointer++
+			case compiler.OpConstant:
+				values[stackPointer] = step.value
+				selfValues[stackPointer] = false
+				stackPointer++
+			case compiler.OpSelf:
+				selfValues[stackPointer] = true
+				stackPointer++
+			case compiler.OpSend:
+				result, ok := vm.executeSingleIntegerFunctionPlan(step.fn, values[stackPointer-1])
+				if !ok {
+					failed = true
+					break
+				}
+				stackPointer--
+				values[stackPointer-1] = result
+				selfValues[stackPointer-1] = false
+			case compiler.OpNeg, compiler.OpNegate:
+				if values[stackPointer-1] == math.MinInt64 {
+					failed = true
+					break
+				}
+				values[stackPointer-1] = -values[stackPointer-1]
+			case compiler.OpSetLocal:
+				locals[step.local] = values[stackPointer-1]
+			case compiler.OpPop:
+				stackPointer--
+			default:
+				result, ok := applyIntegerBinary(step.op, values[stackPointer-2], values[stackPointer-1])
+				if !ok {
+					failed = true
+					break
+				}
+				stackPointer--
+				values[stackPointer-1] = result
+			}
+		}
+		if failed {
+			for _, local := range usedLocals {
+				locals[local] = before[local]
+			}
+			completed = false
+			break
+		}
+	}
+	for _, local := range usedLocals {
+		value := core.NewIntegerValue(locals[local])
+		stackIndex := frame.Bp + local + 1
+		vm.stack[stackIndex] = value
+		if name, ok := vm.topLevelLocalName(frame, local); ok {
+			if binding := vm.topLevelBindingData(); binding != nil {
+				binding.Locals[name] = value
+			}
+		}
+		vm.updateCapturedBindingLocal(frame, local, value)
+	}
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if completed {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+func (vm *VM) tryExecuteCountedIntegerLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	if target < 0 || target+11 >= jumpPosition || jumpPosition+2 >= len(instructions) {
+		return false
+	}
+	position := target
+	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+		return false
+	}
+	counterLocal := int(instructions[position+1])
+	position += 2
+	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+		return false
+	}
+	limitLocal := int(instructions[position+1])
+	position += 2
+	if compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd {
+		return false
+	}
+	whileEnd := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if whileEnd != exitPosition {
+		return false
+	}
+	position += 3
+
+	updates := make([]integerLocalUpdatePlan, 0, 4)
+	usesAdd := false
+	for position < jumpPosition {
+		if len(updates) >= 8 || position+1 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+			return false
+		}
+		update := integerLocalUpdatePlan{local: int(instructions[position+1])}
+		position += 2
+		for position+3 < jumpPosition && compiler.Opcode(instructions[position]) == compiler.OpConstant {
+			constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if constantIndex < 0 || constantIndex >= len(frame.Fn.Constants) {
+				return false
+			}
+			constant := frame.Fn.Constants[constantIndex]
+			if constant == nil || constant.Type != object.ValueInteger {
+				return false
+			}
+			if _, isBig := core.NumericBigIntOverride(constant); isBig {
+				return false
+			}
+			op := compiler.Opcode(instructions[position+3])
+			switch op {
+			case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
+				compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor:
+			default:
+				return false
+			}
+			update.steps = append(update.steps, integerFunctionStep{op: op, value: constant.Data.(int64)})
+			usesAdd = usesAdd || op == compiler.OpAdd
+			position += 4
+		}
+		if len(update.steps) == 0 || position+2 >= jumpPosition ||
+			compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+			int(instructions[position+1]) != update.local ||
+			compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+			return false
+		}
+		for _, prior := range updates {
+			if prior.local == update.local {
+				return false
+			}
+		}
+		updates = append(updates, update)
+		position += 3
+	}
+	if len(updates) == 0 || updates[len(updates)-1].local != counterLocal || limitLocal == counterLocal {
+		return false
+	}
+	counterUpdate := updates[len(updates)-1]
+	if len(counterUpdate.steps) != 1 || counterUpdate.steps[0].op != compiler.OpAdd || counterUpdate.steps[0].value <= 0 {
+		return false
+	}
+	for _, update := range updates {
+		if update.local == limitLocal {
+			return false
+		}
+	}
+	if usesAdd && !vm.fusedIntegerBuiltinsAvailable() {
+		return false
+	}
+
+	var values [8]int64
+	for index, update := range updates {
+		stackIndex := frame.Bp + update.local + 1
+		if stackIndex < 0 || stackIndex >= len(vm.stack) {
+			return false
+		}
+		value := vm.stack[stackIndex]
+		if value == nil || value.Type != object.ValueInteger {
+			return false
+		}
+		if _, isCell := value.Data.(*closureCell); isCell {
+			return false
+		}
+		if _, isBig := core.NumericBigIntOverride(value); isBig {
+			return false
+		}
+		values[index] = value.Data.(int64)
+	}
+	limitIndex := frame.Bp + limitLocal + 1
+	if limitIndex < 0 || limitIndex >= len(vm.stack) {
+		return false
+	}
+	limitValue := vm.stack[limitIndex]
+	if limitValue == nil || limitValue.Type != object.ValueInteger {
+		return false
+	}
+	if _, isBig := core.NumericBigIntOverride(limitValue); isBig {
+		return false
+	}
+	limit := limitValue.Data.(int64)
+	counterIndex := len(updates) - 1
+
+	completed := true
+	for iterations := 0; values[counterIndex] < limit; iterations++ {
+		if iterations == 1_000_000 {
+			completed = false
+			break
+		}
+		before := values
+		for index, update := range updates {
+			result, ok := applyIntegerUpdate(values[index], update.steps)
+			if !ok {
+				values = before
+				vm.commitIntegerLoopLocals(frame, updates, values)
+				return false
+			}
+			values[index] = result
+		}
+	}
+	vm.commitIntegerLoopLocals(frame, updates, values)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if completed {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+func applyIntegerUpdate(value int64, steps []integerFunctionStep) (int64, bool) {
+	result := value
+	for _, step := range steps {
+		right := step.value
+		switch step.op {
+		case compiler.OpAdd:
+			if (right > 0 && result > math.MaxInt64-right) ||
+				(right < 0 && result < math.MinInt64-right) {
+				return 0, false
+			}
+			result += right
+		case compiler.OpSub:
+			if (right < 0 && result > math.MaxInt64+right) ||
+				(right > 0 && result < math.MinInt64+right) {
+				return 0, false
+			}
+			result -= right
+		case compiler.OpMul:
+			product := result * right
+			if result == -1 && right == math.MinInt64 ||
+				right == -1 && result == math.MinInt64 ||
+				result != 0 && product/result != right {
+				return 0, false
+			}
+			result = product
+		case compiler.OpMod:
+			if right == 0 {
+				return 0, false
+			}
+			result %= right
+			if result != 0 && (result < 0) != (right < 0) {
+				result += right
+			}
+		case compiler.OpBitAnd:
+			result &= right
+		case compiler.OpBitOr:
+			result |= right
+		case compiler.OpBitXor:
+			result ^= right
+		default:
+			return 0, false
+		}
+	}
+	return result, true
+}
+
+func (vm *VM) commitIntegerLoopLocals(frame *Frame, updates []integerLocalUpdatePlan, values [8]int64) {
+	var last *object.EmeraldValue
+	for index, update := range updates {
+		value := core.NewIntegerValue(values[index])
+		stackIndex := frame.Bp + update.local + 1
+		vm.stack[stackIndex] = value
+		if name, ok := vm.topLevelLocalName(frame, update.local); ok {
+			if binding := vm.topLevelBindingData(); binding != nil {
+				binding.Locals[name] = value
+			}
+		}
+		vm.updateCapturedBindingLocal(frame, update.local, value)
+		last = value
+	}
+	if last != nil {
+		vm.recordPoppedValue(last)
+	}
+}
+
+func (vm *VM) fusedIntegerBuiltinsAvailable() bool {
+	generation := object.CurrentMethodGeneration()
+	if vm.fusedIntegerGeneration != generation {
+		vm.fusedIntegerGeneration = generation
+		vm.fusedIntegerOps = core.IntegerPlusUsesBuiltinImplementation()
+	}
+	return vm.fusedIntegerOps
+}
+
+func (vm *VM) cachedIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) {
+	cached, found := vm.integerFunctionCache[fn]
+	if !found {
+		plan, supported := buildIntegerFunctionPlan(fn)
+		cached = integerFunctionCacheEntry{plan: plan, supported: supported}
+		vm.integerFunctionCache[fn] = cached
+	}
+	return cached.plan, cached.supported && cached.plan != nil
+}
+
+func applyIntegerBinary(op compiler.Opcode, left, right int64) (int64, bool) {
+	switch op {
+	case compiler.OpAdd:
+		if (right > 0 && left > math.MaxInt64-right) ||
+			(right < 0 && left < math.MinInt64-right) {
+			return 0, false
+		}
+		return left + right, true
+	case compiler.OpSub:
+		if (right < 0 && left > math.MaxInt64+right) ||
+			(right > 0 && left < math.MinInt64+right) {
+			return 0, false
+		}
+		return left - right, true
+	case compiler.OpMul:
+		product := left * right
+		if left == -1 && right == math.MinInt64 ||
+			right == -1 && left == math.MinInt64 ||
+			left != 0 && product/left != right {
+			return 0, false
+		}
+		return product, true
+	case compiler.OpMod:
+		if right == 0 {
+			return 0, false
+		}
+		result := left % right
+		if result != 0 && (result < 0) != (right < 0) {
+			result += right
+		}
+		return result, true
+	case compiler.OpBitAnd:
+		return left & right, true
+	case compiler.OpBitOr:
+		return left | right, true
+	case compiler.OpBitXor:
+		return left ^ right, true
+	case compiler.OpBitRightShift:
+		if right < 0 || right >= 64 {
+			return 0, false
+		}
+		return left >> uint(right), true
+	case compiler.OpBitLeftShift:
+		if right < 0 || right >= 64 {
+			return 0, false
+		}
+		result := left << uint(right)
+		if result>>uint(right) != left {
+			return 0, false
+		}
+		return result, true
+	}
+	return 0, false
+}
+
+func (vm *VM) executeSingleIntegerFunctionPlan(fn *object.Function, argument int64) (int64, bool) {
+	plan, ok := vm.cachedIntegerFunctionPlan(fn)
+	if !ok || len(fn.ParamLocalIndices) != 1 || plan.usesAdd && !vm.fusedIntegerBuiltinsAvailable() {
+		return 0, false
+	}
+	var stack [16]int64
+	stackPointer := 0
+	for _, step := range plan.steps {
+		switch step.op {
+		case compiler.OpGetLocal:
+			if step.param != 0 {
+				return 0, false
+			}
+			stack[stackPointer] = argument
+			stackPointer++
+		case compiler.OpConstant:
+			stack[stackPointer] = step.value
+			stackPointer++
+		case compiler.OpNeg, compiler.OpNegate:
+			if stackPointer < 1 || stack[stackPointer-1] == math.MinInt64 {
+				return 0, false
+			}
+			stack[stackPointer-1] = -stack[stackPointer-1]
+		case compiler.OpReturnValue:
+			if stackPointer != 1 {
+				return 0, false
+			}
+			return stack[0], true
+		default:
+			if stackPointer < 2 {
+				return 0, false
+			}
+			result, ok := applyIntegerBinary(step.op, stack[stackPointer-2], stack[stackPointer-1])
+			if !ok {
+				return 0, false
+			}
+			stackPointer--
+			stack[stackPointer-1] = result
+		}
+	}
+	return 0, false
+}
+
+func buildIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) {
+	if fn == nil || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		len(fn.ParamLocalIndices) == 0 {
+		return nil, false
+	}
+	for _, pattern := range fn.ParamPatterns {
+		if pattern != nil {
+			return nil, false
+		}
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan := &integerFunctionPlan{}
+	stackDepth := 0
+	instructions := fn.Instructions
+	for position := 0; position < len(instructions); {
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpGetLocal:
+			if position+1 >= len(instructions) {
+				return nil, false
+			}
+			localIndex := int(instructions[position+1])
+			paramIndex := -1
+			for index, candidate := range fn.ParamLocalIndices {
+				if candidate == localIndex {
+					paramIndex = index
+					break
+				}
+			}
+			if paramIndex < 0 {
+				return nil, false
+			}
+			plan.steps = append(plan.steps, integerFunctionStep{op: op, param: paramIndex})
+			stackDepth++
+			position += 2
+		case compiler.OpConstant:
+			if position+2 >= len(instructions) {
+				return nil, false
+			}
+			constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if constantIndex < 0 || constantIndex >= len(fn.Constants) {
+				return nil, false
+			}
+			constant := fn.Constants[constantIndex]
+			if constant == nil || constant.Type != object.ValueInteger {
+				return nil, false
+			}
+			if _, isBig := core.NumericBigIntOverride(constant); isBig {
+				return nil, false
+			}
+			plan.steps = append(plan.steps, integerFunctionStep{op: op, value: constant.Data.(int64)})
+			stackDepth++
+			position += 3
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
+			compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor,
+			compiler.OpBitLeftShift, compiler.OpBitRightShift:
+			if stackDepth < 2 {
+				return nil, false
+			}
+			plan.steps = append(plan.steps, integerFunctionStep{op: op})
+			plan.usesAdd = plan.usesAdd || op == compiler.OpAdd
+			stackDepth--
+			position++
+		case compiler.OpNeg, compiler.OpNegate:
+			if stackDepth < 1 {
+				return nil, false
+			}
+			plan.steps = append(plan.steps, integerFunctionStep{op: op})
+			position++
+		case compiler.OpReturnValue:
+			if stackDepth != 1 || position != len(instructions)-1 {
+				return nil, false
+			}
+			plan.steps = append(plan.steps, integerFunctionStep{op: op})
+			position++
+		default:
+			return nil, false
+		}
+		if stackDepth > 16 {
+			return nil, false
+		}
+	}
+	if len(plan.steps) == 0 || plan.steps[len(plan.steps)-1].op != compiler.OpReturnValue {
+		return nil, false
+	}
+	return plan, true
 }
 
 func valueHasClassInAncestry(value *object.EmeraldValue, target *object.Class) bool {
@@ -9292,6 +10725,35 @@ func backtraceMethodLabel(receiver *object.EmeraldValue, methodObj *object.Metho
 		}
 	}
 	return name
+}
+
+func (vm *VM) buildInvocationMetadata(receiver *object.EmeraldValue, name string, method *object.Method, owner *object.Class) invocationMetadata {
+	dispatchClass := receiver.Class
+	if method.DispatchOwner != nil && method.DispatchOwner.Type == object.ValueModule && receiver.Type == object.ValueClass {
+		if class, ok := receiver.Data.(*object.Class); ok && class.SingletonClass != nil {
+			dispatchClass = class.SingletonClass
+		}
+	}
+	result := invocationMetadata{
+		label:             backtraceMethodLabel(receiver, method, owner, name),
+		traceDefinedClass: traceDefinedClass(method, owner),
+		traceMethodID:     traceMethodID(method, name),
+	}
+	if prependedOwner, prependedModule := methodFromPrependedModule(dispatchClass, name, method); prependedModule != nil {
+		result.superStart = prependedOwner
+		result.superModule = prependedModule
+	} else if includedOwner, ownerModule := methodFromIncludedModule(dispatchClass, name, method); ownerModule != nil {
+		result.superStart = includedOwner
+		result.superModule = ownerModule
+	} else if owner == receiver.Class {
+		result.superStart = receiver.Class
+		result.superAfterClass = true
+	} else if owner == nil {
+		result.superStart = receiver.Class
+	} else {
+		result.superStart = owner.SuperClass
+	}
+	return result
 }
 
 func backtraceOwnerLabel(owner *object.EmeraldValue, name string) string {
@@ -9364,41 +10826,6 @@ func (vm *VM) enforceCurrentFrameLocals() int {
 		vm.sp = minSp
 	}
 	return vm.sp
-}
-
-func (vm *VM) detachedMethodClosure(method *object.Method) *object.Closure {
-	if method == nil || method.Closure == nil {
-		return nil
-	}
-	closure := method.Closure
-	free := make([]*object.EmeraldValue, len(closure.Free))
-	for i, value := range closure.Free {
-		free[i] = detachClosureCapture(value)
-	}
-	detached := &object.Closure{
-		Fn:               closure.Fn,
-		Free:             free,
-		Block:            closure.Block,
-		Binding:          closure.Binding,
-		ClassStack:       closure.ClassStack,
-		Refinements:      append([]*object.EmeraldValue(nil), closure.Refinements...),
-		RefinementsFixed: closure.RefinementsFixed,
-		AutoSplat:        closure.AutoSplat,
-		ReturnOwnerID:    closure.ReturnOwnerID,
-		BreakOwnerID:     closure.BreakOwnerID,
-	}
-	method.Closure = detached
-	return detached
-}
-
-func detachClosureCapture(value *object.EmeraldValue) *object.EmeraldValue {
-	if value == nil {
-		return core.R.NilVal
-	}
-	if cell, ok := value.Data.(*closureCell); ok {
-		return &object.EmeraldValue{Type: object.ValueObject, Data: cell, Class: value.Class}
-	}
-	return value
 }
 
 func methodArityError(fn *object.Function, argc int) *object.EmeraldValue {
@@ -10892,8 +12319,8 @@ func inheritsFrom(cls *object.Class, name string) bool {
 func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool {
 	previousException := core.LastException
 	if previousException == exception {
-		if before, ok := vm.instructionExceptions[frame]; ok {
-			previousException = before
+		if frame != nil && frame.InstructionSnapshotSet {
+			previousException = frame.InstructionException
 		}
 	}
 	termination := core.IsTerminationResult(exception)
@@ -12007,7 +13434,7 @@ func (vm *VM) expandYieldSplatArgs(args []*object.EmeraldValue, splatIndex int) 
 }
 
 func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if os.Getenv("RGO_DEBUG_FOR_LOOP") == "1" {
+	if debugForLoopEnabled {
 		blockType := object.ValueNil
 		if block != nil {
 			blockType = block.Type
@@ -12192,10 +13619,11 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if closure.Binding != nil {
 		methodName = closure.Binding.Method
 	}
-	parameters := core.TracePointParameters(fn, isLambda)
-	newFrame := &Frame{ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure, MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block, IsLambda: isLambda, BlockBreak: false, BlockBreakVal: nil, BlockNextVal: nil, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self, TraceParameters: parameters}
-	vm.frames = append(vm.frames, newFrame)
-	vm.fp++
+	var parameters *object.EmeraldValue
+	if core.TracePointEventActive("b_call") || core.TracePointEventActive("b_return") {
+		parameters = core.TracePointParameters(fn, isLambda)
+	}
+	vm.pushReusableFrame(Frame{ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure, MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block, IsLambda: isLambda, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self, TraceParameters: parameters})
 	if core.TracePointEventActive("b_call") {
 		binding := vm.currentFrameBinding()
 		binding.Line = fn.DefinitionLine
@@ -12204,18 +13632,14 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 
 	frame := vm.frames[vm.fp]
 	instructions := frame.Fn.Instructions
-	count := 0
 	for frame.Ip < len(instructions)-1 {
-		count++
-		if count > 1000 {
-			break
-		}
 		frame.Ip++
 		op := compiler.Opcode(instructions[frame.Ip])
 		vm.fireTracePointLine(frame, op)
-		vm.instructionExceptions[frame] = core.LastException
+		frame.InstructionException = core.LastException
+		frame.InstructionSnapshotSet = true
 		if err := vm.execute(op, frame); err != nil {
-			break
+			return core.NewRuntimeError(err.Error())
 		}
 		if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
 			break
@@ -12283,7 +13707,8 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 			vm.rescueStack = append(vm.rescueStack[:i], vm.rescueStack[i+1:]...)
 		}
 	}
-	delete(vm.instructionExceptions, frame)
+	frame.InstructionException = nil
+	frame.InstructionSnapshotSet = false
 	vm.frames = vm.frames[:vm.fp]
 	vm.fp--
 
@@ -13217,7 +14642,15 @@ func (vm *VM) fireTracePointLine(frame *Frame, op compiler.Opcode) {
 	if frame == nil {
 		return
 	}
-	line := vm.sourceLineForFrame(frame)
+	line := frame.ExecutionLine
+	if frame.Fn != nil {
+		if mapped, ok := frame.Fn.LineMap[frame.Ip]; ok {
+			line = int64(mapped)
+		}
+	}
+	if line == 0 {
+		line = vm.sourceLineForFrame(frame)
+	}
 	frame.ExecutionLine = line
 	if !core.TracePointEventActive("line") {
 		return
@@ -13244,6 +14677,9 @@ func (vm *VM) fireTracePointLine(frame *Frame, op compiler.Opcode) {
 func (vm *VM) fireTracePointReturn(frame *Frame, value *object.EmeraldValue) {
 	if frame == nil || !core.TracePointEventActive("return") {
 		return
+	}
+	if frame.TraceParameters == nil && frame.Fn != nil {
+		frame.TraceParameters = core.TracePointParameters(frame.Fn, true)
 	}
 	binding := vm.currentFrameBinding()
 	core.FireTracePointReturn("return", binding, frame.TraceSelf, frame.TraceDefinedClass, frame.TraceMethodID, frame.TraceCalleeID, frame.TraceParameters, value)

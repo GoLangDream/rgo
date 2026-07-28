@@ -227,7 +227,6 @@ func runRubySourceWithEncoding(source string, filename string, argv []string, so
 }
 
 func runRubySourceWithEncodingAndPreload(source string, filename string, argv []string, sourceEncoding, preloadSource, preloadFile string) {
-	_ = os.Setenv("MSPEC_RUNNER", "1")
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
@@ -264,6 +263,7 @@ func runRubySourceWithEncodingAndPreload(source string, filename string, argv []
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	v.SetInstructionLimit(uint64(getEnvInt("RGO_VM_INSTRUCTION_LIMIT")))
 	v.SetFreezeStringLiterals(vm.SourceFreezesStringLiterals(source))
 	v.SetChillStringLiterals(vm.SourceChillsStringLiterals(source))
 	v.SetProgramName(filename)
@@ -492,7 +492,6 @@ func runRubyPathLauncher(args []string) {
 }
 
 func runRubyFile(filename string, argv []string) {
-	_ = os.Setenv("MSPEC_RUNNER", "1")
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
@@ -708,7 +707,7 @@ func getEnvInt(name string) int {
 }
 
 func executeSpecFile(filename string) error {
-	core.Init()
+	core.InitWithMspec()
 	abs, err := filepath.Abs(filename)
 	if err != nil {
 		return fmt.Errorf("Error reading file: %v", err)
@@ -745,6 +744,7 @@ func executeSpecFile(filename string) error {
 
 	bytecode := c.Bytecode()
 	v := vm.New(bytecode)
+	v.SetInstructionLimit(uint64(getEnvInt("RGO_VM_INSTRUCTION_LIMIT")))
 	v.SetProgramName(filename)
 	err = v.Run()
 	if err != nil {

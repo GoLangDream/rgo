@@ -12,6 +12,36 @@ func init() {
 	Init()
 }
 
+func TestMspecRegistrationIsExplicit(t *testing.T) {
+	Init()
+	if _, ok := R.Classes["Object"].GetMethod("describe"); ok {
+		t.Fatal("ordinary runtime unexpectedly exposes MSpec describe")
+	}
+	InitWithMspec()
+	if _, ok := R.Classes["Object"].GetMethod("describe"); !ok {
+		t.Fatal("MSpec runtime did not expose describe")
+	}
+	Init()
+}
+
+func TestSmallIntegerValuesAreCanonicalWithinRuntime(t *testing.T) {
+	Init()
+	first := NewIntegerValue(1024)
+	second := NewIntegerValue(1024)
+	if first != second {
+		t.Fatal("expected cached Integer values to be canonical")
+	}
+	if first.Data != int64(1024) || first.Class != R.Classes["Integer"] {
+		t.Fatalf("unexpected cached Integer value: %#v", first)
+	}
+	if NewIntegerValue(4097) != NewIntegerValue(4097) {
+		t.Fatal("expected lazily paged Integer values to be canonical")
+	}
+	if NewIntegerValue(65536) == NewIntegerValue(65536) {
+		t.Fatal("expected values outside the immediate cache to remain independently allocated")
+	}
+}
+
 func mkInt(v int64) *object.EmeraldValue {
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: v, Class: R.Classes["Integer"]}
 }
@@ -37,6 +67,32 @@ func mkRHash(pairs map[*object.EmeraldValue]*object.EmeraldValue) *object.Emeral
 		Type:  object.ValueHash,
 		Data:  &object.RHash{Pairs: pairs},
 		Class: R.Classes["Hash"],
+	}
+}
+
+func TestHashBucketsTrackInsertLookupAndDelete(t *testing.T) {
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	for i := int64(0); i < 1000; i++ {
+		hashIndexSet(hash, mkInt(i), mkInt(i*3))
+	}
+	data := hashData(hash)
+	if data.BucketSize != 1000 || len(data.Buckets) == 0 {
+		t.Fatalf("expected 1000 indexed keys, got size=%d buckets=%d", data.BucketSize, len(data.Buckets))
+	}
+	for i := int64(0); i < 1000; i++ {
+		assertInt(t, hashIndex(hash, mkInt(i)), i*3)
+	}
+	for i := int64(0); i < 1000; i += 2 {
+		assertInt(t, hashDelete(hash, mkInt(i)), i*3)
+	}
+	if got := hashLength(hash).Data.(int64); got != 500 {
+		t.Fatalf("expected 500 keys after delete, got %d", got)
+	}
+	for i := int64(1); i < 1000; i += 2 {
+		assertInt(t, hashIndex(hash, mkInt(i)), i*3)
+	}
+	if data.BucketSize != 500 {
+		t.Fatalf("expected rebuilt bucket size 500, got %d", data.BucketSize)
 	}
 }
 

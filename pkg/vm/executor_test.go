@@ -19,7 +19,137 @@ import (
 )
 
 func init() {
-	core.Init()
+	core.InitWithMspec()
+}
+
+func compileTestVM(t *testing.T, source string) *VM {
+	t.Helper()
+	core.InitWithMspec()
+	l := lexer.New(source)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		t.Fatalf("parse errors: %v", p.Errors())
+	}
+	c := compiler.New()
+	if err := c.Compile(program); err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	return New(c.Bytecode())
+}
+
+func TestVMHasNoProductionInstructionLimitByDefault(t *testing.T) {
+	machine := compileTestVM(t, `
+i = 0
+while i < 200000
+  i += 1
+end
+i
+`)
+	if err := machine.Run(); err != nil {
+		t.Fatalf("unexpected runtime limit: %v", err)
+	}
+	assertIntResult(t, machine.LastPoppedStackElement(), 200000)
+}
+
+func TestVMInstructionLimitCanBeConfigured(t *testing.T) {
+	machine := compileTestVM(t, `while true; end`)
+	machine.SetInstructionLimit(100)
+	err := machine.Run()
+	if err == nil || !strings.Contains(err.Error(), "instruction limit exceeded") {
+		t.Fatalf("expected instruction limit error, got %v", err)
+	}
+}
+
+func TestVMInstructionLimitAlsoStopsNestedMethodExecution(t *testing.T) {
+	machine := compileTestVM(t, `
+def spin
+  while true
+  end
+end
+spin
+`)
+	machine.SetInstructionLimit(100)
+	err := machine.Run()
+	if err == nil {
+		exception := machine.UnhandledException()
+		message := ""
+		if exception != nil {
+			message = exception.Inspect()
+			if payload, ok := exception.Data.(*object.RException); ok {
+				message = payload.Message
+			}
+		}
+		if !strings.Contains(message, "instruction limit exceeded") {
+			t.Fatalf("expected nested instruction limit error, got %q", message)
+		}
+	} else if !strings.Contains(err.Error(), "instruction limit exceeded") {
+		t.Fatalf("expected nested instruction limit error, got %v", err)
+	}
+}
+
+func TestVMBlockExecutionHasNoFixedInstructionCap(t *testing.T) {
+	result, _ := runRuby(t, `
+count = 0
+1.times do
+  while count < 5000
+    count += 1
+  end
+end
+count
+`)
+	assertIntResult(t, result, 5000)
+}
+
+func TestVMPoppedValueHistoryIsBounded(t *testing.T) {
+	machine := compileTestVM(t, `
+i = 0
+while i < 1000
+  i += 1
+end
+i
+`)
+	if err := machine.Run(); err != nil {
+		t.Fatalf("runtime error: %v", err)
+	}
+	if got := len(machine.GetAllResults()); got != 1 {
+		t.Fatalf("expected one retained result, got %d", got)
+	}
+	assertIntResult(t, machine.LastPoppedStackElement(), 1000)
+}
+
+func TestVMOperandStackGrowsForLargeArrayLiteral(t *testing.T) {
+	source := "[" + strings.Repeat("1,", StackSize+256) + "].length"
+	result, _ := runRuby(t, source)
+	assertIntResult(t, result, StackSize+256)
+}
+
+func TestMethodLookupCacheInvalidatesAfterRedefinition(t *testing.T) {
+	machine := compileTestVM(t, `
+class CachedMethodExample
+  def value
+    1
+  end
+end
+instance = CachedMethodExample.new
+first = instance.value
+instance.value
+class CachedMethodExample
+  def value
+    2
+  end
+end
+[first, instance.value]
+`)
+	if err := machine.Run(); err != nil {
+		t.Fatalf("runtime error: %v", err)
+	}
+	if len(machine.methodCache) == 0 {
+		t.Fatal("expected method lookup cache entries")
+	}
+	if got := machine.LastPoppedStackElement().Inspect(); got != "[1, 2]" {
+		t.Fatalf("expected cache invalidation result [1, 2], got %s", got)
+	}
 }
 
 func TestBreakSplatReturnsOneArrayValue(t *testing.T) {
@@ -46,6 +176,23 @@ func TestNewVMUsesCurrentSourceEncoding(t *testing.T) {
 	}
 }
 
+func TestChildVMReusesRootRuntimeModulesWithoutInvalidatingMethods(t *testing.T) {
+	core.InitWithMspec()
+	root := New(&compiler.Bytecode{})
+	enumerable := root.rubyConsts["Enumerable"]
+	comparable := root.rubyConsts["Comparable"]
+	generation := object.CurrentMethodGeneration()
+
+	child := newVM(&compiler.Bytecode{}, root)
+
+	if child.rubyConsts["Enumerable"] != enumerable || child.rubyConsts["Comparable"] != comparable {
+		t.Fatal("expected child VM to reuse the root runtime modules")
+	}
+	if got := object.CurrentMethodGeneration(); got != generation {
+		t.Fatalf("child VM initialization invalidated method caches: generation %d -> %d", generation, got)
+	}
+}
+
 func TestStringAdditionPreservesReceiverEncoding(t *testing.T) {
 	result, _ := runRuby(t, `("a".force_encoding("US-ASCII") + "b").encoding == Encoding::US_ASCII`)
 	if result != core.R.TrueVal {
@@ -61,6 +208,34 @@ rescue Encoding::CompatibilityError
   true
 end`)
 	assertBoolResult(t, result, true)
+}
+
+func TestStringAppendBuilderPreservesDupAndInvalidatesAfterReplace(t *testing.T) {
+	result, _ := runRuby(t, `
+value = +"a"
+value << "b"
+copy = value.dup
+value << "c"
+value.replace("x")
+value << "y"
+[value, copy]
+`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%s)", result.TypeName(), result.Inspect())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 || values[0].Data != "xy" || values[1].Data != "ab" {
+		t.Fatalf("expected [\"xy\", \"ab\"], got %s", result.Inspect())
+	}
+}
+
+func TestStringAppendBuilderSupportsSelfAppend(t *testing.T) {
+	result, _ := runRuby(t, `
+value = +"a"
+10.times { value << value }
+value.bytesize
+`)
+	assertIntResult(t, result, 1024)
 }
 
 func TestFrozenStringLiteralIsInternedAcrossRequiredFiles(t *testing.T) {
@@ -223,7 +398,7 @@ func runRuby(t *testing.T, source string) (*object.EmeraldValue, string) {
 	t.Helper()
 
 	currentSpecFile := core.CurrentSpecFile
-	core.Init()
+	core.InitWithMspec()
 	core.CurrentSpecFile = currentSpecFile
 	core.LastException = nil
 	core.LastBlockResult = nil
@@ -2263,7 +2438,7 @@ func runRubyExpectError(t *testing.T, source string) error {
 	t.Helper()
 
 	currentSpecFile := core.CurrentSpecFile
-	core.Init()
+	core.InitWithMspec()
 	core.CurrentSpecFile = currentSpecFile
 	core.LastException = nil
 	core.LastBlockResult = nil
@@ -5461,6 +5636,213 @@ end
 
 ChildForInheritance.new.marker`)
 	assertIntResult(t, result, 42)
+}
+
+func TestRubyMethodFramesCanBeReusedAfterRecursiveCalls(t *testing.T) {
+	result, _ := runRuby(t, `
+def recursive_frame_sum(n)
+  return 0 if n == 0
+  n + recursive_frame_sum(n - 1)
+end
+
+[recursive_frame_sum(50), recursive_frame_sum(50)]
+`)
+	if result.Type != object.ValueArray {
+		t.Fatalf("expected Array, got %s (%s)", result.TypeName(), result.Inspect())
+	}
+	values := result.Data.([]*object.EmeraldValue)
+	if len(values) != 2 {
+		t.Fatalf("expected two results, got %s", result.Inspect())
+	}
+	assertIntResult(t, values[0], 1275)
+	assertIntResult(t, values[1], 1275)
+}
+
+func TestFusedIntegerLocalExpressionPreservesArithmetic(t *testing.T) {
+	result, _ := runRuby(t, `
+value = 1
+index = 0
+while index < 100
+  value = (value * 1664525 + 1013904223) % 2147483647
+  index += 1
+end
+value
+`)
+	assertIntResult(t, result, 1642999932)
+}
+
+func TestFusedIntegerLocalExpressionRespectsIntegerPlusOverride(t *testing.T) {
+	result, _ := runRuby(t, `
+class Integer
+  def +(other)
+    42
+  end
+end
+
+value = 1
+value += 2
+value
+`)
+	assertIntResult(t, result, 42)
+}
+
+func TestFusedIntegerLocalExpressionIsDisabledForTracePoint(t *testing.T) {
+	result, _ := runRuby(t, `
+lines = []
+trace = TracePoint.new(:line) { |event| lines << event.lineno }
+value = 1
+trace.enable do
+  value = value * 3 + 4
+end
+[value, lines.empty?]
+`)
+	values := result.Data.([]*object.EmeraldValue)
+	assertIntResult(t, values[0], 7)
+	if values[1] != core.R.FalseVal {
+		t.Fatalf("expected line TracePoint events, got %s", result.Inspect())
+	}
+}
+
+func TestIntegerFunctionPlanExecutesPureExpression(t *testing.T) {
+	result, _ := runRuby(t, `
+def pure_integer_expression(x)
+  ((x * 33) ^ (x >> 3)) & 2147483647
+end
+pure_integer_expression(123)
+`)
+	assertIntResult(t, result, 4052)
+}
+
+func TestIntegerFunctionPlanFallsBackOnOverflow(t *testing.T) {
+	result, _ := runRuby(t, `
+def double_integer_expression(x)
+  x * 2
+end
+double_integer_expression((1 << 63) - 1) == ((1 << 64) - 2)
+`)
+	if result != core.R.TrueVal {
+		t.Fatalf("expected overflow fallback to preserve Bignum semantics, got %s", result.Inspect())
+	}
+}
+
+func TestIntegerFunctionPlanIsDisabledForCallTracePoint(t *testing.T) {
+	result, _ := runRuby(t, `
+def traced_integer_expression(x)
+  x * 3 + 4
+end
+calls = []
+trace = TracePoint.new(:call) { |event| calls << event.method_id }
+trace.enable { traced_integer_expression(2) }
+[calls.include?(:traced_integer_expression), traced_integer_expression(2)]
+`)
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0] != core.R.TrueVal {
+		t.Fatalf("expected call TracePoint event, got %s", result.Inspect())
+	}
+	assertIntResult(t, values[1], 10)
+}
+
+func TestIntegerBytecodeLoopExecutesPureFunctionCalls(t *testing.T) {
+	result, _ := runRuby(t, `
+def integer_loop_value(x)
+  x * 2 + 1
+end
+index = 0
+total = 0
+while index < 100
+  total += integer_loop_value(index)
+  index += 1
+end
+total
+`)
+	assertIntResult(t, result, 10000)
+}
+
+func TestIntegerBytecodeLoopFallsBackOnFunctionOverflow(t *testing.T) {
+	result, _ := runRuby(t, `
+def integer_loop_double(x)
+  x * 2
+end
+index = 0
+value = 1 << 62
+while index < 1
+  value = integer_loop_double(value)
+  index += 1
+end
+value == (1 << 63)
+`)
+	if result != core.R.TrueVal {
+		t.Fatalf("expected loop overflow fallback to preserve Bignum semantics, got %s", result.Inspect())
+	}
+}
+
+func TestIntegerBytecodeLoopUsesRedefinedFunction(t *testing.T) {
+	result, _ := runRuby(t, `
+def redefined_integer_loop_value(x)
+  x * 2
+end
+def redefined_integer_loop_value(x)
+  x * 3
+end
+index = 0
+total = 0
+while index < 10
+  total += redefined_integer_loop_value(index)
+  index += 1
+end
+total
+`)
+	assertIntResult(t, result, 135)
+}
+
+func TestCollectionLoopPlansPreserveArrayHashAndSumSemantics(t *testing.T) {
+	result, _ := runRuby(t, `
+n = 10
+array = []
+hash = {}
+i = 0
+while i < n
+  value = (i * 17) % 1009
+  array << value
+  hash[i % 7] = value
+  i += 1
+end
+i = 0
+sum = 0
+while i < array.length
+  sum += array[i]
+  i += 1
+end
+[array.length, hash.length, hash[0], hash[2], sum]
+`)
+	values := result.Data.([]*object.EmeraldValue)
+	assertIntResult(t, values[0], 10)
+	assertIntResult(t, values[1], 7)
+	assertIntResult(t, values[2], 119)
+	assertIntResult(t, values[3], 153)
+	assertIntResult(t, values[4], 765)
+}
+
+func TestCollectionLoopPlansRespectArrayAppendOverride(t *testing.T) {
+	result, _ := runRuby(t, `
+Array.define_method(:<<) { |value| self }
+n = 3
+array = []
+hash = {}
+i = 0
+while i < n
+  value = (i * 17) % 1009
+  array << value
+  hash[i % 7] = value
+  i += 1
+end
+[array, hash.length]
+`)
+	values := result.Data.([]*object.EmeraldValue)
+	if values[0].Inspect() != "[]" {
+		t.Fatalf("expected overridden Array#<< result, got %s", result.Inspect())
+	}
+	assertIntResult(t, values[1], 3)
 }
 
 func TestClassInheritanceFromQualifiedSuperclass(t *testing.T) {
@@ -14017,6 +14399,20 @@ end
 	assertIntResult(t, result, 42)
 }
 
+func TestEnumeratorNextStopIterationIsRescued(t *testing.T) {
+	result, _ := runRuby(t, `enum = [1].each
+values = []
+while true
+  begin
+    values << enum.next
+  rescue StopIteration
+    break
+  end
+end
+values == [1]`)
+	assertBoolResult(t, result, true)
+}
+
 func TestKernelLoopReturnsEnumeratorStopResult(t *testing.T) {
 	result, _ := runRuby(t, `e = Enumerator.new { |y|
   y << 1
@@ -15405,6 +15801,17 @@ raised`)
 	assertBoolResult(t, result, true)
 }
 
+func TestThreadListSchedulesPendingThread(t *testing.T) {
+	result, _ := runRuby(t, `spawner = Thread.new do
+  Array.new(10) { Thread.new {} }
+end
+begin
+  Thread.list.each { |thread| raise TypeError unless thread.kind_of?(Thread) }
+end while spawner.alive?
+spawner.value.each(&:join).length`)
+	assertIntResult(t, result, 10)
+}
+
 func TestYieldRaisesIntoCallerRescue(t *testing.T) {
 	result, _ := runRuby(t, `def yield_to_block
   yield
@@ -15417,6 +15824,34 @@ rescue NotImplementedError
   raised = true
 end
 raised`)
+	assertBoolResult(t, result, true)
+}
+
+func TestSuperFromCustomMethodMissingRaisesInsteadOfRecursing(t *testing.T) {
+	result, _ := runRuby(t, `class MethodMissingSuperRegression
+  def method_missing(name, *args)
+    super
+  end
+end
+
+begin
+  MethodMissingSuperRegression.new.unknown_method
+  false
+rescue NoMethodError
+  true
+end`)
+	assertBoolResult(t, result, true)
+}
+
+func TestURIRouteToPreservesOpaqueAbsoluteTarget(t *testing.T) {
+	result, _ := runRuby(t, `require 'uri'
+base = URI.parse("http://a/b/c/d;p?q")
+merged = base.merge("http:g")
+routed = base.route_to("http:g")
+merged.kind_of?(URI::HTTP) &&
+  merged.to_s == "http:g" &&
+  routed.kind_of?(URI::Generic) &&
+  routed.to_s == "http:g"`)
 	assertBoolResult(t, result, true)
 }
 
@@ -21075,7 +21510,7 @@ end`)
 }
 
 func TestMspecRaiseErrorMatchesExceptionReturnedByFiberResume(t *testing.T) {
-	core.Init()
+	core.InitWithMspec()
 	_, _ = runRuby(t, `describe "fiber mutex deadlock" do
   it "matches the resumed fiber error in a locked mutex" do
     m = Mutex.new
@@ -21957,7 +22392,7 @@ func TestObjectDefinesArgfAndArgvConstants(t *testing.T) {
 }
 
 func TestSetProgramNameUpdatesDollarZero(t *testing.T) {
-	core.Init()
+	core.InitWithMspec()
 	v := New(&compiler.Bytecode{})
 	v.SetProgramName("fixtures/dollar_zero.rb")
 	value := v.programNameGlobal()

@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -56,6 +57,8 @@ import (
 )
 
 type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
+
+var debugEnumEnabled = os.Getenv("RGO_DEBUG_ENUM") == "1"
 
 type matchDataData struct {
 	Matches   []string
@@ -381,6 +384,7 @@ var procRuby2KeywordFunctions map[*object.Function]bool
 var fileUtimeOverrides map[string]fileTimeOverride
 var currentFileUmask int64 = 0022
 var stringEncodings map[*object.EmeraldValue]string
+var stringAppendBuilders map[*object.EmeraldValue]*strings.Builder
 var stringComparisonInverseDepth int
 var attachedSingletonClasses map[*object.EmeraldValue]*object.Class
 var auxiliaryInstanceVars map[*object.EmeraldValue]map[string]*object.EmeraldValue
@@ -2947,9 +2951,13 @@ func isTruthy(val *object.EmeraldValue) bool {
 type Runtime struct {
 	Classes map[string]*object.Class
 
-	TrueVal  *object.EmeraldValue
-	FalseVal *object.EmeraldValue
-	NilVal   *object.EmeraldValue
+	TrueVal           *object.EmeraldValue
+	FalseVal          *object.EmeraldValue
+	NilVal            *object.EmeraldValue
+	Enumerable        *object.EmeraldValue
+	Comparable        *object.EmeraldValue
+	SmallIntegers     []*object.EmeraldValue
+	integerCachePages []atomic.Pointer[integerCachePage]
 
 	Main *object.EmeraldValue
 }
@@ -2957,6 +2965,14 @@ type Runtime struct {
 var R *Runtime
 
 func Init() {
+	initRuntime(false)
+}
+
+func InitWithMspec() {
+	initRuntime(true)
+}
+
+func initRuntime(withMspec bool) {
 	R = &Runtime{
 		Classes: make(map[string]*object.Class),
 	}
@@ -3041,6 +3057,7 @@ func Init() {
 	currentFileUmask = 0022
 	defaultExternalEncoding = "UTF-8"
 	stringEncodings = make(map[*object.EmeraldValue]string)
+	stringAppendBuilders = make(map[*object.EmeraldValue]*strings.Builder)
 	attachedSingletonClasses = make(map[*object.EmeraldValue]*object.Class)
 	auxiliaryInstanceVars = make(map[*object.EmeraldValue]map[string]*object.EmeraldValue)
 	deduplicatedStrings = make(map[string]*object.EmeraldValue)
@@ -3110,9 +3127,72 @@ func Init() {
 	objectIDCounter++
 
 	R.createClasses()
+	R.initializeSmallIntegers()
 	R.defineMethods()
 	installRbConfigModule(R.Classes["Object"])
-	RegisterMspec()
+	if withMspec {
+		RegisterMspec()
+	}
+}
+
+const (
+	smallIntegerMin    = int64(-1)
+	smallIntegerMax    = int64(4096)
+	pagedIntegerMax    = int64(65535)
+	integerPageSize    = int64(256)
+	cacheIntegerValues = true
+)
+
+type integerCachePage [integerPageSize]object.EmeraldValue
+
+func (rt *Runtime) initializeSmallIntegers() {
+	rt.SmallIntegers = make([]*object.EmeraldValue, smallIntegerMax-smallIntegerMin+1)
+	integerClass := rt.Classes["Integer"]
+	for value := smallIntegerMin; value <= smallIntegerMax; value++ {
+		rt.SmallIntegers[value-smallIntegerMin] = &object.EmeraldValue{
+			Type:  object.ValueInteger,
+			Data:  value,
+			Class: integerClass,
+		}
+	}
+	pageCount := (pagedIntegerMax - smallIntegerMax + integerPageSize - 1) / integerPageSize
+	rt.integerCachePages = make([]atomic.Pointer[integerCachePage], pageCount)
+}
+
+func NewIntegerValue(value int64) *object.EmeraldValue {
+	if cacheIntegerValues && R != nil && value >= smallIntegerMin && value <= smallIntegerMax && len(R.SmallIntegers) > 0 {
+		return R.SmallIntegers[value-smallIntegerMin]
+	}
+	if cacheIntegerValues && R != nil && value > smallIntegerMax && value <= pagedIntegerMax {
+		index := value - smallIntegerMax - 1
+		pageIndex := index / integerPageSize
+		offset := index % integerPageSize
+		slot := &R.integerCachePages[pageIndex]
+		page := slot.Load()
+		if page == nil {
+			candidate := &integerCachePage{}
+			first := smallIntegerMax + 1 + pageIndex*integerPageSize
+			integerClass := R.Classes["Integer"]
+			for i := int64(0); i < integerPageSize; i++ {
+				candidate[i] = object.EmeraldValue{
+					Type:  object.ValueInteger,
+					Data:  first + i,
+					Class: integerClass,
+				}
+			}
+			if slot.CompareAndSwap(nil, candidate) {
+				page = candidate
+			} else {
+				page = slot.Load()
+			}
+		}
+		return &page[offset]
+	}
+	var integerClass *object.Class
+	if R != nil {
+		integerClass = R.Classes["Integer"]
+	}
+	return &object.EmeraldValue{Type: object.ValueInteger, Data: value, Class: integerClass}
 }
 
 func (rt *Runtime) createClasses() {
@@ -5973,7 +6053,7 @@ func (rt *Runtime) defineMethods() {
 	mainObject := R.Main.Data.(*object.Object)
 	mainObject.SingletonMethods["to_s"] = mainToS
 	if singleton := SingletonClass(R.Main); singleton != nil && singleton.Type == object.ValueClass {
-		singleton.Data.(*object.Class).Methods["to_s"] = mainToS
+		singleton.Data.(*object.Class).DefineMethod("to_s", mainToS)
 	}
 	warningModule := object.NewModule("Warning")
 	warningModule.SetInstanceVar("@__warning_deprecated", boolValue(os.Getenv("RGO_WARNING_ALL") == "1"))
@@ -7747,13 +7827,14 @@ func defineMockSingletonWithArity(target *object.EmeraldValue, method string, ar
 			return
 		}
 		previous, hadPrevious := singletonClass.Methods[method]
-		singletonClass.Methods[method] = methodFn
+		singletonClass.DefineMethod(method, methodFn)
 		mockRestores = append(mockRestores, func() {
 			if hadPrevious {
 				singletonClass.Methods[method] = previous
 			} else {
 				delete(singletonClass.Methods, method)
 			}
+			object.BumpMethodGeneration()
 		})
 	default:
 		if InstallNativeSingletonMethod != nil {
@@ -7857,7 +7938,7 @@ func moduleFunction(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		copy.Name = name
 		copy.Visibility = "public"
 		copy.Owner = singleton
-		singletonClass.Methods[name] = &copy
+		singletonClass.DefineMethod(name, &copy)
 		setNamedMethodVisibility(receiver, name, "private")
 		if hook := NotifySingletonMethodAdded(receiver, name); hook != nil && hook.Type == object.ValueException {
 			return hook
@@ -7921,7 +8002,7 @@ func SingletonClass(receiver *object.EmeraldValue) *object.EmeraldValue {
 			class = object.NewClass(name)
 			class.SingletonOwner = receiver
 			for methodName, method := range cls.ClassMethods {
-				class.Methods[methodName] = method
+				class.DefineMethod(methodName, method)
 			}
 			cls.SingletonClass = class
 		}
@@ -10485,9 +10566,9 @@ func moduleAliasMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	}
 	switch receiver.Type {
 	case object.ValueClass:
-		receiver.Data.(*object.Class).Methods[newName] = &copy
+		receiver.Data.(*object.Class).DefineMethod(newName, &copy)
 	case object.ValueModule:
-		receiver.Data.(*object.Module).Methods[newName] = &copy
+		receiver.Data.(*object.Module).DefineMethod(newName, &copy)
 	default:
 		return typeError("not a class/module")
 	}
@@ -10810,12 +10891,14 @@ func removeDirectMethod(receiver *object.EmeraldValue, name string) bool {
 		methods := receiver.Data.(*object.Class).Methods
 		if _, ok := methods[name]; ok {
 			delete(methods, name)
+			object.BumpMethodGeneration()
 			return true
 		}
 	case object.ValueModule:
 		methods := receiver.Data.(*object.Module).Methods
 		if _, ok := methods[name]; ok {
 			delete(methods, name)
+			object.BumpMethodGeneration()
 			return true
 		}
 	}
@@ -10852,7 +10935,7 @@ func moduleUndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		switch receiver.Type {
 		case object.ValueClass:
 			cls := receiver.Data.(*object.Class)
-			cls.Methods[name] = undefined
+			cls.DefineMethod(name, undefined)
 			if cls.IsSingleton && cls.SingletonOwner != nil && cls.SingletonOwner.Type == object.ValueObject {
 				if obj, ok := cls.SingletonOwner.Data.(*object.Object); ok {
 					if obj.SingletonMethods == nil {
@@ -10862,7 +10945,7 @@ func moduleUndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 				}
 			}
 		case object.ValueModule:
-			receiver.Data.(*object.Module).Methods[name] = undefined
+			receiver.Data.(*object.Module).DefineMethod(name, undefined)
 		}
 		hookReceiver, hook := methodMutationHook(receiver, "method_undefined", "singleton_method_undefined")
 		if result := callModuleMethodHook(hookReceiver, hook, name); result != nil && result.Type == object.ValueException {
@@ -11258,7 +11341,7 @@ func setNamedMethodVisibility(receiver *object.EmeraldValue, name, visibility st
 			clone.Visibility = visibility
 			clone.VisibilityAliasStart = cls
 			clone.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: R.Classes["Class"]}
-			cls.Methods[name] = &clone
+			cls.DefineMethod(name, &clone)
 			return true
 		}
 	case object.ValueModule:
@@ -11271,7 +11354,7 @@ func setNamedMethodVisibility(receiver *object.EmeraldValue, name, visibility st
 			clone := *method
 			clone.Visibility = visibility
 			clone.Owner = &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
-			mod.Methods[name] = &clone
+			mod.DefineMethod(name, &clone)
 			return true
 		}
 	}
@@ -11318,6 +11401,7 @@ func setNamedClassMethodVisibility(receiver *object.EmeraldValue, name, visibili
 				clone := *method
 				clone.Visibility = visibility
 				cls.SingletonClass.Methods[name] = &clone
+				object.BumpMethodGeneration()
 				return true
 			}
 		}
@@ -11325,12 +11409,14 @@ func setNamedClassMethodVisibility(receiver *object.EmeraldValue, name, visibili
 			clone := *method
 			clone.Visibility = visibility
 			cls.ClassMethods[name] = &clone
+			object.BumpMethodGeneration()
 			return true
 		}
 		if method, ok := lookupInheritedClassMethodForVisibility(cls, name); ok {
 			clone := *method
 			clone.Visibility = visibility
 			cls.ClassMethods[name] = &clone
+			object.BumpMethodGeneration()
 			return true
 		}
 	case object.ValueModule:
@@ -11340,6 +11426,7 @@ func setNamedClassMethodVisibility(receiver *object.EmeraldValue, name, visibili
 				clone := *method
 				clone.Visibility = visibility
 				mod.SingletonClass.Methods[name] = &clone
+				object.BumpMethodGeneration()
 				return true
 			}
 		}
@@ -13329,7 +13416,7 @@ func methodDefineSingletonMethod(receiver *object.EmeraldValue, args ...*object.
 	method.Owner = singleton
 	method.Visibility = "public"
 	method.EnforceArity = true
-	singletonClass.Methods[name] = method
+	singletonClass.DefineMethod(name, method)
 	if errVal := NotifySingletonMethodAdded(receiver, name); errVal != nil && errVal.Type == object.ValueException {
 		return errVal
 	}
@@ -13455,6 +13542,9 @@ func threadClassList(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		if data := threadValueData(thread); data != nil && !data.finished {
 			threads = append(threads, thread)
 		}
+	}
+	if len(pendingThreads) > 0 {
+		runNextPendingThread()
 	}
 	return &object.EmeraldValue{Type: object.ValueArray, Data: threads, Class: R.Classes["Array"]}
 }
@@ -20067,7 +20157,7 @@ func installErrnoConstants() {
 		if ioClass := R.Classes["IO"]; ioClass != nil {
 			if value := ioClass.Constants["WaitWritable"]; value != nil {
 				if wait, ok := value.Data.(*object.Module); ok {
-					cls.IncludedModules = append(cls.IncludedModules, wait)
+					cls.Include(wait)
 				}
 			}
 			ioClass.DefineConstant("EINPROGRESSWaitWritable", &object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: R.Classes["Class"]})
@@ -22156,7 +22246,7 @@ func enumeratorNext(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if data.block != nil || data.inspectReceiver != nil {
 		return enumeratorExternalNext(data)
 	}
-	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+	if debugEnumEnabled {
 		fmt.Printf("enumeratorNext: index=%d len=%d generated=%v result=%v\n", data.index, len(data.values), data.generated, data.result)
 	}
 	if data.lazy && data.lazyFunc != nil && data.index >= len(data.values) && !data.generated {
@@ -22182,7 +22272,7 @@ func enumeratorNext(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			data.result = nil
 			data.values = nil
 			data.yieldLists = nil
-			if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+			if debugEnumEnabled {
 				fmt.Printf("enumeratorNext generate error=%s\n", errVal.Inspect())
 			}
 			return errVal
@@ -22199,19 +22289,19 @@ func enumeratorNext(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			data.feedSet = false
 			data.feedValue = nil
 		}
-		if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		if debugEnumEnabled {
 			fmt.Printf("enumeratorNext returns value=%s\n", value.Inspect())
 		}
 		return value
 	}
-	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+	if debugEnumEnabled {
 		fmt.Printf("enumeratorNext exhausting; cached result=%v\n", data.result)
 	}
 	LastException = newStopIteration(data.result)
 	if evaluatingRaiseErrorMatcher {
 		LastRaisedResult = LastException
 	}
-	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+	if debugEnumEnabled {
 		exc := LastException.Data.(*object.RException)
 		fmt.Printf("enumeratorNext stop result nil?=%v\n", exc.Result == nil)
 	}
@@ -24584,7 +24674,7 @@ func newStopIteration(result *object.EmeraldValue) *object.EmeraldValue {
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueException,
-		Data:  &object.RException{Message: "StopIteration", Result: result},
+		Data:  &object.RException{Message: "StopIteration", Result: result, Raised: true},
 		Class: R.Classes["StopIteration"],
 	}
 }
@@ -24820,20 +24910,60 @@ func intAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 }
 
 func IntegerPlusUsesBuiltinImplementation() bool {
-	integerClass := R.Classes["Integer"]
-	if integerClass == nil {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd))
+}
+
+func classMethodUsesBuiltin(class *object.Class, name string, expected BuiltinMethod) bool {
+	if class == nil {
 		return false
 	}
-	if len(integerClass.PrependedModules) > 0 {
+	if len(class.PrependedModules) > 0 {
 		return false
 	}
-	method, ok := integerClass.Methods["+"]
+	method, ok := class.Methods[name]
 	if !ok || method == nil || method.Fn == nil {
 		return false
 	}
 	actual := reflect.ValueOf(method.Fn)
-	expected := reflect.ValueOf(BuiltinMethod(intAdd))
-	return actual.Kind() == reflect.Func && actual.Pointer() == expected.Pointer()
+	expectedValue := reflect.ValueOf(expected)
+	return actual.Kind() == reflect.Func && actual.Pointer() == expectedValue.Pointer()
+}
+
+func ASCIIStringLoopBuiltinsAvailable() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "%", BuiltinMethod(intMod)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "chr", BuiltinMethod(intChr)) &&
+		classMethodUsesBuiltin(R.Classes["String"], "<<", BuiltinMethod(stringConcatOne))
+}
+
+func CollectionLoopBuiltinsAvailable() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "*", BuiltinMethod(intMul)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "%", BuiltinMethod(intMod)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "<<", BuiltinMethod(arrayPush)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "[]", BuiltinMethod(arrayIndex)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "length", BuiltinMethod(arrayLength)) &&
+		classMethodUsesBuiltin(R.Classes["Hash"], "[]=", BuiltinMethod(hashIndexSet))
+}
+
+func AppendArrayValues(receiver *object.EmeraldValue, values []*object.EmeraldValue) bool {
+	if receiver == nil || receiver.Type != object.ValueArray || receiver.Class != R.Classes["Array"] || receiver.Frozen {
+		return false
+	}
+	elements, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return false
+	}
+	receiver.Data = append(elements, values...)
+	return true
+}
+
+func StoreHashValue(receiver, key, value *object.EmeraldValue) bool {
+	if receiver == nil || receiver.Type != object.ValueHash || receiver.Class != R.Classes["Hash"] || receiver.Frozen {
+		return false
+	}
+	result := hashIndexSet(receiver, key, value)
+	return result != nil && result.Type != object.ValueException
 }
 
 func intSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -29350,12 +29480,6 @@ func compatibleEncodingName(first, second encodingCompatibilityInfo) string {
 	if first.asciiOnly && !second.asciiOnly {
 		return secondName
 	}
-	if strings.EqualFold(firstName, "US-ASCII") {
-		return secondName
-	}
-	if strings.EqualFold(secondName, "US-ASCII") {
-		return firstName
-	}
 	if !encodingIsASCICompatible(firstName) || !encodingIsASCICompatible(secondName) {
 		return ""
 	}
@@ -32078,18 +32202,54 @@ func hashFindStoredKeyValue(hash *object.RHash, key *object.EmeraldValue) (*obje
 	if hash == nil {
 		return nil, nil, false
 	}
+	ensureHashBuckets(hash)
 	keyHash := hashKeyCode(key)
-	for candidate, value := range hash.Pairs {
-		storedHash, ok := hash.Hashes[candidate]
-		if !ok {
-			storedHash = hashKeyCode(candidate)
-			hash.Hashes[candidate] = storedHash
-		}
-		if storedHash == keyHash && hashKeysEql(candidate, key) {
-			return candidate, value, true
+	for _, candidate := range hash.Buckets[keyHash] {
+		if hashKeysEql(candidate, key) {
+			if value, ok := hash.Pairs[candidate]; ok {
+				return candidate, value, true
+			}
 		}
 	}
 	return nil, nil, false
+}
+
+func ensureHashBuckets(hash *object.RHash) {
+	if hash == nil || hash.Buckets != nil && hash.BucketSize == len(hash.Pairs) {
+		return
+	}
+	if hash.Hashes == nil {
+		hash.Hashes = make(map[*object.EmeraldValue]int64, len(hash.Pairs))
+	}
+	hash.Buckets = make(map[int64][]*object.EmeraldValue, len(hash.Pairs))
+	for key := range hash.Pairs {
+		code, ok := hash.Hashes[key]
+		if !ok {
+			code = hashKeyCode(key)
+			hash.Hashes[key] = code
+		}
+		hash.Buckets[code] = append(hash.Buckets[code], key)
+	}
+	hash.BucketSize = len(hash.Pairs)
+}
+
+func hashAddStoredKey(hash *object.RHash, key *object.EmeraldValue) {
+	if hash == nil {
+		return
+	}
+	code := hashKeyCode(key)
+	if hash.Hashes == nil {
+		hash.Hashes = make(map[*object.EmeraldValue]int64)
+	}
+	hash.Hashes[key] = code
+	if hash.Buckets == nil || hash.BucketSize != len(hash.Pairs)-1 {
+		hash.Buckets = nil
+		hash.BucketSize = 0
+		ensureHashBuckets(hash)
+		return
+	}
+	hash.Buckets[code] = append(hash.Buckets[code], key)
+	hash.BucketSize++
 }
 
 func hashKeysEql(candidate, query *object.EmeraldValue) bool {
@@ -32483,6 +32643,9 @@ func hashRehash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	data.Pairs = nextPairs
 	data.Keys = nextKeys
 	data.Hashes = nextHashes
+	data.Buckets = nil
+	data.BucketSize = 0
+	ensureHashBuckets(data)
 	return receiver
 }
 
@@ -32793,6 +32956,7 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		} else {
 			hash.Pairs[keyValue] = value
 			hash.Keys = append(hash.Keys, keyValue)
+			hashAddStoredKey(hash, keyValue)
 		}
 		return args[1]
 	}
@@ -32808,7 +32972,7 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		}
 		hash.Keys = append(hash.Keys, key)
 		hash.Pairs[key] = args[1]
-		hash.Hashes[key] = hashKeyCode(key)
+		hashAddStoredKey(hash, key)
 		return args[1]
 	}
 	if existing, _, found := hashFindStoredKeyValue(hash, args[0]); found {
@@ -32821,7 +32985,7 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 	hash.Pairs[key] = args[1]
 	hash.Keys = append(hash.Keys, key)
-	hash.Hashes[key] = hashKeyCode(key)
+	hashAddStoredKey(hash, key)
 	return args[1]
 }
 
@@ -47517,7 +47681,15 @@ func hashDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if data == nil {
 		return R.NilVal
 	}
-	if k, v, ok := hashFindKeyValue(data.Pairs, deleteKey, data.CompareByIdentity); ok {
+	var k, v *object.EmeraldValue
+	var ok bool
+	if data.CompareByIdentity {
+		k = hashIdentityKey(deleteKey)
+		v, ok = data.Pairs[k]
+	} else {
+		k, v, ok = hashFindStoredKeyValue(data, deleteKey)
+	}
+	if ok {
 		delete(data.Pairs, k)
 		hashRemoveOrderedKey(receiver, k)
 		return v
@@ -47535,6 +47707,9 @@ func hashClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if h := hashData(receiver); h != nil {
 		h.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue)
 		h.Keys = []*object.EmeraldValue{}
+		h.Hashes = make(map[*object.EmeraldValue]int64)
+		h.Buckets = make(map[int64][]*object.EmeraldValue)
+		h.BucketSize = 0
 		return receiver
 	}
 	receiver.Data = make(map[*object.EmeraldValue]*object.EmeraldValue)
@@ -52030,12 +52205,9 @@ func stringConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		values = append(values, value)
 	}
 	for _, value := range values {
-		encoding, errVal := StringConcatenationEncoding(receiver, value)
-		if errVal != nil {
+		if errVal := appendStringValue(receiver, value); errVal != nil {
 			return errVal
 		}
-		receiver.Data = stringRawValue(receiver) + stringRawValue(value)
-		SetStringEncoding(receiver, encoding)
 	}
 	return receiver
 }
@@ -52044,7 +52216,65 @@ func stringConcatOne(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if len(args) != 1 {
 		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
 	}
-	return stringConcat(receiver, args[0])
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen String")
+	}
+	value, errVal := stringConcatenationValue(receiver, args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if errVal := appendStringValue(receiver, value); errVal != nil {
+		return errVal
+	}
+	return receiver
+}
+
+func appendStringValue(receiver, value *object.EmeraldValue) *object.EmeraldValue {
+	encoding, errVal := StringConcatenationEncoding(receiver, value)
+	if errVal != nil {
+		return errVal
+	}
+	raw := stringRawValue(receiver)
+	builder := stringAppendBuilders[receiver]
+	if builder == nil || !sameStringStorage(builder.String(), raw) {
+		builder = &strings.Builder{}
+		builder.Grow(len(raw) + 64)
+		builder.WriteString(raw)
+		stringAppendBuilders[receiver] = builder
+	}
+	builder.WriteString(stringRawValue(value))
+	receiver.Data = builder.String()
+	SetStringEncoding(receiver, encoding)
+	return nil
+}
+
+func AppendASCIIBytes(receiver *object.EmeraldValue, raw string) *object.EmeraldValue {
+	if receiver == nil || receiver.Type != object.ValueString {
+		return typeError("no implicit conversion into String")
+	}
+	if receiver.Frozen {
+		return frozenError("can't modify frozen String")
+	}
+	encoding := stringEncodingName(receiver)
+	if !encodingIsASCICompatible(encoding) {
+		return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible character encodings")
+	}
+	current := stringRawValue(receiver)
+	builder := stringAppendBuilders[receiver]
+	if builder == nil || !sameStringStorage(builder.String(), current) {
+		builder = &strings.Builder{}
+		builder.Grow(len(current) + len(raw) + 64)
+		builder.WriteString(current)
+		stringAppendBuilders[receiver] = builder
+	}
+	builder.WriteString(raw)
+	receiver.Data = builder.String()
+	SetStringEncoding(receiver, encoding)
+	return nil
+}
+
+func sameStringStorage(left, right string) bool {
+	return len(left) == len(right) && (len(left) == 0 || unsafe.StringData(left) == unsafe.StringData(right))
 }
 
 func stringCoerceConcatenationString(value *object.EmeraldValue) (*object.EmeraldValue, *object.EmeraldValue) {
@@ -53223,7 +53453,14 @@ func hashMergeInto(target *object.RHash, arg *object.EmeraldValue) *object.Emera
 		if !ok {
 			continue
 		}
-		existingKey, existingValue, found := hashFindKeyValue(target.Pairs, key, target.CompareByIdentity)
+		var existingKey, existingValue *object.EmeraldValue
+		var found bool
+		if target.CompareByIdentity {
+			existingKey = hashIdentityKey(key)
+			existingValue, found = target.Pairs[existingKey]
+		} else {
+			existingKey, existingValue, found = hashFindStoredKeyValue(target, key)
+		}
 		if found {
 			if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
 				value = CallBlock(existingKey, existingValue, value)
@@ -53233,10 +53470,20 @@ func hashMergeInto(target *object.RHash, arg *object.EmeraldValue) *object.Emera
 		}
 		target.Pairs[key] = value
 		target.Keys = append(target.Keys, key)
+		if !target.CompareByIdentity {
+			hashAddStoredKey(target, key)
+		}
 	}
 	for _, key := range keysNotInOrder(other, keys) {
 		value := other[key]
-		existingKey, existingValue, found := hashFindKeyValue(target.Pairs, key, target.CompareByIdentity)
+		var existingKey, existingValue *object.EmeraldValue
+		var found bool
+		if target.CompareByIdentity {
+			existingKey = hashIdentityKey(key)
+			existingValue, found = target.Pairs[existingKey]
+		} else {
+			existingKey, existingValue, found = hashFindStoredKeyValue(target, key)
+		}
 		if found {
 			if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
 				value = CallBlock(existingKey, existingValue, value)
@@ -53246,6 +53493,9 @@ func hashMergeInto(target *object.RHash, arg *object.EmeraldValue) *object.Emera
 		}
 		target.Pairs[key] = value
 		target.Keys = append(target.Keys, key)
+		if !target.CompareByIdentity {
+			hashAddStoredKey(target, key)
+		}
 	}
 	return nil
 }
@@ -53302,7 +53552,7 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
 		return newLoopEnumerator()
 	}
-	if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+	if debugEnumEnabled {
 		fmt.Printf("builtinLoop enter blockGiven=%v\n", BlockGivenCheck())
 	}
 	iterations := 0
@@ -53314,7 +53564,7 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		if enumeratorLimitAbort {
 			return R.NilVal
 		}
-		if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+		if debugEnumEnabled {
 			if LastException == nil {
 				fmt.Println("builtinLoop after call: no exception")
 			} else {
@@ -53322,7 +53572,7 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 			}
 		}
 		if LastException != nil {
-			if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+			if debugEnumEnabled {
 				exc := LastException
 				r := exc.Data.(*object.RException)
 				fmt.Printf("builtinLoop handling exception class=%s resultNil=%v\n", exc.Class.Name, r.Result == nil)
@@ -53330,7 +53580,7 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 			if classInheritsFrom(LastException.Class, R.Classes["StopIteration"]) {
 				exc := LastException.Data.(*object.RException)
 				LastException = nil
-				if os.Getenv("RGO_DEBUG_ENUM") == "1" {
+				if debugEnumEnabled {
 					if exc.Result == nil {
 						fmt.Println("builtinLoop stop result=nil")
 					} else {
@@ -58265,6 +58515,7 @@ func openStructDeleteField(receiver *object.EmeraldValue, args ...*object.Emeral
 	if klass := R.Classes["OpenStruct"]; klass != nil {
 		delete(klass.Methods, name)
 		delete(klass.Methods, name+"=")
+		object.BumpMethodGeneration()
 	}
 	return value
 }
@@ -62225,7 +62476,7 @@ func loadWrappedTopLevelSelf(wrapModule *object.EmeraldValue) *object.EmeraldVal
 	singleton := SingletonClass(copyValue)
 	if singleton != nil && singleton.Type == object.ValueClass && wrapModule != nil && wrapModule.Type == object.ValueModule {
 		class := singleton.Data.(*object.Class)
-		class.IncludedModules = append(class.IncludedModules, wrapModule.Data.(*object.Module))
+		class.Include(wrapModule.Data.(*object.Module))
 	}
 	return copyValue
 }
@@ -65483,6 +65734,10 @@ func TracePointEventActive(event string) bool {
 		}
 	}
 	return false
+}
+
+func AnyTracePointActive() bool {
+	return !tracePointDispatching && len(activeTracePoints) > 0
 }
 
 func FireTracePointLine(binding *object.RBinding, frameID int) {
@@ -73914,7 +74169,7 @@ func (r *marshalReader) readValueRaw() (*object.EmeraldValue, *object.EmeraldVal
 			return nil, singletonValue
 		}
 		singleton := singletonValue.Data.(*object.Class)
-		singleton.IncludedModules = append(singleton.IncludedModules, moduleValue.Data.(*object.Module))
+		singleton.Include(moduleValue.Data.(*object.Module))
 		return value, nil
 	case 'S':
 		classNameValue, errVal := r.readInternalValue()
@@ -85943,7 +86198,13 @@ func hashRemoveOrderedKey(receiver, key *object.EmeraldValue) {
 		return
 	}
 	rhash, ok := receiver.Data.(*object.RHash)
-	if !ok || len(rhash.Keys) == 0 {
+	if !ok {
+		return
+	}
+	delete(rhash.Hashes, key)
+	rhash.Buckets = nil
+	rhash.BucketSize = 0
+	if len(rhash.Keys) == 0 {
 		return
 	}
 	for i, existing := range rhash.Keys {
@@ -86501,6 +86762,23 @@ func evaluateKindOfMatcher(payload expectationData, matcher *kindOfMatcher) *obj
 		return R.TrueVal
 	}
 	specRunner.FailCount++
+	actual := "nil"
+	if payload.Value != nil {
+		actual = payload.Value.Inspect()
+		className := ""
+		if payload.Value.Class != nil {
+			className = payload.Value.Class.Name
+			actual = className + " " + actual
+		}
+		if data, ok := payload.Value.Data.(*uriData); ok {
+			actual = className + " " + uriDataString(data)
+		}
+	}
+	expected := "nil"
+	if matcher.Class != nil {
+		expected = matcher.Class.Name
+	}
+	fmt.Printf("    FAILED: expected kind of %s, got %s\n", expected, actual)
 	return R.FalseVal
 }
 
@@ -87442,6 +87720,7 @@ func RegisterMspec() {
 						for name := range missing {
 							delete(root.Methods, name)
 						}
+						object.BumpMethodGeneration()
 					}
 					EvalSource(source)
 				}
@@ -91770,7 +92049,7 @@ func refinementImportMethods(receiver *object.EmeraldValue, args ...*object.Emer
 				closure.RefinementsFixed = true
 				copy.Closure = &closure
 			}
-			target.Methods[name] = &copy
+			target.DefineMethod(name, &copy)
 		}
 	}
 	return receiver

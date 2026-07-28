@@ -41,6 +41,7 @@ func NewModule(name string) *Module {
 
 func (m *Module) DefineMethod(name string, method *Method) {
 	m.Methods[name] = method
+	BumpMethodGeneration()
 }
 
 func (m *Module) GetMethod(name string) (*Method, bool) {
@@ -91,14 +92,17 @@ func (m *Module) Include(module *Module) {
 			m.Methods[name] = method
 		}
 	}
+	BumpMethodGeneration()
 }
 
 func (m *Module) Extend(module *Module) {
 	for name, method := range module.Methods {
 		m.Methods[name] = method
 	}
+	BumpMethodGeneration()
 }
 
 func (m *Module) Prepend(module *Module) {
 	m.PrependedModules = append([]*Module{module}, m.PrependedModules...)
+	BumpMethodGeneration()
 }
