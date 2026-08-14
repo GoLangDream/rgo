@@ -199,6 +199,14 @@ func TestNativePDFRenderLayoutTemplateBindsTypedGraphAndRejectsShapeDrift(t *tes
 	if !ok || output.String() != want {
 		t.Fatalf("typed layout = %q, generic = %q, generic ok=%t", output.String(), want, ok)
 	}
+	var programOutput strings.Builder
+	program := template.writePrograms[template.rootNode]
+	if !nativePDFRenderWriteLayoutProgram(&programOutput, bound, program, 0) {
+		t.Fatal("compiled typed layout writer rejected bound graph")
+	}
+	if programOutput.String() != want {
+		t.Fatalf("compiled typed layout = %q, generic = %q", programOutput.String(), want)
+	}
 
 	wrongKey := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Other", Class: core.R.Classes["Symbol"]}
 	wrongData := nativePDFHashValue([2]*object.EmeraldValue{wrongKey, core.NewIntegerValue(99)})
@@ -216,5 +224,24 @@ func TestNativePDFRenderLayoutTemplateBindsTypedGraphAndRejectsShapeDrift(t *tes
 	}
 	if nativePDFRenderLayoutTemplateFor(cyclePlan, referenceClass) != nil {
 		t.Fatal("cyclic graph must not produce a typed layout template")
+	}
+}
+
+func TestNativePDFRenderRealTextMatchesRubyNumberShape(t *testing.T) {
+	tests := []struct {
+		value float64
+		want  string
+	}{
+		{value: 0, want: "0"},
+		{value: -0, want: "0"},
+		{value: 36, want: "36"},
+		{value: 1.3, want: "1.3"},
+		{value: -1.23456, want: "-1.23456"},
+		{value: 12.345678, want: "12.34568"},
+	}
+	for _, test := range tests {
+		if got := nativePDFRenderRealText(test.value); got != test.want {
+			t.Errorf("nativePDFRenderRealText(%v) = %q, want %q", test.value, got, test.want)
+		}
 	}
 }

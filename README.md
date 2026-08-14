@@ -111,6 +111,16 @@ reference generation 或方法/常量代际不匹配时立即 side-exit；布局
 较大 composite 仍使用原有 compiler/serializer 路径。该模板只改变 proven hot region，不放宽
 自定义 trailer、回调、压缩/加密、子类或非 ASCII guard。
 
+随后又把该模板的瞬时绑定、Reference/page plan 和 serializer 叶子进一步压平：每个模板复用
+per-VM scratch，array/hash 结构预编译为带节点索引的 typed write program，`nil`、布尔、整数、
+浮点、symbol、string 和 reference 直接走对应写入 op；普通 map-backed Reference 的 `@id/@gen`
+及 stream ivar 读取也走已证明的对象布局，浮点格式化绕过 `fmt`。节点绑定、对象代际、Hash
+键、stream cache 和所有 Ruby 可观察写入仍保留 guard，任何 miss 都 side-exit。该增量不放宽
+兼容边界：重建后二页/大图/溢出/重定义 smoke 与定向测试保持一致；单核 20,000 次同图 render
+约 `0.336s`，关闭整个 region 约 `1.8s`。关闭更高层 Prawn AOT/lifecycle 的动态三页 5000
+次为 `0.907s` 对 `1.281s`（约 `1.41x`），剩余主成本仍是对象布局 guard、Hash/ivar map 读取
+和文档构建，因此不把该结果外推为稳定 `3–10x`。
+
 在同一台机器的 20,000 次重复 `Renderer#render` 低负载单核样本中，模板路径两次约
 `0.34–0.35s`，模板接入前二进制约 `0.38–0.39s`；关闭整个 Renderer region 约 `1.8s`。
 这说明 renderer serialization 子路径有约 `1.1x` 的增量和约 `5x` 的 Ruby-region 差距，

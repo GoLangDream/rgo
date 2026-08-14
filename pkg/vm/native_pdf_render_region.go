@@ -95,6 +95,26 @@ type nativePDFRenderLayoutNode struct {
 	entries []nativePDFRenderLayoutEntry
 }
 
+type nativePDFRenderLayoutWriteOpKind uint8
+
+const (
+	nativePDFRenderLayoutWriteLiteral nativePDFRenderLayoutWriteOpKind = iota
+	nativePDFRenderLayoutWriteLength
+	nativePDFRenderLayoutWriteNil
+	nativePDFRenderLayoutWriteBool
+	nativePDFRenderLayoutWriteInteger
+	nativePDFRenderLayoutWriteFloat
+	nativePDFRenderLayoutWriteSymbol
+	nativePDFRenderLayoutWriteString
+	nativePDFRenderLayoutWriteReference
+)
+
+type nativePDFRenderLayoutWriteOp struct {
+	kind nativePDFRenderLayoutWriteOpKind
+	node int
+	text string
+}
+
 type nativePDFRenderLayoutReference struct {
 	dataNode      int
 	rawPresent    bool
@@ -102,12 +122,24 @@ type nativePDFRenderLayoutReference struct {
 }
 
 type nativePDFRenderLayoutTemplate struct {
-	key       nativePDFRenderLayoutTemplateKey
-	rootNode  int
-	infoNode  int
-	signature string
-	nodes     []nativePDFRenderLayoutNode
-	refs      []nativePDFRenderLayoutReference
+	key                 nativePDFRenderLayoutTemplateKey
+	rootNode            int
+	infoNode            int
+	signature           string
+	nodes               []nativePDFRenderLayoutNode
+	refs                []nativePDFRenderLayoutReference
+	writePrograms       [][]nativePDFRenderLayoutWriteOp
+	writeLengthPrograms [][]nativePDFRenderLayoutWriteOp
+
+	// A VM executes one Ruby frame at a time. Keep the transient binding and
+	// reference/page plans on the per-VM template so a hot render does not
+	// allocate a second object graph description on every call. The slices are
+	// never exposed to Ruby and are overwritten before the next use.
+	scratchBound          *nativePDFRenderBoundLayout
+	scratchRefs           []*object.EmeraldValue
+	scratchData           []*object.EmeraldValue
+	scratchReferencePlans []nativePDFRenderReferencePlan
+	scratchPagePlans      []nativePDFRenderPagePlan
 }
 
 type nativePDFRenderBoundLayout struct {
@@ -206,7 +238,7 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 	var output strings.Builder
 	output.Grow(1024 + len(plan.refs)*96)
 	output.WriteString("%PDF-")
-	output.WriteString(nativePDFRealText(plan.version))
+	output.WriteString(nativePDFRenderRealText(plan.version))
 	output.WriteString("\n%\xFF\xFF\xFF\xFF\n")
 	// The complete object graph was cycle-checked by nativePDFRenderRegionPlan
 	// before any writer mutation. No Ruby callback can run between that proof
@@ -472,7 +504,7 @@ func nativePDFRenderRegionInputsFor(receiver *object.EmeraldValue, stateClass, s
 	store := nativePrawnTextLayoutIvar(state, "@store")
 	if state == nil || state.Type != object.ValueObject || state.Class != stateClass || state.Frozen ||
 		store == nil || store.Type != object.ValueObject || store.Class != storeClass || store.Frozen ||
-		core.AttachedSingletonClass(state) != nil || core.AttachedSingletonClass(store) != nil {
+		!nativePDFRenderObjectSingletonFree(state) || !nativePDFRenderObjectSingletonFree(store) {
 		return nativePDFRenderRegionInputs{}, false
 	}
 	versionValue := nativePrawnTextLayoutIvar(state, "@version")
@@ -548,6 +580,43 @@ func nativePDFRenderRegionInputsFor(receiver *object.EmeraldValue, stateClass, s
 	}, true
 }
 
+// nativePDFRenderObjectIvar is the renderer's exact object-layout read. All
+// callers use it only after the surrounding ABI has proven an ordinary Ruby
+// object; compact/hot-sidecar values retain the historical flush-aware read.
+// Keeping this fallback local lets the common map-backed Prawn shape avoid the
+// generic value-kind dispatch on every Reference field.
+func nativePDFRenderObjectIvar(value *object.EmeraldValue, name string) *object.EmeraldValue {
+	if value != nil && value.Type == object.ValueObject {
+		if data, ok := value.Data.(*object.Object); ok && data != nil {
+			if data.HotIntegerInstanceVarMask != 0 || data.Class != nil && data.Class.CompactInstanceVars && data.InstanceVars == nil {
+				return data.GetInstanceVar(name)
+			}
+			if data.InstanceVars != nil {
+				return data.InstanceVars[name]
+			}
+			return nil
+		}
+	}
+	return core.DynamicInstanceVar(value, name)
+}
+
+func nativePDFRenderObjectIntegerIvar(value *object.EmeraldValue, name string) (int64, bool) {
+	item := nativePDFRenderObjectIvar(value, name)
+	if item == nil || item.Type != object.ValueInteger || item.BigIntValue() != nil {
+		return 0, false
+	}
+	integer, ok := item.Data.(int64)
+	return integer, ok
+}
+
+func nativePDFRenderObjectSingletonFree(value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueObject {
+		return false
+	}
+	data, ok := value.Data.(*object.Object)
+	return ok && data != nil && data.SingletonClass == nil
+}
+
 func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, receiver *object.EmeraldValue, referenceClass, streamClass, filterListClass, pageClass, stackClass *object.Class) (*nativePDFRenderRegionPlan, bool) {
 	if vm == nil {
 		return nil, false
@@ -562,8 +631,20 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 		if template == nil || len(template.refs) != len(inputs.ids) {
 			continue
 		}
-		refs := make([]*object.EmeraldValue, len(inputs.ids))
-		refData := make([]*object.EmeraldValue, len(inputs.ids))
+		refs := template.scratchRefs
+		if cap(refs) < len(inputs.ids) {
+			refs = make([]*object.EmeraldValue, len(inputs.ids))
+		} else {
+			refs = refs[:len(inputs.ids)]
+		}
+		refData := template.scratchData
+		if cap(refData) < len(inputs.ids) {
+			refData = make([]*object.EmeraldValue, len(inputs.ids))
+		} else {
+			refData = refData[:len(inputs.ids)]
+		}
+		template.scratchRefs = refs
+		template.scratchData = refData
 		for index, id := range inputs.ids {
 			if id == nil || id.Type != object.ValueInteger {
 				return nil, false
@@ -573,20 +654,34 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 				return nil, false
 			}
 			refs[index] = ref
-			refData[index] = nativePrawnTextLayoutIvar(ref, "@data")
+			refData[index] = nativePDFRenderObjectIvar(ref, "@data")
 		}
 		bound, ok := nativePDFRenderBindLayoutTemplate(template, inputs.root, inputs.info, refData, referenceClass)
 		if !ok {
 			continue
 		}
+		refPlans := template.scratchReferencePlans
+		if cap(refPlans) < len(inputs.ids) {
+			refPlans = make([]nativePDFRenderReferencePlan, len(inputs.ids))
+		} else {
+			refPlans = refPlans[:len(inputs.ids)]
+		}
+		template.scratchReferencePlans = refPlans
+		pagePlans := template.scratchPagePlans
+		if cap(pagePlans) < len(inputs.pageItems) {
+			pagePlans = make([]nativePDFRenderPagePlan, len(inputs.pageItems))
+		} else {
+			pagePlans = pagePlans[:len(inputs.pageItems)]
+		}
+		template.scratchPagePlans = pagePlans
 		plan := &nativePDFRenderRegionPlan{
 			renderer:    receiver,
 			state:       inputs.state,
 			store:       inputs.store,
 			identifiers: inputs.identifiers,
 			objects:     inputs.objects,
-			refs:        make([]nativePDFRenderReferencePlan, 0, len(inputs.ids)),
-			pages:       make([]nativePDFRenderPagePlan, 0, len(inputs.pageItems)),
+			refs:        refPlans,
+			pages:       pagePlans,
 			root:        inputs.root,
 			info:        inputs.info,
 			version:     inputs.version,
@@ -599,18 +694,18 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 				matched = false
 				break
 			}
-			plan.refs = append(plan.refs, refPlan)
+			plan.refs[index] = refPlan
 		}
 		if !matched {
 			continue
 		}
-		for _, page := range inputs.pageItems {
+		for index, page := range inputs.pageItems {
 			pagePlan, pageOK := nativePDFBuildPagePlan(page, inputs.state, pageClass, stackClass)
 			if !pageOK {
 				matched = false
 				break
 			}
-			plan.pages = append(plan.pages, pagePlan)
+			plan.pages[index] = pagePlan
 		}
 		if matched {
 			return plan, true
@@ -623,12 +718,20 @@ func nativePDFRenderBindLayoutTemplate(template *nativePDFRenderLayoutTemplate, 
 	if template == nil || template.rootNode < 0 || template.infoNode < 0 || len(template.nodes) == 0 || referenceClass == nil {
 		return nil, false
 	}
-	bound := &nativePDFRenderBoundLayout{
-		template:    template,
-		values:      make([]*object.EmeraldValue, len(template.nodes)),
-		bound:       make([]bool, len(template.nodes)),
-		identifiers: make([]int64, len(template.nodes)),
-		generations: make([]int64, len(template.nodes)),
+	bound := template.scratchBound
+	if bound == nil || len(bound.values) != len(template.nodes) {
+		bound = &nativePDFRenderBoundLayout{
+			template:    template,
+			values:      make([]*object.EmeraldValue, len(template.nodes)),
+			bound:       make([]bool, len(template.nodes)),
+			identifiers: make([]int64, len(template.nodes)),
+			generations: make([]int64, len(template.nodes)),
+		}
+		template.scratchBound = bound
+	} else {
+		for index := range bound.bound {
+			bound.bound[index] = false
+		}
 	}
 	if !nativePDFRenderAssignLayoutNode(bound, template.rootNode, root) || !nativePDFRenderAssignLayoutNode(bound, template.infoNode, info) || len(refData) != len(template.refs) {
 		return nil, false
@@ -737,11 +840,11 @@ func nativePDFRenderLayoutNodeGuard(node nativePDFRenderLayoutNode, value *objec
 		hash, ok := value.Data.(*object.RHash)
 		return ok && hash != nil && len(hash.Keys) == len(node.entries) && len(hash.Pairs) == len(node.entries)
 	case object.ValueObject:
-		if value.Class != referenceClass || core.AttachedSingletonClass(value) != nil {
+		if value.Class != referenceClass || !nativePDFRenderObjectSingletonFree(value) {
 			return false
 		}
-		identifier, identifierOK := nativePDFObjectIntegerIvar(value, "@identifier")
-		generation, generationOK := nativePDFObjectIntegerIvar(value, "@gen")
+		identifier, identifierOK := nativePDFRenderObjectIntegerIvar(value, "@identifier")
+		generation, generationOK := nativePDFRenderObjectIntegerIvar(value, "@gen")
 		if !identifierOK || !generationOK || bound == nil || nodeIndex >= len(bound.identifiers) || nodeIndex >= len(bound.generations) {
 			return false
 		}
@@ -800,16 +903,16 @@ func nativePDFRenderLayoutHashValueFromRHash(hash *object.RHash, entry nativePDF
 }
 
 func nativePDFRenderLayoutKeyName(key *object.EmeraldValue) (string, bool) {
-	if key == nil || core.AttachedSingletonClass(key) != nil {
+	if key == nil {
 		return "", false
 	}
 	switch key.Type {
-	case object.ValueString:
-		if key.Class != core.R.Classes["String"] {
-			return "", false
-		}
 	case object.ValueSymbol:
 		if key.Class != core.R.Classes["Symbol"] {
+			return "", false
+		}
+	case object.ValueString:
+		if key.Class != core.R.Classes["String"] || core.AttachedSingletonClass(key) != nil {
 			return "", false
 		}
 	default:
@@ -833,33 +936,33 @@ func nativePDFRenderLayoutNodeHasKey(template *nativePDFRenderLayoutTemplate, no
 
 func nativePDFRenderReferenceLayoutPlanFor(ref, data *object.EmeraldValue, layoutRef nativePDFRenderLayoutReference, template *nativePDFRenderLayoutTemplate, bound *nativePDFRenderBoundLayout, referenceClass, streamClass, filterListClass *object.Class) (nativePDFRenderReferencePlan, bool) {
 	if ref == nil || ref.Type != object.ValueObject || ref.Class != referenceClass || ref.Frozen ||
-		core.AttachedSingletonClass(ref) != nil || layoutRef.dataNode < 0 || layoutRef.dataNode >= len(template.nodes) {
+		!nativePDFRenderObjectSingletonFree(ref) || layoutRef.dataNode < 0 || layoutRef.dataNode >= len(template.nodes) {
 		return nativePDFRenderReferencePlan{}, false
 	}
-	identifier, identifierOK := nativePDFObjectIntegerIvar(ref, "@identifier")
-	generation, generationOK := nativePDFObjectIntegerIvar(ref, "@gen")
+	identifier, identifierOK := nativePDFRenderObjectIntegerIvar(ref, "@identifier")
+	generation, generationOK := nativePDFRenderObjectIntegerIvar(ref, "@gen")
 	if !identifierOK || !generationOK || bound == nil || layoutRef.dataNode >= len(bound.values) || bound.values[layoutRef.dataNode] != nativePDFRenderLayoutCanonicalValue(data) {
 		return nativePDFRenderReferencePlan{}, false
 	}
 	boundData := bound.values[layoutRef.dataNode]
-	stream := nativePrawnTextLayoutIvar(ref, "@stream")
+	stream := nativePDFRenderObjectIvar(ref, "@stream")
 	if stream == nil || stream.Type != object.ValueObject || stream.Class != streamClass || stream.Frozen ||
-		core.AttachedSingletonClass(stream) != nil {
+		!nativePDFRenderObjectSingletonFree(stream) {
 		return nativePDFRenderReferencePlan{}, false
 	}
-	filters := nativePrawnTextLayoutIvar(stream, "@filters")
-	list := nativePrawnTextLayoutIvar(filters, "@list")
+	filters := nativePDFRenderObjectIvar(stream, "@filters")
+	list := nativePDFRenderObjectIvar(filters, "@list")
 	items, itemsOK := ([]*object.EmeraldValue)(nil), false
 	if list != nil {
 		items, itemsOK = list.Data.([]*object.EmeraldValue)
 	}
 	if filters == nil || filters.Type != object.ValueObject || filters.Class != filterListClass ||
-		filters.Frozen || core.AttachedSingletonClass(filters) != nil || list == nil || list.Type != object.ValueArray ||
+		filters.Frozen || !nativePDFRenderObjectSingletonFree(filters) || list == nil || list.Type != object.ValueArray ||
 		list.Class != core.R.Classes["Array"] || core.AttachedSingletonClass(list) != nil || !itemsOK || len(items) != 0 {
 		return nativePDFRenderReferencePlan{}, false
 	}
-	raw := nativePrawnTextLayoutIvar(stream, "@stream")
-	filtered := nativePrawnTextLayoutIvar(stream, "@filtered_stream")
+	raw := nativePDFRenderObjectIvar(stream, "@stream")
+	filtered := nativePDFRenderObjectIvar(stream, "@filtered_stream")
 	rawPresent := raw != nil && raw.Type != object.ValueNil
 	filteredPresent := filtered != nil && filtered.Type != object.ValueNil
 	if rawPresent != layoutRef.rawPresent || filteredPresent != layoutRef.filteredCache {
@@ -946,6 +1049,9 @@ func nativePDFRenderLayoutTemplateFor(plan *nativePDFRenderRegionPlan, reference
 		})
 	}
 	template.nodes = builder.nodes
+	if !nativePDFRenderBuildLayoutPrograms(template) {
+		return nil
+	}
 	template.signature = nativePDFRenderLayoutSignature(template)
 	return template
 }
@@ -1080,6 +1186,105 @@ func (builder *nativePDFRenderLayoutTemplateBuilder) add(value *object.EmeraldVa
 	}
 	builder.nodes[index].kind = value.Type
 	return index
+}
+
+func nativePDFRenderBuildLayoutPrograms(template *nativePDFRenderLayoutTemplate) bool {
+	if template == nil || len(template.nodes) == 0 {
+		return false
+	}
+	template.writePrograms = make([][]nativePDFRenderLayoutWriteOp, len(template.nodes))
+	template.writeLengthPrograms = make([][]nativePDFRenderLayoutWriteOp, len(template.nodes))
+	for index := range template.nodes {
+		program, ok := nativePDFRenderCompileLayoutWriteProgram(template, index, false)
+		if !ok {
+			return false
+		}
+		template.writePrograms[index] = program
+		if template.nodes[index].kind == object.ValueHash {
+			lengthProgram, lengthOK := nativePDFRenderCompileLayoutWriteProgram(template, index, true)
+			if !lengthOK {
+				return false
+			}
+			template.writeLengthPrograms[index] = lengthProgram
+		}
+	}
+	return true
+}
+
+func nativePDFRenderCompileLayoutWriteProgram(template *nativePDFRenderLayoutTemplate, rootNode int, withLength bool) ([]nativePDFRenderLayoutWriteOp, bool) {
+	if template == nil || rootNode < 0 || rootNode >= len(template.nodes) {
+		return nil, false
+	}
+	program := make([]nativePDFRenderLayoutWriteOp, 0, 16)
+	visiting := make([]bool, len(template.nodes))
+	var appendNode func(int, bool) bool
+	appendNode = func(nodeIndex int, addLength bool) bool {
+		if nodeIndex < 0 || nodeIndex >= len(template.nodes) || visiting[nodeIndex] {
+			return false
+		}
+		node := template.nodes[nodeIndex]
+		visiting[nodeIndex] = true
+		defer func() { visiting[nodeIndex] = false }()
+		switch node.kind {
+		case object.ValueArray:
+			program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: "["})
+			for index, child := range node.items {
+				if index != 0 {
+					program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: " "})
+				}
+				if !appendNode(child, false) {
+					return false
+				}
+			}
+			program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: "]"})
+		case object.ValueHash:
+			program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: "<< "})
+			lengthWritten := false
+			for _, entry := range node.entries {
+				if addLength && !lengthWritten && entry.keyName > "Length" {
+					program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLength})
+					lengthWritten = true
+				}
+				program = append(program,
+					nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: nativePDFSymbolText(entry.keyName)},
+					nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: " "})
+				if !appendNode(entry.node, false) {
+					return false
+				}
+				program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: "\n"})
+			}
+			if addLength && !lengthWritten {
+				program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLength})
+			}
+			program = append(program, nativePDFRenderLayoutWriteOp{kind: nativePDFRenderLayoutWriteLiteral, text: ">>"})
+		default:
+			var kind nativePDFRenderLayoutWriteOpKind
+			switch node.kind {
+			case object.ValueNil:
+				kind = nativePDFRenderLayoutWriteNil
+			case object.ValueBool:
+				kind = nativePDFRenderLayoutWriteBool
+			case object.ValueInteger:
+				kind = nativePDFRenderLayoutWriteInteger
+			case object.ValueFloat:
+				kind = nativePDFRenderLayoutWriteFloat
+			case object.ValueSymbol:
+				kind = nativePDFRenderLayoutWriteSymbol
+			case object.ValueString:
+				kind = nativePDFRenderLayoutWriteString
+			case object.ValueObject:
+				kind = nativePDFRenderLayoutWriteReference
+			default:
+				return false
+			}
+			program = append(program, nativePDFRenderLayoutWriteOp{kind: kind, node: nodeIndex})
+		}
+		return true
+	}
+	if !appendNode(rootNode, withLength) {
+		return nil, false
+	}
+	return program, true
 }
 
 func nativePDFRenderLayoutKeyForName(value *object.EmeraldValue, name string) *object.EmeraldValue {
@@ -1692,7 +1897,7 @@ func nativePDFRenderReferenceLayout(output *strings.Builder, ref *nativePDFRende
 	nativePDFRenderWriteInt(output, ref.generation)
 	output.WriteString(" obj\n")
 	if !layoutRef.rawPresent {
-		if !nativePDFRenderWriteLayoutNode(output, layout, layoutRef.dataNode, false) {
+		if layoutRef.dataNode >= len(layout.template.writePrograms) || !nativePDFRenderWriteLayoutProgram(output, layout, layout.template.writePrograms[layoutRef.dataNode], 0) {
 			return false
 		}
 		output.WriteString("\nendobj\n")
@@ -1728,31 +1933,160 @@ func nativePDFRenderWriteLayoutHashWithLength(output *strings.Builder, layout *n
 			return false
 		}
 	}
-	output.WriteString("<< ")
-	lengthWritten := false
-	for _, entry := range node.entries {
-		if !lengthWritten && entry.keyName > "Length" {
+	if nodeIndex >= len(layout.template.writeLengthPrograms) {
+		return false
+	}
+	return nativePDFRenderWriteLayoutProgram(output, layout, layout.template.writeLengthPrograms[nodeIndex], length)
+}
+
+func nativePDFRenderWriteLayoutProgram(output *strings.Builder, layout *nativePDFRenderBoundLayout, program []nativePDFRenderLayoutWriteOp, length int) bool {
+	if output == nil || layout == nil || layout.template == nil || len(program) == 0 {
+		return false
+	}
+	for _, op := range program {
+		switch op.kind {
+		case nativePDFRenderLayoutWriteLiteral:
+			output.WriteString(op.text)
+		case nativePDFRenderLayoutWriteLength:
 			nativePDFRenderWriteSymbol(output, "Length")
 			output.WriteByte(' ')
 			nativePDFRenderWriteInt(output, int64(length))
 			output.WriteByte('\n')
-			lengthWritten = true
-		}
-		nativePDFRenderWriteSymbol(output, entry.keyName)
-		output.WriteByte(' ')
-		if !nativePDFRenderWriteLayoutNode(output, layout, entry.node, false) {
+		case nativePDFRenderLayoutWriteNil:
+			if op.node < 0 || op.node >= len(layout.values) || op.node >= len(layout.bound) || !layout.bound[op.node] {
+				return false
+			}
+			output.WriteString("null")
+		case nativePDFRenderLayoutWriteBool:
+			if op.node < 0 || op.node >= len(layout.values) || !layout.bound[op.node] {
+				return false
+			}
+			truth, ok := layout.values[op.node].Data.(bool)
+			if !ok {
+				return false
+			}
+			if truth {
+				output.WriteString("true")
+			} else {
+				output.WriteString("false")
+			}
+		case nativePDFRenderLayoutWriteInteger:
+			if op.node < 0 || op.node >= len(layout.values) || !layout.bound[op.node] || !nativePDFRenderWriteIntegerValue(output, layout.values[op.node]) {
+				return false
+			}
+		case nativePDFRenderLayoutWriteFloat:
+			if op.node < 0 || op.node >= len(layout.values) || !layout.bound[op.node] {
+				return false
+			}
+			floatValue, ok := layout.values[op.node].Data.(float64)
+			if !ok || math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+				return false
+			}
+			output.WriteString(nativePDFRenderRealText(floatValue))
+		case nativePDFRenderLayoutWriteSymbol:
+			if op.node < 0 || op.node >= len(layout.values) || !layout.bound[op.node] {
+				return false
+			}
+			name, ok := layout.values[op.node].Data.(string)
+			if !ok {
+				return false
+			}
+			nativePDFRenderWriteSymbol(output, name)
+		case nativePDFRenderLayoutWriteString:
+			if op.node < 0 || op.node >= len(layout.values) || !layout.bound[op.node] {
+				return false
+			}
+			value := layout.values[op.node]
+			raw, ok := value.Data.(string)
+			if !ok {
+				return false
+			}
+			if nativePDFRenderWriteASCIIString(output, raw, false) {
+				continue
+			}
+			text, textOK := nativePDFStringText(value, false)
+			if !textOK {
+				return false
+			}
+			output.WriteString(text)
+		case nativePDFRenderLayoutWriteReference:
+			if op.node < 0 || op.node >= len(layout.identifiers) || op.node >= len(layout.generations) || !layout.bound[op.node] {
+				return false
+			}
+			nativePDFRenderWriteInt(output, layout.identifiers[op.node])
+			output.WriteByte(' ')
+			nativePDFRenderWriteInt(output, layout.generations[op.node])
+			output.WriteString(" R")
+		default:
 			return false
 		}
-		output.WriteByte('\n')
 	}
-	if !lengthWritten {
-		nativePDFRenderWriteSymbol(output, "Length")
-		output.WriteByte(' ')
-		nativePDFRenderWriteInt(output, int64(length))
-		output.WriteByte('\n')
-	}
-	output.WriteString(">>")
 	return true
+}
+
+func nativePDFRenderWriteLayoutLeaf(output *strings.Builder, layout *nativePDFRenderBoundLayout, nodeIndex int, inContentStream bool) bool {
+	if output == nil || layout == nil || layout.template == nil || nodeIndex < 0 || nodeIndex >= len(layout.template.nodes) || nodeIndex >= len(layout.values) || !layout.bound[nodeIndex] {
+		return false
+	}
+	node := layout.template.nodes[nodeIndex]
+	value := layout.values[nodeIndex]
+	switch node.kind {
+	case object.ValueNil:
+		output.WriteString("null")
+		return true
+	case object.ValueBool:
+		truth, ok := value.Data.(bool)
+		if !ok {
+			return false
+		}
+		if truth {
+			output.WriteString("true")
+		} else {
+			output.WriteString("false")
+		}
+		return true
+	case object.ValueInteger:
+		return nativePDFRenderWriteIntegerValue(output, value)
+	case object.ValueFloat:
+		floatValue, ok := value.Data.(float64)
+		if !ok || math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+			return false
+		}
+		output.WriteString(nativePDFRenderRealText(floatValue))
+		return true
+	case object.ValueSymbol:
+		name, ok := value.Data.(string)
+		if !ok {
+			return false
+		}
+		nativePDFRenderWriteSymbol(output, name)
+		return true
+	case object.ValueString:
+		raw, ok := value.Data.(string)
+		if !ok {
+			return false
+		}
+		if nativePDFRenderWriteASCIIString(output, raw, inContentStream) {
+			return true
+		}
+		text, textOK := nativePDFStringText(value, inContentStream)
+		if !textOK {
+			return false
+		}
+		output.WriteString(text)
+		return true
+	case object.ValueObject:
+		if nodeIndex >= len(layout.identifiers) || nodeIndex >= len(layout.generations) {
+			return false
+		}
+		nativePDFRenderWriteInt(output, layout.identifiers[nodeIndex])
+		output.WriteByte(' ')
+		nativePDFRenderWriteInt(output, layout.generations[nodeIndex])
+		output.WriteString(" R")
+		return true
+	default:
+		return false
+	}
 }
 
 func nativePDFRenderWriteLayoutNode(output *strings.Builder, layout *nativePDFRenderBoundLayout, nodeIndex int, inContentStream bool) bool {
@@ -1883,6 +2217,22 @@ func nativePDFRenderReference(output *strings.Builder, ref *nativePDFRenderRefer
 func nativePDFRenderWriteInt(output *strings.Builder, value int64) {
 	var buffer [32]byte
 	output.Write(strconv.AppendInt(buffer[:0], value, 10))
+}
+
+func nativePDFRenderRealText(value float64) string {
+	var buffer [32]byte
+	encoded := strconv.AppendFloat(buffer[:0], value, 'f', 5, 64)
+	end := len(encoded)
+	for end > 0 && encoded[end-1] == '0' {
+		end--
+	}
+	if end > 0 && encoded[end-1] == '.' {
+		end--
+	}
+	if end == 2 && encoded[0] == '-' && encoded[1] == '0' {
+		return "0"
+	}
+	return string(encoded[:end])
 }
 
 func nativePDFRenderWriteIntegerValue(output *strings.Builder, value *object.EmeraldValue) bool {
