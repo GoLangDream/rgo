@@ -52,6 +52,17 @@ func hasOpcode(instructions Instructions, op Opcode) bool {
 	return false
 }
 
+func TestCompileCatchWithoutBlockDoesNotSetLastException(t *testing.T) {
+	previous := core.LastException
+	core.LastException = nil
+	t.Cleanup(func() { core.LastException = previous })
+
+	compile(t, `catch(:missing_block)`)
+	if core.LastException != nil {
+		t.Fatalf("compilation leaked an exception into runtime state: %v", core.LastException)
+	}
+}
+
 func flipFlopStateIDs(instructions Instructions) []int {
 	var ids []int
 	for i := 0; i < len(instructions); {
@@ -102,6 +113,13 @@ func TestCompileMultipleSplatsAsSingleExpandableArray(t *testing.T) {
 	bc := compile(t, `f(*[:a], *[:b], *[:c], 10)`)
 	if !hasOpcode(bc.Instructions, OpSplatToArray) {
 		t.Fatal("expected multiple splats to be packed into an expandable array")
+	}
+}
+
+func TestCompileYieldMultipleSplatsAsSingleExpandableArray(t *testing.T) {
+	bc := compile(t, `yield(*[:a], *[:b])`)
+	if !hasOpcode(bc.Instructions, OpYieldWithSplat) || !hasOpcode(bc.Instructions, OpSplatToArray) {
+		t.Fatal("expected multiple yield splats to be packed into an expandable array")
 	}
 }
 
@@ -200,6 +218,34 @@ func functionConstants(bytecode *Bytecode) []*object.Function {
 	return functions
 }
 
+func TestMethodLocalLoadsUseFastOpcodeUnlessCaptured(t *testing.T) {
+	bytecode := compile(t, `
+def fast_local(value)
+	value.to_s
+end
+def captured_local(value)
+  reader = -> { value }
+  reader.call
+  value
+end
+`)
+	var fast, captured *object.Function
+	for _, fn := range functionConstants(bytecode) {
+		switch fn.Name {
+		case "fast_local":
+			fast = fn
+		case "captured_local":
+			captured = fn
+		}
+	}
+	if fast == nil || !hasOpcode(fast.Instructions, OpGetLocalFast) {
+		t.Fatal("expected uncaptured method local to use OpGetLocalFast")
+	}
+	if captured == nil || !hasOpcode(captured.Instructions, OpGetLocalCell) || !hasOpcode(captured.Instructions, OpGetLocal) {
+		t.Fatalf("expected captured method local to retain cell-aware OpGetLocal: %x", captured.Instructions)
+	}
+}
+
 func TestCompileParameterDestructuringMetadata(t *testing.T) {
 	bytecode := compile(t, `def unpack((a, *middle, z)); [a, middle, z]; end`)
 	var fn *object.Function
@@ -259,7 +305,7 @@ call_proc { x + 1 }`)
 
 	foundBlockWithLocal := false
 	for _, fn := range functionConstants(bytecode) {
-		if hasOpcode(fn.Instructions, OpGetLocal) {
+		if hasOpcode(fn.Instructions, OpGetLocal) || hasOpcode(fn.Instructions, OpGetLocalFast) {
 			foundBlockWithLocal = true
 			break
 		}
@@ -277,7 +323,7 @@ end
 call_proc { x + 1 }`)
 	foundBlockWithLocal := false
 	for _, fn := range functionConstants(bytecode) {
-		if hasOpcode(fn.Instructions, OpGetLocal) {
+		if hasOpcode(fn.Instructions, OpGetLocal) || hasOpcode(fn.Instructions, OpGetLocalFast) {
 			foundBlockWithLocal = true
 			break
 		}
@@ -455,7 +501,7 @@ func TestCompileDefUsesDistinctLocalIndexes(t *testing.T) {
 
 	indexes := []byte{}
 	for i := 0; i < len(fn.Instructions); i++ {
-		if Opcode(fn.Instructions[i]) == OpGetLocal {
+		if op := Opcode(fn.Instructions[i]); op == OpGetLocal || op == OpGetLocalFast {
 			indexes = append(indexes, fn.Instructions[i+1])
 			i++
 		}
@@ -465,6 +511,23 @@ func TestCompileDefUsesDistinctLocalIndexes(t *testing.T) {
 	}
 	if indexes[0] != 0 || indexes[1] != 1 {
 		t.Fatalf("expected local indexes [0 1], got %v", indexes)
+	}
+}
+
+func TestCompileStringLiteralMatchingParameterAsConstant(t *testing.T) {
+	bc := compile(t, `def assign_link(hash, href); hash["href"] = href; end`)
+	var fn *object.Function
+	for _, candidate := range functionConstants(bc) {
+		if candidate.Name == "assign_link" {
+			fn = candidate
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("expected compiled assign_link function")
+	}
+	if got := countOpcode(fn.Instructions, OpConstant); got != 1 {
+		t.Fatalf("expected literal \"href\" to compile as one constant, got %d", got)
 	}
 }
 
@@ -496,6 +559,18 @@ x`)
 	}
 }
 
+func TestCompilerReusesIntegerConstants(t *testing.T) {
+	c := New()
+	first := c.addConstant(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(42), Class: core.R.Classes["Integer"]})
+	second := c.addConstant(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(42), Class: core.R.Classes["Integer"]})
+	if first != second {
+		t.Fatalf("expected repeated integer constant index %d, got %d", first, second)
+	}
+	if len(c.constants) != 1 {
+		t.Fatalf("expected one integer constant, got %d", len(c.constants))
+	}
+}
+
 func TestCompileInstanceVariableLambdaAssignmentDoesNotCorruptConstants(t *testing.T) {
 	bc := compile(t, `@value_to_return = -> _ { true }`)
 	for i := 0; i < len(bc.Instructions); i++ {
@@ -513,6 +588,46 @@ func TestCompileInstanceVariableLambdaAssignmentDoesNotCorruptConstants(t *testi
 		for _, width := range def.OperandWidths {
 			i += width
 		}
+	}
+}
+
+func TestBytecodeBindsCompiledFunctionsToFinalConstantPool(t *testing.T) {
+	bc := compile(t, `-> { "value" }`)
+	for _, constant := range bc.Constants {
+		fn, ok := constant.Data.(*object.Function)
+		if !ok {
+			continue
+		}
+		if len(fn.Constants) != len(bc.Constants) || len(bc.Constants) == 0 || &fn.Constants[0] != &bc.Constants[0] {
+			t.Fatalf("compiled function does not reference the final bytecode constant pool")
+		}
+		return
+	}
+	t.Fatal("expected compiled lambda function constant")
+}
+
+func TestCompiledAttributeMethodShapes(t *testing.T) {
+	bc := compile(t, `class Shape
+  def value
+    @value
+  end
+  def value=(value)
+    @value = value
+  end
+end`)
+	shapes := map[string][]byte{}
+	for _, constant := range bc.Constants {
+		if fn, ok := constant.Data.(*object.Function); ok && (fn.Name == "value" || fn.Name == "value=") {
+			shapes[fn.Name] = append([]byte(nil), fn.Instructions...)
+		}
+	}
+	reader := shapes["value"]
+	if len(reader) != 4 || Opcode(reader[0]) != OpGetInstanceVar || Opcode(reader[3]) != OpReturnValue {
+		t.Fatalf("unexpected attribute reader shape: %#v", reader)
+	}
+	writer := shapes["value="]
+	if len(writer) != 6 || (Opcode(writer[0]) != OpGetLocal && Opcode(writer[0]) != OpGetLocalFast) || Opcode(writer[2]) != OpSetInstanceVar || Opcode(writer[5]) != OpReturnValue {
+		t.Fatalf("unexpected attribute writer shape: %#v", writer)
 	}
 }
 

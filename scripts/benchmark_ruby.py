@@ -11,10 +11,38 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-RGO = ROOT / "rgo"
+RGO = Path(os.environ.get("RGO_BIN", ROOT / "rgo")).resolve()
 MRI = os.environ.get("RGO_MRI") or shutil.which("ruby")
 REPEATS = int(os.environ.get("RGO_BENCH_REPEATS", "9"))
 STARTUP_REPEATS = int(os.environ.get("RGO_BENCH_STARTUP_REPEATS", "21"))
+BENCH_NICE = int(os.environ.get("RGO_BENCH_NICE", "15"))
+BENCH_CPU = os.environ.get("RGO_BENCH_CPU", "").strip()
+
+
+def benchmark_cpu_set():
+    if not BENCH_CPU:
+        return None
+    cpus = set()
+    for item in BENCH_CPU.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = (int(part) for part in item.split("-", 1))
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(item))
+    return cpus or None
+
+
+BENCH_CPU_SET = benchmark_cpu_set()
+
+
+def setup_benchmark_child():
+    if BENCH_CPU_SET is not None and hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, BENCH_CPU_SET)
+    if BENCH_NICE:
+        os.nice(BENCH_NICE)
 
 
 def checked_output(argv, env):
@@ -26,6 +54,7 @@ def checked_output(argv, env):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        preexec_fn=setup_benchmark_child,
     ).stdout
 
 
@@ -33,6 +62,7 @@ def run_once(argv, env):
     started = time.perf_counter()
     pid = os.fork()
     if pid == 0:
+        setup_benchmark_child()
         null_fd = os.open(os.devnull, os.O_WRONLY)
         os.dup2(null_fd, 1)
         os.dup2(null_fd, 2)
@@ -67,11 +97,12 @@ def main():
         ("startup", ["-e", "nil"], STARTUP_REPEATS),
         ("arith", [str(ROOT / "bench/ruby/arith.rb")], REPEATS),
         ("dispatch", [str(ROOT / "bench/ruby/dispatch.rb")], REPEATS),
+        ("blocks", [str(ROOT / "bench/ruby/blocks.rb")], REPEATS),
         ("collections", [str(ROOT / "bench/ruby/collections.rb")], REPEATS),
         ("strings", [str(ROOT / "bench/ruby/strings.rb")], REPEATS),
     ]
 
-    print("case,engine,median_ms,min_ms,max_ms,median_rss_kb")
+    print("case,engine,median_ms,min_ms,max_ms,median_rss_kb,rgo_over_mri")
     for name, args, repeats in cases:
         rgo_argv = [str(RGO)] + args
         mri_argv = [str(Path(MRI)), "--disable-gems"] + args
@@ -79,8 +110,9 @@ def main():
             raise RuntimeError(f"{name}: RGo and MRI output differ")
         rgo = measure(rgo_argv, rgo_env, repeats)
         mri = measure(mri_argv, mri_env, repeats)
-        print(f"{name},RGO,{rgo[0]*1000:.3f},{rgo[1]*1000:.3f},{rgo[2]*1000:.3f},{rgo[3]:.0f}")
-        print(f"{name},MRI,{mri[0]*1000:.3f},{mri[1]*1000:.3f},{mri[2]*1000:.3f},{mri[3]:.0f}")
+        ratio = rgo[0] / mri[0] if mri[0] > 0 else float("inf")
+        print(f"{name},RGO,{rgo[0]*1000:.3f},{rgo[1]*1000:.3f},{rgo[2]*1000:.3f},{rgo[3]:.0f},{ratio:.3f}")
+        print(f"{name},MRI,{mri[0]*1000:.3f},{mri[1]*1000:.3f},{mri[2]*1000:.3f},{mri[3]:.0f},1.000")
     return 0
 
 

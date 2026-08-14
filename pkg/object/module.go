@@ -4,6 +4,7 @@ type Module struct {
 	Name                string
 	NameValue           *EmeraldValue
 	TemporaryName       bool
+	SyntheticNamespace  bool
 	IsRefinement        bool
 	RefinementTarget    *EmeraldValue
 	RefinementOwner     *EmeraldValue
@@ -86,6 +87,11 @@ func (m *Module) GetInstanceVar(name string) *EmeraldValue {
 }
 
 func (m *Module) Include(module *Module) {
+	for _, included := range m.IncludedModules {
+		if included == module {
+			return
+		}
+	}
 	m.IncludedModules = append(m.IncludedModules, module)
 	for name, method := range module.Methods {
 		if _, ok := m.Methods[name]; !ok {

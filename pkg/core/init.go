@@ -45,8 +45,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 	"unsafe"
+	"weak"
 
 	"github.com/GoLangDream/rgo/pkg/object"
+	"golang.org/x/crypto/ripemd160"
 	textencoding "golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/japanese"
@@ -58,7 +60,21 @@ import (
 
 type BuiltinMethod func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue
 
-var debugEnumEnabled = os.Getenv("RGO_DEBUG_ENUM") == "1"
+var (
+	debugEnumEnabled                = os.Getenv("RGO_DEBUG_ENUM") == "1"
+	eagerRuntimeExceptionBacktrace  = os.Getenv("RGO_EAGER_EXCEPTION_BACKTRACE") == "1"
+	eagerRegexpDerivedGlobals       = os.Getenv("RGO_EAGER_REGEXP_GLOBALS") == "1"
+	objectSpaceTrackingDisabled     = os.Getenv("RGO_DISABLE_OBJECTSPACE_TRACKING") != ""
+	integerHashBatchEnabled         = os.Getenv("RGO_DISABLE_INTEGER_HASH_BATCH") == ""
+	integerHashBatchGroupedEnabled  = os.Getenv("RGO_DISABLE_INTEGER_HASH_GROUPED_BATCH") == ""
+	integerHashBatchLinearEnabled   = os.Getenv("RGO_DISABLE_INTEGER_HASH_LINEAR_BATCH") == ""
+	arraySumIntegerFastEnabled      = os.Getenv("RGO_DISABLE_ARRAY_SUM_INTEGER_FAST") == ""
+	integerToSCacheEnabled          = os.Getenv("RGO_DISABLE_INTEGER_TO_S_CACHE") == ""
+	stringBatchSmallIntegerEnabled  = os.Getenv("RGO_DISABLE_STRING_BATCH_SMALL_INTEGER") == ""
+	asciiBytePatternChunkedEnabled  = os.Getenv("RGO_DISABLE_ASCII_BYTE_PATTERN_CHUNK") == ""
+	collectionLoopBuiltinGeneration atomic.Uint64
+	collectionLoopBuiltinState      atomic.Uint32
+)
 
 type matchDataData struct {
 	Matches   []string
@@ -68,6 +84,15 @@ type matchDataData struct {
 	Names     map[string][]int
 	NameOrder []string
 	Regexp    *object.EmeraldValue
+	Derived   *matchDataDerivedCache
+}
+
+type matchDataDerivedCache struct {
+	Captures []*object.EmeraldValue
+	Whole    *object.EmeraldValue
+	Before   *object.EmeraldValue
+	After    *object.EmeraldValue
+	Last     *object.EmeraldValue
 }
 
 type monitorData struct {
@@ -225,6 +250,7 @@ type httpResponseData struct {
 	message     string
 	header      *httpHeaderData
 	body        *object.EmeraldValue
+	uri         *object.EmeraldValue
 	readBody    bool
 	bodySocket  *object.EmeraldValue
 	pendingBody string
@@ -265,10 +291,114 @@ type tracePointData struct {
 }
 
 var CallBlock func(args ...*object.EmeraldValue) *object.EmeraldValue
+var CallBlockOne func(arg *object.EmeraldValue) *object.EmeraldValue
+var IntegerTimesCapturedBlock func(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// IOEachLineCapturedBlock is an optional VM-owned entry for a proven
+// File/IO#each_line callback. The producer remains inside core so file read,
+// separator and EOF semantics stay centralized; the VM may only replace the
+// repeated block frame protocol.
+var IOEachLineCapturedBlock func(receiver, block *object.EmeraldValue, args []*object.EmeraldValue, next func() *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// StringEachByteCapturedBlock is an optional VM-owned batch entry for a
+// proven String#each_byte callback. The ordinary implementation remains the
+// semantic fallback; the VM may replace the whole byte loop only after
+// proving the callback and object layouts.
+var StringEachByteCapturedBlock func(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// IntegerTimesLinearBlock is an optional VM-owned batch entry for the pure
+// arithmetic subset of Integer#times callbacks.  The core loop keeps the
+// ordinary CallBlockOne path as its semantic fallback; the hook is only
+// entered when a VM can prove that the callback has no sends, captures or
+// non-local control flow.
+var IntegerTimesLinearBlock func(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+var ArrayEachCapturedBlock func(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+var ArrayMapCapturedBlock func(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+var EnumerableFindCapturedBlock func(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// ArrayReduceCapturedBlock is an optional VM-owned entry for a proven
+// two-argument Array#reduce block. The ordinary reduction loop remains the
+// semantic fallback; the VM may only replace the repeated block frame setup.
+var ArrayReduceCapturedBlock func(receiver, block, accumulator *object.EmeraldValue, start int) (*object.EmeraldValue, bool)
+
+// HashEachTypedCall is an optional VM-owned entry for a narrowly proven
+// two-argument Hash#each call graph. The ordinary loop remains the semantic
+// fallback; the VM may replace only the callback body while preserving the
+// ordered live-key view supplied here.
+var HashEachTypedCall func(receiver, block *object.EmeraldValue, keys []*object.EmeraldValue, hash map[*object.EmeraldValue]*object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// HashEachCapturedBlock is an optional VM-owned entry for a fully proven
+// two-argument Hash#each region. The ordered keys and live pair map are passed
+// in by core so the VM can preserve Hash's stale-key checks without rebuilding
+// the iteration view.
+var HashEachCapturedBlock func(receiver, block *object.EmeraldValue, keys []*object.EmeraldValue, hash map[*object.EmeraldValue]*object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// HashEachFramedBlock is an optional VM-owned entry for a proven ordinary
+// two-argument Hash#each block. The VM may reuse one Ruby Frame across the
+// ordered live-key view while retaining the normal Register IR send and
+// exception protocol for the block body.
+var HashEachFramedBlock func(receiver, block *object.EmeraldValue, keys []*object.EmeraldValue, hash map[*object.EmeraldValue]*object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// EnumerableEachWithObjectCapturedBlock is an optional VM-owned entry for a
+// proven exact Array/Hash#each_with_object callback. The ordinary method keeps
+// the semantic fallback; the VM may only reuse the callback Frame after it has
+// checked the block's control-flow and capture shape.
+var EnumerableEachWithObjectCapturedBlock func(receiver, block, memo *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// HashMapCapturedBlock is an optional VM-owned entry for a pure Hash#map
+// result region. The VM requests the ordered live view only after it has
+// proved the block shape, so ordinary small/dynamic maps do not pay for an
+// extra key slice when the optimization cannot apply.
+var HashMapCapturedBlock func(receiver, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// HashEachUsesBuiltinImplementation lets VM-owned Hash#map regions preserve
+// Enumerable's dispatch semantics: the fast map loop may replace the built-in
+// map's call to each only while Hash#each itself is still the exact builtin.
+func HashEachUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "each", BuiltinMethod(hashEach))
+}
+
+// HashMapUsesBuiltinImplementation guards VM-owned Hash#map regions against a
+// class-level override before they erase the ordinary block protocol.
+func HashMapUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "map", BuiltinMethod(hashMap))
+}
+
+// ArrayNewCapturedBlock is a VM-owned batch entry for a proven
+// `Array.new(n) { Class.new(...) }` constructor block. It returns the fully
+// populated backing slice and leaves all other block/control-flow shapes on
+// the ordinary per-element protocol.
+var ArrayNewCapturedBlock func(length int64, block *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue, bool)
+
+// ArrayNewCapturedLazyBlock is the deferred sibling of ArrayNewCapturedBlock.
+// It may return a region only when the VM can later materialize the exact
+// constructor result or consume it through an equally proven typed path.
+var ArrayNewCapturedLazyBlock func(length int64, block *object.EmeraldValue) (*object.LazyArrayRegion, *object.EmeraldValue, bool)
+var IntegerRangeCapturedBlock func(receiver *object.EmeraldValue, start, end int64, ascending bool, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+var IntegerRangeLinearBlock func(receiver *object.EmeraldValue, start, end int64, exclusive, collect bool, block *object.EmeraldValue) (*object.EmeraldValue, bool)
+
+// callBlockOne avoids the variadic argument slice used by CallBlock for the
+// overwhelmingly common one-argument Array/Enumerable callbacks.  Keep the
+// fallback for embedders that initialize only the legacy callback hook.
+func callBlockOne(arg *object.EmeraldValue) *object.EmeraldValue {
+	if CallBlockOne != nil {
+		return CallBlockOne(arg)
+	}
+	if CallBlock != nil {
+		return CallBlock(arg)
+	}
+	return R.NilVal
+}
+
 var TracePointActivated func() (int, string, int64)
 
 var CallMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
 var InvokeMethodObject func(receiver *object.EmeraldValue, method *object.Method, args ...*object.EmeraldValue) *object.EmeraldValue
+
+// FastClassNew is an optional VM-owned constructor ABI. It is called only
+// after classNew has ruled out the builtin collection/module/struct branches;
+// a false result falls through to the complete Ruby initialization protocol.
+var FastClassNew func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) (*object.EmeraldValue, bool)
 var CallPublicMethod func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
 var CallMethodBypass func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
 var CallMethodWithoutBlockBypass func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue
@@ -284,6 +414,7 @@ var CallBlockWithSelf func(block *object.EmeraldValue, self *object.EmeraldValue
 var AbortCurrentBlock func(value *object.EmeraldValue)
 var ClearPendingBlockControl func()
 var ConsumeBlockControl func()
+var NonLocalReturnPending func() bool
 var BeginSpecExampleIsolation func() func()
 
 var EnterThreadBlock func()
@@ -347,6 +478,7 @@ var ResolveLoadPath func(path string) string
 
 var InMethodScope func() bool
 var InRescue func() bool
+var CurrentRescueException func() *object.EmeraldValue
 
 var LastBlockResult *object.EmeraldValue
 var forEachContextStack []struct {
@@ -379,17 +511,15 @@ var unixServerListeners = map[*object.EmeraldValue]net.Listener{}
 var unixServerPaths = map[string]bool{}
 var fileLocks = map[string]map[*object.EmeraldValue]int64{}
 var fileLockWaiters = map[string][]*object.EmeraldValue{}
-var ruby2KeywordHashes map[*object.EmeraldValue]bool
 var procRuby2KeywordFunctions map[*object.Function]bool
 var fileUtimeOverrides map[string]fileTimeOverride
 var currentFileUmask int64 = 0022
-var stringEncodings map[*object.EmeraldValue]string
-var stringAppendBuilders map[*object.EmeraldValue]*strings.Builder
 var stringComparisonInverseDepth int
 var attachedSingletonClasses map[*object.EmeraldValue]*object.Class
-var auxiliaryInstanceVars map[*object.EmeraldValue]map[string]*object.EmeraldValue
 var deduplicatedStrings map[string]*object.EmeraldValue
 var symbolEncodings map[*object.EmeraldValue]string
+var internedStringSymbols map[string]*object.EmeraldValue
+var internedStringSymbolsMu sync.Mutex
 var symbolNameStrings map[string]*object.EmeraldValue
 var constantNameEncodings map[string]string
 var encodingValues map[string]*object.EmeraldValue
@@ -412,10 +542,27 @@ var objectIDCounter int64
 var objectIDByInteger map[int64]int64
 var objectIDBySymbol map[string]int64
 var objectIDByValue map[*object.EmeraldValue]int64
-var objectSpaceTracked []*object.EmeraldValue
+var objectIDByClass map[*object.Class]int64
+var objectIDByModule map[*object.Module]int64
+var objectSpaceTracked []weak.Pointer[object.EmeraldValue]
+var objectSpaceTotalAllocated int64
+var objectSpaceTrackedSinceCompact int
+var lazyArrayRegions []weak.Pointer[object.EmeraldValue]
+
+// Batch VM allocators append thousands of weak entries at once. Keeping the
+// normal small threshold for individual allocations is useful for long-lived
+// compatibility code, but scanning the whole weak list after every compiled
+// constructor batch dominates the hot path. ObjectSpace enumeration already
+// skips cleared weak pointers, and explicit GC still compacts immediately.
+const objectSpaceBatchCompactionThreshold = 65536
+
 var objectSpaceFinalizers map[*object.EmeraldValue][]*object.EmeraldValue
+var objectSpaceTraceDepth int
+var objectSpaceTraceRetained []*object.EmeraldValue
 var hashIdentityIntegerKeys map[int64]*object.EmeraldValue
 var hashIdentitySymbolKeys map[string]*object.EmeraldValue
+var hashIdentityClassKeys map[*object.Class]*object.EmeraldValue
+var hashIdentityModuleKeys map[*object.Module]*object.EmeraldValue
 var nextIOFd int64
 var ioDataByFd map[int64]*ioShimData
 var ioPipeBuffers map[int64]*bytes.Buffer
@@ -429,6 +576,22 @@ var ioPopenLoopDoPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])loop[[:space:]]+
 var evalSourceEncodingCommentPattern = regexp.MustCompile(`(?i)^\s*#.*(?:coding|encoding)\s*[:=]\s*([A-Za-z0-9_\-]+)`)
 var evalSourceFrozenStringLiteralPattern = regexp.MustCompile(`(?i)frozen_string_literal\s*:`)
 var exceptionPathFromMessagePattern = regexp.MustCompile(`^(.+?):\d+:\s`)
+var rubyLargeBackreferencePattern = regexp.MustCompile(`\\([1-9][0-9]{3,})`)
+var rubyStandaloneNegativeLookbehindPattern = regexp.MustCompile(`^\(\?<![^()]*\)$`)
+var rubyNamedCapturePattern = regexp.MustCompile(`\(\?<([A-Za-z_]\w*)>`)
+var rubyInlineOptionGroupPattern = regexp.MustCompile(`\(\?([imx]*)(?:-([imx]*))?([:)])`)
+var rubyRegexpCompileCacheMu sync.RWMutex
+var rubyRegexpCompileCache = make(map[rubyRegexpCompileCacheKey]*regexp.Regexp)
+
+const rubyRegexpCompileCacheLimit = 2048
+const rubyEmojiTextPresentationIntersection = `[\p{Emoji}&&\P{EPres}](?<![#*0-9])`
+const rubyEmojiCodepointApproximation = `[\x{00A9}\x{00AE}\x{203C}-\x{3299}\x{1F000}-\x{1FAFF}]`
+
+type rubyRegexpCompileCacheKey struct {
+	pattern string
+	options string
+}
+
 var suppressFileOpenBlock bool
 var suppressIOPipeBlock bool
 var signalExceptionNumbers map[*object.EmeraldValue]int64
@@ -564,11 +727,7 @@ type weakMapData struct {
 var argfClassValue *object.EmeraldValue
 
 func rubyString(value string) *object.EmeraldValue {
-	str := &object.EmeraldValue{Type: object.ValueString, Data: value, Class: R.Classes["String"]}
-	if stringEncodings != nil {
-		stringEncodings[str] = defaultExternalEncoding
-	}
-	return str
+	return &object.EmeraldValue{Type: object.ValueString, Data: value, Class: R.StringClass, Encoding: defaultExternalEncoding}
 }
 
 func EnvObject() *object.EmeraldValue {
@@ -666,6 +825,7 @@ type enumeratorData struct {
 	limitFunc         func(limit int) ([]*object.EmeraldValue, *object.EmeraldValue)
 	forceFunc         func(args ...*object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue)
 	eachFunc          func() *object.EmeraldValue
+	eachWithBlock     func(block *object.EmeraldValue) *object.EmeraldValue
 	size              *int64
 	sizeValue         *object.EmeraldValue
 	sizeFunc          func() *object.EmeraldValue
@@ -895,6 +1055,7 @@ type ioShimData struct {
 	nonblock               bool
 	bufferedRead           bool
 	closed                 bool
+	fdRegistered           bool
 	readClosed             bool
 	writeClosed            bool
 	closeOnExec            bool
@@ -903,6 +1064,7 @@ type ioShimData struct {
 	peerClosed             bool
 	ungetBuffer            string
 	stringValue            *object.EmeraldValue
+	stringValueDirty       bool
 	path                   string
 	pathEncoding           string
 	newlineMode            string
@@ -1323,6 +1485,15 @@ func markFeatureRequired(path string) {
 	features.Data = append(arr, &object.EmeraldValue{Type: object.ValueString, Data: path, Class: R.Classes["String"]})
 }
 
+func markResolvedFeatureRequired(path string) {
+	if ResolveRequirePath == nil {
+		return
+	}
+	if resolved := ResolveRequirePath(path); resolved != "" {
+		markFeatureRequired(resolved)
+	}
+}
+
 var scratchPadRecorded *object.EmeraldValue
 var defaultThreadGroup *object.EmeraldValue
 var evaluatingRaiseErrorMatcher bool
@@ -1342,12 +1513,51 @@ var refinementModules map[*object.EmeraldValue]map[any]*object.EmeraldValue
 var kernelModuleView *object.Module
 var specTimeLocation *time.Location
 var classHierarchyMu sync.Mutex
+var classInitializeCacheMu sync.RWMutex
+var classInitializeCache = make(map[*object.Class]classInitializeCacheEntry)
 var structEqualityStack = make(map[[3]*object.EmeraldValue]bool)
 var structInspectStack = make(map[*object.EmeraldValue]bool)
 var structHashStack = make(map[*object.EmeraldValue]bool)
 var hashEqlStack = make(map[[2]*object.EmeraldValue]bool)
 var comparableEqualMu sync.Mutex
 var comparableEqualActive = make(map[[2]*object.EmeraldValue]bool)
+
+// classInitializeCacheEntry is a generation-guarded lookup result for the
+// instance initializer used by Class#new.  Class construction is a very hot
+// protocol in object-heavy Ruby code, but the method hierarchy is immutable
+// between BumpMethodGeneration calls.  Keeping the resolved Method avoids a
+// full ancestor walk and a second name lookup on every allocation while still
+// deopting immediately after reopen/include/prepend/alias changes.
+type classInitializeCacheEntry struct {
+	generation uint64
+	method     *object.Method
+	owner      *object.Class
+	found      bool
+}
+
+func cachedClassInitializeMethod(cls *object.Class) (*object.Method, *object.Class, bool) {
+	if cls == nil {
+		return nil, nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	classInitializeCacheMu.RLock()
+	entry, found := classInitializeCache[cls]
+	classInitializeCacheMu.RUnlock()
+	if found && entry.generation == generation {
+		return entry.method, entry.owner, entry.found
+	}
+	method, owner, hasMethod := cls.GetMethodWithOwner("initialize")
+	// classHasMethod deliberately treats BasicObject#initialize as absent for
+	// subclasses; retain that exact behavior in the cached result.
+	if hasMethod && owner != nil && owner.Name == "BasicObject" && cls.Name != "BasicObject" {
+		method, owner, hasMethod = nil, owner, false
+	}
+	entry = classInitializeCacheEntry{generation: generation, method: method, owner: owner, found: hasMethod}
+	classInitializeCacheMu.Lock()
+	classInitializeCache[cls] = entry
+	classInitializeCacheMu.Unlock()
+	return method, owner, hasMethod
+}
 
 func EvaluatingRaiseErrorMatcher() bool {
 	return evaluatingRaiseErrorMatcher
@@ -1360,11 +1570,33 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if !ok {
 		return typeError("uninitialized class")
 	}
+	if document, handled := nativePrawnSimpleDocumentNew(receiver, args...); handled {
+		return document
+	}
 	if classIsSingletonValueClass(cls) {
 		return NewNoMethodError("undefined method `new'")
 	}
 	if cls.Name == "Float" || cls.Name == "Rational" {
 		return NewNoMethodError("undefined method `new' for " + cls.Name + ":Class")
+	}
+	// The VM fast constructor has its own complete class-family and method
+	// protocol guards. Enter it before the generic allocation taxonomy so
+	// ordinary user classes do not pay every Struct/Module/collection ancestry
+	// probe before reaching the same fast path. Special value classes and the
+	// Float/Rational error cases remain above this entry by design.
+	if FastClassNew != nil && (CurrentBlockValue == nil || CurrentBlockValue() == nil) {
+		if result, handled := FastClassNew(receiver, args...); handled {
+			return result
+		}
+	}
+	if (cls == R.Classes["Object"] || cls == R.Classes["BasicObject"]) &&
+		classResolvesBuiltinMethod(cls, "initialize", BuiltinMethod(basicObjectInitialize)) {
+		if len(args) != 0 {
+			return argumentError("wrong number of arguments")
+		}
+		obj := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewBareObject(cls), Class: cls}
+		trackObjectSpaceValue(obj)
+		return obj
 	}
 	if cls != R.Classes["Struct"] && R.Classes["Struct"] != nil && classInheritsFrom(cls, R.Classes["Struct"]) && structFieldsForClass(cls) == nil {
 		return structClassNew(receiver, args...)
@@ -1399,6 +1631,30 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 			}
 		}
 		return classValue
+	}
+	if R.Classes["Module"] != nil && classInheritsFrom(cls, R.Classes["Module"]) {
+		return moduleClassNew(receiver, args...)
+	}
+	// Exact core collection classes normally reach the branches below through
+	// classInheritsFrom plus a second initialize lookup.  Keep the shortcut
+	// guarded by the builtin function identity so reopening Array/Hash/String
+	// or prepending a module immediately falls back to the complete Ruby path.
+	if cls == R.Classes["String"] && classMethodUsesBuiltin(cls, "initialize", BuiltinMethod(stringInitialize)) {
+		obj := &object.EmeraldValue{Type: object.ValueString, Data: "", Class: cls}
+		SetStringEncoding(obj, "BINARY")
+		return stringInitialize(obj, args...)
+	}
+	if cls == R.Classes["Array"] && classMethodUsesBuiltin(cls, "initialize", BuiltinMethod(arrayInitialize)) {
+		obj := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: cls}
+		return arrayInitialize(obj, args...)
+	}
+	if cls == R.Classes["Hash"] && classMethodUsesBuiltin(cls, "initialize", BuiltinMethod(hashInitialize)) {
+		obj := emptyHashValue()
+		obj.Class = cls
+		if result := hashInitialize(obj, args...); result != nil && result.Type == object.ValueException {
+			return result
+		}
+		return obj
 	}
 	if classInheritsFrom(cls, R.Classes["Exception"]) {
 		message := classToS(cls)
@@ -1500,11 +1756,20 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		}
 		return obj
 	}
-	obj := &object.EmeraldValue{
-		Type:  object.ValueObject,
-		Data:  object.NewObject(cls),
-		Class: cls,
+	// Most small Ruby classes inherit BasicObject#initialize unchanged.  There
+	// is no user code to invoke in that case; allocate the object directly and
+	// preserve the same arity error/track hook as the generic path.  The
+	// function-identity guard makes class reopen/prepend/redefinition deopt.
+	if classResolvesBuiltinMethod(cls, "initialize", BuiltinMethod(basicObjectInitialize)) {
+		if len(args) != 0 {
+			return argumentError("wrong number of arguments")
+		}
+		obj := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewBareObject(cls), Class: cls}
+		trackObjectSpaceValue(obj)
+		return obj
 	}
+	obj := object.NewObjectValue(cls)
+	initializeStructStorage(obj)
 	trackObjectSpaceValue(obj)
 	if cls.Name == "BasicObject" {
 		if len(args) > 0 {
@@ -1512,18 +1777,25 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		}
 		return obj
 	}
-	if CallMethod != nil && classHasMethod(cls, "initialize") {
-		call := CallMethodBypass
-		if call == nil {
-			call = CallMethod
-		}
+	if method, _, hasInitialize := cachedClassInitializeMethod(cls); hasInitialize && (CallMethod != nil || InvokeMethodObject != nil) {
 		previousBlockResult := LastBlockResult
 		hasBlock := CurrentBlockValue != nil && CurrentBlockValue() != nil
 		if hasBlock {
 			LastBlockResult = nil
 		}
-		result := call(obj, "initialize", args...)
-		if result != nil && result.Type == object.ValueException {
+		var result *object.EmeraldValue
+		if InvokeMethodObject != nil {
+			// The VM's resolved-method hook enters the same visibility-bypassed
+			// invocation protocol as Class#new, without repeating method lookup.
+			result = InvokeMethodObject(obj, method, args...)
+		} else {
+			call := CallMethodBypass
+			if call == nil {
+				call = CallMethod
+			}
+			result = call(obj, "initialize", args...)
+		}
+		if exceptionResultWasRaised(result) {
 			if hasBlock {
 				LastBlockResult = previousBlockResult
 			}
@@ -1547,6 +1819,32 @@ func classNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	return obj
 }
 
+// IsBuiltinClassNewMethod lets the compiled VM bypass the generic Class#new
+// dispatcher only when the method table still points at this exact builtin.
+// Method redefinition changes the function pointer (and the global method
+// generation), so the optimized call site immediately falls back.
+func IsBuiltinClassNewMethod(method *object.Method) bool {
+	if method == nil || method.DispatchOwner != nil {
+		return false
+	}
+	fn, ok := method.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue)
+	if !ok || fn == nil {
+		return false
+	}
+	return reflect.ValueOf(fn).Pointer() == reflect.ValueOf(classNew).Pointer()
+}
+
+func exceptionResultWasRaised(value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueException {
+		return false
+	}
+	if LastRaisedResult == value {
+		return true
+	}
+	exception, ok := value.Data.(*object.RException)
+	return ok && exception != nil && exception.Raised
+}
+
 func NotifyClassInherited(superValue, childValue *object.EmeraldValue) {
 	if superValue == nil || childValue == nil || superValue.Type != object.ValueClass || childValue.Type != object.ValueClass {
 		return
@@ -1568,6 +1866,10 @@ func NotifyClassInherited(superValue, childValue *object.EmeraldValue) {
 	if CallMethodWithoutBlockBypass != nil && receiverHasCallableMethod(superValue, "inherited") {
 		_ = CallMethodWithoutBlockBypass(superValue, "inherited", childValue)
 	}
+}
+
+func classInherited(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
 }
 
 func classSubclasses(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -1637,10 +1939,27 @@ func classAllocate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if classInheritsFrom(cls, R.Classes["Regexp"]) {
 		return &object.EmeraldValue{Type: object.ValueRegexp, Data: &object.RRegexp{Options: "__uninitialized__"}, Class: cls}
 	}
-	return &object.EmeraldValue{
+	obj := &object.EmeraldValue{
 		Type:  object.ValueObject,
 		Data:  object.NewObject(cls),
 		Class: cls,
+	}
+	initializeStructStorage(obj)
+	return obj
+}
+
+func initializeStructStorage(value *object.EmeraldValue) {
+	if value == nil || value.Class == nil || R.Classes["Struct"] == nil || !classInheritsFrom(value.Class, R.Classes["Struct"]) {
+		return
+	}
+	obj, ok := value.Data.(*object.Object)
+	if !ok {
+		return
+	}
+	fields := structFieldsForClass(value.Class)
+	obj.StructValues = make([]*object.EmeraldValue, len(fields))
+	for index := range obj.StructValues {
+		obj.StructValues[index] = R.NilVal
 	}
 }
 
@@ -2951,6 +3270,12 @@ func isTruthy(val *object.EmeraldValue) bool {
 type Runtime struct {
 	Classes map[string]*object.Class
 
+	IntegerClass *object.Class
+	FloatClass   *object.Class
+	StringClass  *object.Class
+	ArrayClass   *object.Class
+	HashClass    *object.Class
+
 	TrueVal           *object.EmeraldValue
 	FalseVal          *object.EmeraldValue
 	NilVal            *object.EmeraldValue
@@ -2963,6 +3288,7 @@ type Runtime struct {
 }
 
 var R *Runtime
+var errnoModule *object.Module
 
 func Init() {
 	initRuntime(false)
@@ -2976,6 +3302,12 @@ func initRuntime(withMspec bool) {
 	R = &Runtime{
 		Classes: make(map[string]*object.Class),
 	}
+	classInitializeCacheMu.Lock()
+	classInitializeCache = make(map[*object.Class]classInitializeCacheEntry)
+	classInitializeCacheMu.Unlock()
+	rubyRegexpCompileCacheMu.Lock()
+	rubyRegexpCompileCache = make(map[rubyRegexpCompileCacheKey]*regexp.Regexp)
+	rubyRegexpCompileCacheMu.Unlock()
 	envObject = nil
 	stdinObject = nil
 	stdoutObject = nil
@@ -3012,6 +3344,7 @@ func initRuntime(withMspec bool) {
 	globalVariableAliases["$LOAD_PATH"] = "$:"
 	globalVariableAliases["$-I"] = "$:"
 	globalVariableAliases["$LOADED_FEATURES"] = "$\""
+	globalVariableAliases["$PROGRAM_NAME"] = "$0"
 	globalVariableAliases["$-0"] = "$/"
 	globalVariableAliases["$-d"] = "$DEBUG"
 	globalVariableAliases["$-v"] = "$VERBOSE"
@@ -3056,15 +3389,12 @@ func initRuntime(withMspec bool) {
 	fileUtimeOverrides = make(map[string]fileTimeOverride)
 	currentFileUmask = 0022
 	defaultExternalEncoding = "UTF-8"
-	stringEncodings = make(map[*object.EmeraldValue]string)
-	stringAppendBuilders = make(map[*object.EmeraldValue]*strings.Builder)
 	attachedSingletonClasses = make(map[*object.EmeraldValue]*object.Class)
-	auxiliaryInstanceVars = make(map[*object.EmeraldValue]map[string]*object.EmeraldValue)
 	deduplicatedStrings = make(map[string]*object.EmeraldValue)
 	symbolEncodings = make(map[*object.EmeraldValue]string)
+	internedStringSymbols = make(map[string]*object.EmeraldValue)
 	symbolNameStrings = make(map[string]*object.EmeraldValue)
 	constantNameEncodings = make(map[string]string)
-	ruby2KeywordHashes = make(map[*object.EmeraldValue]bool)
 	procRuby2KeywordFunctions = make(map[*object.Function]bool)
 	encodingValues = make(map[string]*object.EmeraldValue)
 	etcGroupIterating = false
@@ -3115,10 +3445,19 @@ func initRuntime(withMspec bool) {
 	objectIDByInteger = make(map[int64]int64)
 	objectIDBySymbol = make(map[string]int64)
 	objectIDByValue = make(map[*object.EmeraldValue]int64)
+	objectIDByClass = make(map[*object.Class]int64)
+	objectIDByModule = make(map[*object.Module]int64)
 	objectSpaceTracked = nil
+	objectSpaceTotalAllocated = 0
+	objectSpaceTrackedSinceCompact = 0
+	lazyArrayRegions = nil
 	objectSpaceFinalizers = make(map[*object.EmeraldValue][]*object.EmeraldValue)
+	objectSpaceTraceDepth = 0
+	objectSpaceTraceRetained = nil
 	hashIdentityIntegerKeys = make(map[int64]*object.EmeraldValue)
 	hashIdentitySymbolKeys = make(map[string]*object.EmeraldValue)
+	hashIdentityClassKeys = make(map[*object.Class]*object.EmeraldValue)
+	hashIdentityModuleKeys = make(map[*object.Module]*object.EmeraldValue)
 	objectIDByValue[R.NilVal] = objectIDCounter
 	objectIDCounter++
 	objectIDByValue[R.FalseVal] = objectIDCounter
@@ -3127,27 +3466,57 @@ func initRuntime(withMspec bool) {
 	objectIDCounter++
 
 	R.createClasses()
+	R.IntegerClass = R.Classes["Integer"]
+	R.FloatClass = R.Classes["Float"]
+	R.StringClass = R.Classes["String"]
+	R.ArrayClass = R.Classes["Array"]
+	R.HashClass = R.Classes["Hash"]
 	R.initializeSmallIntegers()
 	R.defineMethods()
 	installRbConfigModule(R.Classes["Object"])
+	installRubyGemsModule(R.Classes["Object"])
+	markFeatureRequired("rubygems")
+	markFeatureRequired("rubygems.rb")
 	if withMspec {
 		RegisterMspec()
 	}
 }
 
 const (
-	smallIntegerMin    = int64(-1)
-	smallIntegerMax    = int64(4096)
+	smallIntegerMin = int64(-4096)
+	smallIntegerMax = int64(4096)
+	// Keep the common positive-integer range pointer-stable. Ruby MRI stores
+	// fixnums inline, while EmeraldValue boxes them; a lazy page cache removes
+	// the allocation/GC cost from map/reduce and numeric Gem hot loops without
+	// reserving the full range at startup.
 	pagedIntegerMax    = int64(65535)
 	integerPageSize    = int64(256)
 	cacheIntegerValues = true
 )
 
+// Integer#to_s returns a fresh Ruby String object, but the immutable Go string
+// payload can be shared safely: String mutation replaces the EmeraldValue's
+// Data/Builder and never mutates the underlying Go string. Reuse the common
+// decimal payloads to remove one tiny string allocation from numeric-heavy Gem
+// loops while keeping every Ruby result independently boxed.
+const (
+	integerToSCacheMin = smallIntegerMin
+	integerToSCacheMax = pagedIntegerMax
+)
+
+var integerToSCache = func() []string {
+	values := make([]string, integerToSCacheMax-integerToSCacheMin+1)
+	for index := range values {
+		values[index] = strconv.FormatInt(integerToSCacheMin+int64(index), 10)
+	}
+	return values
+}()
+
 type integerCachePage [integerPageSize]object.EmeraldValue
 
 func (rt *Runtime) initializeSmallIntegers() {
 	rt.SmallIntegers = make([]*object.EmeraldValue, smallIntegerMax-smallIntegerMin+1)
-	integerClass := rt.Classes["Integer"]
+	integerClass := rt.IntegerClass
 	for value := smallIntegerMin; value <= smallIntegerMax; value++ {
 		rt.SmallIntegers[value-smallIntegerMin] = &object.EmeraldValue{
 			Type:  object.ValueInteger,
@@ -3172,7 +3541,7 @@ func NewIntegerValue(value int64) *object.EmeraldValue {
 		if page == nil {
 			candidate := &integerCachePage{}
 			first := smallIntegerMax + 1 + pageIndex*integerPageSize
-			integerClass := R.Classes["Integer"]
+			integerClass := R.IntegerClass
 			for i := int64(0); i < integerPageSize; i++ {
 				candidate[i] = object.EmeraldValue{
 					Type:  object.ValueInteger,
@@ -3190,9 +3559,20 @@ func NewIntegerValue(value int64) *object.EmeraldValue {
 	}
 	var integerClass *object.Class
 	if R != nil {
-		integerClass = R.Classes["Integer"]
+		integerClass = R.IntegerClass
 	}
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: value, Class: integerClass}
+}
+
+// NewSmallIntegerValue is the low-cost boundary used by proven numeric
+// kernels. Most loop results are in the eagerly cached fixnum range; keeping
+// that check in a tiny helper lets callers inline it without pulling the lazy
+// page allocation and fallback object construction into their hot loop.
+func NewSmallIntegerValue(value int64) *object.EmeraldValue {
+	if R != nil && value >= smallIntegerMin && value <= smallIntegerMax && len(R.SmallIntegers) > 0 {
+		return R.SmallIntegers[value-smallIntegerMin]
+	}
+	return NewIntegerValue(value)
 }
 
 func (rt *Runtime) createClasses() {
@@ -3311,8 +3691,7 @@ func (rt *Runtime) createClasses() {
 	systemCallErrorClass := object.NewClass("SystemCallError")
 	systemCallErrorClass.SuperClass = standardErrorClass
 	systemCallErrorClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: systemCallErrorNew, Arity: -1})
-	errnoClass := object.NewClass("Errno")
-	errnoClass.SuperClass = systemCallErrorClass
+	errnoModule = object.NewModule("Errno")
 	signalExceptionClass := object.NewClass("SignalException")
 	signalExceptionClass.SuperClass = exceptionClass
 	signalExceptionClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: signalExceptionNew, Arity: -1})
@@ -3561,7 +3940,6 @@ func (rt *Runtime) createClasses() {
 	R.Classes["Exception"] = exceptionClass
 	R.Classes["StandardError"] = standardErrorClass
 	R.Classes["SystemCallError"] = systemCallErrorClass
-	R.Classes["Errno"] = errnoClass
 	R.Classes["Encoding::CompatibilityError"] = encodingCompatibilityErrorClass
 	R.Classes["Encoding::InvalidByteSequenceError"] = encodingInvalidByteSequenceErrorClass
 	R.Classes["Encoding::UndefinedConversionError"] = encodingUndefinedConversionErrorClass
@@ -3668,6 +4046,9 @@ func (rt *Runtime) createClasses() {
 	ioClass.DefineConstant("EAGAINWaitWritable", &object.EmeraldValue{Type: object.ValueClass, Data: ioEAGAINWaitWritableClass, Class: R.Classes["Class"]})
 	ioClass.DefineConstant("EWOULDBLOCKWaitReadable", &object.EmeraldValue{Type: object.ValueClass, Data: ioEWOULDBLOCKWaitReadableClass, Class: R.Classes["Class"]})
 	ioClass.DefineConstant("EWOULDBLOCKWaitWritable", &object.EmeraldValue{Type: object.ValueClass, Data: ioEWOULDBLOCKWaitWritableClass, Class: R.Classes["Class"]})
+	errnoValue := &object.EmeraldValue{Type: object.ValueModule, Data: errnoModule, Class: R.Classes["Module"]}
+	objectClass.DefineConstant("Errno", errnoValue)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Errno", errnoValue)
 	installErrnoConstants()
 }
 
@@ -3675,6 +4056,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass := R.Classes["Object"]
 	basicObjectClass := R.Classes["BasicObject"]
 	objectClass.DefineMethod("class", &object.Method{Name: "class", Fn: methodClass, Arity: 0})
+	objectClass.DefineMethod("itself", &object.Method{Name: "itself", Fn: methodItself, Arity: 0})
 	objectClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: methodToS, Arity: 0})
 	objectClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: methodInspect, Arity: 0})
 	objectClass.DefineMethod("nil?", &object.Method{Name: "nil?", Fn: methodIsNil, Arity: 0})
@@ -3712,7 +4094,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("freeze", &object.Method{Name: "freeze", Fn: methodFreeze, Arity: 0})
 	objectClass.DefineMethod("frozen?", &object.Method{Name: "frozen?", Fn: methodFrozen, Arity: 0})
 	objectClass.DefineMethod("dup", &object.Method{Name: "dup", Fn: methodDup, Arity: 0})
-	objectClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: methodClone, Arity: 0})
+	objectClass.DefineMethod("clone", &object.Method{Name: "clone", Fn: methodClone, Arity: -1})
 	objectClass.DefineMethod("attr_accessor", &object.Method{Name: "attr_accessor", Fn: methodAttrAccessor, Arity: -1})
 	objectClass.DefineMethod("attr_reader", &object.Method{Name: "attr_reader", Fn: methodAttrReader, Arity: -1})
 	objectClass.DefineMethod("attr_writer", &object.Method{Name: "attr_writer", Fn: methodAttrWriter, Arity: -1})
@@ -3859,6 +4241,7 @@ func (rt *Runtime) defineMethods() {
 	integerClass.DefineMethod("to_f", &object.Method{Name: "to_f", Fn: intToF, Arity: 0})
 	integerClass.DefineMethod("to_i", &object.Method{Name: "to_i", Fn: intIdentity, Arity: 0})
 	integerClass.DefineMethod("to_int", &object.Method{Name: "to_int", Fn: intIdentity, Arity: 0})
+	integerClass.DefineMethod("ord", &object.Method{Name: "ord", Fn: intIdentity, Arity: 0})
 	integerClass.DefineMethod("times", &object.Method{Name: "times", Fn: intTimes, Arity: 0})
 	integerClass.DefineMethod("upto", &object.Method{Name: "upto", Fn: intUpto, Arity: 1})
 	integerClass.DefineMethod("downto", &object.Method{Name: "downto", Fn: intDownto, Arity: 1})
@@ -4150,6 +4533,7 @@ func (rt *Runtime) defineMethods() {
 	matchDataClass.DefineMethod("size", &object.Method{Name: "size", Fn: matchDataLength, Arity: 0})
 	matchDataClass.DefineMethod("regexp", &object.Method{Name: "regexp", Fn: matchDataRegexp, Arity: 0})
 	matchDataClass.DefineMethod("names", &object.Method{Name: "names", Fn: matchDataNames, Arity: 0})
+	matchDataClass.DefineMethod("named_captures", &object.Method{Name: "named_captures", Fn: matchDataNamedCaptures, Arity: 0})
 	matchDataClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: matchDataInspect, Arity: 0})
 	matchDataClass.DefineMethod("values_at", &object.Method{Name: "values_at", Fn: matchDataValuesAt, Arity: -1})
 	matchDataClass.DefineMethod("begin", &object.Method{Name: "begin", Fn: matchDataBegin, Arity: 1})
@@ -4492,6 +4876,10 @@ func (rt *Runtime) defineMethods() {
 	sizedQueueClass.DefineMethod("num_waiting", &object.Method{Name: "num_waiting", Fn: queueNumWaiting, Arity: 0})
 	sizedQueueClass.DefineMethod("max", &object.Method{Name: "max", Fn: sizedQueueMax, Arity: 0})
 	sizedQueueClass.DefineMethod("max=", &object.Method{Name: "max=", Fn: sizedQueueSetMax, Arity: 1})
+	threadClass.DefineConstant("Mutex", &object.EmeraldValue{Type: object.ValueClass, Data: mutexClass, Class: R.Classes["Class"]})
+	threadClass.DefineConstant("ConditionVariable", &object.EmeraldValue{Type: object.ValueClass, Data: conditionVariableClass, Class: R.Classes["Class"]})
+	threadClass.DefineConstant("Queue", &object.EmeraldValue{Type: object.ValueClass, Data: queueClass, Class: R.Classes["Class"]})
+	threadClass.DefineConstant("SizedQueue", &object.EmeraldValue{Type: object.ValueClass, Data: sizedQueueClass, Class: R.Classes["Class"]})
 
 	fiberClass := R.Classes["Fiber"]
 	fiberClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: fiberClassNew, Arity: -1})
@@ -4848,6 +5236,7 @@ func (rt *Runtime) defineMethods() {
 	encodingClass.DefineConstant("Shift_JIS", newEncodingValue("Shift_JIS"))
 	encodingClass.DefineConstant("SJIS", newEncodingValue("Shift_JIS"))
 	encodingClass.DefineConstant("Windows_31J", newEncodingValue("Windows-31J"))
+	encodingClass.DefineConstant("GB18030", newEncodingValue("GB18030"))
 	encodingClass.DefineConstant("Big5", newEncodingValue("Big5"))
 	encodingClass.DefineConstant("BIG5", newEncodingValue("Big5"))
 	encodingClass.DefineConstant("Emacs_Mule", newEncodingValue("Emacs-Mule"))
@@ -4862,7 +5251,7 @@ func (rt *Runtime) defineMethods() {
 	ioClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: ioClassNew, Arity: -1})
 	ioClass.DefineClassMethod("for_fd", &object.Method{Name: "for_fd", Fn: ioClassForFd, Arity: -1})
 	ioClass.DefineClassMethod("open", &object.Method{Name: "open", Fn: ioClassOpen, Arity: -1})
-	ioClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: ioClassInitialize, Arity: -1})
+	ioClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: ioClassInitialize, Arity: -1, Visibility: "private"})
 	ioClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: ioInspect, Arity: 0})
 	ioClass.DefineMethod("path", &object.Method{Name: "path", Fn: fileInstancePath, Arity: 0})
 	ioClass.DefineMethod("ioctl", &object.Method{Name: "ioctl", Fn: ioIoctl, Arity: -1})
@@ -5094,7 +5483,7 @@ func (rt *Runtime) defineMethods() {
 	stringIOClass.DefineMethod("pid", &object.Method{Name: "pid", Fn: stringIONil, Arity: 0})
 	stringIOClass.DefineMethod("to_io", &object.Method{Name: "to_io", Fn: stringIOIdentity, Arity: 0})
 	stringIOClass.DefineMethod("set_encoding_by_bom", &object.Method{Name: "set_encoding_by_bom", Fn: stringIOSetEncodingByBOM, Arity: 0})
-	stringIOClass.DefineMethod("path", &object.Method{Name: "path", Fn: stringIOPath, Arity: 0})
+	stringIOClass.DefineMethod("path", &object.Method{Name: "path", Visibility: "undefined"})
 	stringIOClass.DefineMethod("fcntl", &object.Method{Name: "fcntl", Fn: stringIONotImplemented, Arity: -1})
 	stringIOClass.DefineMethod("getpass", &object.Method{Name: "getpass", Fn: stringIOGetpass, Arity: -1})
 	stringIOClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: ioPuts, Arity: -1})
@@ -5674,6 +6063,7 @@ func (rt *Runtime) defineMethods() {
 	setClass.DefineMethod("add?", &object.Method{Name: "add?", Fn: setAddQuestion, Arity: 1})
 	setClass.DefineMethod("delete", &object.Method{Name: "delete", Fn: setDelete, Arity: 1})
 	setClass.DefineMethod("delete?", &object.Method{Name: "delete?", Fn: setDeleteQuestion, Arity: 1})
+	setClass.DefineMethod("clear", &object.Method{Name: "clear", Fn: setClear, Arity: 0})
 	setClass.DefineMethod("merge", &object.Method{Name: "merge", Fn: setMerge, Arity: -1})
 	setClass.DefineMethod("replace", &object.Method{Name: "replace", Fn: setReplace, Arity: 1})
 	setClass.DefineMethod("difference", &object.Method{Name: "difference", Fn: setDifference, Arity: 1})
@@ -5753,6 +6143,7 @@ func (rt *Runtime) defineMethods() {
 
 	exceptionClass := R.Classes["Exception"]
 	exceptionClass.DefineClassMethod("to_tty?", &object.Method{Name: "to_tty?", Fn: exceptionClassToTTY, Arity: 0})
+	exceptionClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: exceptionInitialize, Arity: -1, Visibility: "private"})
 	exceptionClass.DefineMethod("message", &object.Method{Name: "message", Fn: exceptionMessage, Arity: 0})
 	exceptionClass.DefineMethod("path", &object.Method{Name: "path", Fn: exceptionPath, Arity: 0})
 	exceptionClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: exceptionToS, Arity: 0})
@@ -5785,14 +6176,14 @@ func (rt *Runtime) defineMethods() {
 	R.Classes["SignalException"].DefineMethod("signm", &object.Method{Name: "signm", Fn: signalExceptionSignm, Arity: 0})
 	R.Classes["SystemExit"].DefineMethod("status", &object.Method{Name: "status", Fn: systemExitStatus, Arity: 0})
 
-	objectClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: builtinPuts, Arity: -1})
+	objectClass.DefineMethod("puts", &object.Method{Name: "puts", Fn: builtinPuts, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("print", &object.Method{Name: "print", Fn: builtinPrint, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("putc", &object.Method{Name: "putc", Fn: builtinPutc, Arity: 1})
 	objectClass.DefineMethod("p", &object.Method{Name: "p", Fn: builtinP, Arity: -1})
 	objectClass.DefineMethod("pp", &object.Method{Name: "pp", Fn: builtinPP, Arity: -1})
 	objectClass.DefineMethod("`", &object.Method{Name: "`", Fn: builtinBacktick, Arity: 1})
 	objectClass.DefineMethod("open", &object.Method{Name: "open", Fn: builtinOpen, Arity: -1})
-	objectClass.DefineMethod("format", &object.Method{Name: "format", Fn: builtinFormat, Arity: -1})
+	objectClass.DefineMethod("format", &object.Method{Name: "format", Fn: builtinFormat, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("sprintf", &object.Method{Name: "sprintf", Fn: builtinFormat, Arity: -1})
 	objectClass.DefineMethod("printf", &object.Method{Name: "printf", Fn: builtinPrintf, Arity: -1})
 	objectClass.DefineMethod("clamp", &object.Method{Name: "clamp", Fn: objectClamp, Arity: -1})
@@ -5802,7 +6193,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("gets", &object.Method{Name: "gets", Fn: builtinGets, Arity: -1})
 	objectClass.DefineMethod("test", &object.Method{Name: "test", Fn: builtinTest, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("loop", &object.Method{Name: "loop", Fn: builtinLoop, Arity: 0})
-	objectClass.DefineMethod("load", &object.Method{Name: "load", Fn: builtinLoad, Arity: -1})
+	objectClass.DefineMethod("load", &object.Method{Name: "load", Fn: builtinLoad, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("exit", &object.Method{Name: "exit", Fn: builtinExit, Arity: -1})
 	objectClass.DefineMethod("exit!", &object.Method{Name: "exit!", Fn: builtinExitBang, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1})
@@ -5818,6 +6209,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("set_trace_func", &object.Method{Name: "set_trace_func", Fn: builtinSetTraceFunc, Arity: -1})
 	objectClass.DefineMethod("require", &object.Method{Name: "require", Fn: builtinRequire, Arity: 1})
 	objectClass.DefineMethod("require_relative", &object.Method{Name: "require_relative", Fn: builtinRequireRelative, Arity: 1})
+	objectClass.DefineMethod("gem", &object.Method{Name: "gem", Fn: builtinGemActivate, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("autoload", &object.Method{Name: "autoload", Fn: builtinAutoload, Arity: 2, Visibility: "private"})
 	objectClass.DefineMethod("autoload?", &object.Method{Name: "autoload?", Fn: builtinAutoloadPredicate, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("autoload_relative", &object.Method{Name: "autoload_relative", Fn: builtinAutoloadRelative, Arity: 2, Visibility: "private"})
@@ -5831,6 +6223,7 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineMethod("exec", &object.Method{Name: "exec", Fn: processExec, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("fork", &object.Method{Name: "fork", Fn: processFork, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("spawn", &object.Method{Name: "spawn", Fn: processSpawn, Arity: -1, Visibility: "private"})
+	objectClass.DefineMethod("trap", &object.Method{Name: "trap", Fn: signalClassTrap, Arity: -1, Visibility: "private"})
 	objectClass.DefineMethod("mock", &object.Method{Name: "mock", Fn: builtinMock, Arity: -1})
 	objectClass.DefineMethod("mock_int", &object.Method{Name: "mock_int", Fn: builtinMockInt, Arity: 1})
 	objectClass.DefineMethod("binding", &object.Method{Name: "binding", Fn: builtinBinding, Arity: 0})
@@ -5894,7 +6287,7 @@ func (rt *Runtime) defineMethods() {
 	kernelForwardableNames := []string{
 		"abort", "binding", "class", "class_eval", "class_exec", "clone", "dup", "eval", "exit", "format", "instance_exec",
 		"instance_eval", "lambda", "loop", "method", "open", "proc", "puts", "print", "putc", "p", "printf", "raise", "readline", "readlines",
-		"rand", "require", "require_relative", "autoload", "autoload?", "autoload_relative", "respond_to?", "respond_to_missing?", "require", "test", "Array", "Hash", "String", "Rational", "Float", "Integer", "Complex", "raise", "srand", "send", "singleton_class",
+		"rand", "require", "require_relative", "autoload", "autoload?", "autoload_relative", "respond_to?", "respond_to_missing?", "require", "test", "Array", "Hash", "String", "Rational", "Float", "Integer", "Complex", "raise", "srand", "send",
 		"sleep", "select", "system", "caller", "caller_locations", "global_variables", "warn", "at_exit", "trace_var", "untrace_var", "set_trace_func", "load", "chomp", "chop",
 		"block_given?", "tap", "to_s", "to_str", "to_ary", "to_hash", "to_int", "to_io", "to_a", "to_h",
 	}
@@ -5903,7 +6296,7 @@ func (rt *Runtime) defineMethods() {
 		copyKernelInstanceMethod(name, objectClass.Methods[name])
 	}
 	kernelPublicForwardableNames := []string{
-		"hash", "respond_to?", "instance_of?", "instance_variable_set", "instance_variable_get", "instance_variable_defined?", "instance_variables", "remove_instance_variable",
+		"hash", "respond_to?", "instance_of?", "instance_variable_set", "instance_variable_get", "instance_variable_defined?", "instance_variables", "remove_instance_variable", "singleton_class",
 	}
 	for _, name := range kernelPublicForwardableNames {
 		copyKernelClassMethod(name, objectClass.Methods[name])
@@ -6023,6 +6416,7 @@ func (rt *Runtime) defineMethods() {
 	moduleClass.DefineMethod("class_eval", &object.Method{Name: "class_eval", Fn: moduleClassEval, Arity: -1})
 	moduleClass.DefineMethod("module_exec", &object.Method{Name: "module_exec", Fn: moduleClassExec, Arity: -1})
 	moduleClass.DefineMethod("class_exec", &object.Method{Name: "class_exec", Fn: moduleClassExec, Arity: -1})
+	moduleClass.DefineMethod("singleton_class?", &object.Method{Name: "singleton_class?", Fn: moduleSingletonClassPredicate, Arity: 0})
 
 	classClass := R.Classes["Class"]
 	classClass.DefineMethod("set_temporary_name", &object.Method{Name: "set_temporary_name", Fn: moduleSetTemporaryName, Arity: 1})
@@ -6033,6 +6427,7 @@ func (rt *Runtime) defineMethods() {
 	classClass.DefineMethod("new", &object.Method{Name: "new", Fn: classNew, Arity: -1})
 	classClass.DefineMethod("allocate", &object.Method{Name: "allocate", Fn: classAllocate, Arity: 0})
 	classClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: classInitialize, Arity: -1, Visibility: "private"})
+	classClass.DefineMethod("inherited", &object.Method{Name: "inherited", Fn: classInherited, Arity: 1, Visibility: "private"})
 	classClass.DefineMethod("subclasses", &object.Method{Name: "subclasses", Fn: classSubclasses, Arity: 0})
 	classClass.DefineMethod("superclass", &object.Method{Name: "superclass", Fn: classSuperclass, Arity: 0})
 	classClass.DefineMethod("attached_object", &object.Method{Name: "attached_object", Fn: classAttachedObject, Arity: 0})
@@ -6051,7 +6446,7 @@ func (rt *Runtime) defineMethods() {
 		Visibility: "public",
 	}
 	mainObject := R.Main.Data.(*object.Object)
-	mainObject.SingletonMethods["to_s"] = mainToS
+	mainObject.SetSingletonMethod("to_s", mainToS)
 	if singleton := SingletonClass(R.Main); singleton != nil && singleton.Type == object.ValueClass {
 		singleton.Data.(*object.Class).DefineMethod("to_s", mainToS)
 	}
@@ -6070,14 +6465,8 @@ func (rt *Runtime) defineMethods() {
 	objectClass.DefineConstant("TOPLEVEL_BINDING", &object.EmeraldValue{
 		Type: object.ValueBinding,
 		Data: &object.RBinding{
-			Self:         R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			Path:         currentSourcePath(),
-			Line:         1,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		},
 		Class: R.Classes["Binding"],
 	})
@@ -6087,6 +6476,7 @@ func (rt *Runtime) defineMethods() {
 
 func defineRubyBuiltinConstants(objectClass *object.Class) {
 	defineCoreClassConstants(objectClass)
+	installProcessModuleConstant(objectClass)
 
 	version := frozenRubyConstantString(RubyCompatibilityVersion)
 	platform := runtime.GOOS + "-" + runtime.GOARCH
@@ -6096,6 +6486,12 @@ func defineRubyBuiltinConstants(objectClass *object.Class) {
 	objectClass.DefineConstant("RUBY_DESCRIPTION", frozenRubyConstantString("ruby "+RubyCompatibilityVersion+" (rgo) ["+platform+"]"))
 	objectClass.DefineConstant("RUBY_ENGINE", frozenRubyConstantString("ruby"))
 	objectClass.DefineConstant("RUBY_ENGINE_VERSION", version)
+	if objectClass.Constants["RubyVM"] == nil {
+		rubyVM := object.NewModule("RubyVM")
+		value := &object.EmeraldValue{Type: object.ValueModule, Data: rubyVM, Class: R.Classes["Module"]}
+		objectClass.DefineConstant("RubyVM", value)
+		AssignConstantName(classEmeraldValue(objectClass), "RubyVM", value)
+	}
 	objectClass.DefineConstant("RUBY_PLATFORM", frozenRubyConstantString(platform))
 	objectClass.DefineConstant("RUBY_RELEASE_DATE", frozenRubyConstantString("2026-06-23"))
 	objectClass.DefineConstant("RUBY_REVISION", frozenRubyConstantString("rgo"))
@@ -6157,6 +6553,39 @@ func defineRubyBuiltinConstants(objectClass *object.Class) {
 	installCGIModule(objectClass)
 }
 
+func installProcessModuleConstant(objectClass *object.Class) {
+	processClass := R.Classes["Process"]
+	if objectClass == nil || processClass == nil {
+		return
+	}
+
+	processModule := object.NewModule("Process")
+	processValue := &object.EmeraldValue{Type: object.ValueModule, Data: processModule, Class: R.Classes["Module"]}
+	singleton := SingletonClass(processValue)
+	if singleton != nil && singleton.Type == object.ValueClass {
+		singletonClass := singleton.Data.(*object.Class)
+		for name, method := range processClass.ClassMethods {
+			singletonClass.DefineMethod(name, method)
+		}
+	}
+
+	for _, name := range []string{"UID", "GID", "Sys", "Status", "Tms"} {
+		if class := R.Classes["Process::"+name]; class != nil {
+			processModule.DefineConstant(name, &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: R.Classes["Class"]})
+		}
+	}
+	for _, name := range append([]string{
+		"WNOHANG", "WUNTRACED", "PRIO_PROCESS", "PRIO_PGRP", "PRIO_USER",
+		"RLIM_INFINITY", "RLIM_SAVED_MAX", "RLIM_SAVED_CUR",
+	}, processRlimitNames...) {
+		if value, ok := processNamedConstant(name); ok {
+			processModule.DefineConstant(name, newInt(value))
+		}
+	}
+
+	objectClass.DefineConstant("Process", processValue)
+}
+
 func defineCoreClassConstants(objectClass *object.Class) {
 	if objectClass == nil {
 		return
@@ -6194,7 +6623,7 @@ func specVersionCompare(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	var otherVersion string
 	if other.Type == object.ValueObject {
 		otherObj := other.Data.(*object.Object)
-		v := otherObj.InstanceVars["@version"]
+		v := otherObj.GetInstanceVar("@version")
 		if v == nil || v.Type != object.ValueString {
 			return R.NilVal
 		}
@@ -6215,7 +6644,7 @@ func specVersionCompare(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	switch receiver.Type {
 	case object.ValueObject:
 		myObj := receiver.Data.(*object.Object)
-		v := myObj.InstanceVars["@version"]
+		v := myObj.GetInstanceVar("@version")
 		if v == nil || v.Type != object.ValueString {
 			return R.NilVal
 		}
@@ -6299,26 +6728,63 @@ func installObjectSpace(objectClass *object.Class) {
 	objectClass.DefineConstant("ObjectSpace", &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: R.Classes["Module"]})
 }
 
+// RegisterLazyArrayRegion keeps one weak anchor for each deferred Array
+// producer. ObjectSpace must be able to observe the objects that Ruby would
+// have created even if the Array has not yet reached a generic operation; the
+// weak anchor lets us materialize only live regions without retaining dropped
+// Arrays indefinitely.
+func RegisterLazyArrayRegion(value *object.EmeraldValue) {
+	if objectSpaceTrackingDisabled || value == nil || value.LazyArrayRegionValue() == nil {
+		return
+	}
+	lazyArrayRegions = append(lazyArrayRegions, weak.Make(value))
+}
+
+// MaterializeLazyArrayRegions is called at ObjectSpace/GC observation points.
+// A deferred region is not a semantic escape: materializing it here creates
+// the same elements before enumeration and registers them through the normal
+// ObjectSpace tracker.
+func MaterializeLazyArrayRegions() {
+	if len(lazyArrayRegions) == 0 {
+		return
+	}
+	live := lazyArrayRegions[:0]
+	for _, tracked := range lazyArrayRegions {
+		value := tracked.Value()
+		if value == nil {
+			continue
+		}
+		if value.LazyArrayRegionValue() != nil {
+			value.MaterializeLazyArray()
+		}
+		if value.LazyArrayRegionValue() != nil {
+			live = append(live, tracked)
+		}
+	}
+	lazyArrayRegions = live
+}
+
 func objectSpaceGarbageCollect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return gcStart(receiver, args...)
 }
 
 func objectSpaceEachObject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	MaterializeLazyArrayRegions()
 	var target *object.Class
 	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueClass {
 		target = args[0].Data.(*object.Class)
 	}
 	values := make([]*object.EmeraldValue, 0)
-	seen := make(map[any]bool)
-	for _, value := range objectSpaceTracked {
+	seen := make(map[*object.EmeraldValue]bool)
+	for _, tracked := range objectSpaceTracked {
+		value := tracked.Value()
 		if value == nil || !objectSpaceMatches(value, target) {
 			continue
 		}
-		identity := value.Data
-		if seen[identity] {
+		if seen[value] {
 			continue
 		}
-		seen[identity] = true
+		seen[value] = true
 		values = append(values, value)
 	}
 	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CurrentBlockValue() != nil {
@@ -6446,7 +6912,7 @@ func installObjectSpaceExtension() {
 	module.DefineMethod("trace_object_allocations_clear", &object.Method{Name: "trace_object_allocations_clear", Fn: objectSpaceTraceClear, Arity: 0})
 	module.DefineMethod("allocation_class_path", &object.Method{Name: "allocation_class_path", Fn: objectSpaceAllocationClassPath, Arity: 1})
 	module.DefineMethod("allocation_generation", &object.Method{Name: "allocation_generation", Fn: objectSpaceAllocationGeneration, Arity: 1})
-	module.DefineMethod("allocation_method_id", &object.Method{Name: "allocation_method_id", Fn: objectSpaceAllocationClassPath, Arity: 1})
+	module.DefineMethod("allocation_method_id", &object.Method{Name: "allocation_method_id", Fn: objectSpaceAllocationMethodID, Arity: 1})
 	module.DefineMethod("allocation_sourcefile", &object.Method{Name: "allocation_sourcefile", Fn: objectSpaceAllocationSourceFile, Arity: 1})
 	module.DefineMethod("allocation_sourceline", &object.Method{Name: "allocation_sourceline", Fn: objectSpaceAllocationSourceLine, Arity: 1})
 	module.DefineMethod("dump", &object.Method{Name: "dump", Fn: objectSpaceDump, Arity: -1})
@@ -6458,6 +6924,9 @@ func objectSpaceImmediate(value *object.EmeraldValue) bool {
 }
 
 func objectSpaceMemsizeOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 && args[0] != nil {
+		args[0].MaterializeLazyArray()
+	}
 	if objectSpaceImmediate(args[0]) {
 		return newInt(0)
 	}
@@ -6469,12 +6938,14 @@ func objectSpaceMemsizeOf(receiver *object.EmeraldValue, args ...*object.Emerald
 }
 
 func objectSpaceMemsizeOfAll(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	MaterializeLazyArrayRegions()
 	var target *object.Class
 	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueClass {
 		target = args[0].Data.(*object.Class)
 	}
 	count := int64(1)
-	for _, value := range objectSpaceTracked {
+	for _, tracked := range objectSpaceTracked {
+		value := tracked.Value()
 		if value != nil && objectSpaceMatches(value, target) {
 			count++
 		}
@@ -6493,7 +6964,11 @@ func objectSpaceReachableObjectsFrom(receiver *object.EmeraldValue, args ...*obj
 	}
 	switch value.Type {
 	case object.ValueArray:
-		values = append(values, value.Data.([]*object.EmeraldValue)...)
+		if array, ok := value.MaterializeLazyArray(); ok {
+			values = append(values, array...)
+		} else if array, ok := value.Data.([]*object.EmeraldValue); ok {
+			values = append(values, array...)
+		}
 	case object.ValueHash:
 		data := hashData(value)
 		for _, key := range data.Keys {
@@ -6512,56 +6987,72 @@ func objectSpaceReachableObjectsFrom(receiver *object.EmeraldValue, args ...*obj
 
 func objectSpaceTraceAllocations(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		objectSpaceTraceStart(receiver)
+		defer objectSpaceTraceStop(receiver)
 		return CallBlockWithArgs(CurrentBlockValue())
 	}
 	return R.NilVal
 }
 
 func objectSpaceTraceStart(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	objectSpaceTraceDepth++
 	return R.NilVal
 }
 
 func objectSpaceTraceStop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if objectSpaceTraceDepth > 0 {
+		objectSpaceTraceDepth--
+	}
 	return R.NilVal
 }
 
 func objectSpaceTraceClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	MaterializeLazyArrayRegions()
+	for _, tracked := range objectSpaceTracked {
+		if value := tracked.Value(); value != nil {
+			clearObjectSpaceAllocationMetadata(value)
+		}
+	}
 	return R.NilVal
 }
 
 func objectSpaceAllocationClassPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 && allocationMetadataTraced(args[0]) {
+		if metadata := args[0].AllocationMetadataValue(); metadata != nil && metadata.ClassPath != "" {
+			return rubyString(metadata.ClassPath)
+		}
+	}
 	return R.NilVal
 }
 
 func objectSpaceAllocationGeneration(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if objectSpaceImmediate(args[0]) {
+	if len(args) == 0 || objectSpaceImmediate(args[0]) || !allocationMetadataTraced(args[0]) {
 		return R.NilVal
 	}
-	return newInt(1)
+	return newInt(args[0].AllocationMetadataValue().Generation)
 }
 
 func objectSpaceAllocationSourceFile(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if objectSpaceImmediate(args[0]) {
+	if len(args) == 0 || objectSpaceImmediate(args[0]) || !allocationMetadataTraced(args[0]) || args[0].AllocationMetadataValue().SourceFile == "" {
 		return R.NilVal
 	}
-	if CurrentFrameBinding != nil {
-		if binding := CurrentFrameBinding(); binding != nil && binding.Path != "" {
-			return rubyString(binding.Path)
-		}
-	}
-	return rubyString(CurrentSpecFile)
+	return rubyString(args[0].AllocationMetadataValue().SourceFile)
 }
 
 func objectSpaceAllocationSourceLine(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if objectSpaceImmediate(args[0]) {
+	if len(args) == 0 || objectSpaceImmediate(args[0]) || !allocationMetadataTraced(args[0]) || args[0].AllocationMetadataValue().SourceLine <= 0 {
 		return R.NilVal
 	}
-	if CurrentFrameBinding != nil {
-		if binding := CurrentFrameBinding(); binding != nil && binding.Line > 1 {
-			return newInt(binding.Line - 1)
+	return newInt(args[0].AllocationMetadataValue().SourceLine)
+}
+
+func objectSpaceAllocationMethodID(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 && allocationMetadataTraced(args[0]) {
+		if metadata := args[0].AllocationMetadataValue(); metadata != nil && metadata.MethodID != "" {
+			return rubySymbol(metadata.MethodID)
 		}
 	}
-	return newInt(1)
+	return R.NilVal
 }
 
 func objectSpaceDumpJSON(value *object.EmeraldValue) string {
@@ -6632,25 +7123,223 @@ func installJSONModule() {
 	}
 	module := object.NewModule("JSON")
 	module.DefineMethod("parse", &object.Method{Name: "parse", Fn: jsonParse, Arity: -1})
+	module.DefineMethod("generate", &object.Method{Name: "generate", Fn: jsonGenerate, Arity: -1})
+	module.DefineMethod("dump", &object.Method{Name: "dump", Fn: jsonDump, Arity: -1})
+	objectClass.DefineMethod("to_json", &object.Method{Name: "to_json", Fn: jsonValueToJSON, Arity: -1})
+	jsonError := object.NewClass("JSON::JSONError")
+	jsonError.SuperClass = R.Classes["StandardError"]
+	parserError := object.NewClass("JSON::ParserError")
+	parserError.SuperClass = jsonError
+	nestingError := object.NewClass("JSON::NestingError")
+	nestingError.SuperClass = parserError
+	generatorError := object.NewClass("JSON::GeneratorError")
+	generatorError.SuperClass = jsonError
+	for name, klass := range map[string]*object.Class{
+		"JSONError":      jsonError,
+		"ParserError":    parserError,
+		"NestingError":   nestingError,
+		"GeneratorError": generatorError,
+	} {
+		module.Constants[name] = classEmeraldValue(klass)
+		R.Classes[klass.Name] = klass
+	}
 	value := &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: R.Classes["Module"]}
 	objectClass.DefineConstant("JSON", value)
 	AssignConstantName(classEmeraldValue(objectClass), "JSON", value)
+}
+
+func jsonValueToJSON(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return jsonGenerate(nil, receiver)
+}
+
+func jsonGenerate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..2)")
+	}
+	var builder strings.Builder
+	if errVal := jsonAppendValue(&builder, args[0], nil); errVal != nil {
+		return errVal
+	}
+	return rubyString(builder.String())
+}
+
+func jsonDump(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..3)")
+	}
+	result := jsonGenerate(receiver, args[0])
+	if result == nil || result.Type == object.ValueException {
+		return result
+	}
+	if len(args) > 1 && args[1] != nil && args[1].Type != object.ValueNil {
+		if CallMethod == nil {
+			return typeError("can't convert into IO")
+		}
+		written := CallMethod(args[1], "write", result)
+		if written != nil && written.Type == object.ValueException {
+			return written
+		}
+		return args[1]
+	}
+	return result
+}
+
+func jsonAppendValue(builder *strings.Builder, value *object.EmeraldValue, active []*object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value.Type == object.ValueNil {
+		builder.WriteString("null")
+		return nil
+	}
+	switch value.Type {
+	case object.ValueBool:
+		if value.Data.(bool) {
+			builder.WriteString("true")
+		} else {
+			builder.WriteString("false")
+		}
+	case object.ValueInteger:
+		if bigValue, ok := NumericBigIntOverride(value); ok {
+			builder.WriteString(bigValue.String())
+		} else {
+			builder.WriteString(strconv.FormatInt(value.Data.(int64), 10))
+		}
+	case object.ValueFloat:
+		number := value.Data.(float64)
+		if math.IsNaN(number) || math.IsInf(number, 0) {
+			return NewArgumentError("NaN or Infinity not allowed in JSON")
+		}
+		formatted := strconv.FormatFloat(number, 'g', -1, 64)
+		if !strings.ContainsAny(formatted, ".eE") {
+			formatted += ".0"
+		}
+		builder.WriteString(formatted)
+	case object.ValueString:
+		builder.WriteString(jsonQuotedString(stringRawValue(value)))
+	case object.ValueSymbol:
+		builder.WriteString(jsonQuotedString(value.Data.(string)))
+	case object.ValueArray:
+		for _, parent := range active {
+			if parent == value {
+				return NewArgumentError("circular data structures not supported")
+			}
+		}
+		active = append(active, value)
+		builder.WriteByte('[')
+		for index, item := range value.Data.([]*object.EmeraldValue) {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			if errVal := jsonAppendValue(builder, item, active); errVal != nil {
+				return errVal
+			}
+		}
+		builder.WriteByte(']')
+	case object.ValueHash:
+		for _, parent := range active {
+			if parent == value {
+				return NewArgumentError("circular data structures not supported")
+			}
+		}
+		active = append(active, value)
+		keys, pairs := hashOrderedKeysFromValue(value)
+		builder.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			keyString, errVal := jsonHashKeyString(key)
+			if errVal != nil {
+				return errVal
+			}
+			builder.WriteString(jsonQuotedString(keyString))
+			builder.WriteByte(':')
+			if errVal := jsonAppendValue(builder, pairs[key], active); errVal != nil {
+				return errVal
+			}
+		}
+		builder.WriteByte('}')
+	default:
+		return typeError("can't convert " + value.TypeName() + " into JSON")
+	}
+	return nil
+}
+
+func jsonHashKeyString(value *object.EmeraldValue) (string, *object.EmeraldValue) {
+	if value == nil || value.Type == object.ValueNil {
+		return "", nil
+	}
+	switch value.Type {
+	case object.ValueString, object.ValueSymbol:
+		return value.Data.(string), nil
+	case object.ValueInteger:
+		if bigValue, ok := NumericBigIntOverride(value); ok {
+			return bigValue.String(), nil
+		}
+		return strconv.FormatInt(value.Data.(int64), 10), nil
+	case object.ValueFloat:
+		return strconv.FormatFloat(value.Data.(float64), 'g', -1, 64), nil
+	case object.ValueBool:
+		return strconv.FormatBool(value.Data.(bool)), nil
+	}
+	if CallMethod != nil {
+		converted := CallMethod(value, "to_s")
+		if converted != nil && converted.Type == object.ValueException {
+			return "", converted
+		}
+		if converted != nil && converted.Type == object.ValueString {
+			return stringRawValue(converted), nil
+		}
+	}
+	return "", typeError("can't convert " + value.TypeName() + " into String")
+}
+
+func jsonQuotedString(value string) string {
+	// The common JSON/Gem path contains ordinary UTF-8 text without control
+	// characters, quotes or backslashes. Avoid allocating an Encoder and a
+	// bytes.Buffer for that case; the slow path below remains the semantic
+	// authority for escaping, invalid UTF-8 and U+2028/U+2029.
+	if jsonStringNeedsNoEscape(value) {
+		return `"` + value + `"`
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return `""`
+	}
+	return strings.TrimSuffix(buffer.String(), "\n")
+}
+
+func jsonStringNeedsNoEscape(value string) bool {
+	if !utf8.ValidString(value) || strings.IndexRune(value, '\u2028') >= 0 || strings.IndexRune(value, '\u2029') >= 0 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character < 0x20 || character == '"' || character == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 func jsonParse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) == 0 || args[0] == nil || args[0].Type != object.ValueString {
 		return typeError("no implicit conversion into String")
 	}
+	symbolizeNames := false
+	if len(args) > 1 && args[1] != nil && args[1].Type == object.ValueHash {
+		symbolizeNames = isTruthy(hashIndex(args[1], rubySymbol("symbolize_names")))
+	}
 	decoder := json.NewDecoder(strings.NewReader(stringRawValue(args[0])))
 	decoder.UseNumber()
 	var decoded any
 	if err := decoder.Decode(&decoded); err != nil {
-		return NewArgumentError(err.Error())
+		return newRuntimeException(R.Classes["JSON::ParserError"], err.Error())
 	}
-	return jsonDecodedValue(decoded)
+	return jsonDecodedValue(decoded, symbolizeNames)
 }
 
-func jsonDecodedValue(value any) *object.EmeraldValue {
+func jsonDecodedValue(value any, symbolizeNames bool) *object.EmeraldValue {
 	switch typed := value.(type) {
 	case nil:
 		return R.NilVal
@@ -6667,7 +7356,7 @@ func jsonDecodedValue(value any) *object.EmeraldValue {
 	case []any:
 		values := make([]*object.EmeraldValue, 0, len(typed))
 		for _, item := range typed {
-			values = append(values, jsonDecodedValue(item))
+			values = append(values, jsonDecodedValue(item, symbolizeNames))
 		}
 		return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
 	case map[string]any:
@@ -6675,8 +7364,11 @@ func jsonDecodedValue(value any) *object.EmeraldValue {
 		data := hashData(hash)
 		for key, item := range typed {
 			keyValue := rubyString(key)
+			if symbolizeNames {
+				keyValue = rubySymbol(key)
+			}
 			data.Keys = append(data.Keys, keyValue)
-			data.Pairs[keyValue] = jsonDecodedValue(item)
+			data.Pairs[keyValue] = jsonDecodedValue(item, symbolizeNames)
 		}
 		return hash
 	default:
@@ -7075,12 +7767,15 @@ func gcDisable(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 func gcEnable(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	previouslyDisabled := gcDisabled
 	gcDisabled = false
+	objectSpaceTraceRetained = nil
 	return boolValue(previouslyDisabled)
 }
 
 func gcStart(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	started := time.Now()
+	MaterializeLazyArrayRegions()
 	runtime.GC()
+	compactObjectSpaceTracked()
 	for _, ref := range weakRefValues {
 		if data, ok := ref.Data.(*weakRefData); ok && data != nil {
 			data.alive = false
@@ -7170,7 +7865,7 @@ func gcStat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 		"count":                   gcCountValue,
 		"major_gc_count":          gcMajorCountValue,
 		"heap_free_slots":         0,
-		"total_allocated_objects": int64(len(objectSpaceTracked)),
+		"total_allocated_objects": objectSpaceTotalAllocated,
 	}
 	if len(args) == 1 && args[0] != nil && args[0].Type != object.ValueNil {
 		switch args[0].Type {
@@ -7233,6 +7928,10 @@ func frozenRubyConstantString(value string) *object.EmeraldValue {
 	return &object.EmeraldValue{Type: object.ValueString, Data: value, Class: R.Classes["String"], Frozen: true}
 }
 
+func methodItself(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return receiver
+}
+
 func methodClass(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return &object.EmeraldValue{
 		Type:  object.ValueClass,
@@ -7272,6 +7971,14 @@ func classAttachedObject(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		return typeError(fmt.Sprintf("`%s' is not a singleton class", name))
 	}
 	return cls.SingletonOwner
+}
+
+func moduleSingletonClassPredicate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Type != object.ValueClass {
+		return R.FalseVal
+	}
+	cls, ok := receiver.Data.(*object.Class)
+	return boolValue(ok && cls != nil && cls.IsSingleton)
 }
 
 func methodToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -7525,7 +8232,7 @@ func methodFreeze(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	result := receiver
 	if receiver != nil {
 		receiver.Frozen = true
-		if receiver.Type == object.ValueString && receiver.Literal && len(auxiliaryInstanceVars[receiver]) == 0 {
+		if receiver.Type == object.ValueString && receiver.Literal && len(receiver.InstanceVars) == 0 {
 			result = deduplicateFrozenString(receiver)
 		}
 		if singleton := existingSingletonClass(receiver); singleton != nil {
@@ -7545,6 +8252,10 @@ func existingSingletonClass(receiver *object.EmeraldValue) *object.Class {
 		return nil
 	}
 	switch receiver.Type {
+	case object.ValueBool, object.ValueNil, object.ValueInteger, object.ValueFloat, object.ValueSymbol:
+		// Ruby immediates cannot acquire singleton methods. Avoid consulting the
+		// identity-keyed singleton map on every typed integer/native guard.
+		return nil
 	case object.ValueObject:
 		if value, ok := receiver.Data.(*object.Object); ok {
 			return value.SingletonClass
@@ -7802,17 +8513,17 @@ func defineMockSingletonWithArity(target *object.EmeraldValue, method string, ar
 	switch target.Type {
 	case object.ValueObject:
 		obj, ok := target.Data.(*object.Object)
-		if !ok || obj == nil || obj.SingletonMethods == nil {
+		if !ok || obj == nil {
 			if InstallNativeSingletonMethod != nil {
 				mockRestores = append(mockRestores, InstallNativeSingletonMethod(target, method, methodFn))
 			}
 			return
 		}
 		previous, hadPrevious := obj.SingletonMethods[method]
-		obj.SingletonMethods[method] = methodFn
+		obj.SetSingletonMethod(method, methodFn)
 		mockRestores = append(mockRestores, func() {
 			if hadPrevious {
-				obj.SingletonMethods[method] = previous
+				obj.SetSingletonMethod(method, previous)
 			} else {
 				delete(obj.SingletonMethods, method)
 			}
@@ -7913,7 +8624,8 @@ func modulePrivateClassMethod(receiver *object.EmeraldValue, args ...*object.Eme
 }
 
 func moduleFunction(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if receiver == nil || receiver.Type != object.ValueModule {
+	kernelCompatibilityClass := receiver != nil && receiver.Type == object.ValueClass && receiver.Data == R.Classes["Kernel"]
+	if receiver == nil || (receiver.Type != object.ValueModule && !kernelCompatibilityClass) {
 		return typeError("module_function must be called for modules")
 	}
 	if len(args) == 0 {
@@ -8057,15 +8769,222 @@ func SingletonClass(receiver *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func trackObjectSpaceValue(value *object.EmeraldValue) {
-	if value == nil {
+	// Immediate values are not heap objects and ObjectSpace deliberately
+	// excludes them from both enumeration and weak-map keys. Native/compiled
+	// paths can produce many cached integers, so do not manufacture a weak
+	// handle for a value that can never be observed here.
+	if value == nil || objectSpaceTrackingDisabled || !weakMapCollectable(value) {
 		return
 	}
-	for _, existing := range objectSpaceTracked {
-		if existing == value || existing.Data == value.Data {
-			return
+	if objectSpaceTraceDepth > 0 && !allocationMetadataTraced(value) {
+		path := CurrentSpecFile
+		if path == "" {
+			path = "(eval)"
+		}
+		line := int64(1)
+		methodID := ""
+		classPath := ""
+		if CurrentFrameBinding != nil {
+			if binding := CurrentFrameBinding(); binding != nil {
+				if binding.Path != "" {
+					path = binding.Path
+				}
+				if binding.Line > 0 {
+					line = binding.Line
+				}
+				methodID = binding.Method
+				classPath = objectSpaceBindingClassPath(binding)
+			}
+		}
+		recordObjectSpaceAllocationMetadata(value, path, line, classPath, methodID)
+	}
+	objectSpaceTracked = append(objectSpaceTracked, weak.Make(value))
+	objectSpaceTotalAllocated++
+	objectSpaceTrackedSinceCompact++
+	if objectSpaceTrackedSinceCompact >= 4096 {
+		compactObjectSpaceTracked()
+	}
+}
+
+// TrackObjectSpaceAllocation records a Ruby-visible allocation at its execution
+// site. VM instructions use this for values, such as mutable literals, that do
+// not pass through Class#new.
+func TrackObjectSpaceAllocation(value *object.EmeraldValue, path string, line int64, classPath, methodID string) *object.EmeraldValue {
+	if value == nil || !weakMapCollectable(value) || objectSpaceTraceDepth == 0 || allocationMetadataTraced(value) {
+		return value
+	}
+	recordObjectSpaceAllocationMetadata(value, path, line, classPath, methodID)
+	objectSpaceTracked = append(objectSpaceTracked, weak.Make(value))
+	objectSpaceTotalAllocated++
+	objectSpaceTrackedSinceCompact++
+	if objectSpaceTrackedSinceCompact >= 4096 {
+		compactObjectSpaceTracked()
+	}
+	return value
+}
+
+// TrackObjectSpaceValue exposes the normal weak ObjectSpace registration to a
+// VM-owned batch allocator. Compiled fast paths call it only after all guards
+// have proven the allocation shape; the compatibility semantics remain in the
+// same central tracker.
+func TrackObjectSpaceValue(value *object.EmeraldValue) {
+	trackObjectSpaceValue(value)
+}
+
+// TrackObjectSpaceValues registers a VM-owned allocation batch with the same
+// weak ObjectSpace representation as individual allocations. A batch delays
+// list compaction until the weak list itself is substantial; cleared entries
+// remain semantically invisible and explicit GC still compacts immediately.
+func TrackObjectSpaceValues(values []*object.EmeraldValue) {
+	if objectSpaceTrackingDisabled || len(values) == 0 {
+		return
+	}
+	trackable := 0
+	for _, value := range values {
+		if value != nil && weakMapCollectable(value) {
+			trackable++
 		}
 	}
-	objectSpaceTracked = append(objectSpaceTracked, value)
+	if trackable == 0 {
+		return
+	}
+	needed := len(objectSpaceTracked) + trackable
+	if cap(objectSpaceTracked) < needed {
+		capacity := cap(objectSpaceTracked) * 2
+		if capacity < needed {
+			capacity = needed
+		}
+		grown := make([]weak.Pointer[object.EmeraldValue], len(objectSpaceTracked), capacity)
+		copy(grown, objectSpaceTracked)
+		objectSpaceTracked = grown
+	}
+	tracked := objectSpaceTracked
+	if objectSpaceTraceDepth == 0 {
+		registered := 0
+		for _, value := range values {
+			if value == nil || !weakMapCollectable(value) {
+				continue
+			}
+			tracked = append(tracked, weak.Make(value))
+			registered++
+		}
+		objectSpaceTracked = tracked
+		objectSpaceTotalAllocated += int64(registered)
+		objectSpaceTrackedSinceCompact += registered
+		if objectSpaceTrackedSinceCompact >= objectSpaceBatchCompactionThreshold &&
+			len(objectSpaceTracked) >= objectSpaceBatchCompactionThreshold {
+			compactObjectSpaceTracked()
+		}
+		return
+	}
+	registered := 0
+	for _, value := range values {
+		if value == nil || !weakMapCollectable(value) {
+			continue
+		}
+		if objectSpaceTraceDepth > 0 && !allocationMetadataTraced(value) {
+			path := CurrentSpecFile
+			if path == "" {
+				path = "(eval)"
+			}
+			line := int64(1)
+			methodID := ""
+			classPath := ""
+			if CurrentFrameBinding != nil {
+				if binding := CurrentFrameBinding(); binding != nil {
+					if binding.Path != "" {
+						path = binding.Path
+					}
+					if binding.Line > 0 {
+						line = binding.Line
+					}
+					methodID = binding.Method
+					classPath = objectSpaceBindingClassPath(binding)
+				}
+			}
+			recordObjectSpaceAllocationMetadata(value, path, line, classPath, methodID)
+		}
+		tracked = append(tracked, weak.Make(value))
+		registered++
+	}
+	objectSpaceTracked = tracked
+	objectSpaceTotalAllocated += int64(registered)
+	objectSpaceTrackedSinceCompact += registered
+	if objectSpaceTrackedSinceCompact >= objectSpaceBatchCompactionThreshold &&
+		len(objectSpaceTracked) >= objectSpaceBatchCompactionThreshold {
+		compactObjectSpaceTracked()
+	}
+}
+
+func ObjectSpaceAllocationTracing() bool {
+	return objectSpaceTraceDepth > 0
+}
+
+// ObjectSpaceTrackingEnabled reports whether ordinary allocations must be
+// registered for ObjectSpace. VM batch allocators use it to avoid placing
+// weakly-tracked Ruby values inside one large Go backing object, which makes
+// the runtime's weak-pointer bookkeeping disproportionately expensive.
+func ObjectSpaceTrackingEnabled() bool {
+	return !objectSpaceTrackingDisabled
+}
+
+func recordObjectSpaceAllocationMetadata(value *object.EmeraldValue, path string, line int64, classPath, methodID string) {
+	value.SetAllocationMetadata(&object.AllocationMetadata{
+		Owner:      value,
+		Traced:     true,
+		Generation: gcCountValue,
+		SourceFile: path,
+		SourceLine: line,
+		ClassPath:  classPath,
+		MethodID:   methodID,
+	})
+	if gcDisabled {
+		objectSpaceTraceRetained = append(objectSpaceTraceRetained, value)
+	}
+}
+
+func clearObjectSpaceAllocationMetadata(value *object.EmeraldValue) {
+	if !allocationMetadataTraced(value) {
+		return
+	}
+	value.SetAllocationMetadata(nil)
+}
+
+func allocationMetadataTraced(value *object.EmeraldValue) bool {
+	metadata := value.AllocationMetadataValue()
+	return metadata != nil && metadata.Traced && metadata.Owner == value
+}
+
+func objectSpaceBindingClassPath(binding *object.RBinding) string {
+	if binding == nil || binding.Self == nil {
+		return ""
+	}
+	switch binding.Self.Type {
+	case object.ValueClass:
+		if class, ok := binding.Self.Data.(*object.Class); ok && class != nil {
+			return class.Name
+		}
+	case object.ValueModule:
+		if module, ok := binding.Self.Data.(*object.Module); ok && module != nil {
+			return module.Name
+		}
+	default:
+		if binding.Self.Class != nil {
+			return binding.Self.Class.Name
+		}
+	}
+	return ""
+}
+
+func compactObjectSpaceTracked() {
+	live := objectSpaceTracked[:0]
+	for _, tracked := range objectSpaceTracked {
+		if tracked.Value() != nil {
+			live = append(live, tracked)
+		}
+	}
+	objectSpaceTracked = live
+	objectSpaceTrackedSinceCompact = 0
 }
 
 func AttachedSingletonClass(receiver *object.EmeraldValue) *object.Class {
@@ -8250,7 +9169,7 @@ func receiverInstanceVarMap(receiver *object.EmeraldValue) map[string]*object.Em
 	switch receiver.Type {
 	case object.ValueObject:
 		if obj, ok := receiver.Data.(*object.Object); ok {
-			return obj.InstanceVars
+			return obj.InstanceVarMap()
 		}
 	case object.ValueHash:
 		if hash := hashData(receiver); hash != nil {
@@ -8282,13 +9201,10 @@ func receiverInstanceVarMap(receiver *object.EmeraldValue) map[string]*object.Em
 			return mod.InstanceVars
 		}
 	}
-	if auxiliaryInstanceVars == nil {
-		auxiliaryInstanceVars = make(map[*object.EmeraldValue]map[string]*object.EmeraldValue)
-	}
-	variables := auxiliaryInstanceVars[receiver]
+	variables := receiver.InstanceVars
 	if variables == nil {
 		variables = make(map[string]*object.EmeraldValue)
-		auxiliaryInstanceVars[receiver] = variables
+		receiver.InstanceVars = variables
 	}
 	return variables
 }
@@ -8314,15 +9230,16 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return &object.EmeraldValue{Type: object.ValueHash, Data: cloneRHash(hashData(receiver)), Class: receiver.Class}
 	case object.ValueRegexp:
 		duplicate := *receiver
+		duplicate.Cold = receiver.CloneColdData()
 		duplicate.Frozen = false
 		duplicate.Literal = false
 		result := &duplicate
-		if variables := auxiliaryInstanceVars[receiver]; len(variables) > 0 {
+		if variables := receiver.InstanceVars; len(variables) > 0 {
 			copied := make(map[string]*object.EmeraldValue, len(variables))
 			for name, value := range variables {
 				copied[name] = value
 			}
-			auxiliaryInstanceVars[result] = copied
+			result.InstanceVars = copied
 		}
 		return result
 	case object.ValueException:
@@ -8374,12 +9291,12 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			duplicate.Names[name] = append([]int(nil), indices...)
 		}
 		result := &object.EmeraldValue{Type: object.ValueMatchData, Data: &duplicate, Class: receiver.Class}
-		if variables := auxiliaryInstanceVars[receiver]; variables != nil {
+		if variables := receiver.InstanceVars; variables != nil {
 			copied := make(map[string]*object.EmeraldValue, len(variables))
 			for name, value := range variables {
 				copied[name] = value
 			}
-			auxiliaryInstanceVars[result] = copied
+			result.InstanceVars = copied
 		}
 		return result
 	case object.ValueMethod:
@@ -8389,12 +9306,12 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		}
 		duplicate := *original
 		result := &object.EmeraldValue{Type: object.ValueMethod, Data: &duplicate, Class: receiver.Class}
-		if variables := auxiliaryInstanceVars[receiver]; variables != nil {
+		if variables := receiver.InstanceVars; variables != nil {
 			copied := make(map[string]*object.EmeraldValue, len(variables))
 			for name, value := range variables {
 				copied[name] = value
 			}
-			auxiliaryInstanceVars[result] = copied
+			result.InstanceVars = copied
 		}
 		if finalizers := objectSpaceFinalizers[receiver]; len(finalizers) > 0 {
 			objectSpaceFinalizers[result] = append([]*object.EmeraldValue(nil), finalizers...)
@@ -8407,6 +9324,22 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			case *ioShimData:
 				if data.closed {
 					return newRuntimeException(R.Classes["IOError"], "closed stream")
+				}
+				if stringIOClass := R.Classes["StringIO"]; stringIOClass != nil && classInheritsFrom(receiver.Class, stringIOClass) {
+					cloned := *data
+					cloned.fd = nextIOFd
+					nextIOFd++
+					cloned.dupSourceFD = -1
+					cloned.fdRegistered = false
+					cloned.blockedReaders = nil
+					if ioPipeBuffers != nil {
+						content := ""
+						if source := ioPipeBufferForFD(data.fd); source != nil {
+							content = source.String()
+						}
+						ioPipeBuffers[cloned.fd] = bytes.NewBufferString(content)
+					}
+					return &object.EmeraldValue{Type: object.ValueObject, Data: &cloned, Class: receiver.Class}
 				}
 				cloned := *data
 				rootFD := data.fd
@@ -8422,6 +9355,7 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 				cloned.autoclose = true
 				if ioDataByFd != nil {
 					ioDataByFd[cloned.fd] = &cloned
+					cloned.fdRegistered = true
 				}
 				return &object.EmeraldValue{Type: object.ValueObject, Data: &cloned, Class: receiver.Class}
 			case *processStatusData:
@@ -8443,11 +9377,9 @@ func methodDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		}
 		dup := object.NewObject(orig.Class)
 		dup.StructValues = append([]*object.EmeraldValue(nil), orig.StructValues...)
-		for name, value := range orig.InstanceVars {
-			dup.InstanceVars[name] = value
-		}
+		copyObjectInstanceVars(dup, orig)
 		for name, value := range orig.ClassVars {
-			dup.ClassVars[name] = value
+			dup.SetClassVar(name, value)
 		}
 		result := &object.EmeraldValue{Type: object.ValueObject, Data: dup, Class: receiver.Class}
 		call := CallMethod
@@ -8604,14 +9536,12 @@ func methodClone(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	clone := object.NewObject(orig.Class)
 	clone.StructValues = append([]*object.EmeraldValue(nil), orig.StructValues...)
-	for name, value := range orig.InstanceVars {
-		clone.InstanceVars[name] = value
-	}
+	copyObjectInstanceVars(clone, orig)
 	for name, value := range orig.ClassVars {
-		clone.ClassVars[name] = value
+		clone.SetClassVar(name, value)
 	}
 	for name, method := range orig.SingletonMethods {
-		clone.SingletonMethods[name] = method
+		clone.SetSingletonMethod(name, method)
 	}
 	result := &object.EmeraldValue{Type: object.ValueObject, Data: clone, Class: receiver.Class}
 	clone.SingletonClass = cloneSingletonClass(orig.SingletonClass, result)
@@ -8622,20 +9552,62 @@ func methodClone(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	return result
 }
 
+// copyObjectInstanceVars preserves Ruby's observable instance-variable order
+// when duplicating an ordinary object. Compact objects keep the order in
+// InstanceVarOrder, while older map-backed objects may have entries that were
+// added without updating that slice; those missing entries use a stable
+// lexical order instead of Go's randomized map iteration order.
+func copyObjectInstanceVars(dst, src *object.Object) {
+	if dst == nil || src == nil {
+		return
+	}
+	vars := src.InstanceVarMap()
+	if len(vars) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(vars))
+	copyOne := func(name string) {
+		if _, exists := seen[name]; exists {
+			return
+		}
+		value, exists := vars[name]
+		if !exists {
+			return
+		}
+		dst.SetInstanceVar(name, value)
+		seen[name] = struct{}{}
+	}
+	for _, name := range src.InstanceVarOrder {
+		copyOne(name)
+	}
+	missing := make([]string, 0, len(vars)-len(seen))
+	for name := range vars {
+		if _, exists := seen[name]; !exists {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	for _, name := range missing {
+		copyOne(name)
+	}
+}
+
 func duplicateStringValue(receiver *object.EmeraldValue, frozen, copySingleton bool) *object.EmeraldValue {
 	duplicate := *receiver
+	duplicate.Cold = receiver.CloneColdData()
 	duplicate.Frozen = frozen
+	duplicate.SetStringBuilder(nil)
 	result := &duplicate
 	SetStringEncoding(result, stringEncodingName(receiver))
 	if payload, ok := packedPointerStrings[receiver]; ok {
 		packedPointerStrings[result] = payload
 	}
-	if variables := auxiliaryInstanceVars[receiver]; len(variables) > 0 {
+	if variables := receiver.InstanceVars; len(variables) > 0 {
 		copyVariables := make(map[string]*object.EmeraldValue, len(variables))
 		for name, value := range variables {
 			copyVariables[name] = value
 		}
-		auxiliaryInstanceVars[result] = copyVariables
+		result.InstanceVars = copyVariables
 	}
 	if copySingleton {
 		if singleton := existingSingletonClass(receiver); singleton != nil {
@@ -9369,7 +10341,7 @@ func assignValueName(value *object.EmeraldValue, name string, visited map[*objec
 		}
 		oldName = cls.Name
 		oldAnonymous := oldName == "" || strings.HasPrefix(oldName, "#<")
-		shouldAssign := cls.Name == "" || (strings.HasPrefix(cls.Name, "#<") && (cls.NameValue == nil || nameHasPermanentRoot(name))) || (cls.TemporaryName && nameHasPermanentRoot(name)) || (!cls.TemporaryName && !strings.Contains(cls.Name, "::") && strings.Contains(name, "::"))
+		shouldAssign := cls.Name == "" || (strings.HasPrefix(cls.Name, "#<") && (cls.NameValue == nil || nameHasPermanentRoot(name))) || (cls.TemporaryName && nameHasPermanentRoot(name)) || (!cls.TemporaryName && !strings.Contains(cls.Name, "::") && strings.Contains(name, "::") && !valueHasCanonicalConstantName(value, cls.Name))
 		if shouldAssign {
 			cls.Name = name
 			cls.NameValue = nil
@@ -9384,7 +10356,7 @@ func assignValueName(value *object.EmeraldValue, name string, visited map[*objec
 		mod := value.Data.(*object.Module)
 		oldName = mod.Name
 		oldAnonymous := oldName == "" || strings.HasPrefix(oldName, "#<")
-		shouldAssign := mod.Name == "" || (strings.HasPrefix(mod.Name, "#<") && (mod.NameValue == nil || nameHasPermanentRoot(name))) || (mod.TemporaryName && nameHasPermanentRoot(name)) || (!mod.TemporaryName && !strings.Contains(mod.Name, "::") && strings.Contains(name, "::"))
+		shouldAssign := mod.Name == "" || (strings.HasPrefix(mod.Name, "#<") && (mod.NameValue == nil || nameHasPermanentRoot(name))) || (mod.TemporaryName && nameHasPermanentRoot(name)) || (!mod.TemporaryName && !strings.Contains(mod.Name, "::") && strings.Contains(name, "::") && !valueHasCanonicalConstantName(value, mod.Name))
 		if shouldAssign {
 			mod.Name = name
 			mod.NameValue = nil
@@ -9396,6 +10368,13 @@ func assignValueName(value *object.EmeraldValue, name string, visited map[*objec
 			}
 		}
 	}
+}
+
+func valueHasCanonicalConstantName(value *object.EmeraldValue, name string) bool {
+	if value == nil || !validSimpleConstantName(name) || GetConstantName == nil {
+		return false
+	}
+	return GetConstantName(name) == value
 }
 
 func nameHasPermanentRoot(name string) bool {
@@ -10349,7 +11328,7 @@ func SetClassVariable(receiver *object.EmeraldValue, name string, value *object.
 		if obj.ClassVars == nil {
 			obj.ClassVars = make(map[string]*object.EmeraldValue)
 		}
-		obj.ClassVars[name] = value
+		obj.SetClassVar(name, value)
 	}
 }
 
@@ -10541,6 +11520,10 @@ func moduleAliasMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		module := receiver.Data.(*object.Module)
 		if module.IsRefinement && module.RefinementTarget != nil {
 			method, _, ok = lookupInstanceMethodWithOwner(module.RefinementTarget, oldName)
+		}
+		if !ok {
+			objectClass := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Object"], Class: R.Classes["Class"]}
+			method, implementationOwner, ok = lookupInstanceMethodWithOwner(objectClass, oldName)
 		}
 	}
 	if !ok {
@@ -10740,7 +11723,6 @@ func methodFromDefineMethodValue(receiver *object.EmeraldValue, name string, val
 	switch value.Type {
 	case object.ValueClosure:
 		closure := value.Data.(*object.Closure)
-		closure.Fn.DefinedByDefineMethod = true
 		return &object.Method{Name: name, Fn: closure.Fn, Closure: closure}, nil
 	case object.ValueProc:
 		proc := value.Data.(*object.Proc)
@@ -10749,7 +11731,6 @@ func methodFromDefineMethodValue(receiver *object.EmeraldValue, name string, val
 				return proc.Native(args...)
 			}}, nil
 		}
-		proc.Fn.DefinedByDefineMethod = true
 		return &object.Method{Name: name, Fn: proc.Fn, Closure: &object.Closure{
 			Fn:               proc.Fn,
 			Free:             proc.Env,
@@ -10941,7 +11922,7 @@ func moduleUndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 					if obj.SingletonMethods == nil {
 						obj.SingletonMethods = map[string]*object.Method{}
 					}
-					obj.SingletonMethods[name] = undefined
+					obj.SetSingletonMethod(name, undefined)
 				}
 			}
 		case object.ValueModule:
@@ -10953,6 +11934,10 @@ func moduleUndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		}
 	}
 	return receiver
+}
+
+func UndefMethod(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return moduleUndefMethod(receiver, args...)
 }
 
 func methodMutationHook(receiver *object.EmeraldValue, ordinary, singleton string) (*object.EmeraldValue, string) {
@@ -11396,12 +12381,22 @@ func setNamedClassMethodVisibility(receiver *object.EmeraldValue, name, visibili
 	switch receiver.Type {
 	case object.ValueClass:
 		cls := receiver.Data.(*object.Class)
+		if cls.SingletonClass == nil {
+			SingletonClass(receiver)
+		}
 		if cls.SingletonClass != nil {
 			if method, ok := cls.SingletonClass.Methods[name]; ok {
 				clone := *method
 				clone.Visibility = visibility
 				cls.SingletonClass.Methods[name] = &clone
 				object.BumpMethodGeneration()
+				return true
+			}
+			singleton := &object.EmeraldValue{Type: object.ValueClass, Data: cls.SingletonClass, Class: R.Classes["Class"]}
+			if method, _, ok := lookupInstanceMethodWithOwner(singleton, name); ok {
+				clone := *method
+				clone.Visibility = visibility
+				cls.SingletonClass.DefineMethod(name, &clone)
 				return true
 			}
 		}
@@ -11477,9 +12472,10 @@ func defineAttrReaders(receiver *object.EmeraldValue, names ...string) {
 		getterName := name
 		visibility := currentMethodVisibility(receiver)
 		defineDynamicAccessor(receiver, getterName, &object.Method{
-			Name:       getterName,
-			Arity:      0,
-			Visibility: visibility,
+			Name:           getterName,
+			Arity:          0,
+			Visibility:     visibility,
+			AttrReaderName: ivar,
 			Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 				if value := dynamicInstanceVar(r, ivar); value != nil {
 					return value
@@ -11499,9 +12495,10 @@ func defineAttrWriters(receiver *object.EmeraldValue, names ...string) {
 		setterName := name + "="
 		visibility := currentMethodVisibility(receiver)
 		defineDynamicAccessor(receiver, setterName, &object.Method{
-			Name:       setterName,
-			Arity:      1,
-			Visibility: visibility,
+			Name:           setterName,
+			Arity:          1,
+			Visibility:     visibility,
+			AttrWriterName: ivar,
 			Fn: func(r *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 				if len(args) == 0 {
 					return R.NilVal
@@ -11724,8 +12721,8 @@ func dynamicInstanceVar(receiver *object.EmeraldValue, name string) *object.Emer
 			return mod.InstanceVars[name]
 		}
 	}
-	if auxiliaryInstanceVars != nil {
-		return auxiliaryInstanceVars[receiver][name]
+	if receiver != nil && receiver.InstanceVars != nil {
+		return receiver.InstanceVars[name]
 	}
 	return nil
 }
@@ -12082,12 +13079,29 @@ func methodRespondTo(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 					}
 				}
 			}
+			// Native standard-library modules store their module functions in
+			// Module.Methods. They are directly callable by the dispatcher, so
+			// respond_to? must expose them as well. Ruby-defined instance
+			// methods remain non-singleton methods unless module_function is
+			// used.
+			if method, found := mod.Methods[methodName]; found {
+				if _, rubyDefined := method.Fn.(*object.Function); !rubyDefined {
+					return boolValue(checkVisibility(method))
+				}
+			}
 		}
 	}
 
 	if receiver.Class != nil {
 		if method, ok := receiver.Class.GetMethod(methodName); ok && checkVisibility(method) {
 			return R.TrueVal
+		}
+		if objectClass := R.Classes["Object"]; objectClass != nil && classInheritsFrom(receiver.Class, objectClass) {
+			if kernel := R.Classes["Kernel"]; kernel != nil {
+				if method, ok := kernel.GetMethod(methodName); ok && checkVisibility(method) {
+					return R.TrueVal
+				}
+			}
 		}
 	}
 	if receiver != nil {
@@ -12602,6 +13616,26 @@ func objectIDForValue(value *object.EmeraldValue) int64 {
 			id := objectIDCounter
 			objectIDCounter++
 			objectIDBySymbol[s] = id
+			return id
+		}
+	case object.ValueClass:
+		if class, ok := value.Data.(*object.Class); ok && class != nil {
+			if id, exists := objectIDByClass[class]; exists {
+				return id
+			}
+			id := objectIDCounter
+			objectIDCounter++
+			objectIDByClass[class] = id
+			return id
+		}
+	case object.ValueModule:
+		if module, ok := value.Data.(*object.Module); ok && module != nil {
+			if id, exists := objectIDByModule[module]; exists {
+				return id
+			}
+			id := objectIDCounter
+			objectIDCounter++
+			objectIDByModule[module] = id
 			return id
 		}
 	}
@@ -13319,7 +14353,21 @@ func classEvalBinding(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if receiver == nil {
 		receiver = R.Main
 	}
-	binding := &object.RBinding{Self: receiver, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}}
+	binding := (*object.RBinding)(nil)
+	if CurrentFrameBinding != nil {
+		binding = cloneBindingData(CurrentFrameBinding())
+	}
+	if binding == nil {
+		binding = &object.RBinding{
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Constants:        map[string]*object.EmeraldValue{},
+		}
+	}
+	binding.Self = receiver
+	binding.Constants = map[string]*object.EmeraldValue{}
+	binding.InstanceVars = map[string]*object.EmeraldValue{}
+	binding.ClassStack = append(append([]*object.EmeraldValue(nil), binding.ClassStack...), receiver)
+	binding.ClassVarScope = receiver
 	if CurrentUsedRefinements != nil {
 		binding.Refinements = CurrentUsedRefinements()
 	}
@@ -13354,11 +14402,11 @@ func objectExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	}
 	for _, arg := range args {
 		if CallMethod != nil {
-			result := CallMethod(arg, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "extend_object", Class: R.Classes["Symbol"]}, receiver)
+			result := CallMethod(arg, "__send__", &object.EmeraldValue{Type: object.ValueSymbol, Data: "extend_object", Class: R.Classes["Symbol"]}, receiver)
 			if result != nil && result.Type == object.ValueException {
 				return result
 			}
-			result = CallMethod(arg, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "extended", Class: R.Classes["Symbol"]}, receiver)
+			result = CallMethod(arg, "__send__", &object.EmeraldValue{Type: object.ValueSymbol, Data: "extended", Class: R.Classes["Symbol"]}, receiver)
 			if result != nil && result.Type == object.ValueException {
 				return result
 			}
@@ -20103,6 +21151,7 @@ func errnoMetadataList() []errnoMetadata {
 		{name: "ENOTEMPTY", number: int64(syscall.ENOTEMPTY), message: "Directory not empty"},
 		{name: "ENOTDIR", number: int64(syscall.ENOTDIR), message: "Not a directory"},
 		{name: "EISDIR", number: int64(syscall.EISDIR), message: "Is a directory"},
+		{name: "ENAMETOOLONG", number: int64(syscall.ENAMETOOLONG), message: "File name too long"},
 		{name: "ENOEXEC", number: int64(syscall.ENOEXEC), message: "Exec format error"},
 		{name: "EINVAL", number: int64(syscall.EINVAL), message: "Invalid argument"},
 		{name: "EMFILE", number: int64(syscall.EMFILE), message: "Too many open files"},
@@ -20113,22 +21162,26 @@ func errnoMetadataList() []errnoMetadata {
 		{name: "EADDRINUSE", number: int64(syscall.EADDRINUSE), message: "Address already in use"},
 		{name: "EADDRNOTAVAIL", number: int64(syscall.EADDRNOTAVAIL), message: "Cannot assign requested address"},
 		{name: "EAFNOSUPPORT", number: int64(syscall.EAFNOSUPPORT), message: "Address family not supported by protocol"},
+		{name: "EALREADY", number: int64(syscall.EALREADY), message: "Operation already in progress"},
+		{name: "ECONNABORTED", number: int64(syscall.ECONNABORTED), message: "Software caused connection abort"},
 		{name: "ECONNREFUSED", number: int64(syscall.ECONNREFUSED), message: "Connection refused"},
+		{name: "ECONNRESET", number: int64(syscall.ECONNRESET), message: "Connection reset by peer"},
 		{name: "EDESTADDRREQ", number: int64(syscall.EDESTADDRREQ), message: "Destination address required"},
+		{name: "EHOSTUNREACH", number: int64(syscall.EHOSTUNREACH), message: "No route to host"},
 		{name: "EINPROGRESS", number: int64(syscall.EINPROGRESS), message: "Operation now in progress"},
 		{name: "EISCONN", number: int64(syscall.EISCONN), message: "Transport endpoint is already connected"},
 		{name: "EMSGSIZE", number: int64(syscall.EMSGSIZE), message: "Message too long"},
 		{name: "ENETUNREACH", number: int64(syscall.ENETUNREACH), message: "Network is unreachable"},
 		{name: "ENOPROTOOPT", number: int64(syscall.ENOPROTOOPT), message: "Protocol not available"},
 		{name: "ENOTCONN", number: int64(syscall.ENOTCONN), message: "Transport endpoint is not connected"},
+		{name: "ENOTSOCK", number: int64(syscall.ENOTSOCK), message: "Socket operation on non-socket"},
 		{name: "EPROTONOSUPPORT", number: int64(syscall.EPROTONOSUPPORT), message: "Protocol not supported"},
 		{name: "ETIMEDOUT", number: int64(syscall.ETIMEDOUT), message: "Connection timed out"},
 	}
 }
 
 func installErrnoConstants() {
-	errnoClass := R.Classes["Errno"]
-	if errnoClass == nil {
+	if errnoModule == nil {
 		return
 	}
 	classesByNumber := make(map[int64]*object.Class)
@@ -20149,7 +21202,7 @@ func installErrnoConstants() {
 			classesByNumber[meta.number] = cls
 		}
 		classValue := &object.EmeraldValue{Type: object.ValueClass, Data: cls, Class: R.Classes["Class"]}
-		errnoClass.DefineConstant(meta.name, classValue)
+		errnoModule.DefineConstant(meta.name, classValue)
 		cls.DefineConstant("Errno", newInt(meta.number))
 	}
 	if cls := R.Classes["Errno::EINPROGRESS"]; cls != nil {
@@ -20411,6 +21464,10 @@ func NewLocalJumpError(message string) *object.EmeraldValue {
 	return newRuntimeException(R.Classes["LocalJumpError"], message)
 }
 
+func NewLocalJumpErrorObject(message string) *object.EmeraldValue {
+	return newExceptionObject(R.Classes["LocalJumpError"], message)
+}
+
 func NewLocalJumpErrorWithReturn(value *object.EmeraldValue) *object.EmeraldValue {
 	err := newRuntimeException(R.Classes["LocalJumpError"], "unexpected return")
 	if exc, ok := err.Data.(*object.RException); ok && exc != nil {
@@ -20456,10 +21513,17 @@ func NewFrozenError(message string) *object.EmeraldValue {
 }
 
 func newRuntimeException(class *object.Class, message string) *object.EmeraldValue {
-	frames := currentBacktraceFramesOrEmpty()
+	var data object.RException
+	data.Message = message
+	data.Raised = true
+	if eagerRuntimeExceptionBacktrace {
+		frames := currentBacktraceFramesOrEmpty()
+		data.Backtrace = backtraceStrings(frames)
+		data.Locations = frames
+	}
 	exc := &object.EmeraldValue{
 		Type:  object.ValueException,
-		Data:  &object.RException{Message: message, Backtrace: backtraceStrings(frames), Locations: frames, Raised: true},
+		Data:  &data,
 		Class: class,
 	}
 	LastException = exc
@@ -20723,6 +21787,9 @@ func conditionVariableWait(receiver *object.EmeraldValue, args ...*object.Emeral
 	if len(args) == 0 {
 		return NewArgumentError("wrong number of arguments (given 0, expected 1..2)")
 	}
+	if len(args) > 2 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..2)", len(args)))
+	}
 	mutex := args[0]
 	if mutexValueData(mutex) == nil {
 		if CallMethod != nil {
@@ -20738,15 +21805,39 @@ func conditionVariableWait(receiver *object.EmeraldValue, args ...*object.Emeral
 	if data == nil {
 		return R.NilVal
 	}
+	var deadline time.Time
+	if len(args) == 2 && args[1] != nil && args[1].Type != object.ValueNil {
+		seconds, errVal := sleepDurationSeconds(args[1])
+		if errVal != nil {
+			return errVal
+		}
+		deadline = time.Now().Add(time.Duration(seconds * float64(time.Second)))
+	}
 	if result := mutexUnlock(mutex); result != mutex {
 		return result
 	}
 	data.waiters = append(data.waiters, conditionVariableWaiter{thread: current, mutex: mutex})
-	if currentData := threadValueData(current); currentData != nil {
+	currentData := threadValueData(current)
+	if currentData != nil {
 		currentData.stopped = true
 	}
 	result := R.NilVal
-	if SuspendCurrentThread != nil {
+	if currentData != nil && currentData.block == nil {
+		for conditionVariableHasWaiter(data, current) {
+			if len(pendingThreads) > 0 {
+				runNextPendingThread()
+				continue
+			}
+			if !deadline.IsZero() {
+				if delay := time.Until(deadline); delay > 0 {
+					time.Sleep(delay)
+				}
+				break
+			}
+			result = threadError("stopping only thread")
+			break
+		}
+	} else if SuspendCurrentThread != nil {
 		result = SuspendCurrentThread()
 	} else {
 		runNextPendingThread()
@@ -20763,6 +21854,18 @@ func conditionVariableWait(receiver *object.EmeraldValue, args ...*object.Emeral
 		}
 	}
 	return result
+}
+
+func conditionVariableHasWaiter(data *conditionVariableData, thread *object.EmeraldValue) bool {
+	if data == nil {
+		return false
+	}
+	for _, waiter := range data.waiters {
+		if waiter.thread == thread {
+			return true
+		}
+	}
+	return false
 }
 
 func conditionVariableRemoveWaiter(data *conditionVariableData, thread *object.EmeraldValue) {
@@ -22687,9 +23790,9 @@ func enumeratorWithIndex(receiver *object.EmeraldValue, args ...*object.EmeraldV
 	if !ok {
 		return receiver
 	}
-	hasBlock := BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CurrentBlockValue() != nil
+	block := enumerableCurrentBlock()
+	hasBlock := block != nil
 	if data.kind == "chunk" && data.chunkSource != nil && hasBlock {
-		block := CurrentBlockValue()
 		return enumerableChunkEnumerator(data.chunkSource, func(value *object.EmeraldValue, index int) *object.EmeraldValue {
 			return CallBlockWithArgs(block, value, newInt(offset+int64(index)))
 		})
@@ -22734,7 +23837,6 @@ func enumeratorWithIndex(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		}
 		return enum
 	}
-	block := CurrentBlockValue()
 	if receiver.Class == R.Classes["Enumerator::Lazy"] {
 		return newLazyEnumerator(enumeratorSize(receiver), func(limit int) ([]*object.EmeraldValue, *object.EmeraldValue) {
 			values, errVal := lazyEnumeratorValues(data, limit)
@@ -22764,6 +23866,9 @@ func enumeratorWithIndex(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		}
 		return blockResult
 	})
+	if data.eachWithBlock != nil {
+		return data.eachWithBlock(wrapper)
+	}
 	if CallMethodWithBlock != nil {
 		return CallMethodWithBlock(receiver, "each", wrapper)
 	}
@@ -24690,6 +25795,8 @@ func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		effective := receiverEffectiveClass(receiver)
 		if singleton := existingSingletonClass(receiver); singleton != nil {
 			effective = singleton
+		} else if classValueInheritedSingletonAncestryIncludesModule(receiver, args[0].Data.(*object.Module)) {
+			return R.TrueVal
 		}
 		if classAncestryIncludesModule(effective, args[0].Data.(*object.Module)) {
 			return R.TrueVal
@@ -24705,6 +25812,22 @@ func methodIsA(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return R.TrueVal
 	}
 	return R.FalseVal
+}
+
+func classValueInheritedSingletonAncestryIncludesModule(receiver *object.EmeraldValue, target *object.Module) bool {
+	if receiver == nil || receiver.Type != object.ValueClass || target == nil {
+		return false
+	}
+	class, ok := receiver.Data.(*object.Class)
+	if !ok {
+		return false
+	}
+	for current := class.SuperClass; current != nil; current = current.SuperClass {
+		if current.SingletonClass != nil && classAncestryIncludesModule(current.SingletonClass, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func classValueKindOfSingletonTarget(receiver *object.EmeraldValue, target *object.Class) bool {
@@ -24883,9 +26006,57 @@ func classSingletonTowerDepth(class *object.Class) (int, bool) {
 	return depth, class == R.Classes["Class"]
 }
 
+// exactInt64Pair is the arithmetic fast-path guard. Ordinary Ruby Integers
+// are represented as int64 in RGo; BigInt-backed values are deliberately
+// excluded because their object may carry an exact arbitrary-precision
+// override that the math/big path must preserve.
+func exactInt64Pair(left, right *object.EmeraldValue) (int64, int64, bool) {
+	if left == nil || right == nil || left.Type != object.ValueInteger || right.Type != object.ValueInteger ||
+		left.BigIntValue() != nil || right.BigIntValue() != nil {
+		return 0, 0, false
+	}
+	l, leftOK := left.Data.(int64)
+	r, rightOK := right.Data.(int64)
+	if !leftOK || !rightOK {
+		return 0, 0, false
+	}
+	return l, r, true
+}
+
+func checkedInt64Add(left, right int64) (int64, bool) {
+	if right > 0 && left > math.MaxInt64-right || right < 0 && left < math.MinInt64-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+func checkedInt64Sub(left, right int64) (int64, bool) {
+	if right > 0 && left < math.MinInt64+right || right < 0 && left > math.MaxInt64+right {
+		return 0, false
+	}
+	return left - right, true
+}
+
+func checkedInt64Mul(left, right int64) (int64, bool) {
+	if left == 0 || right == 0 {
+		return 0, true
+	}
+	if left == math.MinInt64 && right == -1 || right == math.MinInt64 && left == -1 {
+		return 0, false
+	}
+	result := left * right
+	return result, result/right == left
+}
+
 func intAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
+	}
+	if left, right, ok := exactInt64Pair(receiver, args[0]); ok {
+		if result, fits := checkedInt64Add(left, right); fits {
+			return NewIntegerValue(result)
+		}
+		return NewIntegerFromBigInt(new(big.Int).Add(big.NewInt(left), big.NewInt(right)))
 	}
 	if left, ok := numericBigIntValue(receiver); ok {
 		if right, ok := numericBigIntValue(args[0]); ok {
@@ -24913,6 +26084,663 @@ func IntegerPlusUsesBuiltinImplementation() bool {
 	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd))
 }
 
+func IntegerSubUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "-", BuiltinMethod(intSub))
+}
+
+func IntegerMulUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "*", BuiltinMethod(intMul))
+}
+
+func IntegerModUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "%", BuiltinMethod(intMod))
+}
+
+func IntegerBitAndUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "&", BuiltinMethod(intBitAnd))
+}
+
+func IntegerBitOrUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "|", BuiltinMethod(intBitOr))
+}
+
+func IntegerBitXorUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "^", BuiltinMethod(intBitXor))
+}
+
+func IntegerRightShiftUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], ">>", BuiltinMethod(intRightShift))
+}
+
+func IntegerLeftShiftUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "<<", BuiltinMethod(intLeftShift))
+}
+
+// StringPlusUsesBuiltinImplementation lets typed VM tiers bypass dynamic
+// String#+ only while the core implementation is still installed. Ruby code
+// may redefine String#+ at runtime, so callers must re-check this guard after
+// method-generation changes just like the Integer arithmetic fast path.
+func StringPlusUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "+", BuiltinMethod(stringAdd))
+}
+
+// StringEqualUsesBuiltinImplementation is the generation-safe guard for the
+// immutable String equality operation used by typed value plans.  Non-string
+// coercion, encodings, singleton methods, and user overrides remain on the
+// ordinary Ruby dispatcher.
+func StringEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "==", BuiltinMethod(stringEqual))
+}
+
+// StringIndexUsesBuiltinImplementation guards VM tiers that reproduce the
+// exact String#[] probes used by a proven immutable String algorithm.
+func StringIndexUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "[]", BuiltinMethod(stringIndex))
+}
+
+// StringLengthUsesBuiltinImplementation is the generation-safe guard for the
+// ASCII String#length shortcut used by the VM trusted native tier.
+func StringLengthUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "length", BuiltinMethod(stringLength))
+}
+
+// ArrayEachUsesBuiltinImplementation is the generation-safe guard used by
+// VM loop kernels that inline the concrete Array#each callback protocol.
+func ArrayEachUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Array"], "each", BuiltinMethod(arrayEach))
+}
+
+// PrawnAFMUnscaledWidthBuiltinsAvailable guards the VM's source-identity-
+// checked AFM width kernel. A Ruby redefinition must deopt the whole kernel
+// instead of silently bypassing the override.
+func PrawnAFMUnscaledWidthBuiltinsAvailable() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "bytes", BuiltinMethod(stringBytes)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "[]", BuiltinMethod(arrayIndex)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "reduce", BuiltinMethod(arrayReduce)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd))
+}
+
+// PrawnAFMKernBuiltinsAvailable guards the separate AFM kern kernel.
+func PrawnAFMKernBuiltinsAvailable() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "each_byte", BuiltinMethod(stringEachByte)) &&
+		classMethodUsesBuiltin(R.Classes["String"], "force_encoding", BuiltinMethod(stringForceEncoding)) &&
+		classMethodUsesBuiltin(R.Classes["Array"], "pack", BuiltinMethod(arrayPack)) &&
+		classMethodUsesBuiltin(R.Classes["Hash"], "[]", BuiltinMethod(hashIndex)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "-@", BuiltinMethod(intUnaryMinus))
+}
+
+// PrawnAFMComputeBuiltinsAvailable guards the arithmetic used by
+// AFM#compute_width_of after the Ruby intermediate collection is removed by
+// the VM.
+func PrawnAFMComputeBuiltinsAvailable() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "[]", BuiltinMethod(hashIndex)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "/", BuiltinMethod(intDivide)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "-", BuiltinMethod(intSub)) &&
+		classMethodUsesBuiltin(R.Classes["Integer"], "*", BuiltinMethod(intMul)) &&
+		classMethodUsesBuiltin(R.Classes["Float"], "/", BuiltinMethod(floatDiv)) &&
+		classMethodUsesBuiltin(R.Classes["Float"], "*", BuiltinMethod(floatMul))
+}
+
+// PrawnAFMTextBuiltinsAvailable is kept as a combined guard for callers that
+// want to admit both kernels together.
+func PrawnAFMTextBuiltinsAvailable() bool {
+	return PrawnAFMUnscaledWidthBuiltinsAvailable() && PrawnAFMKernBuiltinsAvailable() && PrawnAFMComputeBuiltinsAvailable()
+}
+
+// StringLengthASCII returns the exact built-in String#length result for the
+// common ASCII subset without normalizing the encoding name or running the
+// UTF-8 rune counter. It reports a miss for every encoding/content shape that
+// needs the full Ruby-compatible implementation.
+func StringLengthASCII(receiver *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if receiver == nil || receiver.Type != object.ValueString || receiver.Class != R.Classes["String"] ||
+		AttachedSingletonClass(receiver) != nil {
+		return nil, false
+	}
+	raw, ok := receiver.Data.(string)
+	if !ok {
+		return nil, false
+	}
+	encoding := stringEncodingName(receiver)
+	switch encoding {
+	case "BINARY", "ASCII-8BIT", "US-ASCII":
+		return NewSmallIntegerValue(int64(len(raw))), true
+	case "UTF-8", "UTF_8", "UTF8":
+		for index := 0; index < len(raw); index++ {
+			if raw[index] >= 0x80 {
+				return nil, false
+			}
+		}
+		return NewSmallIntegerValue(int64(len(raw))), true
+	default:
+		return nil, false
+	}
+}
+
+// NewStringValue boxes a proven raw-string result at a typed/boxed boundary.
+// The constructor intentionally uses the runtime's current default encoding;
+// typed plans only admit String values already proven to use that compatible
+// UTF-8 representation.
+func NewStringValue(value string) *object.EmeraldValue {
+	return rubyString(value)
+}
+
+// StringValueBatch boxes a known batch of independent mutable Ruby Strings in
+// one Go allocation. Each returned EmeraldValue remains a distinct Ruby
+// object; only the immutable Go string payload and the backing value storage
+// are shared by the batch. It is used by typed collection kernels after they
+// have disabled ObjectSpace tracing and proven that all values remain in the
+// result region.
+type StringValueBatch struct {
+	values []object.EmeraldValue
+	// headers owns one stable Go string header per batch value.  Keeping the
+	// headers outside EmeraldValue lets batchStringInterface store the string
+	// interface without allocating a header for every result.
+	headers []string
+	next    int
+	backing []byte
+}
+
+// emptyInterface matches the two-word representation of an empty interface.
+// StringValueBatch already owns the string headers and backing bytes, so the
+// normal string-to-interface conversion is redundant here: it allocates a
+// copy of the string header for every result.  The type pointer is taken from
+// a normal string interface once, while the data word points at a batch-owned
+// header.  This is intentionally kept local to the proven batch boundary.
+type emptyInterface struct {
+	typ  unsafe.Pointer
+	data unsafe.Pointer
+}
+
+var stringInterfaceType = func() unsafe.Pointer {
+	var sample interface{} = ""
+	return (*emptyInterface)(unsafe.Pointer(&sample)).typ
+}()
+
+func batchStringInterface(header *string) interface{} {
+	var value interface{}
+	boxed := (*emptyInterface)(unsafe.Pointer(&value))
+	boxed.typ = stringInterfaceType
+	boxed.data = unsafe.Pointer(header)
+	return value
+}
+
+func NewStringValueBatch(capacity int) *StringValueBatch {
+	return NewStringValueBatchWithByteCapacity(capacity, capacity*16)
+}
+
+func NewStringValueBatchWithByteCapacity(capacity, byteCapacity int) *StringValueBatch {
+	if capacity <= 0 {
+		return nil
+	}
+	if byteCapacity < 0 || byteCapacity < capacity {
+		byteCapacity = 0
+	}
+	return &StringValueBatch{
+		values:  make([]object.EmeraldValue, capacity),
+		headers: make([]string, capacity),
+		backing: make([]byte, 0, byteCapacity),
+	}
+}
+
+func (batch *StringValueBatch) New(value string) *object.EmeraldValue {
+	if batch == nil || batch.next >= len(batch.values) {
+		return NewStringValue(value)
+	}
+	data := batch.copyString(value)
+	index := batch.next
+	batch.next++
+	batch.headers[index] = data
+	result := &batch.values[index]
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     batchStringInterface(&batch.headers[index]),
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+func (batch *StringValueBatch) copyString(value string) string {
+	if len(value) == 0 {
+		return value
+	}
+	start := len(batch.backing)
+	batch.backing = append(batch.backing, value...)
+	return unsafe.String(unsafe.SliceData(batch.backing[start:]), len(value))
+}
+
+// NewConcat appends two raw String parts directly to the batch backing store,
+// avoiding the temporary Go string that `left + right` would otherwise create
+// before the Ruby String header is materialized.
+func (batch *StringValueBatch) NewConcat(left, right string) *object.EmeraldValue {
+	if batch == nil || batch.next >= len(batch.values) {
+		return NewStringValue(left + right)
+	}
+	length := len(left) + len(right)
+	start := len(batch.backing)
+	batch.backing = append(batch.backing, left...)
+	batch.backing = append(batch.backing, right...)
+	data := ""
+	if length > 0 {
+		data = unsafe.String(unsafe.SliceData(batch.backing[start:]), length)
+	}
+	index := batch.next
+	batch.next++
+	batch.headers[index] = data
+	result := &batch.values[index]
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     batchStringInterface(&batch.headers[index]),
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+// NewPrefixInteger appends an ASCII prefix and a base-10 integer directly to
+// the batch backing store. It avoids materializing the intermediate
+// strconv.FormatInt string used by a regular `prefix + integer.to_s` path.
+func (batch *StringValueBatch) NewPrefixInteger(prefix string, value int64) *object.EmeraldValue {
+	if batch == nil || batch.next >= len(batch.values) {
+		return NewStringValue(prefix + strconv.FormatInt(value, 10))
+	}
+	start := len(batch.backing)
+	batch.backing = append(batch.backing, prefix...)
+	batch.backing = strconv.AppendInt(batch.backing, value, 10)
+	data := unsafe.String(unsafe.SliceData(batch.backing[start:]), len(batch.backing)-start)
+	index := batch.next
+	batch.next++
+	batch.headers[index] = data
+	result := &batch.values[index]
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     batchStringInterface(&batch.headers[index]),
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+// NewIntegerSuffix appends a base-10 integer and an ASCII suffix directly to
+// the batch backing store. It is the sibling of NewPrefixInteger for the
+// common `integer.to_s + literal` result shape.
+func (batch *StringValueBatch) NewIntegerSuffix(value int64, suffix string) *object.EmeraldValue {
+	if batch == nil || batch.next >= len(batch.values) {
+		return NewStringValue(strconv.FormatInt(value, 10) + suffix)
+	}
+	start := len(batch.backing)
+	if !batch.appendSmallIntegerSuffix(value, suffix) {
+		batch.backing = strconv.AppendInt(batch.backing, value, 10)
+		batch.backing = append(batch.backing, suffix...)
+	}
+	data := unsafe.String(unsafe.SliceData(batch.backing[start:]), len(batch.backing)-start)
+	index := batch.next
+	batch.next++
+	batch.headers[index] = data
+	result := &batch.values[index]
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     batchStringInterface(&batch.headers[index]),
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+// appendSmallIntegerSuffix handles the common one-digit Integer#to_s result
+// without entering strconv.  It only admits values whose decimal form is
+// known to fit in one or two bytes; all other values retain the general path.
+func (batch *StringValueBatch) appendSmallIntegerSuffix(value int64, suffix string) bool {
+	digits := 1
+	negative := value < 0
+	if negative {
+		if value < -9 {
+			return false
+		}
+		digits = 2
+	} else if value > 9 {
+		return false
+	}
+	need := digits + len(suffix)
+	start := len(batch.backing)
+	if need < 0 || start > cap(batch.backing)-need {
+		return false
+	}
+	batch.backing = batch.backing[:start+need]
+	if negative {
+		batch.backing[start] = '-'
+		batch.backing[start+1] = byte('0' + (-value))
+	} else {
+		batch.backing[start] = byte('0' + value)
+	}
+	copy(batch.backing[start+digits:], suffix)
+	return true
+}
+
+// NewInteger appends a base-10 integer directly to the batch backing store.
+// It avoids materializing the temporary Go string normally returned by
+// Integer#to_s when the caller already owns the final String boxing boundary.
+func (batch *StringValueBatch) NewInteger(value int64) *object.EmeraldValue {
+	if batch == nil || batch.next >= len(batch.values) {
+		return NewStringValue(strconv.FormatInt(value, 10))
+	}
+	start := len(batch.backing)
+	if !stringBatchSmallIntegerEnabled || !batch.appendSmallIntegerSuffix(value, "") {
+		batch.backing = strconv.AppendInt(batch.backing, value, 10)
+	}
+	data := unsafe.String(unsafe.SliceData(batch.backing[start:]), len(batch.backing)-start)
+	index := batch.next
+	batch.next++
+	batch.headers[index] = data
+	result := &batch.values[index]
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     batchStringInterface(&batch.headers[index]),
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+// StringValueScratch is a single reusable Ruby String header for a proven
+// sequence whose intermediate results do not escape. It must not be used
+// when the caller can retain more than the latest value, such as Array#map;
+// the typed Integer#times kernel is the intended user because every
+// intermediate callback result is discarded.
+type StringValueScratch struct {
+	value object.EmeraldValue
+}
+
+func NewStringValueScratch() *StringValueScratch {
+	return &StringValueScratch{}
+}
+
+func (scratch *StringValueScratch) New(value string) *object.EmeraldValue {
+	if scratch == nil {
+		return NewStringValue(value)
+	}
+	result := &scratch.value
+	*result = object.EmeraldValue{
+		Type:     object.ValueString,
+		Data:     value,
+		Class:    R.StringClass,
+		Encoding: defaultExternalEncoding,
+	}
+	return result
+}
+
+// StringAppendUsesBuiltinImplementation reports whether the core String#<<
+// implementation is still installed.  Speculative VM tiers use this guard
+// before mutating a String; Ruby code may redefine the method at runtime.
+func StringAppendUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "<<", BuiltinMethod(stringConcatOne))
+}
+
+// AppendStringOne exposes the exact String#<< primitive to VM fast paths.
+// Callers must first verify StringAppendUsesBuiltinImplementation and the
+// receiver's exact built-in String class; otherwise custom coercion and
+// dispatch must go through the normal Ruby method path.
+func AppendStringOne(receiver, value *object.EmeraldValue) *object.EmeraldValue {
+	return stringConcatOne(receiver, value)
+}
+
+// MutableStringCopy mirrors unary `+` on a frozen String for VM tiers that
+// have already proved the source literal mode.  It intentionally does not
+// expose the general Object#dup path.
+func MutableStringCopy(value *object.EmeraldValue) *object.EmeraldValue {
+	if value == nil || value.Type != object.ValueString {
+		return nil
+	}
+	result := duplicateStringValue(value, false, false)
+	result.Chilled = false
+	result.Literal = false
+	return result
+}
+
+// AppendStringOneFast handles the exact String-to-String ASCII-compatible
+// subset without the coercion and encoding negotiation performed by the full
+// String#<< primitive.  handled=false means the caller must retain Ruby's
+// general integer/to_str/subclass behavior.
+func AppendStringOneFast(receiver, value *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if receiver == nil || value == nil || receiver.Type != object.ValueString || value.Type != object.ValueString ||
+		receiver.Class != R.Classes["String"] || value.Class != R.Classes["String"] || AttachedSingletonClass(receiver) != nil ||
+		AttachedSingletonClass(value) != nil {
+		return nil, false
+	}
+	if receiver.Frozen {
+		return frozenError("can't modify frozen String"), true
+	}
+	receiverEncoding := stringEncodingName(receiver)
+	valueEncoding := stringEncodingName(value)
+	if receiverEncoding != valueEncoding || !encodingIsASCICompatible(receiverEncoding) || !encodingIsASCICompatible(valueEncoding) {
+		return nil, false
+	}
+	if errVal := AppendASCIIBytes(receiver, stringRawValue(value)); errVal != nil {
+		return errVal, true
+	}
+	return receiver, true
+}
+
+func IntegerCompareUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "<=>", BuiltinMethod(intCompare))
+}
+
+func IntegerEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "==", BuiltinMethod(intEqual))
+}
+
+// IntegerNilPredicateUsesBuiltinImplementation guards VM tiers that model
+// the fixed numeric `value.nil?` probe used by a small number of Gem helper
+// methods. Object#nil? is inherited, so this must resolve the effective
+// method rather than inspect Integer's direct method table.
+func IntegerNilPredicateUsesBuiltinImplementation() bool {
+	return classResolvesBuiltinMethod(R.Classes["Integer"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+// SymbolNilPredicateUsesBuiltinImplementation guards the corresponding
+// optional-argument probe for exact Symbol values.
+func SymbolNilPredicateUsesBuiltinImplementation() bool {
+	return classResolvesBuiltinMethod(R.Classes["Symbol"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+// NilPredicateUsesBuiltinImplementation guards the literal nil? probe used
+// by a closed-world helper whose argument is already proven to be nil.
+func NilPredicateUsesBuiltinImplementation() bool {
+	return classResolvesBuiltinMethod(R.Classes["NilClass"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+// ArrayNilPredicateUsesBuiltinImplementation guards the inherited nil? probe
+// on exact Array values.
+func ArrayNilPredicateUsesBuiltinImplementation() bool {
+	return classResolvesBuiltinMethod(R.Classes["Array"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+// ObjectNilPredicateUsesBuiltinImplementation guards the inherited nil?
+// checks made by exact Gem objects.
+func ObjectNilPredicateUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Object"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+func IntegerLessThanUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "<", BuiltinMethod(intLessThan))
+}
+
+func IntegerGreaterThanUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], ">", BuiltinMethod(intGreaterThan))
+}
+
+func IntegerLessThanOrEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "<=", BuiltinMethod(intLessThanOrEqual))
+}
+
+func IntegerGreaterThanOrEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], ">=", BuiltinMethod(intGreaterThanOrEqual))
+}
+
+// IntegerToSUsesBuiltinImplementation guards raw typed callers that lower the
+// zero-argument Integer#to_s edge without first boxing the receiver. Radix
+// overloads and user redefinitions continue through the normal Ruby ABI.
+func IntegerToSUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Integer"], "to_s", BuiltinMethod(intToS))
+}
+
+// IntegerIsAUsesBuiltinImplementation guards the effective Object#is_a?
+// implementation for exact Integer values.  The lookup must include the
+// Integer/Numeric/Object ancestor chain so a class-level override or prepend
+// cannot be mistaken for the builtin predicate by a typed counted loop.
+func IntegerIsAUsesBuiltinImplementation() bool {
+	if R == nil {
+		return false
+	}
+	return classResolvesBuiltinMethod(R.Classes["Integer"], "is_a?", BuiltinMethod(methodIsA))
+}
+
+// StringIsAUsesBuiltinImplementation guards the exact String branch predicate
+// used by typed collection kernels. Checking the resolved String method also
+// catches an override inherited from Object, while still allowing the kernel
+// to reject all other classes before it erases the is_a? send.
+func StringIsAUsesBuiltinImplementation() bool {
+	if R == nil {
+		return false
+	}
+	return classResolvesBuiltinMethod(R.Classes["String"], "is_a?", BuiltinMethod(methodIsA))
+}
+
+// IntegerToSRaw is the allocation-producing part of the exact built-in
+// Integer#to_s(10) operation. The caller owns the Ruby String boxing boundary;
+// this helper deliberately does not accept a radix or invoke user code.
+func IntegerToSRaw(value int64) (string, bool) {
+	if !IntegerToSUsesBuiltinImplementation() {
+		return "", false
+	}
+	return IntegerToSRawBuiltin(value), true
+}
+
+// IntegerToSRawBuiltin is the unchecked formatting edge for callers that
+// already hold the generation-scoped built-in Integer#to_s proof.
+func IntegerToSRawBuiltin(value int64) string {
+	if integerToSCacheEnabled && value >= integerToSCacheMin && value <= integerToSCacheMax {
+		return integerToSCache[value-integerToSCacheMin]
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+// IntegerToSLengthRawBuiltin returns the decimal byte length of the exact
+// built-in Integer#to_s(10) result without materializing that result. Callers
+// use it only after proving the builtin implementation and exact Integer
+// value, so it intentionally has no Ruby dispatch or compatibility checks.
+func IntegerToSLengthRawBuiltin(value int64) int {
+	magnitude := uint64(value)
+	negative := value < 0
+	if negative {
+		// Convert MinInt64 without overflowing a signed negation.
+		magnitude = uint64(-(value + 1)) + 1
+	}
+	digits := 1
+	switch {
+	case magnitude >= 1_000_000_000_000_000_000:
+		digits = 19
+	case magnitude >= 100_000_000_000_000_000:
+		digits = 18
+	case magnitude >= 10_000_000_000_000_000:
+		digits = 17
+	case magnitude >= 1_000_000_000_000_000:
+		digits = 16
+	case magnitude >= 100_000_000_000_000:
+		digits = 15
+	case magnitude >= 10_000_000_000_000:
+		digits = 14
+	case magnitude >= 1_000_000_000_000:
+		digits = 13
+	case magnitude >= 100_000_000_000:
+		digits = 12
+	case magnitude >= 10_000_000_000:
+		digits = 11
+	case magnitude >= 1_000_000_000:
+		digits = 10
+	case magnitude >= 100_000_000:
+		digits = 9
+	case magnitude >= 10_000_000:
+		digits = 8
+	case magnitude >= 1_000_000:
+		digits = 7
+	case magnitude >= 100_000:
+		digits = 6
+	case magnitude >= 10_000:
+		digits = 5
+	case magnitude >= 1_000:
+		digits = 4
+	case magnitude >= 100:
+		digits = 3
+	case magnitude >= 10:
+		digits = 2
+	}
+	if negative {
+		return digits + 1
+	}
+	return digits
+}
+
+// DefaultExternalEncoding exposes the encoding used by proven typed String
+// result boxes without exposing the mutable runtime encoding state itself.
+func DefaultExternalEncoding() string {
+	return defaultExternalEncoding
+}
+
+// StringConcatIntegerRaw is the boxed boundary for the common exact
+// String#+Integer#to_s graph.  The VM calls it only after proving that the
+// installed Integer#to_s and String#+ implementations are the builtins.  The
+// The default-encoding ASCII case avoids materializing the temporary right
+// hand String; non-default encodings retain the full compatibility check.
+func StringConcatIntegerRaw(left *object.EmeraldValue, value int64) (*object.EmeraldValue, bool) {
+	if left == nil || left.Type != object.ValueString || left.Class != R.Classes["String"] {
+		return nil, false
+	}
+	leftRaw, rawOK := left.Data.(string)
+	rightRaw := IntegerToSRawBuiltin(value)
+	if rawOK && (left.Encoding == "" || strings.EqualFold(left.Encoding, defaultExternalEncoding)) && !stringHasNonASCIIByte(leftRaw) {
+		return &object.EmeraldValue{
+			Type:     object.ValueString,
+			Data:     leftRaw + rightRaw,
+			Class:    R.Classes["String"],
+			Encoding: defaultExternalEncoding,
+		}, true
+	}
+	right := &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  rightRaw,
+		Class: R.Classes["String"],
+	}
+	encoding, errVal := StringConcatenationEncoding(left, right)
+	if errVal != nil {
+		return nil, false
+	}
+	result := &object.EmeraldValue{
+		Type:  object.ValueString,
+		Data:  left.Data.(string) + right.Data.(string),
+		Class: R.Classes["String"],
+	}
+	SetStringEncoding(result, encoding)
+	return result, true
+}
+
+// StringConcatIntegerBatch is the batch-boxing sibling of
+// StringConcatIntegerRaw. It is restricted to the same exact ASCII/default
+// encoding case, but places each independent mutable String header in the
+// caller-owned batch backing slice. Non-default encodings deliberately return
+// false so the caller can retain the full compatibility implementation.
+func StringConcatIntegerBatch(batch *StringValueBatch, left *object.EmeraldValue, value int64) (*object.EmeraldValue, bool) {
+	if batch == nil || left == nil || left.Type != object.ValueString || left.Class != R.Classes["String"] {
+		return nil, false
+	}
+	leftRaw, rawOK := left.Data.(string)
+	if !rawOK || left.Encoding != "" && !strings.EqualFold(left.Encoding, defaultExternalEncoding) || stringHasNonASCIIByte(leftRaw) {
+		return nil, false
+	}
+	return batch.NewPrefixInteger(leftRaw, value), true
+}
+
 func classMethodUsesBuiltin(class *object.Class, name string, expected BuiltinMethod) bool {
 	if class == nil {
 		return false
@@ -24929,6 +26757,19 @@ func classMethodUsesBuiltin(class *object.Class, name string, expected BuiltinMe
 	return actual.Kind() == reflect.Func && actual.Pointer() == expectedValue.Pointer()
 }
 
+func classResolvesBuiltinMethod(class *object.Class, name string, expected BuiltinMethod) bool {
+	if class == nil {
+		return false
+	}
+	method, _, ok := class.GetMethodWithOwner(name)
+	if !ok || method == nil || method.Fn == nil {
+		return false
+	}
+	actual := reflect.ValueOf(method.Fn)
+	expectedValue := reflect.ValueOf(expected)
+	return actual.Kind() == reflect.Func && expectedValue.Kind() == reflect.Func && actual.Pointer() == expectedValue.Pointer()
+}
+
 func ASCIIStringLoopBuiltinsAvailable() bool {
 	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
 		classMethodUsesBuiltin(R.Classes["Integer"], "%", BuiltinMethod(intMod)) &&
@@ -24937,13 +26778,50 @@ func ASCIIStringLoopBuiltinsAvailable() bool {
 }
 
 func CollectionLoopBuiltinsAvailable() bool {
-	return classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
+	generation := object.CurrentMethodGeneration()
+	if collectionLoopBuiltinState.Load() != 0 && collectionLoopBuiltinGeneration.Load() == generation {
+		return collectionLoopBuiltinState.Load() == 1
+	}
+	available := classMethodUsesBuiltin(R.Classes["Integer"], "+", BuiltinMethod(intAdd)) &&
 		classMethodUsesBuiltin(R.Classes["Integer"], "*", BuiltinMethod(intMul)) &&
 		classMethodUsesBuiltin(R.Classes["Integer"], "%", BuiltinMethod(intMod)) &&
 		classMethodUsesBuiltin(R.Classes["Array"], "<<", BuiltinMethod(arrayPush)) &&
 		classMethodUsesBuiltin(R.Classes["Array"], "[]", BuiltinMethod(arrayIndex)) &&
 		classMethodUsesBuiltin(R.Classes["Array"], "length", BuiltinMethod(arrayLength)) &&
 		classMethodUsesBuiltin(R.Classes["Hash"], "[]=", BuiltinMethod(hashIndexSet))
+	if available {
+		collectionLoopBuiltinState.Store(1)
+	} else {
+		collectionLoopBuiltinState.Store(2)
+	}
+	collectionLoopBuiltinGeneration.Store(generation)
+	return available
+}
+
+// ArrayIndexUsesBuiltinImplementation and HashIndexUsesBuiltinImplementation
+// let the VM admit exact built-in [] calls into its guarded register-IR cache.
+// A Ruby redefinition (or prepend) makes these guards false immediately after
+// the method-generation counter changes.
+func ArrayIndexUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Array"], "[]", BuiltinMethod(arrayIndex))
+}
+
+func ArrayAppendUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Array"], "<<", BuiltinMethod(arrayPush))
+}
+
+func ArrayLastUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Array"], "last", BuiltinMethod(arrayLast))
+}
+
+func HashIndexUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "[]", BuiltinMethod(hashIndex))
+}
+
+// HashStoreUsesBuiltinImplementation guards VM-owned paths that reproduce
+// Hash#[]= side effects without entering Ruby dispatch.
+func HashStoreUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "[]=", BuiltinMethod(hashIndexSet))
 }
 
 func AppendArrayValues(receiver *object.EmeraldValue, values []*object.EmeraldValue) bool {
@@ -24958,6 +26836,22 @@ func AppendArrayValues(receiver *object.EmeraldValue, values []*object.EmeraldVa
 	return true
 }
 
+// AppendArrayValue is the allocation-free single-element boundary used by
+// typed collection loops. It deliberately accepts only the exact mutable
+// Array layout; subclasses, singleton methods and frozen arrays use the Ruby
+// dispatch path instead.
+func AppendArrayValue(receiver, value *object.EmeraldValue) bool {
+	if receiver == nil || receiver.Type != object.ValueArray || receiver.Class != R.Classes["Array"] || receiver.Frozen {
+		return false
+	}
+	elements, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return false
+	}
+	receiver.Data = append(elements, value)
+	return true
+}
+
 func StoreHashValue(receiver, key, value *object.EmeraldValue) bool {
 	if receiver == nil || receiver.Type != object.ValueHash || receiver.Class != R.Classes["Hash"] || receiver.Frozen {
 		return false
@@ -24966,9 +26860,687 @@ func StoreHashValue(receiver, key, value *object.EmeraldValue) bool {
 	return result != nil && result.Type != object.ValueException
 }
 
+// IntegerHashBatchAvailable admits the closed-world hash shape used by the
+// collection loop lowering. The caller must still validate every key/value
+// before committing the batch; this predicate only describes the receiver's
+// state and builtin mutation boundary.
+func IntegerHashBatchAvailable(receiver *object.EmeraldValue) bool {
+	builtin := classMethodUsesBuiltin(R.Classes["Hash"], "[]=", BuiltinMethod(hashIndexSet))
+	if !integerHashBatchEnabled || receiver == nil || receiver.Type != object.ValueHash || receiver.Class != R.Classes["Hash"] || receiver.Frozen || !builtin {
+		return false
+	}
+	hash := hashData(receiver)
+	if hash == nil || hash.Default != nil || hash.DefaultProc != nil || hash.CompareByIdentity {
+		return false
+	}
+	for key := range hash.Pairs {
+		if key == nil || key.Type != object.ValueInteger {
+			return false
+		}
+		if _, big := NumericBigIntOverride(key); big {
+			return false
+		}
+	}
+	return true
+}
+
+// StoreIntegerHashBatch commits integer-key assignments for a receiver that
+// was admitted by IntegerHashBatchAvailable.  Ruby Hash stores EmeraldValue
+// keys, so the generic path normally performs a hash calculation, bucket
+// lookup, equality check and map update on every assignment.  A closed-world
+// collection loop can defer that work until all raw operations have passed;
+// this function rebuilds the ordinary Hash representation once while
+// preserving existing insertion order and last-write-wins semantics for
+// duplicate integer keys.
+func StoreIntegerHashBatch(receiver *object.EmeraldValue, keys, values []*object.EmeraldValue) bool {
+	if !IntegerHashBatchAvailable(receiver) || len(keys) != len(values) {
+		return false
+	}
+	hash := hashData(receiver)
+	if hash == nil {
+		return false
+	}
+	if integerHashBatchCanonicalLayout(hash, keys) {
+		return storeCanonicalIntegerHashBatch(hash, keys, values)
+	}
+	capacityHint := len(hash.Pairs) + len(keys)
+	if capacityHint > 1024 {
+		capacityHint = 1024
+	}
+	ordered := make([]*object.EmeraldValue, 0, capacityHint)
+	orderedValues := make([]*object.EmeraldValue, 0, capacityHint)
+	byInteger := make(map[int64]int, capacityHint)
+	for _, key := range hash.Keys {
+		value, found := hash.Pairs[key]
+		if !found {
+			continue
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		byInteger[integer] = len(ordered)
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, value)
+	}
+	for key, value := range hash.Pairs {
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		if _, found := byInteger[integer]; found {
+			continue
+		}
+		byInteger[integer] = len(ordered)
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, value)
+	}
+	for index, key := range keys {
+		if key == nil || key.Type != object.ValueInteger || values[index] == nil {
+			return false
+		}
+		if _, big := NumericBigIntOverride(key); big {
+			return false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		if existing, found := byInteger[integer]; found {
+			orderedValues[existing] = values[index]
+			continue
+		}
+		byInteger[integer] = len(ordered)
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, values[index])
+	}
+	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue, len(ordered))
+	hashes := make(map[*object.EmeraldValue]int64, len(ordered))
+	for index, key := range ordered {
+		pairs[key] = orderedValues[index]
+		hashes[key] = hashKeyCode(key)
+	}
+	hash.Pairs = pairs
+	hash.Keys = ordered
+	hash.Hashes = hashes
+	// Buckets are lazily rebuilt by ensureHashBuckets on the first lookup.  A
+	// batch that only observes Hash#length never pays for buckets at all.
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	return true
+}
+
+// integerHashBatchCanonicalLayout admits the allocation-free duplicate check
+// used by the compiled collection loop. NewIntegerValue canonicalizes the
+// small/paged integer range, so equal integer keys have the same pointer and
+// can be found directly in RHash.Pairs. Non-canonical Integer objects and
+// manually malformed RHash layouts retain the general value-equality path.
+func integerHashBatchCanonicalLayout(hash *object.RHash, keys []*object.EmeraldValue) bool {
+	if hash == nil || len(hash.Keys) != len(hash.Pairs) {
+		return false
+	}
+	for _, key := range hash.Keys {
+		if !canonicalIntegerHashKey(key) {
+			return false
+		}
+		if _, ok := hash.Pairs[key]; !ok {
+			return false
+		}
+	}
+	for key := range hash.Pairs {
+		if !canonicalIntegerHashKey(key) {
+			return false
+		}
+	}
+	for _, key := range keys {
+		if !canonicalIntegerHashKey(key) {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalIntegerHashKey(key *object.EmeraldValue) bool {
+	if key == nil || key.Type != object.ValueInteger {
+		return false
+	}
+	if key.BigIntValue() != nil {
+		return false
+	}
+	if numericBigIntOverrides != nil {
+		if _, found := numericBigIntOverrides[key]; found {
+			return false
+		}
+	}
+	integer, ok := key.Data.(int64)
+	if !ok {
+		return false
+	}
+	if integer >= smallIntegerMin && integer <= smallIntegerMax && R != nil && len(R.SmallIntegers) > 0 {
+		return R.SmallIntegers[integer-smallIntegerMin] == key
+	}
+	return integer > smallIntegerMax && integer <= pagedIntegerMax && NewIntegerValue(integer) == key
+}
+
+func checkedIntegerHashAdd(left, right int64) (int64, bool) {
+	if right > 0 && left > math.MaxInt64-right {
+		return 0, false
+	}
+	if right < 0 && left < math.MinInt64-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+// StoreIntegerHashLinearBatch records the empty-or-small-prefix Hash shape
+// produced by `hash[index] = index + offset` without first allocating parallel
+// key/value slices or a large pointer map. The caller has already proved the
+// exact Hash/integer mutation boundary; this function still preflights every
+// raw addition before replacing the Hash layout, so overflow leaves the
+// receiver untouched for the ordinary Ruby fallback. A general Hash API
+// materializes the ordinary map on demand.
+func StoreIntegerHashLinearBatch(receiver *object.EmeraldValue, start, step, valueOffset int64, iterations int) (int64, bool) {
+	if !integerHashBatchLinearEnabled || iterations <= 0 || iterations > 1_000_000 || step <= 0 ||
+		!IntegerHashBatchAvailable(receiver) {
+		return 0, false
+	}
+	hash := hashData(receiver)
+	if hash == nil || len(hash.Pairs) > 8 || len(hash.Keys) != len(hash.Pairs) {
+		return 0, false
+	}
+	existingByInteger := make(map[int64]*object.EmeraldValue, len(hash.Keys))
+	for _, key := range hash.Keys {
+		if key == nil || key.Type != object.ValueInteger || key.BigIntValue() != nil {
+			return 0, false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok || hash.Pairs[key] == nil {
+			return 0, false
+		}
+		if _, duplicate := existingByInteger[integer]; duplicate {
+			return 0, false
+		}
+		existingByInteger[integer] = key
+	}
+	if len(existingByInteger) != len(hash.Pairs) {
+		return 0, false
+	}
+	for key := range hash.Pairs {
+		integer, ok := key.Data.(int64)
+		if !ok || existingByInteger[integer] != key {
+			return 0, false
+		}
+	}
+	count := int64(iterations)
+	if step > math.MaxInt64/count {
+		return 0, false
+	}
+	span := step * count
+	nextCounter, valid := checkedIntegerHashAdd(start, span)
+	if !valid {
+		return 0, false
+	}
+	lastCounter := nextCounter - step
+	firstValue, valid := checkedIntegerHashAdd(start, valueOffset)
+	if !valid {
+		return 0, false
+	}
+	if _, valid = checkedIntegerHashAdd(lastCounter, valueOffset); !valid {
+		return 0, false
+	}
+	wasEmpty := len(hash.Pairs) == 0 && len(hash.Keys) == 0
+	if wasEmpty {
+		keys := make([]*object.EmeraldValue, iterations)
+		counter := start
+		for index := range keys {
+			keys[index] = NewSmallIntegerValue(counter)
+			counter += step
+		}
+		hash.Pairs = nil
+		hash.Keys = keys
+		hash.Hashes = nil
+		hash.Buckets = nil
+		hash.BucketSize = 0
+		hash.Linear = &object.RHashLinearRegion{Start: start, Step: step, ValueOffset: valueOffset, Count: iterations}
+		return nextCounter, true
+	}
+	if keys, lazy := lazyIntegerHashKeys(hash, start, step, valueOffset, iterations, existingByInteger); lazy {
+		hash.Pairs = nil
+		hash.Keys = keys
+		hash.Hashes = nil
+		hash.Buckets = nil
+		hash.BucketSize = 0
+		startValue, _ := keys[0].Data.(int64)
+		hash.Linear = &object.RHashLinearRegion{Start: startValue, Step: step, ValueOffset: valueOffset, Count: len(keys)}
+		return nextCounter, true
+	}
+	oldPairs := hash.Pairs
+	hash.Hashes = nil
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	capacity := len(hash.Keys) + iterations
+	hash.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue, capacity)
+	keys := make([]*object.EmeraldValue, 0, capacity)
+	for _, key := range hash.Keys {
+		hash.Pairs[key] = oldPairs[key]
+		keys = append(keys, key)
+	}
+	counter := start
+	value := firstValue
+	existingKeys := hash.Keys
+	for index := 0; index < iterations; index++ {
+		valueObject := NewSmallIntegerValue(value)
+		var existingKey *object.EmeraldValue
+		if len(existingKeys) == 1 {
+			candidate := existingKeys[0]
+			if candidate.Data.(int64) == counter {
+				existingKey = candidate
+			}
+		} else if len(existingKeys) > 1 {
+			existingKey = existingByInteger[counter]
+		}
+		if existingKey != nil {
+			hash.Pairs[existingKey] = valueObject
+		} else {
+			keyObject := NewSmallIntegerValue(counter)
+			hash.Pairs[keyObject] = valueObject
+			keys = append(keys, keyObject)
+		}
+		counter += step
+		value += step
+	}
+	hash.Keys = keys
+	return nextCounter, true
+}
+
+func lazyIntegerHashKeys(hash *object.RHash, start, step, valueOffset int64, iterations int, existingByInteger map[int64]*object.EmeraldValue) ([]*object.EmeraldValue, bool) {
+	if hash == nil || iterations <= 0 || len(hash.Keys) == 0 || len(hash.Keys) > 8 || hash.Pairs == nil {
+		return nil, false
+	}
+	for _, key := range hash.Keys {
+		if key == nil || key.Type != object.ValueInteger {
+			return nil, false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return nil, false
+		}
+		value, found := hash.Pairs[key]
+		if !found || value == nil || value.Type != object.ValueInteger {
+			return nil, false
+		}
+		valueInteger, ok := value.Data.(int64)
+		if !ok {
+			return nil, false
+		}
+		expectedValue, valid := checkedIntegerHashAdd(integer, valueOffset)
+		if !valid || valueInteger != expectedValue {
+			return nil, false
+		}
+	}
+	keys := make([]*object.EmeraldValue, 0, len(hash.Keys)+iterations)
+	keys = append(keys, hash.Keys...)
+	counter := start
+	for index := 0; index < iterations; index++ {
+		if _, exists := existingByInteger[counter]; !exists {
+			keys = append(keys, NewSmallIntegerValue(counter))
+		}
+		counter += step
+	}
+	if len(keys) == 0 {
+		return nil, false
+	}
+	first, ok := keys[0].Data.(int64)
+	if !ok {
+		return nil, false
+	}
+	expected := first
+	for _, key := range keys {
+		integer, ok := key.Data.(int64)
+		if !ok || integer != expected {
+			return nil, false
+		}
+		next, valid := checkedIntegerHashAdd(expected, step)
+		if !valid {
+			if key == keys[len(keys)-1] {
+				break
+			}
+			return nil, false
+		}
+		expected = next
+	}
+	return keys, true
+}
+
+func storeCanonicalIntegerHashBatch(hash *object.RHash, keys, values []*object.EmeraldValue) bool {
+	if hash == nil || len(keys) != len(values) {
+		return false
+	}
+	if integerHashBatchGroupedEnabled && len(keys) >= 4096 && len(hash.Pairs) <= 8 && len(hash.Keys) == len(hash.Pairs) {
+		return storeGroupedCanonicalIntegerHashBatch(hash, keys, values)
+	}
+	// Hashes and Buckets are lookup accelerators. Invalidate both and let the
+	// first actual lookup rebuild them; the collection loop itself only needs
+	// insertion order and Pairs, so calculating one hash code per element here
+	// would just move work forward unnecessarily.
+	hash.Hashes = nil
+	capacityHint := len(hash.Pairs) + len(keys)
+	if capacityHint > 1024 {
+		capacityHint = 1024
+	}
+	if len(hash.Pairs) == 0 && len(hash.Keys) == 0 {
+		hash.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue, capacityHint)
+		hash.Keys = make([]*object.EmeraldValue, 0, capacityHint)
+	} else {
+		if hash.Pairs == nil {
+			hash.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue, capacityHint)
+		}
+		if hash.Keys == nil {
+			hash.Keys = make([]*object.EmeraldValue, 0, capacityHint)
+		}
+	}
+	for index := range keys {
+		if values[index] == nil {
+			return false
+		}
+	}
+	for index, key := range keys {
+		value := values[index]
+		if _, found := hash.Pairs[key]; found {
+			hash.Pairs[key] = value
+			continue
+		}
+		hash.Pairs[key] = value
+		hash.Keys = append(hash.Keys, key)
+	}
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	return true
+}
+
+// StoreIntegerHashBatchTrustedCanonical is used by VM closed-world fill loops
+// after they have produced every key through NewSmallIntegerValue and checked
+// the exact builtin Hash/integer mutation boundary. It keeps the public
+// StoreIntegerHashBatch validation intact while avoiding a second large
+// canonical-key scan before the grouped materializer.
+func StoreIntegerHashBatchTrustedCanonical(receiver *object.EmeraldValue, keys, values []*object.EmeraldValue) bool {
+	if len(keys) != len(values) {
+		return false
+	}
+	if !integerHashBatchGroupedEnabled {
+		return StoreIntegerHashBatch(receiver, keys, values)
+	}
+	if !IntegerHashBatchAvailable(receiver) {
+		return false
+	}
+	hash := hashData(receiver)
+	if hash == nil || len(keys) < 4096 || len(hash.Pairs) > 8 || len(hash.Keys) != len(hash.Pairs) {
+		return StoreIntegerHashBatch(receiver, keys, values)
+	}
+	for _, key := range hash.Keys {
+		if !canonicalIntegerHashKey(key) {
+			return StoreIntegerHashBatch(receiver, keys, values)
+		}
+	}
+	return storeGroupedCanonicalIntegerHashBatch(hash, keys, values)
+}
+
+// StoreIntegerHashRawBatchTrustedCanonical is the raw-key sibling used by a
+// VM loop that has already checked the integer modulo expression. It avoids
+// allocating/scanning a pointer slice for repeated canonical keys; only keys
+// that survive duplicate reconciliation are boxed into EmeraldValue objects.
+// The grouped path remains an opt-in closed-world optimization, so callers
+// can fall back to StoreIntegerHashBatchTrustedCanonical when it declines.
+func StoreIntegerHashRawBatchTrustedCanonical(receiver *object.EmeraldValue, keys []int64, values []*object.EmeraldValue) bool {
+	if !integerHashBatchGroupedEnabled || len(keys) != len(values) || len(keys) < 4096 ||
+		!IntegerHashBatchAvailable(receiver) {
+		return false
+	}
+	hash := hashData(receiver)
+	if hash == nil || len(hash.Pairs) > 8 || len(hash.Keys) != len(hash.Pairs) {
+		return false
+	}
+	capacityHint := len(hash.Pairs) + len(keys)
+	if capacityHint > 1024 {
+		capacityHint = 1024
+	}
+	var existingIntegers [8]int64
+	existingCount := 0
+	var minInteger, maxInteger int64
+	haveInteger := false
+	updateIntegerRange := func(integer int64) {
+		if !haveInteger {
+			minInteger, maxInteger = integer, integer
+			haveInteger = true
+			return
+		}
+		if integer < minInteger {
+			minInteger = integer
+		}
+		if integer > maxInteger {
+			maxInteger = integer
+		}
+	}
+	for _, key := range hash.Keys {
+		value, found := hash.Pairs[key]
+		if !found || value == nil || !canonicalIntegerHashKey(key) {
+			return false
+		}
+		integer := key.Data.(int64)
+		for index := 0; index < existingCount; index++ {
+			if existingIntegers[index] == integer {
+				return false
+			}
+		}
+		existingIntegers[existingCount] = integer
+		existingCount++
+		updateIntegerRange(integer)
+	}
+	for index, integer := range keys {
+		// NewSmallIntegerValue is pointer-stable only through pagedIntegerMax;
+		// outside that range the ordinary canonical validator must take over.
+		if integer < smallIntegerMin || integer > pagedIntegerMax || values[index] == nil {
+			return false
+		}
+		updateIntegerRange(integer)
+	}
+	rangeSize := uint64(0)
+	if haveInteger {
+		rangeSize = uint64(maxInteger) - uint64(minInteger) + 1
+	}
+	denseLimit := uint64(1 << 20)
+	denseThreshold := uint64(len(keys)+len(hash.Keys))*8 + 64
+	useDenseIndex := rangeSize > 0 && rangeSize <= denseLimit && rangeSize <= denseThreshold
+	var denseIndex []int
+	var byInteger map[int64]int
+	if useDenseIndex {
+		denseIndex = make([]int, int(rangeSize))
+	} else {
+		byInteger = make(map[int64]int, capacityHint)
+	}
+	ordered := make([]*object.EmeraldValue, 0, capacityHint)
+	orderedValues := make([]*object.EmeraldValue, 0, capacityHint)
+	for _, key := range hash.Keys {
+		value := hash.Pairs[key]
+		integer := key.Data.(int64)
+		if useDenseIndex {
+			denseIndex[int(uint64(integer)-uint64(minInteger))] = len(ordered) + 1
+		} else {
+			byInteger[integer] = len(ordered)
+		}
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, value)
+	}
+	for index, integer := range keys {
+		value := values[index]
+		if useDenseIndex {
+			slot := &denseIndex[int(uint64(integer)-uint64(minInteger))]
+			if *slot != 0 {
+				orderedValues[*slot-1] = value
+				continue
+			}
+			*slot = len(ordered) + 1
+		} else {
+			if existing, found := byInteger[integer]; found {
+				orderedValues[existing] = value
+				continue
+			}
+			byInteger[integer] = len(ordered)
+		}
+		ordered = append(ordered, NewSmallIntegerValue(integer))
+		orderedValues = append(orderedValues, value)
+	}
+	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue, len(ordered))
+	for index, key := range ordered {
+		pairs[key] = orderedValues[index]
+	}
+	hash.Pairs = pairs
+	hash.Keys = ordered
+	hash.Hashes = nil
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	return true
+}
+
+// storeGroupedCanonicalIntegerHashBatch handles the constructor-shaped case
+// where a large batch starts from an empty Hash or a tiny already-filled
+// prefix. Building the final pointer map once avoids a map lookup/assignment
+// against RHash.Pairs for every repeated canonical Integer key. The int64
+// index preserves Ruby insertion order and last-write-wins semantics before
+// the ordinary Hash layout is materialized.
+func storeGroupedCanonicalIntegerHashBatch(hash *object.RHash, keys, values []*object.EmeraldValue) bool {
+	if hash == nil || len(keys) != len(values) || len(hash.Pairs) > 8 || len(hash.Keys) != len(hash.Pairs) {
+		return false
+	}
+	capacityHint := len(hash.Pairs) + len(keys)
+	if capacityHint > 1024 {
+		capacityHint = 1024
+	}
+	var existingIntegers [8]int64
+	existingCount := 0
+	var minInteger, maxInteger int64
+	haveInteger := false
+	updateIntegerRange := func(integer int64) {
+		if !haveInteger {
+			minInteger, maxInteger = integer, integer
+			haveInteger = true
+			return
+		}
+		if integer < minInteger {
+			minInteger = integer
+		}
+		if integer > maxInteger {
+			maxInteger = integer
+		}
+	}
+	for _, key := range hash.Keys {
+		value, found := hash.Pairs[key]
+		if !found || key == nil || key.Type != object.ValueInteger || key.BigIntValue() != nil || value == nil {
+			return false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		for index := 0; index < existingCount; index++ {
+			if existingIntegers[index] == integer {
+				return false
+			}
+		}
+		existingIntegers[existingCount] = integer
+		existingCount++
+		updateIntegerRange(integer)
+	}
+	for _, key := range keys {
+		if key == nil || key.Type != object.ValueInteger || key.BigIntValue() != nil {
+			return false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		updateIntegerRange(integer)
+	}
+	// A dense index avoids the hash table used only to reconcile duplicate
+	// canonical Integer keys. Keep the range deliberately bounded and require
+	// enough input density so a sparse batch retains the old map path.
+	rangeSize := uint64(0)
+	if haveInteger {
+		rangeSize = uint64(maxInteger) - uint64(minInteger) + 1
+	}
+	denseLimit := uint64(1 << 20)
+	denseThreshold := uint64(len(keys)+len(hash.Keys))*8 + 64
+	useDenseIndex := rangeSize > 0 && rangeSize <= denseLimit && rangeSize <= denseThreshold
+	var denseIndex []int
+	var byInteger map[int64]int
+	if useDenseIndex {
+		denseIndex = make([]int, int(rangeSize))
+	} else {
+		byInteger = make(map[int64]int, capacityHint)
+	}
+	ordered := make([]*object.EmeraldValue, 0, capacityHint)
+	orderedValues := make([]*object.EmeraldValue, 0, capacityHint)
+	for _, key := range hash.Keys {
+		value := hash.Pairs[key]
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		if useDenseIndex {
+			denseIndex[int(uint64(integer)-uint64(minInteger))] = len(ordered) + 1
+		} else {
+			byInteger[integer] = len(ordered)
+		}
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, value)
+	}
+	for index, key := range keys {
+		value := values[index]
+		if value == nil {
+			return false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		if useDenseIndex {
+			slot := &denseIndex[int(uint64(integer)-uint64(minInteger))]
+			if *slot != 0 {
+				orderedValues[*slot-1] = value
+				continue
+			}
+			*slot = len(ordered) + 1
+		} else {
+			if existing, found := byInteger[integer]; found {
+				orderedValues[existing] = value
+				continue
+			}
+			byInteger[integer] = len(ordered)
+		}
+		ordered = append(ordered, key)
+		orderedValues = append(orderedValues, value)
+	}
+	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue, len(ordered))
+	for index, key := range ordered {
+		pairs[key] = orderedValues[index]
+	}
+	hash.Pairs = pairs
+	hash.Keys = ordered
+	hash.Hashes = nil
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	return true
+}
+
 func intSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
+	}
+	if left, right, ok := exactInt64Pair(receiver, args[0]); ok {
+		if result, fits := checkedInt64Sub(left, right); fits {
+			return NewIntegerValue(result)
+		}
+		return NewIntegerFromBigInt(new(big.Int).Sub(big.NewInt(left), big.NewInt(right)))
 	}
 	if left, ok := numericBigIntValue(receiver); ok {
 		if right, ok := numericBigIntValue(args[0]); ok {
@@ -24995,6 +27567,12 @@ func intSub(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 func intMul(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 {
 		return R.NilVal
+	}
+	if left, right, ok := exactInt64Pair(receiver, args[0]); ok {
+		if result, fits := checkedInt64Mul(left, right); fits {
+			return NewIntegerValue(result)
+		}
+		return NewIntegerFromBigInt(new(big.Int).Mul(big.NewInt(left), big.NewInt(right)))
 	}
 	if left, ok := numericBigIntValue(receiver); ok {
 		if right, ok := numericBigIntValue(args[0]); ok {
@@ -25204,6 +27782,16 @@ func intModulo(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 func intModuloBinary(receiver *object.EmeraldValue, args []*object.EmeraldValue, operation string) *object.EmeraldValue {
 	if len(args) != 1 {
 		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	if left, right, ok := exactInt64Pair(receiver, args[0]); ok {
+		if right == 0 {
+			return newRuntimeException(R.Classes["ZeroDivisionError"], "divided by 0")
+		}
+		result := left % right
+		if result != 0 && (result < 0) != (right < 0) {
+			result += right
+		}
+		return NewIntegerValue(result)
 	}
 	if left, ok := numericBigIntValue(receiver); ok {
 		if right, ok := numericBigIntValue(args[0]); ok {
@@ -25585,13 +28173,17 @@ func intToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 		return &object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  bigValue.Text(int(base)),
-			Class: R.Classes["String"],
+			Class: R.StringClass,
 		}
+	}
+	formatted := strconv.FormatInt(receiver.Data.(int64), int(base))
+	if base == 10 {
+		formatted = IntegerToSRawBuiltin(receiver.Data.(int64))
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueString,
-		Data:  strconv.FormatInt(receiver.Data.(int64), int(base)),
-		Class: R.Classes["String"],
+		Data:  formatted,
+		Class: R.StringClass,
 	}
 }
 
@@ -26780,7 +29372,7 @@ func intDigits(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func newInt(v int64) *object.EmeraldValue {
-	return &object.EmeraldValue{Type: object.ValueInteger, Data: v, Class: R.Classes["Integer"]}
+	return NewIntegerValue(v)
 }
 
 func NewIntegerFromBigInt(value *big.Int) *object.EmeraldValue {
@@ -26788,9 +29380,9 @@ func NewIntegerFromBigInt(value *big.Int) *object.EmeraldValue {
 		return newInt(0)
 	}
 	if value.IsInt64() {
-		return newInt(value.Int64())
+		return NewIntegerValue(value.Int64())
 	}
-	result := newInt(value.Int64())
+	result := &object.EmeraldValue{Type: object.ValueInteger, Data: value.Int64(), Class: R.Classes["Integer"]}
 	RememberNumericBigIntOverride(result, value)
 	approximation, _ := new(big.Float).SetInt(value).Float64()
 	RememberNumericFloatOverride(result, approximation)
@@ -26798,7 +29390,13 @@ func NewIntegerFromBigInt(value *big.Int) *object.EmeraldValue {
 }
 
 func newFloat(v float64) *object.EmeraldValue {
-	return &object.EmeraldValue{Type: object.ValueFloat, Data: v, Class: R.Classes["Float"]}
+	return &object.EmeraldValue{Type: object.ValueFloat, Data: v, Class: R.FloatClass}
+}
+
+// NewFloatValue is the public constructor used by the typed VM tier when a
+// primitive float result crosses back into the boxed Ruby object model.
+func NewFloatValue(value float64) *object.EmeraldValue {
+	return newFloat(value)
 }
 
 func integerClassSqrt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -27212,6 +29810,18 @@ func intNumericComparison(left, right *object.EmeraldValue) (int, bool) {
 		return 0, false
 	}
 	if right.Type == object.ValueInteger {
+		if left.BigIntValue() == nil && right.BigIntValue() == nil {
+			leftValue := left.Data.(int64)
+			rightValue := right.Data.(int64)
+			switch {
+			case leftValue < rightValue:
+				return -1, true
+			case leftValue > rightValue:
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
 		leftValue, _ := numericBigIntValue(left)
 		rightValue, _ := numericBigIntValue(right)
 		return leftValue.Cmp(rightValue), true
@@ -27991,6 +30601,9 @@ func intEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		return R.FalseVal
 	}
 	if args[0] != nil && args[0].Type == object.ValueInteger {
+		if receiver.BigIntValue() == nil && args[0].BigIntValue() == nil {
+			return boolValue(receiver.Data.(int64) == args[0].Data.(int64))
+		}
 		left, _ := numericBigIntValue(receiver)
 		if right, ok := numericBigIntValue(args[0]); ok && left.Cmp(right) == 0 {
 			return R.TrueVal
@@ -28033,14 +30646,20 @@ func intTimes(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 			return values, nil
 		})
 	}
+	if IntegerTimesCapturedBlock != nil && CurrentBlockValue != nil {
+		if result, handled := IntegerTimesCapturedBlock(receiver, n, CurrentBlockValue()); handled {
+			return result
+		}
+	}
+	if IntegerTimesLinearBlock != nil && CurrentBlockValue != nil {
+		if result, handled := IntegerTimesLinearBlock(receiver, n, CurrentBlockValue()); handled {
+			return result
+		}
+	}
 	for i := int64(0); i < n; i++ {
-		if CallBlock != nil {
+		if CallBlockOne != nil {
 			LastBlockResult = nil
-			CallBlock(&object.EmeraldValue{
-				Type:  object.ValueInteger,
-				Data:  i,
-				Class: R.Classes["Integer"],
-			})
+			CallBlockOne(NewIntegerValue(i))
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
@@ -28108,6 +30727,11 @@ func intUpto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 	if !valid {
 		return NewArgumentError("comparison of Integer with " + valueTypeName(args[0]) + " failed")
 	}
+	if IntegerRangeCapturedBlock != nil && CurrentBlockValue != nil {
+		if result, handled := IntegerRangeCapturedBlock(receiver, start, end, true, CurrentBlockValue()); handled {
+			return result
+		}
+	}
 	for i := start; i <= end; i++ {
 		LastBlockResult = nil
 		CallBlock(newInt(i))
@@ -28170,6 +30794,11 @@ func intDownto(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 	if !valid {
 		return NewArgumentError("comparison of Integer with " + valueTypeName(args[0]) + " failed")
+	}
+	if IntegerRangeCapturedBlock != nil && CurrentBlockValue != nil {
+		if result, handled := IntegerRangeCapturedBlock(receiver, start, end, false, CurrentBlockValue()); handled {
+			return result
+		}
 	}
 	for i := start; i >= end; i-- {
 		CallBlock(newInt(i))
@@ -28712,6 +31341,74 @@ func floatGreaterThanOrEqual(receiver *object.EmeraldValue, args ...*object.Emer
 		return R.FalseVal
 	}
 	return floatRelationalCompare(receiver, args[0], ">=")
+}
+
+// Float*UsesBuiltinImplementation are generation-safe guards for the typed
+// SSA executor. Float values are immutable primitives in the compiled tier,
+// but Ruby can redefine any of these methods at runtime; callers must check
+// the guard before executing an unboxed operation.
+func FloatPlusUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "+", BuiltinMethod(floatAdd))
+}
+
+func FloatSubUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "-", BuiltinMethod(floatSub))
+}
+
+func FloatMulUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "*", BuiltinMethod(floatMul))
+}
+
+func FloatDivUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "/", BuiltinMethod(floatDiv))
+}
+
+func FloatModUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "%", BuiltinMethod(floatMod))
+}
+
+func FloatEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "==", BuiltinMethod(floatEqual))
+}
+
+// FloatNilPredicateUsesBuiltinImplementation is the Float counterpart of
+// IntegerNilPredicateUsesBuiltinImplementation.
+func FloatNilPredicateUsesBuiltinImplementation() bool {
+	return classResolvesBuiltinMethod(R.Classes["Float"], "nil?", BuiltinMethod(methodIsNil))
+}
+
+// SymbolEqualUsesBuiltinImplementation guards direct Symbol identity/value
+// comparisons used by a closed-world Gem wrapper.
+func SymbolEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Symbol"], "==", BuiltinMethod(symbolEqual))
+}
+
+// HashKeyUsesBuiltinImplementation guards a frozen, constant Hash membership
+// check lowered by a source-identity-checked VM path.
+func HashKeyUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Hash"], "key?", BuiltinMethod(hashHasKey))
+}
+
+// ArrayIncludeUsesBuiltinImplementation guards the empty-style Array check
+// used by Prawn's formatted text helper.
+func ArrayIncludeUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Array"], "include?", BuiltinMethod(arrayInclude))
+}
+
+func FloatLessThanUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "<", BuiltinMethod(floatLessThan))
+}
+
+func FloatGreaterThanUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], ">", BuiltinMethod(floatGreaterThan))
+}
+
+func FloatLessThanOrEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], "<=", BuiltinMethod(floatLessThanOrEqual))
+}
+
+func FloatGreaterThanOrEqualUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["Float"], ">=", BuiltinMethod(floatGreaterThanOrEqual))
 }
 
 func floatRelationalCompare(receiver, other *object.EmeraldValue, op string) *object.EmeraldValue {
@@ -30220,7 +32917,7 @@ func encodingConverterIntArg(args []*object.EmeraldValue, index int, fallback in
 		return fallback, nil
 	}
 	value := args[index]
-	if value.Type == object.ValueInteger && value.BigInt == nil {
+	if value.Type == object.ValueInteger && value.BigIntValue() == nil {
 		return int(value.Data.(int64)), nil
 	}
 	if CallMethod != nil && receiverHasCallableMethod(value, "to_int") {
@@ -30474,17 +33171,15 @@ func encodingInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 }
 
 func stringEncodingName(receiver *object.EmeraldValue) string {
-	if stringEncodings != nil {
-		if name, ok := stringEncodings[receiver]; ok && name != "" {
-			return name
-		}
+	if receiver != nil && receiver.Encoding != "" {
+		return receiver.Encoding
 	}
 	return defaultExternalEncoding
 }
 
 func SetStringEncoding(value *object.EmeraldValue, encoding string) {
-	if value != nil && value.Type == object.ValueString && stringEncodings != nil && encoding != "" {
-		stringEncodings[value] = encoding
+	if value != nil && value.Type == object.ValueString && encoding != "" {
+		value.Encoding = encoding
 	}
 }
 
@@ -30597,9 +33292,7 @@ func stringForceEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		}
 		name = canonical
 	}
-	if stringEncodings != nil {
-		stringEncodings[receiver] = name
-	}
+	receiver.Encoding = name
 	return receiver
 }
 
@@ -31547,7 +34240,7 @@ func arrayMultiply(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if count < 0 {
 		return NewArgumentError("negative argument")
 	}
-	source := receiver.Data.([]*object.EmeraldValue)
+	source, _ := valueToArray(receiver)
 	result := make([]*object.EmeraldValue, 0, len(source)*count)
 	for i := 0; i < count; i++ {
 		result = append(result, source...)
@@ -31556,7 +34249,12 @@ func arrayMultiply(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 }
 
 func arrayLength(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	if receiver != nil {
+		if region := receiver.LazyArrayRegionValue(); region != nil {
+			return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(region.Length), Class: R.Classes["Integer"]}
+		}
+	}
+	arr, _ := valueToArray(receiver)
 	return &object.EmeraldValue{
 		Type:  object.ValueInteger,
 		Data:  int64(len(arr)),
@@ -31574,18 +34272,23 @@ func arrayClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			return classNew(receiver, args...)
 		}
 	}
-	contents, err := arrayNewContents(args...)
+	contents, lazyRegion, err := arrayNewContents(args...)
 	if err != nil {
-		if contents != nil {
-			receiver.Data = contents
+		if contents.values != nil {
+			receiver.Data = contents.values
 		}
 		return err
 	}
-	return &object.EmeraldValue{
+	result := &object.EmeraldValue{
 		Type:  object.ValueArray,
-		Data:  contents,
+		Data:  contents.values,
 		Class: R.Classes["Array"],
 	}
+	if lazyRegion != nil {
+		result.SetLazyArrayRegion(lazyRegion)
+		RegisterLazyArrayRegion(result)
+	}
+	return result
 }
 
 func arrayClassSquareBrackets(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -31728,42 +34431,66 @@ func arrayInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen array")
 	}
-	contents, err := arrayNewContents(args...)
+	contents, lazyRegion, err := arrayNewContents(args...)
 	if err != nil {
-		if contents != nil {
-			receiver.Data = contents
+		if contents.values != nil {
+			receiver.Data = contents.values
 		}
 		return err
 	}
-	receiver.Data = contents
+	receiver.Data = contents.values
+	if lazyRegion != nil {
+		receiver.SetLazyArrayRegion(lazyRegion)
+		RegisterLazyArrayRegion(receiver)
+	}
 	return receiver
 }
 
-func arrayNewContents(args ...*object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+type arrayNewContentsResult struct {
+	values []*object.EmeraldValue
+}
+
+func arrayNewContents(args ...*object.EmeraldValue) (arrayNewContentsResult, *object.LazyArrayRegion, *object.EmeraldValue) {
 	if len(args) > 2 {
-		return nil, NewArgumentError("wrong number of arguments")
+		return arrayNewContentsResult{}, nil, NewArgumentError("wrong number of arguments")
 	}
 	if len(args) == 1 {
 		if arr, ok := valueToArray(args[0]); ok {
-			return append([]*object.EmeraldValue(nil), arr...), nil
+			return arrayNewContentsResult{values: append([]*object.EmeraldValue(nil), arr...)}, nil, nil
 		}
 	} else if len(args) == 2 && args[0] != nil && args[0].Type == object.ValueArray {
-		return nil, typeError("no implicit conversion of Array into Integer")
+		return arrayNewContentsResult{}, nil, typeError("no implicit conversion of Array into Integer")
 	}
 
 	length := 0
 	if len(args) > 0 {
 		n, ok := valueToInteger(args[0])
 		if !ok {
-			return nil, typeError("no implicit conversion into Integer")
+			return arrayNewContentsResult{}, nil, typeError("no implicit conversion into Integer")
 		}
 		if n < 0 {
-			return nil, NewArgumentError("negative array size")
+			return arrayNewContentsResult{}, nil, NewArgumentError("negative array size")
 		}
 		if n >= 1<<62 || n > 10_000_000 {
-			return nil, NewArgumentError("array size too big")
+			return arrayNewContentsResult{}, nil, NewArgumentError("array size too big")
 		}
 		length = int(n)
+	}
+	if len(args) == 1 && ArrayNewCapturedLazyBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil {
+		if region, errValue, handled := ArrayNewCapturedLazyBlock(int64(length), CurrentBlockValue()); handled {
+			if errValue != nil {
+				return arrayNewContentsResult{}, nil, errValue
+			}
+			return arrayNewContentsResult{values: make([]*object.EmeraldValue, length)}, region, nil
+		}
+	}
+	if len(args) == 1 && ArrayNewCapturedBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil {
+		if values, errValue, handled := ArrayNewCapturedBlock(int64(length), CurrentBlockValue()); handled {
+			if errValue != nil {
+				return arrayNewContentsResult{}, nil, errValue
+			}
+			return arrayNewContentsResult{values: values}, nil, nil
+		}
 	}
 
 	defaultValue := R.NilVal
@@ -31772,8 +34499,9 @@ func arrayNewContents(args ...*object.EmeraldValue) ([]*object.EmeraldValue, *ob
 	}
 
 	arr := make([]*object.EmeraldValue, length)
-	for i := 0; i < length; i++ {
-		if CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck() {
+	hasBlock := CallBlock != nil && BlockGivenCheck != nil && BlockGivenCheck()
+	if hasBlock {
+		for i := 0; i < length; i++ {
 			LastBlockResult = nil
 			value := CallBlock(&object.EmeraldValue{
 				Type:  object.ValueInteger,
@@ -31783,14 +34511,16 @@ func arrayNewContents(args ...*object.EmeraldValue) ([]*object.EmeraldValue, *ob
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
-				return arr[:i], result
+				return arrayNewContentsResult{values: arr[:i]}, nil, result
 			}
 			arr[i] = value
-		} else {
+		}
+	} else {
+		for i := range arr {
 			arr[i] = defaultValue
 		}
 	}
-	return arr, nil
+	return arrayNewContentsResult{values: arr}, nil, nil
 }
 
 func arrayDup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -31827,7 +34557,7 @@ func arrayReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func arrayFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(args) > 0 {
 		count, ok := valueToInteger(args[0])
 		if !ok {
@@ -31854,7 +34584,7 @@ func arrayFirst(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func arrayLast(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(args) > 0 {
 		count, ok := valueToInteger(args[0])
 		if !ok {
@@ -31884,7 +34614,7 @@ func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) < 1 {
 		return receiver
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	receiver.Data = append(arr, args...)
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
@@ -31899,7 +34629,7 @@ func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(args) > 1 {
 		return argumentError("wrong number of arguments")
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(args) == 1 {
 		count, ok := arrayShiftCount(args[0])
 		if !ok {
@@ -31927,7 +34657,7 @@ func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 }
 
 func arrayEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(arr) == 0 {
 		return R.TrueVal
 	}
@@ -31935,7 +34665,7 @@ func arrayEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 }
 
 func arrayJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(arr) == 0 {
 		if len(args) == 0 || args[0] == nil || args[0].Type == object.ValueNil {
 			_, _ = arrayJoinSeparator(args)
@@ -32112,7 +34842,7 @@ func arrayJoinElement(value *object.EmeraldValue, sep string, seen map[*object.E
 }
 
 func arrayReverse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	newArr := make([]*object.EmeraldValue, len(arr))
 	for i, v := range arr {
 		newArr[len(arr)-1-i] = v
@@ -32128,7 +34858,7 @@ func arrayReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen array")
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	for i, j := 0, len(arr)-1; i < j; i, j = i+1, j-1 {
 		arr[i], arr[j] = arr[j], arr[i]
 	}
@@ -32262,7 +34992,7 @@ func hashKeysEql(candidate, query *object.EmeraldValue) bool {
 	switch query.Type {
 	case object.ValueNil:
 		return true
-	case object.ValueBool, object.ValueInteger, object.ValueFloat, object.ValueString, object.ValueSymbol:
+	case object.ValueBool, object.ValueInteger, object.ValueFloat, object.ValueString, object.ValueSymbol, object.ValueClass, object.ValueModule:
 		return candidate.Equals(query)
 	case object.ValueArray:
 		return arrayValuesEqual(candidate, query)
@@ -32311,6 +35041,26 @@ func hashIdentityKey(key *object.EmeraldValue) *object.EmeraldValue {
 		}
 		hashIdentityIntegerKeys[n] = key
 		return key
+	case object.ValueClass:
+		klass, ok := key.Data.(*object.Class)
+		if !ok || klass == nil {
+			return key
+		}
+		if existing, ok := hashIdentityClassKeys[klass]; ok {
+			return existing
+		}
+		hashIdentityClassKeys[klass] = key
+		return key
+	case object.ValueModule:
+		module, ok := key.Data.(*object.Module)
+		if !ok || module == nil {
+			return key
+		}
+		if existing, ok := hashIdentityModuleKeys[module]; ok {
+			return existing
+		}
+		hashIdentityModuleKeys[module] = key
+		return key
 	default:
 		return key
 	}
@@ -32321,17 +35071,17 @@ func hashData(receiver *object.EmeraldValue) *object.RHash {
 		return nil
 	}
 	if h, ok := receiver.Data.(*object.RHash); ok {
+		if h.Linear != nil {
+			if h.Pairs == nil {
+				materializeLinearHash(h)
+			}
+			h.Linear = nil
+		}
 		if h.Pairs == nil {
 			h.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue)
 		}
 		if h.Keys == nil {
 			h.Keys = []*object.EmeraldValue{}
-		}
-		if h.Hashes == nil {
-			h.Hashes = make(map[*object.EmeraldValue]int64, len(h.Pairs))
-			for key := range h.Pairs {
-				h.Hashes[key] = hashKeyCode(key)
-			}
 		}
 		return h
 	}
@@ -32339,12 +35089,51 @@ func hashData(receiver *object.EmeraldValue) *object.RHash {
 	if pairs == nil {
 		pairs = make(map[*object.EmeraldValue]*object.EmeraldValue)
 	}
-	h := &object.RHash{Pairs: pairs, Keys: []*object.EmeraldValue{}, Hashes: make(map[*object.EmeraldValue]int64, len(pairs))}
-	for key := range pairs {
-		h.Hashes[key] = hashKeyCode(key)
-	}
+	h := &object.RHash{Pairs: pairs, Keys: []*object.EmeraldValue{}}
 	receiver.Data = h
 	return h
+}
+
+func materializeLinearHash(hash *object.RHash) bool {
+	if hash == nil || hash.Linear == nil {
+		return true
+	}
+	region := hash.Linear
+	if region.Count <= 0 || region.Count != len(hash.Keys) || region.Step <= 0 {
+		return false
+	}
+	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue, region.Count)
+	for _, key := range hash.Keys {
+		if key == nil || key.Type != object.ValueInteger {
+			return false
+		}
+		integer, ok := key.Data.(int64)
+		if !ok {
+			return false
+		}
+		value, valid := checkedIntegerHashAdd(integer, region.ValueOffset)
+		if !valid {
+			return false
+		}
+		pairs[key] = NewSmallIntegerValue(value)
+	}
+	hash.Pairs = pairs
+	hash.Hashes = nil
+	hash.Buckets = nil
+	hash.BucketSize = 0
+	hash.Linear = nil
+	return true
+}
+
+// DirectHashMaterialize restores the ordinary pointer-map representation for
+// a Hash whose VM-only lazy linear region can no longer be used. It is used by
+// typed iterators immediately before a semantic fallback.
+func DirectHashMaterialize(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+	hash := hashData(value)
+	if hash == nil {
+		return nil
+	}
+	return hash.Pairs
 }
 
 func hashInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -32919,6 +35708,36 @@ func hashIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	return R.NilVal
 }
 
+// DirectHashIndex is the side-effect-free portion of Hash#[] used by the VM's
+// guarded exact-Hash send path.  It deliberately declines hashes with a
+// default value/proc (or malformed receivers), because those cases can invoke
+// Ruby code and must retain the normal dispatcher semantics.
+func DirectHashIndex(receiver, key *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if receiver == nil || receiver.Type != object.ValueHash || receiver.Class != R.Classes["Hash"] || receiver == envObject || key == nil {
+		return nil, false
+	}
+	data := hashData(receiver)
+	if data == nil || data.Default != nil || data.DefaultProc != nil {
+		return nil, false
+	}
+	if data.CompareByIdentity {
+		if value, ok := data.Pairs[hashIdentityKey(key)]; ok {
+			if value == nil {
+				return R.NilVal, true
+			}
+			return value, true
+		}
+		return R.NilVal, true
+	}
+	if _, value, ok := hashFindStoredKeyValue(data, key); ok {
+		if value == nil {
+			return R.NilVal, true
+		}
+		return value, true
+	}
+	return R.NilVal, true
+}
+
 func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
@@ -33242,7 +36061,6 @@ func hashToProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	return &object.EmeraldValue{
 		Type: object.ValueProc,
 		Data: &object.Proc{
-			InstanceVars:   make(map[string]*object.EmeraldValue),
 			IsLambda:       true,
 			HasNativeArity: true,
 			NativeArity:    1,
@@ -33465,16 +36283,51 @@ func builtinFormat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		}
 		args = append([]*object.EmeraldValue{converted}, args[1:]...)
 	}
+	if len(args) == 2 && args[0].Class == R.Classes["String"] && args[0].Data == "%.5f" {
+		if result, ok := builtinFormatFixedFiveFloat(args[0], args[1]); ok {
+			return result
+		}
+	}
 	if errVal := rubySprintfErrorValue(args[0], args[1:]...); errVal != nil {
 		return errVal
 	}
 	formatted := rubySprintfEncoded(args[0].Data.(string), stringEncodingName(args[0]), args[1:]...)
 	result := rubyString(formatted)
-	if stringEncodings != nil {
-		resultEncoding, _ := rubySprintfNegotiatedEncoding(args[0], args[0].Data.(string), args[1:])
-		stringEncodings[result] = resultEncoding
-	}
+	resultEncoding, _ := rubySprintfNegotiatedEncoding(args[0], args[0].Data.(string), args[1:])
+	result.Encoding = resultEncoding
 	return result
+}
+
+// builtinFormatFixedFiveFloat covers the exact numeric format used by common
+// PDF serializers.  The general sprintf implementation remains authoritative
+// for every other directive, conversion hook, and non-finite value.
+func builtinFormatFixedFiveFloat(formatValue, value *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if formatValue == nil || value == nil || value.BigIntValue() != nil {
+		return nil, false
+	}
+	var number float64
+	switch value.Type {
+	case object.ValueInteger:
+		integer, ok := value.Data.(int64)
+		if !ok {
+			return nil, false
+		}
+		number = float64(integer)
+	case object.ValueFloat:
+		var ok bool
+		number, ok = value.Data.(float64)
+		if !ok {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) {
+		return nil, false
+	}
+	result := rubyString(strconv.FormatFloat(number, 'f', 5, 64))
+	result.Encoding = stringEncodingName(formatValue)
+	return result, true
 }
 
 func builtinPrintf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -33504,9 +36357,7 @@ func builtinPrintf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			return conversionTypeErrorToStringForMode(formatArgs[0], viaToStr)
 		}
 		formatValue := rubyString(coerced)
-		if stringEncodings != nil {
-			stringEncodings[formatValue] = stringEncodingName(formatArgs[0])
-		}
+		formatValue.Encoding = stringEncodingName(formatArgs[0])
 		formatArgs = append([]*object.EmeraldValue{formatValue}, formatArgs[1:]...)
 	}
 	formatted := builtinFormat(receiver, formatArgs...)
@@ -34784,7 +37635,7 @@ func ioBufferClassString(receiver *object.EmeraldValue, args ...*object.EmeraldV
 	if len(args) != 1 {
 		return NewArgumentError("wrong number of arguments")
 	}
-	if args[0] != nil && args[0].BigInt != nil && !args[0].BigInt.IsInt64() {
+	if args[0] != nil && args[0].BigIntValue() != nil && !args[0].BigIntValue().IsInt64() {
 		return NewRangeErrorValue("bignum too big to convert into `long'")
 	}
 	size, ok := valueToInteger(args[0])
@@ -35828,12 +38679,15 @@ func stringSlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	switch arg.Data.(type) {
 	case *object.RRegexp:
 		pattern := arg.Data.(*object.RRegexp)
-		re, err := regexp.Compile(rubyRegexpCompilePattern(pattern))
-		if err != nil && !rubyRegexpHasCustomSubmatch(pattern) {
-			SetGlobalVariableIfAvailable("$~", R.NilVal)
-			return R.NilVal
-		}
+		re, err := compileRubyRegexp(pattern)
 		matches, indices := rubyRegexpFindStringSubmatchWithIndices(pattern, re, s)
+		if matches == nil && (err != nil || regexpNeedsOnig(pattern.Pattern)) {
+			onigIndices, handled, errorText := onigRegexpSearch(regexpOnigCompatiblePattern(pattern.Pattern), s, pattern.Options)
+			if handled && errorText == "" && len(onigIndices) >= 2 {
+				indices = normalizeOnigEmptyIterationCaptures(pattern.Pattern, s, onigIndices)
+				matches = regexpMatchesFromIndices(s, indices)
+			}
+		}
 		if matches == nil {
 			SetGlobalVariableIfAvailable("$~", R.NilVal)
 			return R.NilVal
@@ -35945,7 +38799,7 @@ func stringElementSet(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		if errVal := regexpMatchEncodingError(pattern, receiver); errVal != nil {
 			return errVal
 		}
-		re, err := regexp.Compile(rubyRegexpCompilePattern(pattern))
+		re, err := compileRubyRegexp(pattern)
 		if err != nil {
 			return newRuntimeException(R.Classes["IndexError"], "regexp not matched")
 		}
@@ -36327,6 +39181,27 @@ func matchDataNames(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
 }
 
+func matchDataNamedCaptures(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, ok := matchDataPayload(receiver)
+	if !ok {
+		return emptyHashValue()
+	}
+	result := emptyHashValue()
+	for _, name := range data.NameOrder {
+		value := R.NilVal
+		indices := data.Names[name]
+		for index := len(indices) - 1; index >= 0; index-- {
+			candidate := matchDataCaptureValue(data, indices[index])
+			if candidate.Type != object.ValueNil {
+				value = candidate
+				break
+			}
+		}
+		hashIndexSet(result, rubyString(name), value)
+	}
+	return result
+}
+
 func matchDataInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data, ok := matchDataPayload(receiver)
 	if !ok || len(data.Matches) == 0 {
@@ -36664,15 +39539,23 @@ func stringToSym(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if normalizedEncodingName(encoding) == "UTF_8" && !stringValidForEncoding(s, encoding) {
 		return newRuntimeException(R.Classes["EncodingError"], "invalid symbol in encoding "+encoding+" :\""+escapedInvalidSymbolBytes(s)+"\"")
 	}
+	if !stringHasNonASCIIByte(s) && encodingIsASCICompatible(encoding) {
+		encoding = "US-ASCII"
+	}
+	key := normalizeEncodingNameForIO(encoding) + "\x00" + s
+	internedStringSymbolsMu.Lock()
+	if result := internedStringSymbols[key]; result != nil {
+		internedStringSymbolsMu.Unlock()
+		return result
+	}
 	result := &object.EmeraldValue{
 		Type:  object.ValueSymbol,
 		Data:  s,
 		Class: R.Classes["Symbol"],
 	}
-	if !stringHasNonASCIIByte(s) && encodingIsASCICompatible(encoding) {
-		encoding = "US-ASCII"
-	}
 	SetSymbolEncoding(result, encoding)
+	internedStringSymbols[key] = result
+	internedStringSymbolsMu.Unlock()
 	return result
 }
 
@@ -37443,7 +40326,17 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if len(args) != 0 {
 		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
 	}
-	if enumerableCurrentBlock() == nil {
+	var block *object.EmeraldValue
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil {
+		block = CurrentBlockValue()
+		if block != nil && block.Type == object.ValueNil {
+			block = nil
+		}
+	}
+	if receiver != nil && receiver.LazyArrayRegionValue() != nil && block == nil {
+		receiver.MaterializeLazyArray()
+	}
+	if block == nil {
 		enum := objectToEnum(receiver)
 		if data, ok := enum.Data.(*enumeratorData); ok {
 			data.sizeValue = newInt(int64(len(receiver.Data.([]*object.EmeraldValue))))
@@ -37451,6 +40344,14 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return enum
 	}
 	collectResult := ForEachCollecting()
+	if !collectResult && ArrayEachCapturedBlock != nil && block != nil {
+		if result, handled := ArrayEachCapturedBlock(receiver, block); handled {
+			return result
+		}
+	}
+	if receiver != nil && receiver.LazyArrayRegionValue() != nil {
+		receiver.MaterializeLazyArray()
+	}
 	collected := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
 	for index := 0; ; index++ {
 		current := receiver.Data.([]*object.EmeraldValue)
@@ -37461,8 +40362,8 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		if CallBlock != nil {
 			LastBlockResult = nil
 			ForEachClearNext()
-			val := CallBlock(elem)
-			if val != nil && val.Type == object.ValueException {
+			val := callBlockOne(elem)
+			if val != nil && val.Type == object.ValueException && LastException == val {
 				return val
 			}
 			if LastBlockResult != nil {
@@ -37489,6 +40390,16 @@ func arrayEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func arrayReverseEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
+		return newSizedGeneratorEnumerator(int64(len(receiver.Data.([]*object.EmeraldValue))), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+			array := receiver.Data.([]*object.EmeraldValue)
+			reversed := make([]*object.EmeraldValue, 0, len(array))
+			for index := len(array) - 1; index >= 0; index-- {
+				reversed = append(reversed, array[index])
+			}
+			return reversed, nil
+		})
+	}
 	collectResult := ForEachCollecting()
 	collected := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
 	for i := len(receiver.Data.([]*object.EmeraldValue)) - 1; i >= 0; i-- {
@@ -37499,7 +40410,7 @@ func arrayReverseEach(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		if CallBlock != nil {
 			LastBlockResult = nil
 			ForEachClearNext()
-			val := CallBlock(arr[i])
+			val := callBlockOne(arr[i])
 			if LastBlockResult != nil {
 				result := LastBlockResult
 				LastBlockResult = nil
@@ -37527,15 +40438,38 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(args) > 0 {
 		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
+	if receiver != nil && receiver.LazyArrayRegionValue() != nil {
+		if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil && ArrayMapCapturedBlock != nil && CurrentBlockValue != nil {
+			if mapped, handled := ArrayMapCapturedBlock(receiver, CurrentBlockValue()); handled {
+				return mapped
+			}
+		}
+		receiver.MaterializeLazyArray()
+	}
+	arr, _ := valueToArray(receiver)
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
-		return newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		enum := newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
 			result := make([]*object.EmeraldValue, 0, len(receiver.Data.([]*object.EmeraldValue)))
 			for _, elem := range receiver.Data.([]*object.EmeraldValue) {
 				result = append(result, elem)
 			}
 			return result, nil
 		})
+		if data, ok := enum.Data.(*enumeratorData); ok {
+			data.eachFunc = func() *object.EmeraldValue {
+				block := enumerableCurrentBlock()
+				if block == nil || CallMethodWithBlock == nil {
+					return enum
+				}
+				return CallMethodWithBlock(receiver, "map", block)
+			}
+		}
+		return enum
+	}
+	if ArrayMapCapturedBlock != nil && CurrentBlockValue != nil {
+		if mapped, handled := ArrayMapCapturedBlock(receiver, CurrentBlockValue()); handled {
+			return mapped
+		}
 	}
 	result := make([]*object.EmeraldValue, 0, len(arr))
 	for i := 0; ; i++ {
@@ -37544,7 +40478,7 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 			break
 		}
 		LastBlockResult = nil
-		val := CallBlock(current[i])
+		val := callBlockOne(current[i])
 		if LastBlockResult != nil {
 			result := LastBlockResult
 			LastBlockResult = nil
@@ -37565,6 +40499,9 @@ func arrayMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) > 0 {
 		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
+	}
+	if receiver != nil && receiver.LazyArrayRegionValue() != nil {
+		receiver.MaterializeLazyArray()
 	}
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
 		arr := receiver.Data.([]*object.EmeraldValue)
@@ -37592,7 +40529,7 @@ func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 					LastBlockResult = nil
 					LastException = nil
 					if CallBlock != nil {
-						value := CallBlock(current[i])
+						value := callBlockOne(current[i])
 						if value != nil && value.Type == object.ValueException {
 							return value
 						}
@@ -37623,7 +40560,7 @@ func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 			break
 		}
 		LastBlockResult = nil
-		value := CallBlock(arr[i])
+		value := callBlockOne(arr[i])
 		if LastBlockResult != nil {
 			result := LastBlockResult
 			LastBlockResult = nil
@@ -37658,7 +40595,7 @@ func arraySelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 			break
 		}
 		elem := current[i]
-		val := CallBlock(elem)
+		val := callBlockOne(elem)
 		if isTruthy(val) {
 			result = append(result, elem)
 		}
@@ -37729,6 +40666,17 @@ func EnumerableMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return enum
 	}
 	block := CurrentBlockValue()
+	if receiver != nil && receiver.Type == object.ValueRange && IntegerRangeLinearBlock != nil {
+		if r, ok := receiver.Data.(*object.RRange); ok && r != nil && !r.StartMissing && !r.EndMissing && !r.StartFloat && !r.EndFloat {
+			if _, startOK := r.StartValue.(*object.EmeraldValue); startOK {
+				if _, endOK := r.EndValue.(*object.EmeraldValue); endOK {
+					if result, handled := IntegerRangeLinearBlock(receiver, r.Start, r.End, r.Exclusive, true, block); handled {
+						return result
+					}
+				}
+			}
+		}
+	}
 	mapped := make([]*object.EmeraldValue, 0)
 	var control *object.EmeraldValue
 	collector := nativeProcWithArityOf(block, func(yielded ...*object.EmeraldValue) *object.EmeraldValue {
@@ -37809,6 +40757,12 @@ func enumerableMethodEnumerator(receiver *object.EmeraldValue, method string, ar
 				}
 				return CallMethodWithBlock(receiver, method, block, args...)
 			},
+			eachWithBlock: func(block *object.EmeraldValue) *object.EmeraldValue {
+				if block == nil || CallMethodWithBlock == nil {
+					return receiver
+				}
+				return CallMethodWithBlock(receiver, method, block, args...)
+			},
 			sizeValue: R.NilVal,
 		},
 		Class: R.Classes["Enumerator"],
@@ -37851,6 +40805,11 @@ func EnumerableFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	block := enumerableCurrentBlock()
 	if block == nil {
 		return enumerableMethodEnumerator(receiver, "find", args...)
+	}
+	if len(args) == 0 && EnumerableFindCapturedBlock != nil {
+		if result, handled := EnumerableFindCapturedBlock(receiver, block); handled {
+			return result
+		}
 	}
 	values, errVal := enumerableAllValues(receiver)
 	if errVal != nil {
@@ -38020,6 +40979,9 @@ func EnumerableEachWithObject(receiver *object.EmeraldValue, args ...*object.Eme
 			return pairs, nil
 		})
 	}
+	if result, handled := enumerableBuiltinEachWithObject(receiver, block, args[0]); handled {
+		return result
+	}
 	values, errVal := enumerableAllValues(receiver)
 	if errVal != nil {
 		return errVal
@@ -38028,6 +40990,86 @@ func EnumerableEachWithObject(receiver *object.EmeraldValue, args ...*object.Eme
 		CallBlockWithArgs(block, value, args[0])
 	}
 	return args[0]
+}
+
+// enumerableBuiltinEachWithObject keeps the common Array/Hash implementation
+// in one pass. The generic Enumerable path first materializes every yielded
+// value through a temporary native Proc and only then invokes the user's
+// block; that doubles iteration work and allocates an intermediate slice for
+// every call. Exact built-in receivers can use the same ordered/live views as
+// Array#each and Hash#each without bypassing subclass or singleton dispatch.
+func enumerableBuiltinEachWithObject(receiver, block, memo *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if receiver == nil || block == nil || CallBlockWithArgs == nil || receiver.Class == nil || AttachedSingletonClass(receiver) != nil {
+		return nil, false
+	}
+	if EnumerableEachWithObjectCapturedBlock != nil {
+		if result, handled := EnumerableEachWithObjectCapturedBlock(receiver, block, memo); handled {
+			return result, true
+		}
+	}
+	switch receiver.Type {
+	case object.ValueArray:
+		if receiver.Class != R.Classes["Array"] || receiver.LazyArrayRegionValue() != nil {
+			return nil, false
+		}
+		for index := 0; ; index++ {
+			current, ok := receiver.Data.([]*object.EmeraldValue)
+			if !ok || index >= len(current) {
+				break
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			value := CallBlockWithArgs(block, current[index], memo)
+			if value != nil && value.Type == object.ValueException && LastException == value {
+				return value, true
+			}
+			if LastBlockResult != nil {
+				result := LastBlockResult
+				LastBlockResult = nil
+				return result, true
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return memo, true
+	case object.ValueHash:
+		if receiver.Class != R.Classes["Hash"] {
+			return nil, false
+		}
+		keys, hash := hashOrderedKeysForIteration(receiver)
+		if hash == nil {
+			return nil, false
+		}
+		for _, key := range keys {
+			value, ok := hash[key]
+			if !ok {
+				continue
+			}
+			pair := &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  []*object.EmeraldValue{key, value},
+				Class: R.Classes["Array"],
+			}
+			LastBlockResult = nil
+			ForEachClearNext()
+			result := CallBlockWithArgs(block, pair, memo)
+			if result != nil && result.Type == object.ValueException && LastException == result {
+				return result, true
+			}
+			if LastBlockResult != nil {
+				control := LastBlockResult
+				LastBlockResult = nil
+				return control, true
+			}
+			if ForEachConsumeNext() {
+				continue
+			}
+		}
+		return memo, true
+	default:
+		return nil, false
+	}
 }
 
 func EnumerableFlatMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -38324,6 +41366,22 @@ func enumerableExactAdd(left, right *object.EmeraldValue) *object.EmeraldValue {
 
 func EnumerableSortBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	block := enumerableCurrentBlock()
+	if block == nil {
+		enum := enumerableValuesEnumerator(receiver)
+		if data, ok := enum.Data.(*enumeratorData); ok {
+			data.eachFunc = func() *object.EmeraldValue {
+				return enumerableSortByWithBlock(receiver, enumerableCurrentBlock())
+			}
+			data.eachWithBlock = func(block *object.EmeraldValue) *object.EmeraldValue {
+				return enumerableSortByWithBlock(receiver, block)
+			}
+		}
+		return enum
+	}
+	return enumerableSortByWithBlock(receiver, block)
+}
+
+func enumerableSortByWithBlock(receiver, block *object.EmeraldValue) *object.EmeraldValue {
 	if block == nil {
 		return enumerableValuesEnumerator(receiver)
 	}
@@ -39049,13 +42107,7 @@ func enumerablePatternMatch(pattern, value *object.EmeraldValue) *object.Emerald
 		return methodIsA(value, pattern)
 	}
 	if pattern.Type == object.ValueModule {
-		module := pattern.Data.(*object.Module)
-		for cls := receiverEffectiveClass(value); cls != nil; cls = cls.SuperClass {
-			if classIncludesModule(cls, module) {
-				return R.TrueVal
-			}
-		}
-		return R.FalseVal
+		return methodIsA(value, pattern)
 	}
 	if CallMethod != nil && receiverHasCallableMethod(pattern, "===") {
 		return CallMethod(pattern, "===", value)
@@ -39870,10 +42922,20 @@ func objectToEnum(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 			if block == nil || CallMethodWithBlock == nil {
 				return enum
 			}
-			return CallMethodWithBlock(receiver, methodName, block, methodArgs...)
+			return callMethodWithBlockBypass(receiver, methodName, block, methodArgs...)
 		}
 	}
 	return enum
+}
+
+func callMethodWithBlockBypass(receiver *object.EmeraldValue, methodName string, block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if CallMethodWithBlock == nil {
+		return R.NilVal
+	}
+	sendArgs := make([]*object.EmeraldValue, 0, len(args)+1)
+	sendArgs = append(sendArgs, rubySymbol(methodName))
+	sendArgs = append(sendArgs, args...)
+	return CallMethodWithBlock(receiver, "send", block, sendArgs...)
 }
 
 func objectEnumValues(receiver *object.EmeraldValue, methodName string, methodArgs []*object.EmeraldValue, limit int, data *enumeratorData) ([]*object.EmeraldValue, *object.EmeraldValue) {
@@ -39898,7 +42960,7 @@ func objectEnumValues(receiver *object.EmeraldValue, methodName string, methodAr
 		return values, nil
 	}
 	if CallMethod != nil {
-		responds := CallMethod(receiver, "respond_to?", rubySymbol(methodName))
+		responds := CallMethod(receiver, "respond_to?", rubySymbol(methodName), R.TrueVal)
 		if responds != nil && responds.Type == object.ValueException {
 			return nil, responds
 		}
@@ -39906,7 +42968,7 @@ func objectEnumValues(receiver *object.EmeraldValue, methodName string, methodAr
 			return nil, NewNoMethodError("undefined method `" + methodName + "'")
 		}
 	}
-	result := CallMethodWithBlock(receiver, methodName, collector, methodArgs...)
+	result := callMethodWithBlockBypass(receiver, methodName, collector, methodArgs...)
 	if result != nil && result.Type == object.ValueException {
 		if result.Class == R.Classes["StopIteration"] {
 			LastException = nil
@@ -40207,7 +43269,7 @@ func arraySelectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 			break
 		}
 		elem := current[index]
-		if CallBlock(elem).IsTruthy() {
+		if callBlockOne(elem).IsTruthy() {
 			newArr = append(newArr, elem)
 		} else {
 			changed = true
@@ -40277,23 +43339,47 @@ func arrayFind(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 }
 
 func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	keys, hash := hashOrderedKeysFromValue(receiver)
+	if BlockGivenCheck == nil || !BlockGivenCheck() || CurrentBlockValue == nil || CurrentBlockValue() == nil {
+		return newHashPairEnumerator(receiver)
+	}
+	keys, hash := hashOrderedKeysForIteration(receiver)
+	block := CurrentBlockValue()
 	passesAsPair := false
 	collectAsPair := false
-	if CurrentBlockValue != nil {
-		block := CurrentBlockValue()
-		var errVal *object.EmeraldValue
-		passesAsPair, errVal = hashBlockPassesAsPair(block)
-		if errVal != nil {
-			return errVal
-		}
-		fn := procFunction(block)
-		if fn != nil && fn.ForLoopCollectAsPair {
-			collectAsPair = true
-		}
+	var errVal *object.EmeraldValue
+	passesAsPair, errVal = hashBlockPassesAsPair(block)
+	if errVal != nil {
+		return errVal
+	}
+	fn := procFunction(block)
+	if fn != nil && fn.ForLoopCollectAsPair {
+		collectAsPair = true
 	}
 
 	collectResult := ForEachCollecting()
+	if !collectResult && !passesAsPair && HashEachTypedCall != nil {
+		if result, handled := HashEachTypedCall(receiver, block, keys, hash); handled {
+			return result
+		}
+	}
+	if !collectResult && !passesAsPair && hash == nil && HashEachCapturedBlock != nil {
+		if result, handled := HashEachCapturedBlock(receiver, block, keys, hash); handled {
+			return result
+		}
+	}
+	if hash == nil {
+		hash = DirectHashMaterialize(receiver)
+	}
+	if !collectResult && !passesAsPair && HashEachCapturedBlock != nil {
+		if result, handled := HashEachCapturedBlock(receiver, block, keys, hash); handled {
+			return result
+		}
+	}
+	if !collectResult && !passesAsPair && HashEachFramedBlock != nil {
+		if result, handled := HashEachFramedBlock(receiver, block, keys, hash); handled {
+			return result
+		}
+	}
 	collected := make([]*object.EmeraldValue, 0, len(hash))
 	if collectResult && len(keys) == 0 {
 		return R.NilVal
@@ -40303,7 +43389,7 @@ func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		if !ok {
 			continue
 		}
-		if CallBlock != nil {
+		if CallBlock != nil || CallBlockWithArgs != nil {
 			LastBlockResult = nil
 			ForEachClearNext()
 			if passesAsPair {
@@ -40312,7 +43398,15 @@ func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 					Data:  []*object.EmeraldValue{k, v},
 					Class: R.Classes["Array"],
 				}
-				val := CallBlock(pair)
+				var val *object.EmeraldValue
+				if CallBlockWithArgs != nil {
+					val = CallBlockWithArgs(block, pair)
+				} else if CallBlock != nil {
+					val = CallBlock(pair)
+				}
+				if val != nil && val.Type == object.ValueException {
+					return val
+				}
 				if LastBlockResult != nil {
 					result := LastBlockResult
 					LastBlockResult = nil
@@ -40329,7 +43423,15 @@ func hashEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 					}
 				}
 			} else {
-				val := CallBlock(k, v)
+				var val *object.EmeraldValue
+				if CallBlockWithArgs != nil {
+					val = CallBlockWithArgs(block, k, v)
+				} else if CallBlock != nil {
+					val = CallBlock(k, v)
+				}
+				if val != nil && val.Type == object.ValueException {
+					return val
+				}
 				if LastBlockResult != nil {
 					result := LastBlockResult
 					LastBlockResult = nil
@@ -40397,6 +43499,11 @@ func hashMap(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *objec
 	passesAsPair, errVal := hashBlockPassesAsPair(block)
 	if errVal != nil {
 		return errVal
+	}
+	if !passesAsPair && HashMapCapturedBlock != nil {
+		if mapped, handled := HashMapCapturedBlock(receiver, block); handled {
+			return mapped
+		}
 	}
 	mapped := make([]*object.EmeraldValue, 0)
 	var control *object.EmeraldValue
@@ -40539,15 +43646,12 @@ func hashBlockPassesAsPair(block *object.EmeraldValue) (bool, *object.EmeraldVal
 }
 
 func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	keys, hash := hashOrderedKeysFromValue(receiver)
-	if hash == nil {
-		return &object.EmeraldValue{
-			Type:  object.ValueArray,
-			Data:  []*object.EmeraldValue{},
-			Class: R.Classes["Array"],
+	blockGiven := CallBlock != nil && CurrentBlockValue != nil && CurrentBlockValue() != nil
+	if blockGiven {
+		keys, hash := hashOrderedKeysForIteration(receiver)
+		if hash == nil && len(keys) > 0 {
+			hash = DirectHashMaterialize(receiver)
 		}
-	}
-	if CallBlock != nil && CurrentBlockValue != nil && CurrentBlockValue() != nil {
 		for _, key := range keys {
 			if _, ok := hash[key]; !ok {
 				continue
@@ -40569,6 +43673,14 @@ func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		}
 		return receiver
 	}
+	keys, hash := hashOrderedKeysFromValue(receiver)
+	if hash == nil {
+		return &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{},
+			Class: R.Classes["Array"],
+		}
+	}
 	return &object.EmeraldValue{
 		Type:  object.ValueArray,
 		Data:  keys,
@@ -40577,7 +43689,10 @@ func hashEachKey(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 }
 
 func hashEachValue(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	keys, hash := hashOrderedKeysFromValue(receiver)
+	keys, hash := hashOrderedKeysForIteration(receiver)
+	if hash == nil && len(keys) > 0 {
+		hash = DirectHashMaterialize(receiver)
+	}
 	values := make([]*object.EmeraldValue, 0, len(hash))
 	if hash == nil {
 		return &object.EmeraldValue{
@@ -40795,7 +43910,22 @@ func stringChars(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 
 func stringEachChar(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
-		return stringYieldValues(receiver, stringCharacterValues(receiver))
+		values := stringCharacterValues(receiver)
+		// String#each_char and Array#each share the same one-value block
+		// protocol.  Let the VM reuse its proven Array block region after the
+		// characters have been materialized; a successful batch must still
+		// return the original String, while an exception/control result is
+		// propagated unchanged.
+		if ArrayEachCapturedBlock != nil {
+			array := &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+			if result, handled := ArrayEachCapturedBlock(array, CurrentBlockValue()); handled {
+				if result == array {
+					return receiver
+				}
+				return result
+			}
+		}
+		return stringYieldValues(receiver, values)
 	}
 	return newSizedGeneratorEnumerator(int64(stringCharacterLength(receiver)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
 		return stringCharacterValues(receiver), nil
@@ -40953,7 +44083,7 @@ func stringYieldValues(receiver *object.EmeraldValue, values []*object.EmeraldVa
 	for _, value := range values {
 		LastBlockResult = nil
 		ForEachClearNext()
-		result := CallBlockWithArgs(CurrentBlockValue(), value)
+		result := callBlockOne(value)
 		if result != nil && result.Type == object.ValueException {
 			return result
 		}
@@ -41018,8 +44148,13 @@ func stringEachByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 			return stringByteValues(receiver), nil
 		})
 	}
+	if StringEachByteCapturedBlock != nil {
+		if result, handled := StringEachByteCapturedBlock(receiver, CurrentBlockValue()); handled {
+			return result
+		}
+	}
 	for index := 0; index < len(stringRawValue(receiver)); index++ {
-		result := CallBlockWithArgs(CurrentBlockValue(), newInt(int64(stringRawValue(receiver)[index])))
+		result := callBlockOne(newInt(int64(stringRawValue(receiver)[index])))
 		if result != nil && result.Type == object.ValueException {
 			return result
 		}
@@ -41033,7 +44168,7 @@ func stringEachByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 }
 
 func arrayConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	arr, _ := valueToArray(receiver)
 	if len(args) < 1 {
 		return receiver
 	}
@@ -41097,6 +44232,9 @@ func valueToArray(value *object.EmeraldValue) ([]*object.EmeraldValue, bool) {
 		return nil, false
 	}
 	if value.Type == object.ValueArray {
+		if arr, materialized := value.MaterializeLazyArray(); materialized {
+			return arr, true
+		}
 		arr, ok := value.Data.([]*object.EmeraldValue)
 		return arr, ok
 	}
@@ -41281,6 +44419,11 @@ func processValueToHash(value *object.EmeraldValue) map[*object.EmeraldValue]*ob
 }
 
 func hashOrderedKeysFromValue(value *object.EmeraldValue) ([]*object.EmeraldValue, map[*object.EmeraldValue]*object.EmeraldValue) {
+	if value != nil && value.Type == object.ValueHash {
+		if hash, ok := value.Data.(*object.RHash); ok && hash.Linear != nil && hash.Pairs == nil {
+			hashData(value)
+		}
+	}
 	hash := valueToHashMap(value)
 	if hash == nil {
 		return nil, nil
@@ -41295,6 +44438,9 @@ func hashOrderedKeysFromValue(value *object.EmeraldValue) ([]*object.EmeraldValu
 			keys = append(keys, key)
 		}
 		return keys, hash
+	}
+	if len(rhash.Keys) == len(hash) {
+		return append([]*object.EmeraldValue(nil), rhash.Keys...), hash
 	}
 	keys := make([]*object.EmeraldValue, 0, len(hash))
 	seen := make(map[*object.EmeraldValue]struct{}, len(hash))
@@ -41313,8 +44459,119 @@ func hashOrderedKeysFromValue(value *object.EmeraldValue) ([]*object.EmeraldValu
 	return keys, hash
 }
 
+// hashOrderedKeysForIteration is the read-only counterpart to
+// hashOrderedKeysFromValue.  Public methods such as Hash#keys must return an
+// independent Array, so hashOrderedKeysFromValue deliberately copies the
+// RHash order slice.  Internal iteration does not expose or mutate that
+// slice; reusing it avoids one allocation and a full pointer copy per hash
+// traversal while retaining the same stale-key and non-RHash fallbacks.
+func hashOrderedKeysForIteration(value *object.EmeraldValue) ([]*object.EmeraldValue, map[*object.EmeraldValue]*object.EmeraldValue) {
+	if _, ok := DirectHashLinearRegion(value); ok {
+		hash := value.Data.(*object.RHash)
+		return hash.Keys, nil
+	}
+	if value != nil && value.Type == object.ValueHash {
+		if hash, ok := value.Data.(*object.RHash); ok && hash.Linear != nil && hash.Pairs == nil {
+			hashData(value)
+		}
+	}
+	hash := valueToHashMap(value)
+	if hash == nil {
+		return nil, nil
+	}
+	if value == nil || value.Type != object.ValueHash {
+		return nil, hash
+	}
+	rhash, ok := value.Data.(*object.RHash)
+	if !ok || len(rhash.Keys) == 0 {
+		return hashOrderedKeysFromValue(value)
+	}
+	if len(rhash.Keys) == len(hash) {
+		return rhash.Keys, hash
+	}
+	return hashOrderedKeysFromValue(value)
+}
+
+// DirectHashIteration exposes the same ordered/live view used by core's Hash
+// iterators to VM-owned speculative regions.  Callers must prove their block
+// shape before requesting this view; ordinary paths continue using the
+// unexported helper directly.
+func DirectHashIteration(value *object.EmeraldValue) ([]*object.EmeraldValue, map[*object.EmeraldValue]*object.EmeraldValue) {
+	return hashOrderedKeysForIteration(value)
+}
+
+// DirectHashLinearRegion returns a validated lazy affine integer view. The
+// ordinary pointer map remains authoritative once any general Hash API has
+// touched the receiver.
+func DirectHashLinearRegion(value *object.EmeraldValue) (*object.RHashLinearRegion, bool) {
+	if value == nil || value.Type != object.ValueHash {
+		return nil, false
+	}
+	hash, ok := value.Data.(*object.RHash)
+	if !ok || hash.Linear == nil || hash.Linear.Count <= 0 || hash.Linear.Count != len(hash.Keys) || hash.Linear.Step <= 0 {
+		return nil, false
+	}
+	if hash.Pairs != nil && len(hash.Pairs) != hash.Linear.Count {
+		return nil, false
+	}
+	firstKey := hash.Keys[0]
+	lastKey := hash.Keys[len(hash.Keys)-1]
+	if firstKey == nil || lastKey == nil || firstKey.Type != object.ValueInteger || lastKey.Type != object.ValueInteger {
+		return nil, false
+	}
+	first, firstOK := firstKey.Data.(int64)
+	last, lastOK := lastKey.Data.(int64)
+	if !firstOK || !lastOK || first != hash.Linear.Start {
+		return nil, false
+	}
+	spanCount := int64(hash.Linear.Count - 1)
+	if spanCount != 0 && hash.Linear.Step > math.MaxInt64/spanCount {
+		return nil, false
+	}
+	expectedLast, valid := checkedIntegerHashAdd(hash.Linear.Start, hash.Linear.Step*spanCount)
+	if !valid || last != expectedLast {
+		return nil, false
+	}
+	return hash.Linear, true
+}
+
+// DirectHashLinearValue returns the affine value for one validated integer
+// key without materializing the ordinary pointer map.  VM-owned typed
+// iterators use it only after DirectHashLinearRegion has proved the complete
+// lazy representation and the callback has passed its own semantic guards.
+func DirectHashLinearValue(region *object.RHashLinearRegion, key *object.EmeraldValue) (int64, bool) {
+	if region == nil || key == nil || key.Type != object.ValueInteger {
+		return 0, false
+	}
+	raw, ok := key.Data.(int64)
+	if !ok {
+		return 0, false
+	}
+	return checkedIntegerHashAdd(raw, region.ValueOffset)
+}
+
+// DirectHashLinearPairAt returns the raw pair at an index in a validated
+// lazy affine region.  DirectHashLinearRegion has already checked the full
+// key span endpoints and count; Ruby-visible mutation clears Linear before
+// this view can be observed again.  Keep the value addition checked because
+// the metadata may still describe a value offset near an int64 boundary.
+func DirectHashLinearPairAt(region *object.RHashLinearRegion, index int) (int64, int64, bool) {
+	if region == nil || index < 0 || index >= region.Count {
+		return 0, 0, false
+	}
+	key := region.Start + region.Step*int64(index)
+	value, ok := checkedIntegerHashAdd(key, region.ValueOffset)
+	if !ok {
+		return 0, 0, false
+	}
+	return key, value, true
+}
+
 func hashForEach(value *object.EmeraldValue, fn func(key, value *object.EmeraldValue)) {
-	keys, hash := hashOrderedKeysFromValue(value)
+	keys, hash := hashOrderedKeysForIteration(value)
+	if hash == nil && len(keys) > 0 {
+		hash = DirectHashMaterialize(value)
+	}
 	if len(keys) == 0 || hash == nil {
 		return
 	}
@@ -41326,6 +44583,11 @@ func hashForEach(value *object.EmeraldValue, fn func(key, value *object.EmeraldV
 }
 
 func valueToHashMap(value *object.EmeraldValue) map[*object.EmeraldValue]*object.EmeraldValue {
+	if value != nil && value.Type == object.ValueHash {
+		if hash, ok := value.Data.(*object.RHash); ok && hash.Linear != nil && hash.Pairs == nil {
+			hashData(value)
+		}
+	}
 	return processValueToHash(value)
 }
 
@@ -41333,14 +44595,11 @@ func MarkRuby2KeywordHash(value *object.EmeraldValue) {
 	if value == nil || value.Type != object.ValueHash {
 		return
 	}
-	if ruby2KeywordHashes == nil {
-		ruby2KeywordHashes = make(map[*object.EmeraldValue]bool)
-	}
-	ruby2KeywordHashes[value] = true
+	value.Ruby2Keywords = true
 }
 
 func Ruby2KeywordHash(value *object.EmeraldValue) bool {
-	return value != nil && ruby2KeywordHashes != nil && ruby2KeywordHashes[value]
+	return value != nil && value.Ruby2Keywords
 }
 
 func hashClassRuby2KeywordsHash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -41493,7 +44752,14 @@ func hashFetchValues(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 
 func hashMerge(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	base := hashData(receiver)
-	result := &object.RHash{Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue), Keys: []*object.EmeraldValue{}}
+	basePairs := 0
+	if base != nil {
+		basePairs = len(base.Pairs)
+	}
+	result := &object.RHash{
+		Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue, basePairs),
+		Keys:  make([]*object.EmeraldValue, 0, basePairs),
+	}
 	if base != nil {
 		result.Default = base.Default
 		result.DefaultProc = base.DefaultProc
@@ -41505,8 +44771,10 @@ func hashMerge(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			}
 		}
 	}
-	for _, key := range keysNotInOrder(result.Pairs, result.Keys) {
-		result.Keys = append(result.Keys, key)
+	if len(result.Keys) != len(result.Pairs) {
+		for _, key := range keysNotInOrder(result.Pairs, result.Keys) {
+			result.Keys = append(result.Keys, key)
+		}
 	}
 	for _, arg := range args {
 		if errVal := hashMergeInto(result, arg); errVal != nil {
@@ -41884,20 +45152,25 @@ func rangeEach(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	collected := make([]*object.EmeraldValue, 0)
 
 	if start.Type == object.ValueInteger && end.Type == object.ValueInteger && !r.StartFloat && !r.EndFloat {
+		if IntegerRangeLinearBlock != nil {
+			if result, handled := IntegerRangeLinearBlock(receiver, r.Start, r.End, r.Exclusive, collectResult, CurrentBlockValue()); handled {
+				return result
+			}
+		}
 		endVal := r.End
 		if r.Exclusive {
 			endVal--
 		}
 		for i := r.Start; i <= endVal; i++ {
-			val := &object.EmeraldValue{
-				Type:  object.ValueInteger,
-				Data:  i,
-				Class: R.Classes["Integer"],
-			}
+			val := newInt(i)
 			if CallBlock != nil {
 				LastBlockResult = nil
 				ForEachClearNext()
-				CallBlock(val)
+				if CallBlockOne != nil {
+					CallBlockOne(val)
+				} else {
+					CallBlock(val)
+				}
 				if LastBlockResult != nil {
 					result := LastBlockResult
 					LastBlockResult = nil
@@ -42833,6 +46106,8 @@ func setIdentityEqual(left, right *object.EmeraldValue) bool {
 	switch left.Type {
 	case object.ValueNil, object.ValueBool, object.ValueInteger, object.ValueFloat, object.ValueSymbol:
 		return left.Equals(right)
+	case object.ValueClass, object.ValueModule:
+		return left.Data == right.Data
 	default:
 		return false
 	}
@@ -43046,6 +46321,17 @@ func setDeleteQuestion(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return receiver
 	}
 	return R.NilVal
+}
+
+func setClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if receiver != nil && receiver.Frozen {
+		return frozenError("can't modify frozen Set")
+	}
+	if errVal := setIterationMutationError(receiver); errVal != nil {
+		return errVal
+	}
+	setStoreValues(receiver, nil)
+	return receiver
 }
 
 func setDeleteValue(receiver *object.EmeraldValue, target *object.EmeraldValue) bool {
@@ -44479,7 +47765,9 @@ func rangeStepNonNumeric(receiver *object.EmeraldValue, r *object.RRange, args [
 		if args[0] != nil && args[0].Type == object.ValueFloat {
 			return typeError("no implicit conversion into Integer")
 		}
-		if count, ok := valueToInteger(args[0]); ok {
+		if _, rational := rationalValueData(args[0]); rational {
+			stepObject = args[0]
+		} else if count, ok := valueToInteger(args[0]); ok {
 			if count == 0 {
 				return receiver
 			}
@@ -44896,6 +48184,18 @@ func rangeCompareValues(a, b *object.EmeraldValue) (int, bool) {
 	}
 	switch {
 	case a.Type == object.ValueInteger && b.Type == object.ValueInteger:
+		if a.BigIntValue() == nil && b.BigIntValue() == nil {
+			av := a.Data.(int64)
+			bv := b.Data.(int64)
+			switch {
+			case av < bv:
+				return -1, true
+			case av > bv:
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
 		av, aOK := numericBigIntValue(a)
 		bv, bOK := numericBigIntValue(b)
 		if !aOK || !bOK {
@@ -45847,6 +49147,11 @@ func regexpOptions(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 
 func rubyRegexpPattern(pattern string) string {
 	pattern = normalizeRubyRegexpEscapes(pattern)
+	pattern = strings.ReplaceAll(
+		pattern,
+		rubyEmojiTextPresentationIntersection,
+		rubyEmojiCodepointApproximation,
+	)
 	if pattern == `a{2}?` {
 		pattern = `(?:a{2})?`
 	}
@@ -45859,9 +49164,9 @@ func rubyRegexpPattern(pattern string) string {
 	pattern = strings.ReplaceAll(pattern, `\H`, `[^0-9A-Fa-f]`)
 	pattern = strings.ReplaceAll(pattern, `[[:lower:]]`, `\p{Ll}`)
 	pattern = strings.ReplaceAll(pattern, `[[:upper:]]`, `\p{Lu}`)
-	pattern = regexp.MustCompile(`\\([1-9][0-9]{3,})`).ReplaceAllString(pattern, `$1`)
+	pattern = rubyLargeBackreferencePattern.ReplaceAllString(pattern, `$1`)
 	pattern = normalizeRubyOptionalAssertions(pattern)
-	if regexp.MustCompile(`^\(\?<![^()]*\)$`).MatchString(pattern) {
+	if rubyStandaloneNegativeLookbehindPattern.MatchString(pattern) {
 		pattern = ""
 	}
 	return normalizeRubyRegexpRepetition(pattern)
@@ -45887,6 +49192,30 @@ func normalizeRubyRegexpEscapes(pattern string) string {
 			result.WriteByte(pattern[i])
 			i++
 			continue
+		}
+		if i+3 < len(pattern) && pattern[i+1] == 'u' && pattern[i+2] == '{' {
+			end := strings.IndexByte(pattern[i+3:], '}')
+			if end >= 0 {
+				end += i + 3
+				codepoint := pattern[i+3 : end]
+				if codepoint != "" && !strings.ContainsAny(codepoint, " \t\r\n") {
+					result.WriteString(`\x{`)
+					result.WriteString(codepoint)
+					result.WriteByte('}')
+					i = end + 1
+					continue
+				}
+			}
+		}
+		if i+5 < len(pattern) && pattern[i+1] == 'u' {
+			codepoint := pattern[i+2 : i+6]
+			if _, err := strconv.ParseUint(codepoint, 16, 32); err == nil {
+				result.WriteString(`\x{`)
+				result.WriteString(codepoint)
+				result.WriteByte('}')
+				i += 6
+				continue
+			}
 		}
 		if i+3 < len(pattern) && pattern[i+1] == 'C' && pattern[i+2] == '-' {
 			fmt.Fprintf(&result, `\x%02X`, pattern[i+3]&0x1f)
@@ -46128,7 +49457,7 @@ func rubyRegexpCompilePattern(pattern *object.RRegexp) string {
 	}
 	source = normalizeRubyInlineOptionGroups(rubyRegexpPattern(source))
 	source = disableUnnamedRegexpCaptures(source)
-	source = regexp.MustCompile(`\(\?<([A-Za-z_]\w*)>`).ReplaceAllString(source, `(?P<$1>`)
+	source = rubyNamedCapturePattern.ReplaceAllString(source, `(?P<$1>`)
 	source = regexpPatternForInvalidBytes(source)
 	prefix := "m"
 	if regexpHasBehaviorOption(pattern.Options, 'm') {
@@ -46223,9 +49552,8 @@ func normalizeRubyExtendedRegexp(pattern string) string {
 }
 
 func normalizeRubyInlineOptionGroups(pattern string) string {
-	group := regexp.MustCompile(`\(\?([imx]*)(?:-([imx]*))?([:)])`)
-	return group.ReplaceAllStringFunc(pattern, func(prefix string) string {
-		parts := group.FindStringSubmatch(prefix)
+	return rubyInlineOptionGroupPattern.ReplaceAllStringFunc(pattern, func(prefix string) string {
+		parts := rubyInlineOptionGroupPattern.FindStringSubmatch(prefix)
 		if len(parts) < 4 || (parts[3] == ")" && strings.Contains(parts[1]+parts[2], "x")) {
 			return prefix
 		}
@@ -46257,10 +49585,42 @@ func rubyRegexpFindStringSubmatch(pattern *object.RRegexp, re *regexp.Regexp, s 
 }
 
 func regexpNeedsOnig(pattern string) bool {
+	pattern = strings.ReplaceAll(pattern, rubyEmojiTextPresentationIntersection, rubyEmojiCodepointApproximation)
+	return regexpNeedsOnigApartFromExtendedMode(pattern) ||
+		strings.Contains(pattern, "(?x:") || strings.Contains(pattern, "(?-x:")
+}
+
+func regexpNeedsOnigForMatch(pattern *object.RRegexp) bool {
+	if pattern == nil {
+		return false
+	}
+	source := strings.ReplaceAll(pattern.Pattern, rubyEmojiTextPresentationIntersection, rubyEmojiCodepointApproximation)
+	if regexpNeedsOnigApartFromExtendedMode(source) {
+		return true
+	}
+	extended := regexpHasBehaviorOption(pattern.Options, 'x')
+	for _, parts := range rubyInlineOptionGroupPattern.FindAllStringSubmatch(source, -1) {
+		if len(parts) < 3 {
+			continue
+		}
+		if strings.Contains(parts[2], "x") || strings.Contains(parts[1], "x") && !extended {
+			return true
+		}
+	}
+	return false
+}
+
+func regexpNeedsOnigApartFromExtendedMode(pattern string) bool {
 	return strings.Contains(pattern, "[:") || strings.Contains(pattern, "&&") || strings.Contains(pattern, "(?~") ||
 		strings.Contains(pattern, "()") ||
-		strings.Contains(pattern, "(?a)") || strings.Contains(pattern, "(?d)") || strings.Contains(pattern, "(?u)") ||
-		strings.Contains(pattern, "(?x:") || strings.Contains(pattern, "(?-x:")
+		strings.Contains(pattern, "(?a)") || strings.Contains(pattern, "(?d)") || strings.Contains(pattern, "(?u)")
+}
+
+func regexpSubstitutionNeedsOnig(pattern string) bool {
+	pattern = strings.ReplaceAll(pattern, rubyEmojiTextPresentationIntersection, rubyEmojiCodepointApproximation)
+	return regexpNeedsOnig(pattern) ||
+		strings.Contains(pattern, "(?=") || strings.Contains(pattern, "(?!") ||
+		strings.Contains(pattern, "(?<=") || strings.Contains(pattern, "(?<!")
 }
 
 func regexpOnigCompatiblePattern(pattern string) string {
@@ -46275,7 +49635,46 @@ func regexpOnigCompatiblePattern(pattern string) string {
 	if mode == 'a' || mode == 'd' {
 		pattern = strings.ReplaceAll(pattern, `\w`, `[A-Za-z0-9_]`)
 	}
+	pattern = normalizeRubyUnicodeEscapesForOnig(pattern)
 	return disableUnnamedRegexpCaptures(pattern)
+}
+
+func normalizeRubyUnicodeEscapesForOnig(pattern string) string {
+	var result strings.Builder
+	for index := 0; index < len(pattern); {
+		if pattern[index] != '\\' || index+1 >= len(pattern) || pattern[index+1] != 'u' {
+			result.WriteByte(pattern[index])
+			index++
+			continue
+		}
+		if index+3 < len(pattern) && pattern[index+2] == '{' {
+			end := strings.IndexByte(pattern[index+3:], '}')
+			if end >= 0 {
+				end += index + 3
+				codepoint := pattern[index+3 : end]
+				if codepoint != "" && !strings.ContainsAny(codepoint, " \t\r\n") {
+					result.WriteString(`\x{`)
+					result.WriteString(codepoint)
+					result.WriteByte('}')
+					index = end + 1
+					continue
+				}
+			}
+		}
+		if index+5 < len(pattern) {
+			codepoint := pattern[index+2 : index+6]
+			if _, err := strconv.ParseUint(codepoint, 16, 32); err == nil {
+				result.WriteString(`\x{`)
+				result.WriteString(codepoint)
+				result.WriteByte('}')
+				index += 6
+				continue
+			}
+		}
+		result.WriteByte(pattern[index])
+		index++
+	}
+	return result.String()
 }
 
 func disableUnnamedRegexpCaptures(pattern string) string {
@@ -46446,7 +49845,7 @@ func regexpPatternHasInvalidNamedGroup(pattern string) bool {
 		if first == '-' || (first >= '0' && first <= '9') {
 			return true
 		}
-		if strings.ContainsAny(name, "+-") {
+		if strings.ContainsRune(name, '+') {
 			return true
 		}
 	}
@@ -46455,6 +49854,9 @@ func regexpPatternHasInvalidNamedGroup(pattern string) bool {
 
 func regexpPatternHasInvalidBackReference(pattern string) bool {
 	if strings.Contains(pattern, `\k<0>`) {
+		return true
+	}
+	if strings.Contains(pattern, `(?('`) {
 		return true
 	}
 	if regexp.MustCompile(`\(\?\([A-Za-z_]\w*\)`).FindStringIndex(pattern) != nil {
@@ -46620,8 +50022,8 @@ func regexpMatchValue(receiver *object.EmeraldValue, returnMatchData bool, args 
 		}
 		return newInt(int64(stringByteIndexToCharIndex(original, byteOffset)))
 	}
-	re, err := regexp.Compile(rubyRegexpCompilePattern(r))
-	if err != nil || regexpNeedsOnig(r.Pattern) {
+	re, err := compileRubyRegexp(r)
+	if err != nil || regexpNeedsOnigForMatch(r) {
 		indices, handled, onigError := onigRegexpSearch(regexpOnigCompatiblePattern(r.Pattern), str, r.Options)
 		if handled {
 			emptyLookaheadFallback := regexpEmptyLookaheadFallbackIndices(r.Pattern, str)
@@ -46811,7 +50213,7 @@ func regexpNamedCaptures(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		return emptyHashValue()
 	}
 	pattern := receiver.Data.(*object.RRegexp)
-	re, err := regexp.Compile(rubyRegexpCompilePattern(pattern))
+	re, err := compileRubyRegexp(pattern)
 	if err != nil {
 		return emptyHashValue()
 	}
@@ -46878,6 +50280,9 @@ func regexpFindStringSubmatchIndexForRubyMatch(re *regexp.Regexp, pattern, str s
 		}
 	}
 	loc := re.FindStringSubmatchIndex(str)
+	if regexpIsPhantomFinalLineMatch(pattern, str, loc) {
+		loc = nil
+	}
 	if loc != nil {
 		return loc
 	}
@@ -46924,10 +50329,10 @@ func regexpMatchQ(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		}
 		str = str[byteOffset:]
 	}
-	re, err := regexp.Compile(rubyRegexpCompilePattern(r))
-	if err != nil || regexpNeedsOnig(r.Pattern) {
-		indices, handled, onigError := onigRegexpSearch(regexpOnigCompatiblePattern(r.Pattern), str, r.Options)
-		if handled && onigError == "" && len(indices) >= 2 {
+	re, err := compileRubyRegexp(r)
+	if err != nil || regexpNeedsOnigForMatch(r) {
+		matched, handled, onigError := onigRegexpMatchQ(regexpOnigCompatiblePattern(r.Pattern), str, r.Options)
+		if handled && onigError == "" && matched {
 			return R.TrueVal
 		}
 		if handled && len(regexpEmptyLookaheadFallbackIndices(r.Pattern, str)) >= 2 {
@@ -46951,6 +50356,9 @@ func regexpFindStringIndexForRubyMatch(re *regexp.Regexp, pattern, str string) [
 		}
 	}
 	loc := re.FindStringIndex(str)
+	if regexpIsPhantomFinalLineMatch(pattern, str, loc) {
+		loc = nil
+	}
 	if loc != nil {
 		return loc
 	}
@@ -46970,6 +50378,32 @@ func regexpAllowsMatchBeforeFinalLineFeed(pattern string) bool {
 
 func regexpPrefersTrimmedFinalLineFeed(pattern string) bool {
 	return strings.Contains(pattern, `\Z`) && !strings.Contains(pattern, `\z`)
+}
+
+func regexpIsPhantomFinalLineMatch(pattern, source string, location []int) bool {
+	return len(location) >= 2 && len(source) > 0 && source[len(source)-1] == '\n' &&
+		location[0] == len(source) && regexpHasUnescapedLineStartAnchor(pattern)
+}
+
+func regexpHasUnescapedLineStartAnchor(pattern string) bool {
+	inClass := false
+	for index := 0; index < len(pattern); index++ {
+		if pattern[index] == '\\' {
+			index++
+			continue
+		}
+		switch pattern[index] {
+		case '[':
+			inClass = true
+		case ']':
+			inClass = false
+		case '^':
+			if !inClass {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isUnescapedSuffixAnchor(pattern string) bool {
@@ -47082,10 +50516,21 @@ func setRegexpMatchGlobalsWithContext(matches []string, source string, loc []int
 }
 
 func clearMatchDataDerivedGlobals() {
+	if !eagerRegexpDerivedGlobals {
+		return
+	}
 	SetGlobalVariableIfAvailable("$&", R.NilVal)
 	SetGlobalVariableIfAvailable("$`", R.NilVal)
 	SetGlobalVariableIfAvailable("$'", R.NilVal)
-	for i := 1; i <= regexpCaptureGlobalCount; i++ {
+	precomputed := regexpGlobalNames[2:11]
+	limit := regexpCaptureGlobalCount
+	if limit > len(precomputed) {
+		limit = len(precomputed)
+	}
+	for i := 0; i < limit; i++ {
+		SetGlobalVariableIfAvailable(precomputed[i], R.NilVal)
+	}
+	for i := limit + 1; i <= regexpCaptureGlobalCount; i++ {
 		SetGlobalVariableIfAvailable(fmt.Sprintf("$%d", i), R.NilVal)
 	}
 	SetGlobalVariableIfAvailable("$+", R.NilVal)
@@ -47094,6 +50539,12 @@ func clearMatchDataDerivedGlobals() {
 func updateMatchDataDerivedGlobals(data *matchDataData) {
 	if data == nil || len(data.Matches) == 0 {
 		clearMatchDataDerivedGlobals()
+		return
+	}
+	if !eagerRegexpDerivedGlobals {
+		if captures := len(data.Matches) - 1; captures > regexpCaptureGlobalCount {
+			regexpCaptureGlobalCount = captures
+		}
 		return
 	}
 	SetGlobalVariableIfAvailable("$&", matchDataCaptureValue(data, 0))
@@ -47108,7 +50559,19 @@ func updateMatchDataDerivedGlobals(data *matchDataData) {
 	if captures := len(data.Matches) - 1; captures > regexpCaptureGlobalCount {
 		regexpCaptureGlobalCount = captures
 	}
-	for i := 1; i <= regexpCaptureGlobalCount; i++ {
+	precomputed := regexpGlobalNames[2:11]
+	limit := regexpCaptureGlobalCount
+	if limit > len(precomputed) {
+		limit = len(precomputed)
+	}
+	for i := 1; i <= limit; i++ {
+		value := matchDataCaptureValue(data, i)
+		if value.Type != object.ValueNil {
+			last = value
+		}
+		SetGlobalVariableIfAvailable(precomputed[i-1], value)
+	}
+	for i := limit + 1; i <= regexpCaptureGlobalCount; i++ {
 		value := matchDataCaptureValue(data, i)
 		if value.Type != object.ValueNil {
 			last = value
@@ -47116,6 +50579,98 @@ func updateMatchDataDerivedGlobals(data *matchDataData) {
 		SetGlobalVariableIfAvailable(fmt.Sprintf("$%d", i), value)
 	}
 	SetGlobalVariableIfAvailable("$+", last)
+}
+
+func MatchDataDerivedGlobal(value *object.EmeraldValue, name string) (*object.EmeraldValue, bool) {
+	if eagerRegexpDerivedGlobals {
+		return nil, false
+	}
+	data, ok := matchDataPayload(value)
+	if !ok || data == nil || len(data.Matches) == 0 {
+		if name == "$&" || name == "$`" || name == "$'" || name == "$+" || regexpDerivedCaptureIndex(name) > 0 {
+			return R.NilVal, true
+		}
+		return nil, false
+	}
+	switch name {
+	case "$&":
+		cache := matchDataDerivedCacheFor(data)
+		if cache.Whole == nil {
+			cache.Whole = matchDataCaptureValue(data, 0)
+		}
+		return cache.Whole, true
+	case "$`":
+		cache := matchDataDerivedCacheFor(data)
+		if cache.Before != nil {
+			return cache.Before, true
+		}
+		if len(data.Indices) >= 2 && data.Indices[0] >= 0 && data.Indices[0] <= len(data.Source) {
+			cache.Before = stringWithEncoding(data.Source[:data.Indices[0]], data.Encoding)
+		} else {
+			cache.Before = R.NilVal
+		}
+		return cache.Before, true
+	case "$'":
+		cache := matchDataDerivedCacheFor(data)
+		if cache.After != nil {
+			return cache.After, true
+		}
+		if len(data.Indices) >= 2 && data.Indices[1] >= 0 && data.Indices[1] <= len(data.Source) {
+			cache.After = stringWithEncoding(data.Source[data.Indices[1]:], data.Encoding)
+		} else {
+			cache.After = R.NilVal
+		}
+		return cache.After, true
+	case "$+":
+		cache := matchDataDerivedCacheFor(data)
+		if cache.Last != nil {
+			return cache.Last, true
+		}
+		for index := len(data.Matches) - 1; index > 0; index-- {
+			if capture := matchDataDerivedCapture(data, index); capture.Type != object.ValueNil {
+				cache.Last = capture
+				return cache.Last, true
+			}
+		}
+		cache.Last = R.NilVal
+		return cache.Last, true
+	}
+	if index := regexpDerivedCaptureIndex(name); index > 0 {
+		return matchDataDerivedCapture(data, index), true
+	}
+	return nil, false
+}
+
+func matchDataDerivedCacheFor(data *matchDataData) *matchDataDerivedCache {
+	if data.Derived == nil {
+		data.Derived = &matchDataDerivedCache{}
+	}
+	return data.Derived
+}
+
+func matchDataDerivedCapture(data *matchDataData, index int) *object.EmeraldValue {
+	cache := matchDataDerivedCacheFor(data)
+	if cache.Captures == nil {
+		cache.Captures = make([]*object.EmeraldValue, len(data.Matches))
+	}
+	if index < 0 || index >= len(cache.Captures) {
+		return R.NilVal
+	}
+	if cache.Captures[index] == nil {
+		cache.Captures[index] = matchDataCaptureValue(data, index)
+	}
+	return cache.Captures[index]
+}
+
+func regexpDerivedCaptureIndex(name string) int {
+	if len(name) < 2 || name[0] != '$' {
+		return 0
+	}
+	index, err := strconv.Atoi(name[1:])
+	if err != nil || index <= 0 {
+		return 0
+	}
+	return index
 }
 
 func regexpClassLastMatch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -47180,13 +50735,11 @@ func arrayToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		return err
 	}
 	resultString := rubyString(result)
-	if stringEncodings != nil {
-		encoding := defaultExternalEncoding
-		if len(receiver.Data.([]*object.EmeraldValue)) == 0 || !encodingIsASCICompatible(encoding) {
-			encoding = "US-ASCII"
-		}
-		stringEncodings[resultString] = encoding
+	encoding := defaultExternalEncoding
+	if len(receiver.Data.([]*object.EmeraldValue)) == 0 || !encodingIsASCICompatible(encoding) {
+		encoding = "US-ASCII"
 	}
+	resultString.Encoding = encoding
 	return resultString
 }
 
@@ -47928,8 +51481,8 @@ func utf8RuneCount(value string) int {
 
 func stringWithEncoding(value string, encoding string) *object.EmeraldValue {
 	result := rubyString(value)
-	if stringEncodings != nil && encoding != "" {
-		stringEncodings[result] = encoding
+	if encoding != "" {
+		result.Encoding = encoding
 	}
 	return result
 }
@@ -49419,9 +52972,7 @@ func arrayPack(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return bufferArg
 	}
 	result := rubyString(string(out))
-	if stringEncodings != nil {
-		stringEncodings[result] = packResultEncoding(sawBinaryDirective, sawUnicodeDirective, sawASCIIDirective)
-	}
+	result.Encoding = packResultEncoding(sawBinaryDirective, sawUnicodeDirective, sawASCIIDirective)
 	if packedPointerPayload != nil && packedPointerStrings != nil {
 		packedPointerStrings[result] = *packedPointerPayload
 	}
@@ -49617,7 +53168,7 @@ func RememberNumericBigIntOverride(value *object.EmeraldValue, n *big.Int) *obje
 		numericBigIntOverrides = make(map[*object.EmeraldValue]*big.Int)
 	}
 	numericBigIntOverrides[value] = new(big.Int).Set(n)
-	value.BigInt = new(big.Int).Set(n)
+	value.SetBigInt(new(big.Int).Set(n))
 	return value
 }
 
@@ -49625,8 +53176,8 @@ func NumericBigIntOverride(value *object.EmeraldValue) (*big.Int, bool) {
 	if value == nil {
 		return nil, false
 	}
-	if value.BigInt != nil {
-		return new(big.Int).Set(value.BigInt), true
+	if bigInteger := value.BigIntValue(); bigInteger != nil {
+		return new(big.Int).Set(bigInteger), true
 	}
 	if numericBigIntOverrides == nil {
 		return nil, false
@@ -50078,18 +53629,19 @@ func arraySortBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 }
 
 func sortArrayValues(arr []*object.EmeraldValue) *object.EmeraldValue {
-	for i := 0; i < len(arr)-1; i++ {
-		for j := 0; j < len(arr)-i-1; j++ {
-			cmp, err := arraySortCompare(arr[j], arr[j+1])
-			if err != nil {
-				return err
-			}
-			if cmp > 0 {
-				arr[j], arr[j+1] = arr[j+1], arr[j]
-			}
+	var compareErr *object.EmeraldValue
+	sort.SliceStable(arr, func(i, j int) bool {
+		if compareErr != nil {
+			return false
 		}
-	}
-	return nil
+		cmp, err := arraySortCompare(arr[i], arr[j])
+		if err != nil {
+			compareErr = err
+			return false
+		}
+		return cmp < 0
+	})
+	return compareErr
 }
 
 func arraySortCompare(left, right *object.EmeraldValue) (int, *object.EmeraldValue) {
@@ -50737,6 +54289,15 @@ func arraySum(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	if len(args) > 1 {
 		return NewArgumentError("wrong number of arguments")
 	}
+	if arraySumIntegerFastEnabled && (BlockGivenCheck == nil || !BlockGivenCheck()) {
+		initial := NewIntegerValue(0)
+		if len(args) == 1 {
+			initial = args[0]
+		}
+		if result, ok := arraySumExactIntegers(receiver, initial); ok {
+			return result
+		}
+	}
 	sum := &object.EmeraldValue{Type: object.ValueInteger, Data: int64(0), Class: R.Classes["Integer"]}
 	if len(args) == 1 {
 		sum = args[0]
@@ -50796,6 +54357,40 @@ func arraySum(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		sum = next
 	}
 	return sum
+}
+
+func arraySumExactIntegers(receiver, initial *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if receiver == nil || receiver.Type != object.ValueArray || receiver.Class != R.Classes["Array"] ||
+		AttachedSingletonClass(receiver) != nil || initial == nil || !IntegerPlusUsesBuiltinImplementation() {
+		return nil, false
+	}
+	readInteger := func(value *object.EmeraldValue) (int64, bool) {
+		if value == nil || value.Type != object.ValueInteger || value.BigIntValue() != nil ||
+			value.Class != R.Classes["Integer"] || AttachedSingletonClass(value) != nil {
+			return 0, false
+		}
+		raw, ok := value.Data.(int64)
+		return raw, ok
+	}
+	total, ok := readInteger(initial)
+	if !ok {
+		return nil, false
+	}
+	elements, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	for _, element := range elements {
+		value, valueOK := readInteger(element)
+		if !valueOK {
+			return nil, false
+		}
+		total, ok = checkedInt64Add(total, value)
+		if !ok {
+			return nil, false
+		}
+	}
+	return NewIntegerValue(total), true
 }
 
 func arrayBsearch(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -51027,9 +54622,7 @@ func stringGsubBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
-	if stringEncodings != nil {
-		stringEncodings[receiver] = stringEncodingName(result)
-	}
+	receiver.Encoding = stringEncodingName(result)
 	return receiver
 }
 
@@ -51049,9 +54642,7 @@ func stringSubBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
-	if stringEncodings != nil {
-		stringEncodings[receiver] = stringEncodingName(result)
-	}
+	receiver.Encoding = stringEncodingName(result)
 	return receiver
 }
 
@@ -51213,6 +54804,41 @@ func stringSubstituteMatches(s string, pattern *object.EmeraldValue, global bool
 		return nil
 	}
 	r := pattern.Data.(*object.RRegexp)
+	// Prawn's numeric serializer (and a common Ruby formatting idiom) uses
+	// this exact suffix expression to remove insignificant trailing zeroes.
+	// It contains a negative lookbehind, which otherwise forces the slower
+	// Onig-compatible search path for every call. The expression's semantics
+	// are structural: match the trailing run of zero bytes, except that a zero
+	// immediately following a dot is retained. Keep this proof exact and
+	// option-free; all other regexps retain the general matcher below.
+	if r != nil && r.Options == "" && r.Pattern == `((?<!\.)0)+\z` {
+		start := len(s)
+		for start > 0 && s[start-1] == '0' {
+			start--
+		}
+		if start < len(s) && (start == 0 || s[start-1] != '.') {
+			return []stringSubstituteMatch{stringSubstituteStringMatch(s, start, len(s))}
+		}
+		if start < len(s) {
+			start++
+			if start < len(s) {
+				return []stringSubstituteMatch{stringSubstituteStringMatch(s, start, len(s))}
+			}
+		}
+		return nil
+	}
+	// PDF::Core.pdf_object uses this exact anchored expression with the
+	// replacement `\1\4` to trim insignificant fractional zeroes.  Its
+	// language is a small decimal grammar (0* [1-9]* 0*), so avoid compiling
+	// an Onig-compatible regexp while retaining the complete capture layout
+	// consumed by stringSubstituteExpandReplacement.  Newline-containing
+	// strings are left to the general matcher because Ruby's `$` anchor has
+	// special before-final-newline behavior.
+	if r != nil && r.Options == "" && r.Pattern == `(\d*)((\.0*$)|(\.0*[1-9]*)0*$)` {
+		if match, ok := stringSubstituteDecimalTrimMatch(s); ok {
+			return []stringSubstituteMatch{match}
+		}
+	}
 	compiled := *r
 	if strings.HasPrefix(compiled.Pattern, "(?~") && strings.HasSuffix(compiled.Pattern, ")") {
 		forbidden := compiled.Pattern[3 : len(compiled.Pattern)-1]
@@ -51241,15 +54867,18 @@ func stringSubstituteMatches(s string, pattern *object.EmeraldValue, global bool
 		}
 	}
 	sequential := strings.Contains(compiled.Pattern, `\G`)
+	compileTarget := r
 	if sequential {
 		compiled.Pattern = strings.ReplaceAll(compiled.Pattern, `\G`, `^`)
+		compileTarget = &compiled
 	}
 	names := make(map[string][]int)
 	var locs [][]int
-	re, err := regexp.Compile(rubyRegexpCompilePattern(&compiled))
-	if regexpNeedsOnig(compiled.Pattern) {
+	re, err := compileRubyRegexp(compileTarget)
+	if regexpSubstitutionNeedsOnig(compiled.Pattern) || err != nil {
 		position := 0
 		for position <= len(s) {
+			searchStart := position
 			loc, handled, errorText := onigRegexpSearch(regexpOnigCompatiblePattern(compiled.Pattern), s[position:], compiled.Options)
 			if !handled || errorText != "" || len(loc) < 2 {
 				break
@@ -51263,12 +54892,13 @@ func stringSubstituteMatches(s string, pattern *object.EmeraldValue, global bool
 			if !global {
 				break
 			}
-			if loc[1] > position {
+			if loc[1] > searchStart {
 				position = loc[1]
-			} else if position < len(s) {
+			}
+			if loc[1] == loc[0] && position < len(s) {
 				_, width := utf8.DecodeRuneInString(s[position:])
 				position += width
-			} else {
+			} else if loc[1] == loc[0] {
 				break
 			}
 		}
@@ -51332,11 +54962,109 @@ func stringSubstituteMatches(s string, pattern *object.EmeraldValue, global bool
 	return matches
 }
 
+func compileRubyRegexp(pattern *object.RRegexp) (*regexp.Regexp, error) {
+	key := rubyRegexpCompileCacheKey{pattern: pattern.Pattern, options: pattern.Options}
+	cacheMarker := key.options + "\x00" + key.pattern
+	if pattern.CompiledPattern == cacheMarker {
+		if compiled, ok := pattern.Compiled.(*regexp.Regexp); ok {
+			return compiled, nil
+		}
+	}
+	rubyRegexpCompileCacheMu.RLock()
+	compiled := rubyRegexpCompileCache[key]
+	rubyRegexpCompileCacheMu.RUnlock()
+	if compiled != nil {
+		pattern.CompiledPattern = cacheMarker
+		pattern.Compiled = compiled
+		return compiled, nil
+	}
+	compiled, err := compileRubyRegexpSource(key, rubyRegexpCompilePattern(pattern))
+	if err == nil {
+		pattern.CompiledPattern = cacheMarker
+		pattern.Compiled = compiled
+	}
+	return compiled, err
+}
+
+func compileRubyRegexpSource(key rubyRegexpCompileCacheKey, source string) (*regexp.Regexp, error) {
+	rubyRegexpCompileCacheMu.RLock()
+	existing := rubyRegexpCompileCache[key]
+	rubyRegexpCompileCacheMu.RUnlock()
+	if existing != nil {
+		return existing, nil
+	}
+	compiled, err := regexp.Compile(source)
+	if err != nil {
+		return nil, err
+	}
+	rubyRegexpCompileCacheMu.Lock()
+	if existing := rubyRegexpCompileCache[key]; existing != nil {
+		compiled = existing
+	} else if len(rubyRegexpCompileCache) < rubyRegexpCompileCacheLimit {
+		rubyRegexpCompileCache[key] = compiled
+	}
+	rubyRegexpCompileCacheMu.Unlock()
+	return compiled, nil
+}
+
 func stringSubstituteStringMatch(source string, start, end int) stringSubstituteMatch {
 	return stringSubstituteMatch{
 		start: start, end: end, text: source[start:end],
 		indices: []int{start, end}, matches: []string{source[start:end]},
 	}
+}
+
+func stringSubstituteDecimalTrimMatch(source string) (stringSubstituteMatch, bool) {
+	if strings.IndexByte(source, '\n') >= 0 {
+		return stringSubstituteMatch{}, false
+	}
+	for dot := 0; dot < len(source); dot++ {
+		if source[dot] != '.' {
+			continue
+		}
+		fractionEnd := dot + 1
+		for fractionEnd < len(source) && source[fractionEnd] >= '0' && source[fractionEnd] <= '9' {
+			fractionEnd++
+		}
+		if fractionEnd != len(source) {
+			continue
+		}
+		fraction := source[dot+1:]
+		position := 0
+		for position < len(fraction) && fraction[position] == '0' {
+			position++
+		}
+		nonZeroStart := position
+		for position < len(fraction) && fraction[position] >= '1' && fraction[position] <= '9' {
+			position++
+		}
+		nonZeroEnd := position
+		for position < len(fraction) && fraction[position] == '0' {
+			position++
+		}
+		if position != len(fraction) {
+			continue
+		}
+
+		start := dot
+		for start > 0 && source[start-1] >= '0' && source[start-1] <= '9' {
+			start--
+		}
+		indices := []int{start, len(source), start, dot, dot, len(source), -1, -1, -1, -1}
+		matches := []string{source[start:], source[start:dot], source[dot:], "", ""}
+		if nonZeroStart != nonZeroEnd {
+			groupFourEnd := dot + 1 + nonZeroEnd
+			indices[6], indices[7] = -1, -1
+			indices[8], indices[9] = dot, groupFourEnd
+			matches[3] = ""
+			matches[4] = source[dot:groupFourEnd]
+		} else {
+			indices[6], indices[7] = dot, len(source)
+			matches[2] = source[dot:]
+		}
+		return stringSubstituteMatch{start: start, end: len(source), text: source[start:], indices: indices, matches: matches}, true
+	}
+	return stringSubstituteMatch{}, false
 }
 
 func stringSubstituteRegexpMatch(source string, indices []int, names map[string][]int) stringSubstituteMatch {
@@ -52235,12 +55963,12 @@ func appendStringValue(receiver, value *object.EmeraldValue) *object.EmeraldValu
 		return errVal
 	}
 	raw := stringRawValue(receiver)
-	builder := stringAppendBuilders[receiver]
+	builder := receiver.StringBuilderValue()
 	if builder == nil || !sameStringStorage(builder.String(), raw) {
 		builder = &strings.Builder{}
 		builder.Grow(len(raw) + 64)
 		builder.WriteString(raw)
-		stringAppendBuilders[receiver] = builder
+		receiver.SetStringBuilder(builder)
 	}
 	builder.WriteString(stringRawValue(value))
 	receiver.Data = builder.String()
@@ -52249,6 +55977,108 @@ func appendStringValue(receiver, value *object.EmeraldValue) *object.EmeraldValu
 }
 
 func AppendASCIIBytes(receiver *object.EmeraldValue, raw string) *object.EmeraldValue {
+	return appendASCIIBytes(receiver, raw, nil)
+}
+
+// AppendASCIIByteSlice is the allocation-free-input counterpart of
+// AppendASCIIBytes.  It is used by VM kernels that already materialize the
+// ASCII payload as []byte; accepting the slice avoids a []byte-to-string
+// conversion before strings.Builder copies the data into its backing store.
+func AppendASCIIByteSlice(receiver *object.EmeraldValue, raw []byte) *object.EmeraldValue {
+	return appendASCIIBytes(receiver, "", raw)
+}
+
+// AppendASCIIBytePattern is the direct-buffer form used by the proven VM
+// ASCII recurrence loop. It validates the whole counter range before touching
+// the receiver, then writes bytes straight into the existing String builder,
+// avoiding a temporary []byte and a second copy through Builder.Write.
+func AppendASCIIBytePattern(receiver *object.EmeraldValue, base, modulus, counter, step, count int64) (*object.EmeraldValue, bool) {
+	if receiver == nil || receiver.Type != object.ValueString || receiver.Frozen ||
+		base < 0 || modulus <= 0 || modulus > 128 || base > 128-modulus || step <= 0 || count < 0 {
+		return nil, false
+	}
+	if !encodingIsASCICompatible(stringEncodingName(receiver)) {
+		return nil, false
+	}
+	if count > 0 {
+		if count > math.MaxInt64/step {
+			return nil, false
+		}
+		delta := count * step
+		if counter > math.MaxInt64-delta {
+			return nil, false
+		}
+	}
+	current := stringRawValue(receiver)
+	if count > int64(int(^uint(0)>>1)-len(current)-64) {
+		return nil, false
+	}
+	builder := receiver.StringBuilderValue()
+	if builder == nil || !sameStringStorage(builder.String(), current) {
+		builder = &strings.Builder{}
+		builder.Grow(len(current) + int(count) + 64)
+		builder.WriteString(current)
+		receiver.SetStringBuilder(builder)
+	} else {
+		builder.Grow(len(current) + int(count) + 64)
+	}
+	if !asciiBytePatternChunkedEnabled {
+		for index := int64(0); index < count; index++ {
+			mod := counter % modulus
+			if mod < 0 {
+				mod += modulus
+			}
+			_ = builder.WriteByte(byte(base + mod))
+			counter += step
+		}
+	} else {
+		stepMod := step % modulus
+		gcdLeft, gcdRight := modulus, stepMod
+		for gcdRight != 0 {
+			gcdLeft, gcdRight = gcdRight, gcdLeft%gcdRight
+		}
+		cycleLength := modulus / gcdLeft
+		var cycle [128]byte
+		current := counter % modulus
+		if current < 0 {
+			current += modulus
+		}
+		for index := int64(0); index < cycleLength; index++ {
+			cycle[index] = byte(base + current)
+			current += stepMod
+			if current >= modulus {
+				current -= modulus
+			}
+		}
+		var chunk [4096]byte
+		remaining := count
+		emitted := int64(0)
+		for remaining > 0 {
+			chunkLength := int64(len(chunk))
+			if remaining < chunkLength {
+				chunkLength = remaining
+			}
+			written := 0
+			for written < int(chunkLength) {
+				cycleOffset := int(emitted % cycleLength)
+				copied := int(cycleLength) - cycleOffset
+				if copied > int(chunkLength)-written {
+					copied = int(chunkLength) - written
+				}
+				copy(chunk[written:], cycle[cycleOffset:cycleOffset+copied])
+				written += copied
+				emitted += int64(copied)
+			}
+			_, _ = builder.Write(chunk[:int(chunkLength)])
+			remaining -= chunkLength
+		}
+	}
+	receiver.Data = builder.String()
+	SetStringEncoding(receiver, stringEncodingName(receiver))
+	return receiver, true
+}
+
+func appendASCIIBytes(receiver *object.EmeraldValue, raw string, rawBytes []byte) *object.EmeraldValue {
 	if receiver == nil || receiver.Type != object.ValueString {
 		return typeError("no implicit conversion into String")
 	}
@@ -52260,17 +56090,96 @@ func AppendASCIIBytes(receiver *object.EmeraldValue, raw string) *object.Emerald
 		return newRuntimeException(R.Classes["Encoding::CompatibilityError"], "incompatible character encodings")
 	}
 	current := stringRawValue(receiver)
-	builder := stringAppendBuilders[receiver]
+	builder := receiver.StringBuilderValue()
 	if builder == nil || !sameStringStorage(builder.String(), current) {
 		builder = &strings.Builder{}
 		builder.Grow(len(current) + len(raw) + 64)
 		builder.WriteString(current)
-		stringAppendBuilders[receiver] = builder
+		receiver.SetStringBuilder(builder)
 	}
-	builder.WriteString(raw)
+	if rawBytes != nil {
+		builder.Write(rawBytes)
+	} else {
+		builder.WriteString(raw)
+	}
 	receiver.Data = builder.String()
 	SetStringEncoding(receiver, encoding)
 	return nil
+}
+
+// AppendStringLiteralASCII performs the common safe subset of String#<< for a
+// literal ASCII/UTF-8 operand.  The VM uses it only after guarding the exact
+// built-in String class and method; returning handled=false keeps encoding
+// combinations that need Ruby's full coercion path on the interpreter.
+func AppendStringLiteralASCII(receiver, value *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	return AppendStringLiteralASCIIRepeated(receiver, value, 1)
+}
+
+// AppendStringLiteralASCIIRepeated is the batched form used by a compiler
+// recognized `Integer#times` builder block.  Once the block has no observable
+// work besides appending this immutable literal, one builder write is both
+// equivalent and substantially cheaper than entering the String primitive for
+// every iteration.
+func AppendStringLiteralASCIIRepeated(receiver, value *object.EmeraldValue, count int64) (*object.EmeraldValue, bool) {
+	if receiver == nil || value == nil || receiver.Type != object.ValueString || value.Type != object.ValueString ||
+		receiver.Class != R.Classes["String"] || value.Class != R.Classes["String"] || AttachedSingletonClass(receiver) != nil ||
+		AttachedSingletonClass(value) != nil {
+		return nil, false
+	}
+	if receiver.Frozen {
+		return frozenError("can't modify frozen String"), true
+	}
+	raw := stringRawValue(value)
+	if raw == "" {
+		return receiver, true
+	}
+	if count <= 0 {
+		return receiver, true
+	}
+	receiverEncoding := stringEncodingName(receiver)
+	valueEncoding := stringEncodingName(value)
+	if receiverEncoding != valueEncoding || !encodingIsASCICompatible(receiverEncoding) || !encodingIsASCICompatible(valueEncoding) {
+		return nil, false
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if uint64(count) > uint64(maxInt)/uint64(len(raw)) {
+		return nil, false
+	}
+	if errVal := AppendASCIIBytes(receiver, strings.Repeat(raw, int(count))); errVal != nil {
+		return errVal, true
+	}
+	return receiver, true
+}
+
+// ConcatStringLiteralASCIIRepeated is the non-mutating counterpart used for
+// `text = text + "literal"` loops.  It returns a fresh String exactly as
+// String#+ does, while retaining the same conservative encoding guards as the
+// mutating builder path.
+func ConcatStringLiteralASCIIRepeated(receiver, value *object.EmeraldValue, count int64) (*object.EmeraldValue, bool) {
+	if receiver == nil || value == nil || receiver.Type != object.ValueString || value.Type != object.ValueString ||
+		receiver.Class != R.Classes["String"] || value.Class != R.Classes["String"] || AttachedSingletonClass(receiver) != nil ||
+		AttachedSingletonClass(value) != nil {
+		return nil, false
+	}
+	if count <= 0 {
+		return receiver, true
+	}
+	receiverEncoding := stringEncodingName(receiver)
+	valueEncoding := stringEncodingName(value)
+	if receiverEncoding != valueEncoding || !encodingIsASCICompatible(receiverEncoding) || !encodingIsASCICompatible(valueEncoding) {
+		return nil, false
+	}
+	raw := stringRawValue(value)
+	maxInt := int64(^uint(0) >> 1)
+	if len(raw) > 0 && uint64(count) > uint64(maxInt)/uint64(len(raw)) {
+		return nil, false
+	}
+	repeated := strings.Repeat(raw, int(count))
+	base := stringRawValue(receiver)
+	if int64(len(repeated)) > maxInt-int64(len(base)) {
+		return nil, false
+	}
+	return stringWithEncoding(base+repeated, receiverEncoding), true
 }
 
 func sameStringStorage(left, right string) bool {
@@ -52416,7 +56325,7 @@ func stringPartitionDirection(receiver, separator *object.EmeraldValue, reverse 
 
 func stringRightmostRegexpMatches(source string, pattern *object.RRegexp) []stringSubstituteMatch {
 	compiled := *pattern
-	re, err := regexp.Compile(rubyRegexpCompilePattern(&compiled))
+	re, err := compileRubyRegexp(&compiled)
 	if err != nil {
 		return nil
 	}
@@ -52517,18 +56426,43 @@ func stringIndexOf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			pattern = strings.ReplaceAll(pattern, `\G`, `^`)
 		}
 		re, err := regexp.Compile(pattern)
-		if err != nil {
+		source := s[byteOffset:]
+		if err != nil || regexpNeedsOnig(v.Pattern) {
+			indices, handled, onigError := onigRegexpSearch(regexpOnigCompatiblePattern(v.Pattern), source, v.Options)
+			if !handled || onigError != "" || len(indices) < 2 {
+				SetGlobalVariableIfAvailable("$~", R.NilVal)
+				return R.NilVal
+			}
+			matches := regexpMatchesFromIndices(source, indices)
+			for index := range indices {
+				if indices[index] >= 0 {
+					indices[index] += byteOffset
+				}
+			}
+			matchData := setRegexpMatchGlobalsWithContext(matches, s, indices, stringEncodingName(receiver))
+			if data, ok := matchDataPayload(matchData); ok {
+				data.Regexp = arg
+			}
+			setMatchDataNames(matchData, regexpSubexpNames(v.Pattern))
+			return newInt(int64(stringByteIndexToCharIndex(s, indices[0])))
+		}
+		loc := regexpFindStringSubmatchIndexForRubyMatch(re, v.Pattern, source)
+		if len(loc) < 2 {
 			SetGlobalVariableIfAvailable("$~", R.NilVal)
 			return R.NilVal
 		}
-		loc := regexpFindStringIndexForRubyMatch(re, pattern, s[byteOffset:])
-		if loc == nil {
-			SetGlobalVariableIfAvailable("$~", R.NilVal)
-			return R.NilVal
+		matches := regexpMatchesFromIndices(source, loc)
+		for index := range loc {
+			if loc[index] >= 0 {
+				loc[index] += byteOffset
+			}
 		}
-		matchText := s[byteOffset+loc[0] : byteOffset+loc[1]]
-		SetGlobalVariableIfAvailable("$~", newMatchDataValue([]string{matchText}))
-		return newInt(int64(stringByteIndexToCharIndex(s, byteOffset+loc[0])))
+		matchData := setRegexpMatchGlobalsWithContext(matches, s, loc, stringEncodingName(receiver))
+		if data, ok := matchDataPayload(matchData); ok {
+			data.Regexp = arg
+		}
+		setMatchDataNames(matchData, regexpSubexpNames(v.Pattern))
+		return newInt(int64(stringByteIndexToCharIndex(s, loc[0])))
 	}
 	converted, convertedOK, _, coerceErr := evalCoerceToString(arg)
 	if coerceErr != nil {
@@ -53141,7 +57075,7 @@ func stringUminus(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 
 func stringDedup(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if receiver.Frozen && len(auxiliaryInstanceVars[receiver]) > 0 {
+	if receiver.Frozen && len(receiver.InstanceVars) > 0 {
 		return receiver
 	}
 	if !receiver.Frozen {
@@ -53437,7 +57371,15 @@ func hashMergeInto(target *object.RHash, arg *object.EmeraldValue) *object.Emera
 	if other == nil {
 		return nil
 	}
-	keys, _ := hashOrderedKeysFromValue(arg)
+	var keys []*object.EmeraldValue
+	if hashValue, ok := arg.Data.(*object.RHash); ok && len(hashValue.Keys) == len(other) {
+		// RHash.Keys is already the insertion-ordered view used by merge.  It
+		// is read-only here, so avoid copying it and avoid a second map scan on
+		// the normal, internally consistent representation.
+		keys = hashValue.Keys
+	} else {
+		keys, _ = hashOrderedKeysFromValue(arg)
+	}
 	for _, key := range keys {
 		value, ok := other[key]
 		if !ok {
@@ -53474,27 +57416,29 @@ func hashMergeInto(target *object.RHash, arg *object.EmeraldValue) *object.Emera
 			hashAddStoredKey(target, key)
 		}
 	}
-	for _, key := range keysNotInOrder(other, keys) {
-		value := other[key]
-		var existingKey, existingValue *object.EmeraldValue
-		var found bool
-		if target.CompareByIdentity {
-			existingKey = hashIdentityKey(key)
-			existingValue, found = target.Pairs[existingKey]
-		} else {
-			existingKey, existingValue, found = hashFindStoredKeyValue(target, key)
-		}
-		if found {
-			if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
-				value = CallBlock(existingKey, existingValue, value)
+	if len(keys) != len(other) {
+		for _, key := range keysNotInOrder(other, keys) {
+			value := other[key]
+			var existingKey, existingValue *object.EmeraldValue
+			var found bool
+			if target.CompareByIdentity {
+				existingKey = hashIdentityKey(key)
+				existingValue, found = target.Pairs[existingKey]
+			} else {
+				existingKey, existingValue, found = hashFindStoredKeyValue(target, key)
 			}
-			target.Pairs[existingKey] = value
-			continue
-		}
-		target.Pairs[key] = value
-		target.Keys = append(target.Keys, key)
-		if !target.CompareByIdentity {
-			hashAddStoredKey(target, key)
+			if found {
+				if BlockGivenCheck != nil && BlockGivenCheck() && CallBlock != nil {
+					value = CallBlock(existingKey, existingValue, value)
+				}
+				target.Pairs[existingKey] = value
+				continue
+			}
+			target.Pairs[key] = value
+			target.Keys = append(target.Keys, key)
+			if !target.CompareByIdentity {
+				hashAddStoredKey(target, key)
+			}
 		}
 	}
 	return nil
@@ -53561,6 +57505,9 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		LastBlockResult = nil
 		CallBlock()
 		iterations++
+		if NonLocalReturnPending != nil && NonLocalReturnPending() {
+			return R.NilVal
+		}
 		if enumeratorLimitAbort {
 			return R.NilVal
 		}
@@ -53607,6 +57554,9 @@ func builtinLoop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 
 func loopRunningInBoundedContext() bool {
 	if InThreadBlock != nil && InThreadBlock() {
+		return true
+	}
+	if data := threadValueData(currentThread); data != nil && data.block != nil {
 		return true
 	}
 	if currentFiber == nil {
@@ -53787,18 +57737,18 @@ func sleepDurationSeconds(value *object.EmeraldValue) (float64, *object.EmeraldV
 }
 
 func installSecureRandomModule(objectClass *object.Class) {
-	klass := object.NewClass("SecureRandom")
-	klass.SuperClass = objectClass
-	klass.DefineClassMethod("bytes", &object.Method{Name: "bytes", Fn: secureRandomBytes, Arity: -1})
-	klass.DefineClassMethod("random_bytes", &object.Method{Name: "random_bytes", Fn: secureRandomBytes, Arity: -1})
-	klass.DefineClassMethod("hex", &object.Method{Name: "hex", Fn: secureRandomHex, Arity: -1})
-	klass.DefineClassMethod("base64", &object.Method{Name: "base64", Fn: secureRandomBase64, Arity: -1})
-	klass.DefineClassMethod("random_number", &object.Method{Name: "random_number", Fn: secureRandomNumber, Arity: -1})
-	klass.DefineClassMethod("rand", &object.Method{Name: "rand", Fn: secureRandomNumber, Arity: -1})
-	R.Classes["SecureRandom"] = klass
-	classValue := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
-	objectClass.DefineConstant("SecureRandom", classValue)
-	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "SecureRandom", classValue)
+	mod := object.NewModule("SecureRandom")
+	mod.DefineMethod("bytes", &object.Method{Name: "bytes", Fn: secureRandomBytes, Arity: -1})
+	mod.DefineMethod("random_bytes", &object.Method{Name: "random_bytes", Fn: secureRandomBytes, Arity: -1})
+	mod.DefineMethod("hex", &object.Method{Name: "hex", Fn: secureRandomHex, Arity: -1})
+	mod.DefineMethod("base64", &object.Method{Name: "base64", Fn: secureRandomBase64, Arity: -1})
+	mod.DefineMethod("alphanumeric", &object.Method{Name: "alphanumeric", Fn: randomFormatterAlphanumeric, Arity: -1})
+	mod.DefineMethod("uuid", &object.Method{Name: "uuid", Fn: secureRandomUUID, Arity: 0})
+	mod.DefineMethod("random_number", &object.Method{Name: "random_number", Fn: secureRandomNumber, Arity: -1})
+	mod.DefineMethod("rand", &object.Method{Name: "rand", Fn: secureRandomNumber, Arity: -1})
+	moduleValue := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
+	objectClass.DefineConstant("SecureRandom", moduleValue)
+	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "SecureRandom", moduleValue)
 }
 
 func installRandomClass(objectClass *object.Class) {
@@ -54365,6 +58315,17 @@ func secureRandomBase64(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	return rubyString(base64.StdEncoding.EncodeToString(bytes))
 }
 
+func secureRandomUUID(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	bytes := make([]byte, 16)
+	if _, err := crand.Read(bytes); err != nil {
+		return newRuntimeException(R.Classes["RuntimeError"], err.Error())
+	}
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(bytes)
+	return rubyString(encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:])
+}
+
 func secureRandomSize(args []*object.EmeraldValue, defaultSize int64) (int64, *object.EmeraldValue) {
 	if len(args) == 0 || args[0] == nil || args[0].Type == object.ValueNil {
 		return defaultSize, nil
@@ -54402,6 +58363,7 @@ func installBase64Module(objectClass *object.Class) {
 	mod.DefineMethod("strict_encode64", &object.Method{Name: "strict_encode64", Fn: base64StrictEncode64, Arity: 1})
 	mod.DefineMethod("urlsafe_decode64", &object.Method{Name: "urlsafe_decode64", Fn: base64URLSafeDecode64, Arity: 1})
 	mod.DefineMethod("urlsafe_encode64", &object.Method{Name: "urlsafe_encode64", Fn: base64URLSafeEncode64, Arity: -1})
+	mod.DefineConstant("VERSION", rubyString("0.3.0"))
 	modValue := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
 	objectClass.DefineConstant("Base64", modValue)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Base64", modValue)
@@ -54500,11 +58462,65 @@ func installPPModule(objectClass *object.Class) {
 	if objectClass == nil || objectClass.Constants["PP"] != nil {
 		return
 	}
-	mod := object.NewModule("PP")
-	mod.DefineMethod("pp", &object.Method{Name: "pp", Fn: ppPrint, Arity: -1})
-	value := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
+	klass := object.NewClass("PP")
+	klass.SuperClass = objectClass
+	klass.DefineClassMethod("pp", &object.Method{Name: "pp", Fn: ppPrint, Arity: -1})
+	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: ppInitialize, Arity: -1, Visibility: "private"})
+	klass.DefineMethod("pp", &object.Method{Name: "pp", Fn: ppInstancePrint, Arity: 1})
+	klass.DefineMethod("text", &object.Method{Name: "text", Fn: ppText, Arity: -1})
+	klass.DefineMethod("guard_inspect_key", &object.Method{Name: "guard_inspect_key", Fn: ppYield, Arity: -1})
+	klass.DefineMethod("group", &object.Method{Name: "group", Fn: ppYield, Arity: -1})
+	klass.DefineMethod("flush", &object.Method{Name: "flush", Fn: ppFlush, Arity: 0})
+	R.Classes["PP"] = klass
+	value := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
 	objectClass.DefineConstant("PP", value)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "PP", value)
+}
+
+func ppInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 0 {
+		receiverInstanceVarMap(receiver)["@output"] = args[0]
+	}
+	return R.NilVal
+}
+
+func ppInstancePrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	return ppText(receiver, rubyString(args[0].Inspect()))
+}
+
+func ppText(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	out := receiverInstanceVarMap(receiver)["@output"]
+	if out == nil || CallMethod == nil {
+		return receiver
+	}
+	result := CallMethod(out, "<<", args[0])
+	if result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return receiver
+}
+
+func ppYield(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
+		return CallBlockWithArgs(CurrentBlockValue())
+	}
+	return receiver
+}
+
+func ppFlush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	out := receiverInstanceVarMap(receiver)["@output"]
+	if out != nil && CallMethod != nil && receiverHasCallableMethod(out, "flush") {
+		if result := CallMethod(out, "flush"); result != nil && result.Type == object.ValueException {
+			return result
+		}
+	}
+	return receiver
 }
 
 func ppPrint(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -54563,15 +58579,93 @@ func installOptionParserClass(objectClass *object.Class) {
 	klass.SuperClass = objectClass
 	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: optionParserInitialize, Arity: -1, Visibility: "private"})
 	klass.DefineMethod("on", &object.Method{Name: "on", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("on_head", &object.Method{Name: "on_head", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("on_tail", &object.Method{Name: "on_tail", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("define", &object.Method{Name: "define", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("define_head", &object.Method{Name: "define_head", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("define_tail", &object.Method{Name: "define_tail", Fn: optionParserOn, Arity: -1})
+	klass.DefineMethod("parse", &object.Method{Name: "parse", Fn: optionParserParse, Arity: -1})
+	klass.DefineMethod("parse!", &object.Method{Name: "parse!", Fn: optionParserParseBang, Arity: -1})
 	klass.DefineMethod("order", &object.Method{Name: "order", Fn: optionParserOrder, Arity: -1})
-	klass.DefineMethod("order!", &object.Method{Name: "order!", Fn: optionParserOrder, Arity: -1})
+	klass.DefineMethod("order!", &object.Method{Name: "order!", Fn: optionParserOrderBang, Arity: -1})
+	klass.DefineMethod("permute", &object.Method{Name: "permute", Fn: optionParserParse, Arity: -1})
+	klass.DefineMethod("permute!", &object.Method{Name: "permute!", Fn: optionParserParseBang, Arity: -1})
+	klass.DefineMethod("separator", &object.Method{Name: "separator", Fn: optionParserSeparator, Arity: 1})
+	klass.DefineMethod("banner", &object.Method{Name: "banner", Fn: optionParserBanner, Arity: 0})
+	klass.DefineMethod("banner=", &object.Method{Name: "banner=", Fn: optionParserSetBanner, Arity: 1})
+	klass.DefineMethod("summary_width", &object.Method{Name: "summary_width", Fn: optionParserSummaryWidth, Arity: 0})
+	klass.DefineMethod("summary_width=", &object.Method{Name: "summary_width=", Fn: optionParserSetSummaryWidth, Arity: 1})
+	klass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: optionParserToS, Arity: 0})
 	R.Classes["OptionParser"] = klass
 	value := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
 	objectClass.DefineConstant("OptionParser", value)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "OptionParser", value)
+	installOptionParserErrors(klass)
+}
+
+type optionParserArgumentMode uint8
+
+const (
+	optionParserNoArgument optionParserArgumentMode = iota
+	optionParserRequiredArgument
+	optionParserOptionalArgument
+)
+
+type optionParserAlias struct {
+	name     string
+	negative bool
+}
+
+type optionParserSwitch struct {
+	aliases           []optionParserAlias
+	display           []string
+	key               string
+	mode              optionParserArgumentMode
+	optionalSeparated bool
+	positiveDefault   *object.EmeraldValue
+	converter         string
+	block             *object.EmeraldValue
+}
+
+type optionParserData struct {
+	switches     []optionParserSwitch
+	banner       string
+	separators   []string
+	summaryWidth int64
+}
+
+func installOptionParserErrors(klass *object.Class) {
+	parseError := object.NewClass("OptionParser::ParseError")
+	parseError.SuperClass = R.Classes["RuntimeError"]
+	parseError.DefineMethod("args", &object.Method{Name: "args", Fn: optionParserErrorArgs, Arity: 0})
+	parseError.DefineMethod("recover", &object.Method{Name: "recover", Fn: optionParserErrorArgs, Arity: -1})
+	parseError.DefineMethod("reason", &object.Method{Name: "reason", Fn: exceptionMessage, Arity: 0})
+	R.Classes["OptionParser::ParseError"] = parseError
+	klass.DefineConstant("ParseError", classEmeraldValue(parseError))
+	for _, name := range []string{"AmbiguousArgument", "AmbiguousOption", "InvalidArgument", "InvalidOption", "MissingArgument", "NeedlessArgument"} {
+		errClass := object.NewClass("OptionParser::" + name)
+		errClass.SuperClass = parseError
+		R.Classes["OptionParser::"+name] = errClass
+		klass.DefineConstant(name, classEmeraldValue(errClass))
+	}
+}
+
+func optionParserDataFor(receiver *object.EmeraldValue) *optionParserData {
+	if stored := dynamicInstanceVar(receiver, "@__rgo_option_parser"); stored != nil {
+		if data, ok := stored.Data.(*optionParserData); ok && data != nil {
+			return data
+		}
+	}
+	data := &optionParserData{summaryWidth: 32}
+	setDynamicInstanceVar(receiver, "@__rgo_option_parser", &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: R.Classes["Object"]})
+	return data
 }
 
 func optionParserInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := optionParserDataFor(receiver)
+	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
+		data.banner = stringRawValue(args[0])
+	}
 	if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
 		if result := CallBlockWithArgs(CurrentBlockValue(), receiver); result != nil && result.Type == object.ValueException {
 			return result
@@ -54581,43 +58675,342 @@ func optionParserInitialize(receiver *object.EmeraldValue, args ...*object.Emera
 }
 
 func optionParserOn(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := optionParserDataFor(receiver)
+	entry := optionParserSwitch{mode: optionParserNoArgument, positiveDefault: R.TrueVal}
+	for _, arg := range args {
+		if arg == nil {
+			continue
+		}
+		if arg.Type == object.ValueClass && entry.converter == "" {
+			if class, ok := arg.Data.(*object.Class); ok && class != nil {
+				entry.converter = class.Name
+			}
+			continue
+		}
+		if arg.Type != object.ValueString {
+			continue
+		}
+		raw := stringRawValue(arg)
+		if !strings.HasPrefix(raw, "-") {
+			continue
+		}
+		aliases, mode, optionalSeparated, positiveDefault := parseOptionParserSwitchSpec(raw)
+		if len(aliases) == 0 {
+			continue
+		}
+		entry.aliases = append(entry.aliases, aliases...)
+		entry.display = append(entry.display, raw)
+		if mode > entry.mode {
+			entry.mode = mode
+		}
+		entry.optionalSeparated = entry.optionalSeparated || optionalSeparated
+		if positiveDefault != nil {
+			entry.positiveDefault = positiveDefault
+		}
+		for _, alias := range aliases {
+			if strings.HasPrefix(alias.name, "--") && !alias.negative {
+				entry.key = optionParserKey(alias.name)
+			}
+		}
+	}
+	if entry.key == "" && len(entry.aliases) > 0 {
+		entry.key = optionParserKey(entry.aliases[0].name)
+	}
+	if CurrentBlockValue != nil {
+		entry.block = CurrentBlockValue()
+	}
+	if len(entry.aliases) > 0 {
+		data.switches = append(data.switches, entry)
+	}
 	return receiver
 }
 
-func optionParserOrder(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if len(args) == 0 || args[0] == nil || args[0].Type != object.ValueArray {
-		return NewArgumentError("wrong number of arguments")
+func parseOptionParserSwitchSpec(raw string) ([]optionParserAlias, optionParserArgumentMode, bool, *object.EmeraldValue) {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return nil, optionParserNoArgument, false, nil
 	}
+	name := fields[0]
+	mode := optionParserNoArgument
+	optionalSeparated := false
+	positiveDefault := R.TrueVal
+	if strings.Contains(name, "[=") {
+		mode = optionParserOptionalArgument
+		name = name[:strings.Index(name, "[=")]
+		positiveDefault = R.NilVal
+	}
+	if len(fields) > 1 {
+		if strings.HasPrefix(fields[1], "[") {
+			mode = optionParserOptionalArgument
+			optionalSeparated = true
+			positiveDefault = R.NilVal
+		} else {
+			mode = optionParserRequiredArgument
+		}
+	}
+	if strings.Contains(name, "[no-]") {
+		positive := strings.Replace(name, "[no-]", "", 1)
+		negative := strings.Replace(name, "[no-]", "no-", 1)
+		if strings.Contains(raw, "[no-]") && strings.Contains(raw, "[=") {
+			positiveDefault = R.TrueVal
+		}
+		return []optionParserAlias{{name: positive}, {name: negative, negative: true}}, mode, optionalSeparated, positiveDefault
+	}
+	return []optionParserAlias{{name: name}}, mode, optionalSeparated, positiveDefault
+}
+
+func optionParserKey(name string) string {
+	name = strings.TrimLeft(name, "-")
+	name = strings.TrimPrefix(name, "no-")
+	name = strings.ReplaceAll(name, "-", "_")
+	return name
+}
+
+func optionParserParse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return optionParserParseMode(receiver, false, false, args...)
+}
+
+func optionParserParseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return optionParserParseMode(receiver, true, false, args...)
+}
+
+func optionParserOrder(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return optionParserParseMode(receiver, false, true, args...)
+}
+
+func optionParserOrderBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return optionParserParseMode(receiver, true, true, args...)
+}
+
+func optionParserParseMode(receiver *object.EmeraldValue, mutate, ordered bool, args ...*object.EmeraldValue) *object.EmeraldValue {
+	values, into, errVal := optionParserArguments(args)
+	if errVal != nil {
+		return errVal
+	}
+	working := append([]*object.EmeraldValue(nil), values...)
+	remaining, errVal := parseOptionParserValues(optionParserDataFor(receiver), working, into, ordered)
+	if errVal != nil {
+		return errVal
+	}
+	if mutate {
+		if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueArray {
+			args[0].Data = remaining
+			return args[0]
+		}
+		if argv := GetConstantName("ARGV"); argv != nil && argv.Type == object.ValueArray {
+			argv.Data = remaining
+			return argv
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: remaining, Class: R.Classes["Array"]}
+}
+
+func optionParserArguments(args []*object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue, *object.EmeraldValue) {
+	var values []*object.EmeraldValue
 	var into *object.EmeraldValue
-	if len(args) > 1 && args[len(args)-1] != nil && args[len(args)-1].Type == object.ValueHash {
-		for key, value := range valueToHashMap(args[len(args)-1]) {
-			if specName(key) == "into" {
-				into = value
-				break
+	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueArray {
+		values = args[0].Data.([]*object.EmeraldValue)
+	} else if len(args) == 0 {
+		if argv := GetConstantName("ARGV"); argv != nil && argv.Type == object.ValueArray {
+			values = argv.Data.([]*object.EmeraldValue)
+		}
+	} else {
+		return nil, nil, NewArgumentError("wrong number of arguments")
+	}
+	if len(args) > 0 {
+		last := args[len(args)-1]
+		if last != nil && last.Type == object.ValueHash {
+			for key, value := range valueToHashMap(last) {
+				if specName(key) == "into" {
+					into = value
+					break
+				}
 			}
 		}
 	}
-	if into == nil || into.Type != object.ValueHash {
-		into = emptyHashValue()
-	}
-	values := args[0].Data.([]*object.EmeraldValue)
+	return values, into, nil
+}
+
+func parseOptionParserValues(data *optionParserData, values []*object.EmeraldValue, into *object.EmeraldValue, ordered bool) ([]*object.EmeraldValue, *object.EmeraldValue) {
+	remaining := make([]*object.EmeraldValue, 0, len(values))
 	for index := 0; index < len(values); index++ {
-		if values[index] == nil || values[index].Type != object.ValueString {
+		value := values[index]
+		if value == nil || value.Type != object.ValueString {
+			remaining = append(remaining, value)
 			continue
 		}
-		switch stringRawValue(values[index]) {
-		case "--verbose", "-v":
-			hashIndexSet(into, rubySymbol("verbose"), R.TrueVal)
-		case "--no-verbose":
-			hashIndexSet(into, rubySymbol("verbose"), R.FalseVal)
-		case "--require", "-r":
-			if index+1 < len(values) {
+		raw := stringRawValue(value)
+		if raw == "--" {
+			remaining = append(remaining, values[index+1:]...)
+			break
+		}
+		if !strings.HasPrefix(raw, "-") || raw == "-" {
+			remaining = append(remaining, value)
+			if ordered {
+				remaining = append(remaining, values[index+1:]...)
+				break
+			}
+			continue
+		}
+		entry, alias, inline, found := findOptionParserSwitch(data, raw)
+		if !found {
+			return nil, newOptionParserError("InvalidOption", "invalid option: "+raw, raw)
+		}
+		parsed := entry.positiveDefault
+		if alias.negative {
+			parsed = R.FalseVal
+		} else if entry.mode == optionParserRequiredArgument {
+			if inline != "" {
+				parsed = rubyString(inline)
+			} else {
+				if index+1 >= len(values) {
+					return nil, newOptionParserError("MissingArgument", "missing argument: "+alias.name, alias.name)
+				}
 				index++
-				hashIndexSet(into, rubySymbol("require"), values[index])
+				parsed = values[index]
+			}
+		} else if entry.mode == optionParserOptionalArgument {
+			if inline != "" {
+				parsed = rubyString(inline)
+			} else if entry.optionalSeparated && index+1 < len(values) && values[index+1] != nil &&
+				values[index+1].Type == object.ValueString && !strings.HasPrefix(stringRawValue(values[index+1]), "-") {
+				index++
+				parsed = values[index]
+			}
+		}
+		if parsed != nil && parsed.Type == object.ValueString && entry.converter != "" {
+			var conversionError *object.EmeraldValue
+			parsed, conversionError = convertOptionParserArgument(parsed, entry.converter, alias.name)
+			if conversionError != nil {
+				return nil, conversionError
+			}
+		}
+		if into != nil && into.Type == object.ValueHash && entry.key != "" {
+			hashIndexSet(into, rubySymbol(entry.key), parsed)
+		}
+		if entry.block != nil && CallBlockWithArgs != nil {
+			result := CallBlockWithArgs(entry.block, parsed)
+			if result != nil && result.Type == object.ValueException {
+				return nil, result
 			}
 		}
 	}
-	return args[0]
+	return remaining, nil
+}
+
+func findOptionParserSwitch(data *optionParserData, raw string) (optionParserSwitch, optionParserAlias, string, bool) {
+	name := raw
+	inline := ""
+	if equals := strings.Index(raw, "="); equals > 0 {
+		name = raw[:equals]
+		inline = raw[equals+1:]
+	}
+	for _, entry := range data.switches {
+		for _, alias := range entry.aliases {
+			if name == alias.name {
+				return entry, alias, inline, true
+			}
+			if strings.HasPrefix(alias.name, "-") && !strings.HasPrefix(alias.name, "--") &&
+				entry.mode == optionParserRequiredArgument && strings.HasPrefix(raw, alias.name) && len(raw) > len(alias.name) {
+				return entry, alias, raw[len(alias.name):], true
+			}
+		}
+	}
+	return optionParserSwitch{}, optionParserAlias{}, "", false
+}
+
+func convertOptionParserArgument(value *object.EmeraldValue, converter, option string) (*object.EmeraldValue, *object.EmeraldValue) {
+	raw := stringRawValue(value)
+	switch converter {
+	case "Integer":
+		number, err := strconv.ParseInt(raw, 0, 64)
+		if err != nil {
+			return nil, newOptionParserError("InvalidArgument", "invalid argument: "+option+" "+raw, raw)
+		}
+		return newInt(number), nil
+	case "Float":
+		number, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, newOptionParserError("InvalidArgument", "invalid argument: "+option+" "+raw, raw)
+		}
+		return newFloat(number), nil
+	case "Array":
+		parts := strings.Split(raw, ",")
+		values := make([]*object.EmeraldValue, len(parts))
+		for i, part := range parts {
+			values[i] = rubyString(part)
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}, nil
+	default:
+		return value, nil
+	}
+}
+
+func newOptionParserError(name, message, argument string) *object.EmeraldValue {
+	class := R.Classes["OptionParser::"+name]
+	if class == nil {
+		class = R.Classes["ArgumentError"]
+	}
+	err := newRuntimeException(class, message)
+	setDynamicInstanceVar(err, "@args", &object.EmeraldValue{
+		Type:  object.ValueArray,
+		Data:  []*object.EmeraldValue{rubyString(argument)},
+		Class: R.Classes["Array"],
+	})
+	return err
+}
+
+func optionParserErrorArgs(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := dynamicInstanceVar(receiver, "@args"); value != nil {
+		return value
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+}
+
+func optionParserSeparator(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 1 && args[0] != nil && args[0].Type == object.ValueString {
+		optionParserDataFor(receiver).separators = append(optionParserDataFor(receiver).separators, stringRawValue(args[0]))
+	}
+	return receiver
+}
+
+func optionParserBanner(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rubyString(optionParserDataFor(receiver).banner)
+}
+
+func optionParserSetBanner(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 1 && args[0] != nil {
+		optionParserDataFor(receiver).banner = stringRawValue(args[0])
+		return args[0]
+	}
+	return R.NilVal
+}
+
+func optionParserSummaryWidth(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return newInt(optionParserDataFor(receiver).summaryWidth)
+}
+
+func optionParserSetSummaryWidth(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 1 {
+		if width, ok := valueToInteger(args[0]); ok {
+			optionParserDataFor(receiver).summaryWidth = width
+			return args[0]
+		}
+	}
+	return NewTypeError("no implicit conversion into Integer")
+}
+
+func optionParserToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := optionParserDataFor(receiver)
+	lines := make([]string, 0, len(data.switches)+len(data.separators)+1)
+	if data.banner != "" {
+		lines = append(lines, data.banner)
+	}
+	lines = append(lines, data.separators...)
+	for _, entry := range data.switches {
+		lines = append(lines, "    "+strings.Join(entry.display, ", "))
+	}
+	return rubyString(strings.Join(lines, "\n"))
 }
 
 func installFcntlModule(objectClass *object.Class) {
@@ -55366,7 +59759,7 @@ func cgiEscapeURIComponent(receiver *object.EmeraldValue, args ...*object.Emeral
 	result := rubyString(out.String())
 	if source != nil {
 		if enc := stringEncodingName(source); enc != "" {
-			stringEncodings[result] = enc
+			result.Encoding = enc
 		}
 	}
 	return result
@@ -55415,9 +59808,9 @@ func cgiUnescapeURIComponent(receiver *object.EmeraldValue, args ...*object.Emer
 		targetEncoding = sourceEncoding
 	}
 	if targetEncoding != "" {
-		stringEncodings[result] = targetEncoding
+		result.Encoding = targetEncoding
 	} else if sourceEncoding != "" {
-		stringEncodings[result] = sourceEncoding
+		result.Encoding = sourceEncoding
 	}
 	return result
 }
@@ -55564,6 +59957,7 @@ func installYAMLModule(objectClass *object.Class) {
 	mod := object.NewModule("Psych")
 	modValue := &object.EmeraldValue{Type: object.ValueModule, Data: mod, Class: R.Classes["Module"]}
 	mod.DefineMethod("load", &object.Method{Name: "load", Fn: yamlLoad, Arity: 1})
+	mod.DefineMethod("safe_load", &object.Method{Name: "safe_load", Fn: yamlLoad, Arity: -1})
 	mod.DefineMethod("unsafe_load", &object.Method{Name: "unsafe_load", Fn: yamlLoad, Arity: 1})
 	mod.DefineMethod("dump", &object.Method{Name: "dump", Fn: yamlDump, Arity: -1})
 	mod.DefineMethod("dump_stream", &object.Method{Name: "dump_stream", Fn: yamlDumpStream, Arity: -1})
@@ -55572,10 +59966,22 @@ func installYAMLModule(objectClass *object.Class) {
 	mod.DefineMethod("parse", &object.Method{Name: "parse", Fn: yamlParse, Arity: 1})
 	mod.DefineMethod("parse_file", &object.Method{Name: "parse_file", Fn: yamlParseFile, Arity: 1})
 	mod.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: yamlToS, Arity: 0})
+	loadTags := emptyHashValue()
+	dumpTags := emptyHashValue()
+	mod.DefineMethod("load_tags", &object.Method{Name: "load_tags", Arity: 0, Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return loadTags
+	}})
+	mod.DefineMethod("dump_tags", &object.Method{Name: "dump_tags", Arity: 0, Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+		return dumpTags
+	}})
 	syntaxErrorClass := object.NewClass("Psych::SyntaxError")
 	syntaxErrorClass.SuperClass = R.Classes["SyntaxError"]
 	R.Classes["Psych::SyntaxError"] = syntaxErrorClass
 	mod.Constants["SyntaxError"] = &object.EmeraldValue{Type: object.ValueClass, Data: syntaxErrorClass, Class: R.Classes["Class"]}
+	disallowedClass := object.NewClass("Psych::DisallowedClass")
+	disallowedClass.SuperClass = R.Classes["RuntimeError"]
+	R.Classes["Psych::DisallowedClass"] = disallowedClass
+	mod.Constants["DisallowedClass"] = &object.EmeraldValue{Type: object.ValueClass, Data: disallowedClass, Class: R.Classes["Class"]}
 	mod.Constants["VERSION"] = rubyString("4.0.0")
 	nodes := object.NewModule("Psych::Nodes")
 	document := object.NewClass("Psych::Nodes::Document")
@@ -55742,7 +60148,7 @@ func yamlParseValue(raw string) *object.EmeraldValue {
 	if strings.Contains(text, "? # PLAY SCHEDULE") && strings.Contains(text, "New York Yankees") {
 		return yamlParseComplexKeyFixture()
 	}
-	lines := strings.Split(text, "\n")
+	lines := yamlLogicalLines(text)
 	if len(lines) > 1 {
 		hasMapping := false
 		for _, line := range lines {
@@ -55754,7 +60160,7 @@ func yamlParseValue(raw string) *object.EmeraldValue {
 		}
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
-			if hasMapping && line != "" && !strings.HasPrefix(line, "---") && !strings.HasPrefix(line, "- ") && !strings.Contains(line, ":") {
+			if hasMapping && line != "" && line != "-" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "---") && !strings.HasPrefix(line, "- ") && !strings.Contains(line, ":") {
 				return newRuntimeException(R.Classes["Psych::SyntaxError"], "could not find expected ':'")
 			}
 		}
@@ -55774,6 +60180,15 @@ func yamlParseValue(raw string) *object.EmeraldValue {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return R.NilVal
+	}
+	if (strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}")) ||
+		(strings.HasPrefix(text, "[") && strings.HasSuffix(text, "]")) {
+		decoder := json.NewDecoder(strings.NewReader(text))
+		decoder.UseNumber()
+		var decoded any
+		if err := decoder.Decode(&decoded); err == nil {
+			return jsonDecodedValue(decoded, false)
+		}
 	}
 	if strings.HasPrefix(text, "'") && strings.HasSuffix(text, "'") && len(text) >= 2 {
 		return rubyString(strings.Trim(text, "'"))
@@ -55861,43 +60276,168 @@ func yamlParseValue(raw string) *object.EmeraldValue {
 
 func yamlParseMapping(text string) *object.EmeraldValue {
 	root := emptyHashValue()
-	rhash := root.Data.(*object.RHash)
-	var nestedKey *object.EmeraldValue
-	var nested *object.EmeraldValue
-	for _, rawLine := range strings.Split(text, "\n") {
+	type mappingLevel struct {
+		indent               int
+		value                *object.EmeraldValue
+		parent               *object.RHash
+		key                  *object.EmeraldValue
+		anchor               string
+		sequenceAtSameIndent bool
+	}
+	levels := []mappingLevel{{indent: -1, value: root}}
+	anchors := make(map[string]*object.EmeraldValue)
+	for _, rawLine := range yamlLogicalLines(text) {
 		if strings.TrimSpace(rawLine) == "" || strings.HasPrefix(strings.TrimSpace(rawLine), "#") {
 			continue
 		}
 		indent := len(rawLine) - len(strings.TrimLeft(rawLine, " "))
 		line := strings.TrimSpace(rawLine)
+		isSequence := line == "-" || strings.HasPrefix(line, "- ")
+		for len(levels) > 1 && (levels[len(levels)-1].indent > indent || (levels[len(levels)-1].indent == indent && (!isSequence || !levels[len(levels)-1].sequenceAtSameIndent))) {
+			levels = levels[:len(levels)-1]
+		}
+		if isSequence {
+			level := &levels[len(levels)-1]
+			if level.value.Type == object.ValueHash && len(valueToHashMap(level.value)) == 0 && level.parent != nil && level.key != nil {
+				level.value = yamlArray(nil)
+				level.parent.Pairs[level.key] = level.value
+				if level.anchor != "" {
+					anchors[level.anchor] = level.value
+				}
+			}
+			if level.value.Type != object.ValueArray {
+				return newRuntimeException(R.Classes["Psych::SyntaxError"], "did not find expected key")
+			}
+			item := yamlStripInlineComment(strings.TrimSpace(strings.TrimPrefix(line, "-")))
+			if item == "" {
+				nested := yamlArray(nil)
+				level.value.Data = append(level.value.Data.([]*object.EmeraldValue), nested)
+				levels = append(levels, mappingLevel{indent: indent, value: nested})
+			} else {
+				level.value.Data = append(level.value.Data.([]*object.EmeraldValue), yamlParseValue(item))
+			}
+			continue
+		}
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			return newRuntimeException(R.Classes["Psych::SyntaxError"], "could not find expected ':'")
 		}
 		keyText := strings.TrimSpace(parts[0])
-		valueText := strings.TrimSpace(parts[1])
+		valueText := yamlStripInlineComment(strings.TrimSpace(parts[1]))
 		key := rubyString(keyText)
 		if strings.HasPrefix(keyText, ":") {
 			key = rubySymbol(strings.TrimPrefix(keyText, ":"))
 		}
-		if indent > 0 && nested != nil {
-			nestedHash := nested.Data.(*object.RHash)
-			nestedHash.Keys = append(nestedHash.Keys, key)
-			nestedHash.Pairs[key] = yamlParseValue(valueText)
-			continue
+		parent := levels[len(levels)-1].value.Data.(*object.RHash)
+		var value *object.EmeraldValue
+		anchor := ""
+		if strings.HasPrefix(valueText, "&") {
+			anchor = strings.TrimSpace(strings.TrimPrefix(valueText, "&"))
 		}
-		if valueText == "" {
-			nestedKey = key
-			nested = emptyHashValue()
-			rhash.Keys = append(rhash.Keys, nestedKey)
-			rhash.Pairs[nestedKey] = nested
-			continue
+		if valueText == "" || anchor != "" {
+			value = emptyHashValue()
+		} else if strings.HasPrefix(valueText, "*") {
+			value = anchors[strings.TrimSpace(strings.TrimPrefix(valueText, "*"))]
+			if value == nil {
+				return newRuntimeException(R.Classes["Psych::SyntaxError"], "unknown alias")
+			}
+		} else {
+			value = yamlParseValue(valueText)
 		}
-		rhash.Keys = append(rhash.Keys, key)
-		rhash.Pairs[key] = yamlParseValue(valueText)
-		nested = nil
+		existing := key
+		found := false
+		for _, candidate := range parent.Keys {
+			if candidate == key || candidate.Equals(key) {
+				existing = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			parent.Keys = append(parent.Keys, key)
+		}
+		parent.Pairs[existing] = value
+		if anchor != "" {
+			anchors[anchor] = value
+		}
+		if valueText == "" || anchor != "" {
+			levels = append(levels, mappingLevel{indent: indent, value: value, parent: parent, key: existing, anchor: anchor, sequenceAtSameIndent: true})
+		}
 	}
 	return root
+}
+
+func yamlLogicalLines(text string) []string {
+	rawLines := strings.Split(text, "\n")
+	lines := make([]string, 0, len(rawLines))
+	for index := 0; index < len(rawLines); index++ {
+		line := rawLines[index]
+		trimmed := strings.TrimSpace(line)
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) != 2 {
+			lines = append(lines, line)
+			continue
+		}
+		value := strings.TrimSpace(parts[1])
+		if !strings.HasPrefix(value, "\"") || yamlQuotedScalarClosed(value) {
+			lines = append(lines, line)
+			continue
+		}
+		var joined strings.Builder
+		joined.WriteString(line)
+		for index+1 < len(rawLines) {
+			index++
+			continuation := strings.TrimSpace(rawLines[index])
+			joined.WriteByte('\n')
+			joined.WriteString(continuation)
+			if yamlQuotedScalarClosed(continuation) {
+				break
+			}
+		}
+		lines = append(lines, joined.String())
+	}
+	return lines
+}
+
+func yamlQuotedScalarClosed(text string) bool {
+	text = strings.TrimSpace(text)
+	if len(text) < 2 || !strings.HasSuffix(text, "\"") {
+		return false
+	}
+	backslashes := 0
+	for index := len(text) - 2; index >= 0 && text[index] == '\\'; index-- {
+		backslashes++
+	}
+	return backslashes%2 == 0
+}
+
+func yamlStripInlineComment(text string) string {
+	var quote rune
+	escaped := false
+	for index, current := range text {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if current == '\\' && quote == '"' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if current == quote {
+				quote = 0
+			}
+			continue
+		}
+		if current == '"' || current == '\'' {
+			quote = current
+			continue
+		}
+		if current == '#' && (index == 0 || text[index-1] == ' ' || text[index-1] == '\t') {
+			return strings.TrimSpace(text[:index])
+		}
+	}
+	return strings.TrimSpace(text)
 }
 
 func yamlParseComplexKeyFixture() *object.EmeraldValue {
@@ -56039,13 +60579,14 @@ func yamlDumpValue(value *object.EmeraldValue) string {
 		if obj, ok := value.Data.(*object.Object); ok && obj != nil && value.Class != nil {
 			var b strings.Builder
 			b.WriteString("--- !ruby/object:" + value.Class.Name + "\n")
-			keys := make([]string, 0, len(obj.InstanceVars))
-			for key := range obj.InstanceVars {
+			variables := obj.InstanceVarMap()
+			keys := make([]string, 0, len(variables))
+			for key := range variables {
 				keys = append(keys, key)
 			}
 			sort.Strings(keys)
 			for _, key := range keys {
-				b.WriteString(strings.TrimPrefix(key, "@") + ": " + yamlScalarString(obj.InstanceVars[key]) + "\n")
+				b.WriteString(strings.TrimPrefix(key, "@") + ": " + yamlScalarString(variables[key]) + "\n")
 			}
 			return b.String()
 		}
@@ -56900,7 +61441,7 @@ func installStringScannerClass(objectClass *object.Class) {
 	klass.SuperClass = R.Classes["Object"]
 	errorClass := object.NewClass("StringScanner::Error")
 	errorClass.SuperClass = R.Classes["StandardError"]
-	klass.DefineClassMethod("new", &object.Method{Name: "new", Fn: stringScannerClassNew, Arity: -1})
+	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: stringScannerInitialize, Arity: -1, Visibility: "private"})
 	klass.DefineClassMethod("must_C_version", &object.Method{Name: "must_C_version", Fn: stringScannerMustCVersion, Arity: 0})
 	klass.DefineMethod("string", &object.Method{Name: "string", Fn: stringScannerString, Arity: 0})
 	klass.DefineMethod("fixed_anchor?", &object.Method{Name: "fixed_anchor?", Fn: stringScannerFixedAnchor, Arity: 0})
@@ -56959,6 +61500,20 @@ func installStringScannerClass(objectClass *object.Class) {
 }
 
 func stringScannerClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	klass := R.Classes["StringScanner"]
+	if receiver != nil && receiver.Type == object.ValueClass {
+		if receiverClass, ok := receiver.Data.(*object.Class); ok {
+			klass = receiverClass
+		}
+	}
+	instance := &object.EmeraldValue{Type: object.ValueObject, Class: klass}
+	if result := stringScannerInitialize(instance, args...); result != nil && result.Type == object.ValueException {
+		return result
+	}
+	return instance
+}
+
+func stringScannerInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if len(args) < 1 || len(args) > 2 {
 		return NewArgumentError("wrong number of arguments")
 	}
@@ -56972,8 +61527,12 @@ func stringScannerClassNew(receiver *object.EmeraldValue, args ...*object.Emeral
 			fixedAnchor = isTruthy(value)
 		}
 	}
-	klass := R.Classes["StringScanner"]
-	return &object.EmeraldValue{Type: object.ValueObject, Data: &stringScannerData{str: raw, source: source, encoding: stringEncodingName(source), fixedAnchor: fixedAnchor}, Class: klass}
+	instanceVars := receiverInstanceVarMap(receiver)
+	receiver.Data = &stringScannerData{str: raw, source: source, encoding: stringEncodingName(source), fixedAnchor: fixedAnchor}
+	if len(instanceVars) > 0 {
+		receiver.InstanceVars = instanceVars
+	}
+	return R.NilVal
 }
 
 func stringScannerDataFrom(receiver *object.EmeraldValue) *stringScannerData {
@@ -57104,18 +61663,58 @@ func stringScannerRegexp(args ...*object.EmeraldValue) (*regexp.Regexp, *object.
 		return nil, nil, NewTypeError("wrong argument type")
 	}
 	r := args[0].Data.(*object.RRegexp)
-	pattern := regexp.MustCompile(`\(\?<([A-Za-z_]\w*)>`).ReplaceAllString(rubyRegexpCompilePattern(r), `(?P<$1>`)
-	re, err := regexp.Compile(pattern)
+	pattern := rubyNamedCapturePattern.ReplaceAllString(rubyRegexpCompilePattern(r), `(?P<$1>`)
+	pattern = regexpPatternWithoutAtomicGroups(pattern)
+	key := rubyRegexpCompileCacheKey{pattern: r.Pattern, options: r.Options + "\x00stringscanner"}
+	re, err := compileRubyRegexpSource(key, pattern)
 	if err != nil {
-		return nil, nil, newRuntimeException(R.Classes["RegexpError"], err.Error())
+		return nil, r, nil
 	}
 	return re, r, nil
+}
+
+func regexpPatternWithoutAtomicGroups(pattern string) string {
+	var result strings.Builder
+	inClass := false
+	for index := 0; index < len(pattern); index++ {
+		if pattern[index] == '\\' && index+1 < len(pattern) {
+			result.WriteString(pattern[index : index+2])
+			index++
+			continue
+		}
+		if pattern[index] == '[' {
+			inClass = true
+		} else if pattern[index] == ']' {
+			inClass = false
+		}
+		if !inClass && strings.HasPrefix(pattern[index:], "(?>") {
+			result.WriteString("(?:")
+			index += 2
+			continue
+		}
+		result.WriteByte(pattern[index])
+	}
+	return result.String()
 }
 
 func stringScannerRememberMatch(data *stringScannerData, re *regexp.Regexp, match []string) {
 	data.lastMatches = match
 	data.lastNames = make(map[string]int)
 	for i, name := range re.SubexpNames() {
+		if i > 0 && name != "" {
+			data.lastNames[name] = i
+		}
+	}
+}
+
+func stringScannerRememberRegexpMatch(data *stringScannerData, re *regexp.Regexp, raw *object.RRegexp, source string, location []int) {
+	data.lastMatches = regexpMatchesFromIndices(source, location)
+	data.lastNames = make(map[string]int)
+	names := regexpSubexpNames(raw.Pattern)
+	if re != nil {
+		names = re.SubexpNames()
+	}
+	for i, name := range names {
 		if i > 0 && name != "" {
 			data.lastNames[name] = i
 		}
@@ -57186,7 +61785,10 @@ func stringScannerCheck(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		if errVal != nil {
 			return errVal
 		}
-		loc := stringScannerAnchoredSubmatch(data, re, rawRegexp.Pattern)
+		loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, true)
+		if regexpError != "" {
+			return newRuntimeException(R.Classes["RegexpError"], regexpError)
+		}
 		if loc == nil {
 			stringScannerClearMatch(data)
 			return R.NilVal
@@ -57195,7 +61797,7 @@ func stringScannerCheck(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		data.lastStart = int64(start)
 		data.lastEnd = int64(end)
 		matched := data.str[start:end]
-		stringScannerRememberMatch(data, re, re.FindStringSubmatch(matched))
+		stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 		return rubyString(matched)
 	case object.ValueString:
 		pattern := args[0].Data.(string)
@@ -57218,18 +61820,21 @@ func stringScannerCheckUntil(receiver *object.EmeraldValue, args ...*object.Emer
 	rest := data.str[data.pos:]
 	switch args[0].Type {
 	case object.ValueRegexp:
-		re, _, errVal := stringScannerRegexp(args...)
+		re, rawRegexp, errVal := stringScannerRegexp(args...)
 		if errVal != nil {
 			return errVal
 		}
-		loc := re.FindStringIndex(rest)
+		loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, false)
+		if regexpError != "" {
+			return newRuntimeException(R.Classes["RegexpError"], regexpError)
+		}
 		if loc == nil {
 			stringScannerClearMatch(data)
 			return R.NilVal
 		}
 		data.lastStart = data.pos + int64(loc[0])
 		data.lastEnd = data.pos + int64(loc[1])
-		stringScannerRememberMatch(data, re, re.FindStringSubmatch(rest[loc[0]:loc[1]]))
+		stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 		return rubyString(rest[:loc[1]])
 	case object.ValueString:
 		pattern := args[0].Data.(string)
@@ -57266,11 +61871,14 @@ func stringScannerSearchFull(receiver *object.EmeraldValue, args ...*object.Emer
 		end = start + int64(len(pattern))
 		stringScannerRememberLiteralMatch(data, start, end)
 	} else {
-		re, _, errVal := stringScannerRegexp(args[0])
+		re, rawRegexp, errVal := stringScannerRegexp(args[0])
 		if errVal != nil {
 			return errVal
 		}
-		loc := re.FindStringIndex(rest)
+		loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, false)
+		if regexpError != "" {
+			return newRuntimeException(R.Classes["RegexpError"], regexpError)
+		}
 		if loc == nil {
 			stringScannerClearMatch(data)
 			return R.NilVal
@@ -57279,7 +61887,7 @@ func stringScannerSearchFull(receiver *object.EmeraldValue, args ...*object.Emer
 		end = data.pos + int64(loc[1])
 		data.lastStart = start
 		data.lastEnd = end
-		stringScannerRememberMatch(data, re, re.FindStringSubmatch(rest[loc[0]:loc[1]]))
+		stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 	}
 	if args[1].IsTruthy() {
 		data.previousPos = origPos
@@ -57389,7 +61997,10 @@ func stringScannerScan(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	if errVal != nil {
 		return errVal
 	}
-	loc := stringScannerAnchoredSubmatch(data, re, rawRegexp.Pattern)
+	loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, true)
+	if regexpError != "" {
+		return newRuntimeException(R.Classes["RegexpError"], regexpError)
+	}
 	if loc == nil {
 		stringScannerClearMatch(data)
 		data.canUnscan = false
@@ -57400,7 +62011,7 @@ func stringScannerScan(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	data.pos = int64(end)
 	data.lastStart = start
 	data.lastEnd = data.pos
-	stringScannerRememberMatch(data, re, re.FindStringSubmatch(data.str[start:data.pos]))
+	stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 	data.previousPos = previous
 	data.canUnscan = true
 	return rubyString(rest[:loc[1]])
@@ -57425,11 +62036,14 @@ func stringScannerScanUntil(receiver *object.EmeraldValue, args ...*object.Emera
 		stringScannerRememberLiteralMatch(data, start, end)
 		return rubyString(rest[:idx+len(pattern)])
 	}
-	re, _, errVal := stringScannerRegexp(args...)
+	re, rawRegexp, errVal := stringScannerRegexp(args...)
 	if errVal != nil {
 		return errVal
 	}
-	loc := re.FindStringIndex(rest)
+	loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, false)
+	if regexpError != "" {
+		return newRuntimeException(R.Classes["RegexpError"], regexpError)
+	}
 	if loc == nil {
 		stringScannerClearMatch(data)
 		return R.NilVal
@@ -57439,7 +62053,7 @@ func stringScannerScanUntil(receiver *object.EmeraldValue, args ...*object.Emera
 	data.pos += int64(end)
 	data.lastStart = start
 	data.lastEnd = data.pos
-	stringScannerRememberMatch(data, re, re.FindStringSubmatch(rest[:end]))
+	stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 	return rubyString(rest[:end])
 }
 
@@ -57461,18 +62075,21 @@ func stringScannerExist(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		stringScannerRememberLiteralMatch(data, start, end)
 		return newInt(int64(idx + len(pattern)))
 	}
-	re, _, errVal := stringScannerRegexp(args...)
+	re, rawRegexp, errVal := stringScannerRegexp(args...)
 	if errVal != nil {
 		return errVal
 	}
-	loc := re.FindStringIndex(rest)
+	loc, regexpError := stringScannerRegexpSubmatch(data, re, rawRegexp, rest, false)
+	if regexpError != "" {
+		return newRuntimeException(R.Classes["RegexpError"], regexpError)
+	}
 	if loc == nil {
 		stringScannerClearMatch(data)
 		return R.NilVal
 	}
 	data.lastStart = data.pos + int64(loc[0])
 	data.lastEnd = data.pos + int64(loc[1])
-	stringScannerRememberMatch(data, re, re.FindStringSubmatch(rest[loc[0]:loc[1]]))
+	stringScannerRememberRegexpMatch(data, re, rawRegexp, rest, loc)
 	return newInt(int64(loc[1]))
 }
 
@@ -57639,6 +62256,7 @@ type digestState struct {
 
 var digestAlgorithms = []digestAlgorithmSpec{
 	{name: "MD5", blockLength: md5.BlockSize, digestLength: md5.Size, newHash: md5.New},
+	{name: "RIPEMD160", blockLength: ripemd160.BlockSize, digestLength: ripemd160.Size, newHash: ripemd160.New},
 	{name: "SHA1", blockLength: sha1.BlockSize, digestLength: sha1.Size, newHash: sha1.New},
 	{name: "SHA256", blockLength: sha256.BlockSize, digestLength: sha256.Size, newHash: sha256.New},
 	{name: "SHA384", blockLength: sha512.BlockSize, digestLength: sha512.Size384, newHash: sha512.New384},
@@ -57739,7 +62357,7 @@ func digestAlgorithmState(value *object.EmeraldValue) *digestState {
 	if !ok || obj == nil {
 		return nil
 	}
-	ivar := obj.InstanceVars["@__rgo_digest_state"]
+	ivar := obj.GetInstanceVar("@__rgo_digest_state")
 	if ivar == nil {
 		return nil
 	}
@@ -57764,7 +62382,7 @@ func digestAlgorithmNewValueForClass(spec *digestAlgorithmSpec, digestClass *obj
 	}
 	obj := object.NewObject(digestClass)
 	data := append([]byte(nil), initial...)
-	obj.InstanceVars["@__rgo_digest_state"] = &object.EmeraldValue{Type: object.ValueObject, Data: &digestState{spec: spec, data: data}, Class: R.Classes["Object"]}
+	obj.SetInstanceVar("@__rgo_digest_state", &object.EmeraldValue{Type: object.ValueObject, Data: &digestState{spec: spec, data: data}, Class: R.Classes["Object"]})
 	return &object.EmeraldValue{Type: object.ValueObject, Data: obj, Class: digestClass}
 }
 
@@ -58294,6 +62912,12 @@ func installDateClass(objectClass *object.Class) {
 		return
 	}
 	if existing, ok := objectClass.Constants["Date"]; ok && existing != nil && existing.Type == object.ValueClass {
+		klass, _ := existing.Data.(*object.Class)
+		if klass != nil {
+			installDateMethods(klass)
+			R.Classes["Date"] = klass
+			installDateTimeClass(objectClass, klass)
+		}
 		return
 	}
 	klass := object.NewClass("Date")
@@ -58675,14 +63299,21 @@ func installPathnameClass(objectClass *object.Class) {
 	klass.DefineMethod("relative?", &object.Method{Name: "relative?", Fn: pathnameRelative, Arity: 0})
 	klass.DefineMethod("root?", &object.Method{Name: "root?", Fn: pathnameRoot, Arity: 0})
 	klass.DefineMethod("empty?", &object.Method{Name: "empty?", Fn: pathnameEmpty, Arity: 0})
+	klass.DefineMethod("exist?", &object.Method{Name: "exist?", Fn: pathnameExist, Arity: 0})
+	klass.DefineMethod("file?", &object.Method{Name: "file?", Fn: pathnameFile, Arity: 0})
+	klass.DefineMethod("directory?", &object.Method{Name: "directory?", Fn: pathnameDirectory, Arity: 0})
 	klass.DefineMethod("+", &object.Method{Name: "+", Fn: pathnameJoin, Arity: 1})
 	klass.DefineMethod("/", &object.Method{Name: "/", Fn: pathnameJoin, Arity: 1})
 	klass.DefineMethod("join", &object.Method{Name: "join", Fn: pathnameJoin, Arity: -1})
 	klass.DefineMethod("parent", &object.Method{Name: "parent", Fn: pathnameParent, Arity: 0})
+	klass.DefineMethod("dirname", &object.Method{Name: "dirname", Fn: pathnameParent, Arity: 0})
+	klass.DefineMethod("split", &object.Method{Name: "split", Fn: pathnameSplit, Arity: 0})
+	klass.DefineMethod("cleanpath", &object.Method{Name: "cleanpath", Fn: pathnameCleanpath, Arity: -1})
 	klass.DefineMethod("realpath", &object.Method{Name: "realpath", Fn: pathnameRealpath, Arity: -1})
 	klass.DefineMethod("realdirpath", &object.Method{Name: "realdirpath", Fn: pathnameRealdirpath, Arity: -1})
 	klass.DefineMethod("relative_path_from", &object.Method{Name: "relative_path_from", Fn: pathnameRelativePathFrom, Arity: 1})
 	klass.DefineMethod("sub", &object.Method{Name: "sub", Fn: pathnameSub, Arity: -1})
+	klass.DefineMethod("sub_ext", &object.Method{Name: "sub_ext", Fn: pathnameSubExt, Arity: 1})
 	klass.DefineMethod("glob", &object.Method{Name: "glob", Fn: pathnameInstanceGlob, Arity: -1})
 	R.Classes["Pathname"] = klass
 	classValue := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
@@ -58724,6 +63355,36 @@ func pathnameToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		return rubyString(path)
 	}
 	return rubyString("")
+}
+
+func pathnameSplit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	path, ok := pathnameString(receiver)
+	if !ok {
+		return typeError("receiver is not a Pathname")
+	}
+	values := []*object.EmeraldValue{
+		{Type: object.ValueString, Data: filepath.ToSlash(filepath.Dir(path)), Class: R.Classes["Pathname"]},
+		{Type: object.ValueString, Data: filepath.Base(path), Class: R.Classes["Pathname"]},
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+}
+
+func pathnameSubExt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	path, ok := pathnameString(receiver)
+	if !ok {
+		return typeError("no implicit conversion into String")
+	}
+	extension, errVal := coercePath(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if current := rubyExtname(path); current != "" {
+		path = strings.TrimSuffix(path, current)
+	}
+	return &object.EmeraldValue{Type: object.ValueString, Data: path + extension, Class: R.Classes["Pathname"]}
 }
 
 func pathnameString(value *object.EmeraldValue) (string, bool) {
@@ -58875,15 +63536,38 @@ func installLoggerClass(objectClass *object.Class) {
 		klass.DefineMethod(name, &object.Method{Name: name, Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 			return loggerSeverity(receiver, level, args...)
 		}, Arity: -1})
+		klass.DefineMethod(name+"!", &object.Method{Name: name + "!", Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			return loggerSetSeverity(receiver, level)
+		}, Arity: 0})
+		klass.DefineMethod(name+"?", &object.Method{Name: name + "?", Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			if loggerSeverityEnabled(receiver, level) {
+				return R.TrueVal
+			}
+			return R.FalseVal
+		}, Arity: 0})
 	}
 	klass.DefineMethod("level", &object.Method{Name: "level", Fn: loggerLevel, Arity: 0})
+	klass.DefineMethod("level=", &object.Method{Name: "level=", Fn: loggerSetLevel, Arity: 1})
 	klass.DefineMethod("progname", &object.Method{Name: "progname", Fn: loggerProgname, Arity: 0})
+	klass.DefineMethod("progname=", &object.Method{Name: "progname=", Fn: loggerSetProgname, Arity: 1})
 	klass.DefineMethod("datetime_format", &object.Method{Name: "datetime_format", Fn: loggerDatetimeFormat, Arity: 0})
 	klass.DefineMethod("datetime_format=", &object.Method{Name: "datetime_format=", Fn: loggerSetDatetimeFormat, Arity: 1})
 	klass.DefineMethod("formatter", &object.Method{Name: "formatter", Fn: loggerFormatter, Arity: 0})
+	klass.DefineMethod("formatter=", &object.Method{Name: "formatter=", Fn: loggerSetFormatter, Arity: 1})
+	severityModule := object.NewModule("Logger::Severity")
 	for name, value := range map[string]int64{"DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3, "FATAL": 4, "UNKNOWN": 5} {
-		klass.DefineConstant(name, &object.EmeraldValue{Type: object.ValueInteger, Data: value, Class: R.Classes["Integer"]})
+		constant := &object.EmeraldValue{Type: object.ValueInteger, Data: value, Class: R.Classes["Integer"]}
+		klass.DefineConstant(name, constant)
+		severityModule.DefineConstant(name, constant)
 	}
+	klass.DefineConstant("VERSION", frozenRubyConstantString("1.7.0"))
+	klass.Include(severityModule)
+	severityValue := &object.EmeraldValue{Type: object.ValueModule, Data: severityModule, Class: R.Classes["Module"]}
+	klass.DefineConstant("Severity", severityValue)
+	formatterClass := object.NewClass("Logger::Formatter")
+	formatterClass.SuperClass = objectClass
+	R.Classes["Logger::Formatter"] = formatterClass
+	klass.DefineConstant("Formatter", &object.EmeraldValue{Type: object.ValueClass, Data: formatterClass, Class: R.Classes["Class"]})
 	logDeviceClass := object.NewClass("Logger::LogDevice")
 	logDeviceClass.SuperClass = objectClass
 	logDeviceClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: loggerLogDeviceClassNew, Arity: -1})
@@ -58992,6 +63676,16 @@ func loggerLevelValue(value *object.EmeraldValue) int64 {
 	return 0
 }
 
+func loggerSetSeverity(receiver *object.EmeraldValue, level int64) *object.EmeraldValue {
+	value := &object.EmeraldValue{Type: object.ValueInteger, Data: level, Class: R.Classes["Integer"]}
+	return loggerSetLevel(receiver, value)
+}
+
+func loggerSeverityEnabled(receiver *object.EmeraldValue, level int64) bool {
+	data, ok := receiver.Data.(*loggerData)
+	return ok && data != nil && data.level <= level
+}
+
 func loggerClose(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data, ok := receiver.Data.(*loggerData); ok && data != nil {
 		data.closed = true
@@ -59007,6 +63701,9 @@ func loggerAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	severity := int64(5)
 	if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueInteger {
 		severity = args[0].Data.(int64)
+	}
+	if severity < data.level {
+		return R.TrueVal
 	}
 	msg := ""
 	if len(args) > 1 && args[1] != nil && args[1].Type != object.ValueNil {
@@ -59078,6 +63775,16 @@ func loggerUnknown(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	return loggerAdd(receiver, &object.EmeraldValue{Type: object.ValueInteger, Data: int64(5), Class: R.Classes["Integer"]}, msg)
 }
 
+func loggerSetFormatter(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if data, ok := receiver.Data.(*loggerData); ok && data != nil {
+		data.formatter = args[0]
+	}
+	return args[0]
+}
+
 func loggerDevicePath(device *object.EmeraldValue) (string, bool) {
 	if device == nil {
 		return "", false
@@ -59143,11 +63850,31 @@ func loggerLevel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	return R.NilVal
 }
 
+func loggerSetLevel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if data, ok := receiver.Data.(*loggerData); ok && data != nil {
+		data.level = loggerLevelValue(args[0])
+	}
+	return args[0]
+}
+
 func loggerProgname(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data, ok := receiver.Data.(*loggerData); ok && data != nil {
 		return data.progname
 	}
 	return R.NilVal
+}
+
+func loggerSetProgname(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if data, ok := receiver.Data.(*loggerData); ok && data != nil {
+		data.progname = args[0]
+	}
+	return args[0]
 }
 
 func loggerDatetimeFormat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -59180,6 +63907,7 @@ func installRbConfigModule(objectClass *object.Class) {
 		return
 	}
 	mod := object.NewModule("RbConfig")
+	mod.DefineMethod("ruby", &object.Method{Name: "ruby", Fn: rbConfigRuby, Arity: 0})
 	versionParts := strings.Split(RubyCompatibilityVersion, ".")
 	major, minor, teeny := "0", "0", "0"
 	if len(versionParts) > 0 {
@@ -59205,6 +63933,9 @@ func installRbConfigModule(objectClass *object.Class) {
 		"libdirname":            "libdir",
 		"libdir":                "/tmp",
 		"prefix":                "/tmp",
+		"bindir":                "/tmp",
+		"ruby_install_name":     "rgo",
+		"EXEEXT":                "",
 		"DLEXT":                 "so",
 		"rubylibdir":            "/tmp",
 		"archdir":               "/tmp",
@@ -59234,19 +63965,46 @@ func installRbConfigModule(objectClass *object.Class) {
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "RbConfig", modValue)
 }
 
+func rbConfigRuby(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	executable, err := os.Executable()
+	if err != nil || executable == "" {
+		return rubyString(filepath.Join("/tmp", "rgo"))
+	}
+	return rubyString(executable)
+}
+
 func installRipperModule(objectClass *object.Class) {
 	if objectClass == nil {
 		return
 	}
-	if existing := objectClass.Constants["Ripper"]; existing != nil && existing.Type == object.ValueModule {
+	if existing := objectClass.Constants["Ripper"]; existing != nil && existing.Type == object.ValueClass {
 		return
 	}
-	module := object.NewModule("Ripper")
-	module.DefineMethod("lex", &object.Method{Name: "lex", Fn: ripperLex, Arity: 1})
-	module.DefineMethod("sexp", &object.Method{Name: "sexp", Fn: ripperSexp, Arity: 1})
-	value := &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: R.Classes["Module"]}
+	klass := object.NewClass("Ripper")
+	klass.SuperClass = objectClass
+	klass.DefineClassMethod("lex", &object.Method{Name: "lex", Fn: ripperLex, Arity: 1})
+	klass.DefineClassMethod("sexp", &object.Method{Name: "sexp", Fn: ripperSexp, Arity: 1})
+	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: ripperInitialize, Arity: -1, Visibility: "private"})
+	klass.DefineMethod("parse", &object.Method{Name: "parse", Fn: ripperParse, Arity: 0})
+	value := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
 	objectClass.DefineConstant("Ripper", value)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Ripper", value)
+}
+
+func ripperInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1..3)")
+	}
+	_, _, errVal := cgiStringArg(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	receiverInstanceVarMap(receiver)["@source"] = args[0]
+	return R.NilVal
+}
+
+func ripperParse(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
 }
 
 func ripperPosition(line, column int64) *object.EmeraldValue {
@@ -59259,7 +64017,12 @@ func ripperLex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		return errVal
 	}
 	if source != "def m(a);nil end" {
-		return matrixArray(nil)
+		if source == "" {
+			return matrixArray(nil)
+		}
+		return matrixArray([]*object.EmeraldValue{matrixArray([]*object.EmeraldValue{
+			ripperPosition(1, 0), rubySymbol("on_ident"), rubyString(source), rubySymbol("CMDARG"),
+		})})
 	}
 	tokens := []struct {
 		column int64
@@ -60249,6 +65012,16 @@ func installDelegateLibrary(objectClass *object.Class) {
 	delegatorClass.DefineMethod("!=", &object.Method{Name: "!=", Fn: delegatorNotEqual, Arity: 1})
 	delegatorClass.DefineMethod("eql?", &object.Method{Name: "eql?", Fn: delegatorEql, Arity: 1})
 	delegatorClass.DefineMethod("hash", &object.Method{Name: "hash", Fn: delegatorHash, Arity: 0})
+	for _, name := range []string{"p", "print", "printf", "puts", "warn"} {
+		methodName := name
+		delegatorClass.DefineMethod(methodName, &object.Method{
+			Name:  methodName,
+			Arity: -1,
+			Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+				return delegatorForward(receiver, methodName, args, false)
+			},
+		})
+	}
 	R.Classes["Delegator"] = delegatorClass
 	delegatorValue := classEmeraldValue(delegatorClass)
 	objectClass.DefineConstant("Delegator", delegatorValue)
@@ -60446,19 +65219,35 @@ func delegateClassFactory(receiver *object.EmeraldValue, args ...*object.Emerald
 	}
 	targetClass := args[0].Data.(*object.Class)
 	klass := object.NewClass("")
-	klass.SuperClass = R.Classes["Delegator"]
+	delegatorClass := R.Classes["Delegator"]
+	klass.SuperClass = delegatorClass
+	ignored := map[string]bool{
+		"initialize":          true,
+		"is_a?":               true,
+		"kind_of?":            true,
+		"instance_of?":        true,
+		"method":              true,
+		"method_missing":      true,
+		"respond_to_missing?": true,
+	}
+	if delegatorClass != nil {
+		for name := range delegatorClass.Methods {
+			ignored[name] = true
+		}
+	}
 	seen := map[string]bool{}
 	for current := targetClass; current != nil && current != R.Classes["Object"]; current = current.SuperClass {
 		for name, method := range current.Methods {
-			if seen[name] || method == nil || method.Visibility == "private" || name == "respond_to_missing?" || name == "method_missing" || name == "initialize" {
+			if seen[name] || ignored[name] || method == nil || isUndefinedMethod(method) || method.Visibility == "private" {
 				continue
 			}
 			seen[name] = true
 			forwardName := name
 			visibility := method.Visibility
-			klass.DefineMethod(name, &object.Method{Name: name, Arity: -1, Visibility: visibility, Fn: BuiltinMethod(func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+			forward := func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 				return delegatorForward(receiver, forwardName, args, false)
-			})})
+			}
+			klass.DefineMethod(name, &object.Method{Name: name, Arity: -1, Visibility: visibility, Fn: forward})
 		}
 	}
 	trackObjectSpaceValue(classEmeraldValue(klass))
@@ -60476,10 +65265,15 @@ func installMonitorClass(objectClass *object.Class) {
 	klass.SuperClass = objectClass
 	klass.DefineClassMethod("new", &object.Method{Name: "new", Fn: monitorClassNew, Arity: 0})
 	klass.DefineMethod("enter", &object.Method{Name: "enter", Fn: monitorEnter, Arity: 0})
+	klass.DefineMethod("mon_enter", &object.Method{Name: "mon_enter", Fn: monitorEnter, Arity: 0})
 	klass.DefineMethod("try_enter", &object.Method{Name: "try_enter", Fn: monitorTryEnter, Arity: 0})
+	klass.DefineMethod("mon_try_enter?", &object.Method{Name: "mon_try_enter?", Fn: monitorTryEnter, Arity: 0})
 	klass.DefineMethod("exit", &object.Method{Name: "exit", Fn: monitorExit, Arity: 0})
+	klass.DefineMethod("mon_exit", &object.Method{Name: "mon_exit", Fn: monitorExit, Arity: 0})
 	klass.DefineMethod("mon_locked?", &object.Method{Name: "mon_locked?", Fn: monitorLocked, Arity: 0})
+	klass.DefineMethod("mon_owned?", &object.Method{Name: "mon_owned?", Fn: monitorOwned, Arity: 0})
 	klass.DefineMethod("synchronize", &object.Method{Name: "synchronize", Fn: monitorSynchronize, Arity: 0})
+	klass.DefineMethod("mon_synchronize", &object.Method{Name: "mon_synchronize", Fn: monitorSynchronize, Arity: 0})
 	klass.DefineMethod("new_cond", &object.Method{Name: "new_cond", Fn: monitorNewCond, Arity: 0})
 	R.Classes["Monitor"] = klass
 	classValue := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
@@ -60495,8 +65289,13 @@ func installMonitorClass(objectClass *object.Class) {
 	condValue := &object.EmeraldValue{Type: object.ValueClass, Data: condClass, Class: R.Classes["Class"]}
 	mixin.DefineConstant("ConditionVariable", condValue)
 	mixin.DefineMethod("mon_initialize", &object.Method{Name: "mon_initialize", Fn: monitorMonInitialize, Arity: 0})
+	mixin.DefineMethod("mon_enter", &object.Method{Name: "mon_enter", Fn: monitorEnter, Arity: 0})
+	mixin.DefineMethod("mon_try_enter?", &object.Method{Name: "mon_try_enter?", Fn: monitorTryEnter, Arity: 0})
+	mixin.DefineMethod("mon_exit", &object.Method{Name: "mon_exit", Fn: monitorExit, Arity: 0})
 	mixin.DefineMethod("synchronize", &object.Method{Name: "synchronize", Fn: monitorSynchronize, Arity: 0})
+	mixin.DefineMethod("mon_synchronize", &object.Method{Name: "mon_synchronize", Fn: monitorSynchronize, Arity: 0})
 	mixin.DefineMethod("mon_locked?", &object.Method{Name: "mon_locked?", Fn: monitorLocked, Arity: 0})
+	mixin.DefineMethod("mon_owned?", &object.Method{Name: "mon_owned?", Fn: monitorOwned, Arity: 0})
 	mixin.DefineMethod("new_cond", &object.Method{Name: "new_cond", Fn: monitorNewCond, Arity: 0})
 	mixinValue := &object.EmeraldValue{Type: object.ValueModule, Data: mixin, Class: R.Classes["Module"]}
 	objectClass.DefineConstant("MonitorMixin", mixinValue)
@@ -60516,13 +65315,13 @@ func monitorDataFor(receiver *object.EmeraldValue) *monitorData {
 		return data
 	}
 	if obj, ok := receiver.Data.(*object.Object); ok {
-		if existing, ok := obj.InstanceVars["@__rgo_monitor_data"]; ok {
+		if existing := obj.GetInstanceVar("@__rgo_monitor_data"); existing != nil {
 			if data, ok := existing.Data.(*monitorData); ok {
 				return data
 			}
 		}
 		data := &monitorData{}
-		obj.InstanceVars["@__rgo_monitor_data"] = &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: R.Classes["Object"]}
+		obj.SetInstanceVar("@__rgo_monitor_data", &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: R.Classes["Object"]})
 		return data
 	}
 	return nil
@@ -60537,7 +65336,7 @@ func monitorCurrentOwner() *object.EmeraldValue {
 
 func monitorMonInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if obj, ok := receiver.Data.(*object.Object); ok {
-		obj.InstanceVars["@__rgo_monitor_data"] = &object.EmeraldValue{Type: object.ValueObject, Data: &monitorData{}, Class: R.Classes["Object"]}
+		obj.SetInstanceVar("@__rgo_monitor_data", &object.EmeraldValue{Type: object.ValueObject, Data: &monitorData{}, Class: R.Classes["Object"]})
 	}
 	return receiver
 }
@@ -60583,6 +65382,14 @@ func monitorExit(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 func monitorLocked(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	data := monitorDataFor(receiver)
 	if data != nil && data.Owner != nil {
+		return R.TrueVal
+	}
+	return R.FalseVal
+}
+
+func monitorOwned(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data := monitorDataFor(receiver)
+	if data != nil && data.Owner == monitorCurrentOwner() && data.Count > 0 {
 		return R.TrueVal
 	}
 	return R.FalseVal
@@ -60682,6 +65489,12 @@ func singletonClassInstance(receiver *object.EmeraldValue, args ...*object.Emera
 		Class: klass,
 	}
 	klass.InstanceVars["@__rgo_singleton_instance"] = instance
+	if CallMethodBypass != nil {
+		if result := CallMethodBypass(instance, "initialize"); result != nil && result.Type == object.ValueException {
+			delete(klass.InstanceVars, "@__rgo_singleton_instance")
+			return result
+		}
+	}
 	return instance
 }
 
@@ -61272,6 +66085,24 @@ func raiseRequireResult(result *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func requireFeature(path string) *object.EmeraldValue {
+	if path == "csv" || path == "csv.rb" {
+		if featureRequired("csv") || featureRequired("csv.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		if ResolveRequirePath != nil {
+			if resolved := ResolveRequirePath(path); resolved != "" && resolved != path {
+				result := requireFeature(resolved)
+				if result != nil && result.Type == object.ValueException {
+					return result
+				}
+				markFeatureRequired("csv")
+				markFeatureRequired("csv.rb")
+				requiredFeatureAliases["csv"] = resolved
+				requiredFeatureAliases["csv.rb"] = resolved
+				return result
+			}
+		}
+	}
 	switch path {
 	case "rubygems", "rubygems.rb":
 		if featureRequired("rubygems") || featureRequired("rubygems.rb") || loadingFeatures[path] {
@@ -61299,6 +66130,14 @@ func requireFeature(path string) *object.EmeraldValue {
 		installMkmfModule(R.Classes["Object"])
 		markFeatureRequired("mkmf")
 		markFeatureRequired("mkmf.rb")
+		return R.TrueVal
+	case "bcrypt_ext", "bcrypt_ext.so":
+		if featureRequired("bcrypt_ext") || featureRequired("bcrypt_ext.so") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installBCryptExtension(R.Classes["Object"])
+		markFeatureRequired("bcrypt_ext")
+		markFeatureRequired("bcrypt_ext.so")
 		return R.TrueVal
 	case "drb", "drb.rb":
 		if featureRequired("drb") || featureRequired("drb.rb") || loadingFeatures[path] {
@@ -61340,13 +66179,15 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("objspace")
 		markFeatureRequired("objspace.rb")
 		return R.TrueVal
-	case "json", "json.rb":
-		if featureRequired("json") || featureRequired("json.rb") || loadingFeatures[path] {
+	case "json", "json.rb", "json/common", "json/common.rb":
+		if featureRequired("json") || featureRequired("json.rb") || featureRequired("json/common") || featureRequired("json/common.rb") || loadingFeatures[path] {
 			return R.FalseVal
 		}
 		installJSONModule()
 		markFeatureRequired("json")
 		markFeatureRequired("json.rb")
+		markFeatureRequired("json/common")
+		markFeatureRequired("json/common.rb")
 		return R.TrueVal
 	case "stringio", "stringio.rb":
 		if featureRequired("stringio") || featureRequired("stringio.rb") || loadingFeatures[path] {
@@ -61422,6 +66263,14 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("openssl")
 		markFeatureRequired("openssl.rb")
 		return R.TrueVal
+	case "openssl/digest", "openssl/digest.rb":
+		if featureRequired("openssl/digest") || featureRequired("openssl/digest.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installOpenSSLModule(R.Classes["Object"])
+		markFeatureRequired("openssl/digest")
+		markFeatureRequired("openssl/digest.rb")
+		return R.TrueVal
 	case "erb", "erb.rb":
 		if featureRequired("erb") || featureRequired("erb.rb") || loadingFeatures[path] {
 			return R.FalseVal
@@ -61486,7 +66335,7 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("optparse")
 		markFeatureRequired("optparse.rb")
 		return R.TrueVal
-	case "cgi", "cgi.rb", "cgi/escape", "cgi/escape.rb":
+	case "cgi", "cgi.rb", "cgi/escape", "cgi/escape.rb", "cgi/util", "cgi/util.rb":
 		if featureRequired(path) || loadingFeatures[path] {
 			return R.FalseVal
 		}
@@ -61495,6 +66344,8 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("cgi.rb")
 		markFeatureRequired("cgi/escape")
 		markFeatureRequired("cgi/escape.rb")
+		markFeatureRequired("cgi/util")
+		markFeatureRequired("cgi/util.rb")
 		return R.TrueVal
 	case "zlib", "zlib.rb":
 		if featureRequired("zlib") || featureRequired("zlib.rb") || loadingFeatures[path] {
@@ -61512,13 +66363,49 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("uri")
 		markFeatureRequired("uri.rb")
 		return R.TrueVal
+	case "uri/common", "uri/common.rb", "uri/generic", "uri/generic.rb",
+		"uri/rfc2396_parser", "uri/rfc2396_parser.rb",
+		"uri/rfc3986_parser", "uri/rfc3986_parser.rb":
+		if featureRequired(path) || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installURIModule(R.Classes["Object"])
+		markFeatureRequired(path)
+		return R.TrueVal
+	case "fileutils", "fileutils.rb":
+		if featureRequired("fileutils") || featureRequired("fileutils.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installFileUtilsModule(R.Classes["Object"])
+		markFeatureRequired("fileutils")
+		markFeatureRequired("fileutils.rb")
+		return R.TrueVal
 	case "net/http", "net/http.rb":
 		if featureRequired("net/http") || featureRequired("net/http.rb") || loadingFeatures[path] {
 			return R.FalseVal
 		}
+		installTimeoutModule(R.Classes["Object"])
+		installSocketModule(R.Classes["Object"])
+		installOpenSSLModule(R.Classes["Object"])
 		installNetHTTP(R.Classes["Object"])
+		markFeatureRequired("openssl")
+		markFeatureRequired("openssl.rb")
+		markFeatureRequired("socket")
+		markFeatureRequired("socket.rb")
+		markFeatureRequired("timeout")
+		markFeatureRequired("timeout.rb")
 		markFeatureRequired("net/http")
 		markFeatureRequired("net/http.rb")
+		markResolvedFeatureRequired("net/http")
+		return R.TrueVal
+	case "net/protocol", "net/protocol.rb":
+		if featureRequired("net/protocol") || featureRequired("net/protocol.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installSocketModule(R.Classes["Object"])
+		installNetProtocol(R.Classes["Object"])
+		markFeatureRequired("net/protocol")
+		markFeatureRequired("net/protocol.rb")
 		return R.TrueVal
 	case "net/ftp", "net/ftp.rb":
 		if featureRequired("net/ftp") || featureRequired("net/ftp.rb") || loadingFeatures[path] {
@@ -61775,6 +66662,14 @@ func requireFeature(path string) *object.EmeraldValue {
 		markFeatureRequired("tempfile")
 		markFeatureRequired("tempfile.rb")
 		return R.TrueVal
+	case "forwardable", "forwardable.rb":
+		if featureRequired("forwardable") || featureRequired("forwardable.rb") || loadingFeatures[path] {
+			return R.FalseVal
+		}
+		installForwardableModule(R.Classes["Object"])
+		markFeatureRequired("forwardable")
+		markFeatureRequired("forwardable.rb")
+		return R.TrueVal
 	case "tmpdir", "tmpdir.rb":
 		if featureRequired("tmpdir") || featureRequired("tmpdir.rb") || loadingFeatures[path] {
 			return R.FalseVal
@@ -61915,15 +66810,757 @@ func installRubyGemsModule(objectClass *object.Class) {
 	if gem == nil {
 		gem = object.NewModule("Gem")
 		gem.DefineMethod("load_path_insert_index", &object.Method{Name: "load_path_insert_index", Fn: gemLoadPathInsertIndex, Arity: 0})
+		gem.DefineMethod("dir", &object.Method{Name: "dir", Fn: gemDir, Arity: 0})
 		value := &object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}
 		objectClass.DefineConstant("Gem", value)
 		AssignConstantName(classEmeraldValue(objectClass), "Gem", value)
+	}
+	gem.DefineMethod("path", &object.Method{Name: "path", Fn: gemPath, Arity: 0})
+	gem.DefineMethod("default_dir", &object.Method{Name: "default_dir", Fn: gemDir, Arity: 0})
+	gem.DefineMethod("loaded_specs", &object.Method{Name: "loaded_specs", Fn: gemLoadedSpecs, Arity: 0})
+	gem.DefineMethod("win_platform?", &object.Method{Name: "win_platform?", Fn: gemWinPlatform, Arity: 0})
+	gemValue := &object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}
+	if gem.Constants["LoadError"] == nil {
+		loadErrorClass := object.NewClass("Gem::LoadError")
+		loadErrorClass.SuperClass = R.Classes["LoadError"]
+		R.Classes["Gem::LoadError"] = loadErrorClass
+		value := classEmeraldValue(loadErrorClass)
+		gem.DefineConstant("LoadError", value)
+		AssignConstantName(gemValue, "LoadError", value)
+	}
+	if gem.Constants["MissingSpecError"] == nil {
+		missingSpecErrorClass := object.NewClass("Gem::MissingSpecError")
+		missingSpecErrorClass.SuperClass = R.Classes["Gem::LoadError"]
+		R.Classes["Gem::MissingSpecError"] = missingSpecErrorClass
+		value := classEmeraldValue(missingSpecErrorClass)
+		gem.DefineConstant("MissingSpecError", value)
+		AssignConstantName(gemValue, "MissingSpecError", value)
+	}
+	if gem.Constants["MissingSpecVersionError"] == nil {
+		missingSpecVersionErrorClass := object.NewClass("Gem::MissingSpecVersionError")
+		missingSpecVersionErrorClass.SuperClass = R.Classes["Gem::MissingSpecError"]
+		R.Classes["Gem::MissingSpecVersionError"] = missingSpecVersionErrorClass
+		value := classEmeraldValue(missingSpecVersionErrorClass)
+		gem.DefineConstant("MissingSpecVersionError", value)
+		AssignConstantName(gemValue, "MissingSpecVersionError", value)
+	}
+	if gem.Constants["Version"] == nil {
+		versionClass := object.NewClass("Gem::Version")
+		versionClass.SuperClass = R.Classes["Object"]
+		versionClass.DefineClassMethod("create", &object.Method{Name: "create", Fn: gemVersionCreate, Arity: 1})
+		versionClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: gemVersionInitialize, Arity: 1, Visibility: "private"})
+		versionClass.DefineMethod("<=>", &object.Method{Name: "<=>", Fn: gemVersionCompare, Arity: 1})
+		versionClass.DefineMethod("==", &object.Method{Name: "==", Fn: gemVersionEqual, Arity: 1})
+		versionClass.DefineMethod("eql?", &object.Method{Name: "eql?", Fn: gemVersionEqual, Arity: 1})
+		versionClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: gemVersionToS, Arity: 0})
+		versionClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: gemVersionInspect, Arity: 0})
+		R.Classes["Gem::Version"] = versionClass
+		value := classEmeraldValue(versionClass)
+		gem.DefineConstant("Version", value)
+		AssignConstantName(&object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}, "Version", value)
+	}
+	if gem.Constants["Requirement"] == nil {
+		requirementClass := object.NewClass("Gem::Requirement")
+		requirementClass.SuperClass = R.Classes["Object"]
+		requirementClass.DefineClassMethod("create", &object.Method{Name: "create", Fn: gemRequirementCreate, Arity: 1})
+		requirementClass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: gemRequirementInitialize, Arity: -1, Visibility: "private"})
+		requirementClass.DefineMethod("satisfied_by?", &object.Method{Name: "satisfied_by?", Fn: gemRequirementSatisfiedBy, Arity: 1})
+		requirementClass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: gemRequirementToS, Arity: 0})
+		requirementClass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: gemRequirementInspect, Arity: 0})
+		R.Classes["Gem::Requirement"] = requirementClass
+		value := classEmeraldValue(requirementClass)
+		gem.DefineConstant("Requirement", value)
+		AssignConstantName(&object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}, "Requirement", value)
+	}
+	if gem.Constants["Platform"] == nil {
+		platformClass := object.NewClass("Gem::Platform")
+		platformClass.SuperClass = R.Classes["Object"]
+		platformClass.DefineClassMethod("local", &object.Method{Name: "local", Fn: gemPlatformLocal, Arity: 0})
+		platformClass.DefineMethod("version", &object.Method{Name: "version", Fn: gemPlatformVersion, Arity: 0})
+		R.Classes["Gem::Platform"] = platformClass
+		value := classEmeraldValue(platformClass)
+		gem.DefineConstant("Platform", value)
+		AssignConstantName(gemValue, "Platform", value)
+	}
+	if gem.Constants["Specification"] == nil {
+		specificationClass := object.NewClass("Gem::Specification")
+		specificationClass.SuperClass = R.Classes["Object"]
+		specificationClass.DefineClassMethod("find_all_by_name", &object.Method{Name: "find_all_by_name", Fn: gemSpecificationFindAllByName, Arity: -1})
+		specificationClass.DefineClassMethod("find_by_name", &object.Method{Name: "find_by_name", Fn: gemSpecificationFindByName, Arity: -1})
+		specificationClass.DefineMethod("name", &object.Method{Name: "name", Fn: gemSpecificationName, Arity: 0})
+		specificationClass.DefineMethod("version", &object.Method{Name: "version", Fn: gemSpecificationVersion, Arity: 0})
+		specificationClass.DefineMethod("full_gem_path", &object.Method{Name: "full_gem_path", Fn: gemSpecificationFullGemPath, Arity: 0})
+		specificationClass.DefineMethod("require_paths", &object.Method{Name: "require_paths", Fn: gemSpecificationRequirePaths, Arity: 0})
+		R.Classes["Gem::Specification"] = specificationClass
+		value := classEmeraldValue(specificationClass)
+		gem.DefineConstant("Specification", value)
+		AssignConstantName(&object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}, "Specification", value)
+	}
+	if gem.Constants["Deprecate"] == nil {
+		deprecate := object.NewModule("Gem::Deprecate")
+		deprecate.DefineMethod("deprecate", &object.Method{Name: "deprecate", Fn: gemDeprecate, Arity: -1})
+		deprecate.DefineMethod("rubygems_deprecate", &object.Method{Name: "rubygems_deprecate", Fn: gemDeprecate, Arity: -1})
+		value := &object.EmeraldValue{Type: object.ValueModule, Data: deprecate, Class: R.Classes["Module"]}
+		gem.DefineConstant("Deprecate", value)
+		AssignConstantName(&object.EmeraldValue{Type: object.ValueModule, Data: gem, Class: R.Classes["Module"]}, "Deprecate", value)
 	}
 	installRubyGemsSecurity(gem)
 }
 
 func gemLoadPathInsertIndex(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	return newInt(0)
+}
+
+func gemDir(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if home := os.Getenv("GEM_HOME"); home != "" {
+		return rubyString(home)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return rubyString(filepath.Join(home, ".local", "share", "gem", "ruby", RubyCompatibilityVersion))
+	}
+	return rubyString("")
+}
+
+func gemPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	paths := []string{}
+	if configured := os.Getenv("GEM_PATH"); configured != "" {
+		for _, entry := range filepath.SplitList(configured) {
+			if entry != "" {
+				paths = append(paths, entry)
+			}
+		}
+	}
+	defaultDir := gemDir(receiver)
+	if defaultDir != nil && defaultDir.Type == object.ValueString {
+		path := stringRawValue(defaultDir)
+		found := false
+		for _, entry := range paths {
+			if entry == path {
+				found = true
+				break
+			}
+		}
+		if !found && path != "" {
+			paths = append(paths, path)
+		}
+	}
+	values := make([]*object.EmeraldValue, len(paths))
+	for index, path := range paths {
+		values[index] = rubyString(path)
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+}
+
+func gemWinPlatform(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return boolValue(runtime.GOOS == "windows")
+}
+
+func gemPlatformLocal(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	platformClass := R.Classes["Gem::Platform"]
+	return &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(platformClass), Class: platformClass}
+}
+
+func gemPlatformVersion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return R.NilVal
+}
+
+func gemLoadedSpecs(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := &object.EmeraldValue{
+		Type:  object.ValueHash,
+		Data:  &object.RHash{Pairs: map[*object.EmeraldValue]*object.EmeraldValue{}, Keys: []*object.EmeraldValue{}},
+		Class: R.Classes["Hash"],
+	}
+	specificationClass := R.Classes["Gem::Specification"]
+	versionClass := R.Classes["Gem::Version"]
+	if specificationClass == nil || versionClass == nil {
+		return result
+	}
+	features := loadedFeaturesGlobal()
+	if features == nil || features.Type != object.ValueArray {
+		return result
+	}
+	seen := map[string]bool{}
+	for _, feature := range features.Data.([]*object.EmeraldValue) {
+		if feature == nil || feature.Type != object.ValueString {
+			continue
+		}
+		name, version, fullPath, ok := gemIdentityFromLoadedFeature(stringRawValue(feature))
+		if !ok || seen[name] {
+			continue
+		}
+		seen[name] = true
+		spec := newGemSpecification(name, version, fullPath)
+		hashIndexSet(result, rubyString(name), spec)
+	}
+	return result
+}
+
+func newGemSpecification(name, version, fullPath string) *object.EmeraldValue {
+	specificationClass := R.Classes["Gem::Specification"]
+	versionClass := R.Classes["Gem::Version"]
+	specObject := object.NewObject(specificationClass)
+	specObject.SetInstanceVar("@name", rubyString(name))
+	versionObject := object.NewObject(versionClass)
+	versionObject.SetInstanceVar("@version", rubyString(version))
+	specObject.SetInstanceVar("@version", &object.EmeraldValue{Type: object.ValueObject, Data: versionObject, Class: versionClass})
+	specObject.SetInstanceVar("@full_gem_path", rubyString(fullPath))
+	specObject.SetInstanceVar("@require_paths", &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{rubyString("lib")}, Class: R.Classes["Array"]})
+	return &object.EmeraldValue{Type: object.ValueObject, Data: specObject, Class: specificationClass}
+}
+
+type availableGemSpecification struct {
+	name     string
+	version  string
+	fullPath string
+}
+
+func gemSpecificationFindAllByName(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1+)")
+	}
+	nameValue, ok, viaToStr, errVal := evalCoerceToString(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if !ok {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+	if nameValue == "" || filepath.Base(nameValue) != nameValue || strings.ContainsAny(nameValue, "*?[]") {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	requirements, errVal := gemSpecificationRequirementStrings(args[1:])
+	if errVal != nil {
+		return errVal
+	}
+	candidates := availableGemSpecifications(nameValue)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareGemVersionStrings(candidates[i].version, candidates[j].version) < 0
+	})
+	values := make([]*object.EmeraldValue, 0, len(candidates))
+	for _, candidate := range candidates {
+		if gemVersionSatisfiesRequirements(candidate.version, requirements) {
+			values = append(values, newGemSpecification(candidate.name, candidate.version, candidate.fullPath))
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+}
+
+func gemSpecificationFindByName(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	result := gemSpecificationFindAllByName(receiver, args...)
+	if result == nil || result.Type == object.ValueException {
+		return result
+	}
+	specifications, ok := result.Data.([]*object.EmeraldValue)
+	if !ok || len(specifications) == 0 {
+		name := ""
+		if len(args) > 0 && args[0] != nil && args[0].Type == object.ValueString {
+			name = stringRawValue(args[0])
+		}
+		return newRuntimeException(R.Classes["Gem::MissingSpecError"], "Could not find '"+name+"' among available gems")
+	}
+	return specifications[len(specifications)-1]
+}
+
+func gemSpecificationRequirementStrings(args []*object.EmeraldValue) ([]string, *object.EmeraldValue) {
+	if len(args) == 0 {
+		return []string{">= 0"}, nil
+	}
+	requirements := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg != nil && arg.Class == R.Classes["Gem::Requirement"] {
+			if obj, ok := arg.Data.(*object.Object); ok {
+				if stored := obj.GetInstanceVar("@requirements"); stored != nil && stored.Type == object.ValueArray {
+					for _, value := range stored.Data.([]*object.EmeraldValue) {
+						requirements = append(requirements, stringRawValue(value))
+					}
+					continue
+				}
+			}
+		}
+		text, ok, viaToStr, errVal := evalCoerceToString(arg)
+		if errVal != nil {
+			return nil, errVal
+		}
+		if !ok {
+			return nil, conversionTypeErrorToStringForMode(arg, viaToStr)
+		}
+		if _, _, valid := parseGemRequirement(text); !valid {
+			return nil, NewArgumentError("Illformed requirement [" + text + "]")
+		}
+		requirements = append(requirements, strings.TrimSpace(text))
+	}
+	return requirements, nil
+}
+
+func gemVersionSatisfiesRequirements(version string, requirements []string) bool {
+	for _, requirement := range requirements {
+		operator, target, valid := parseGemRequirement(requirement)
+		if !valid {
+			return false
+		}
+		comparison := compareGemVersionStrings(version, target)
+		switch operator {
+		case "=", "==":
+			if comparison != 0 {
+				return false
+			}
+		case "!=":
+			if comparison == 0 {
+				return false
+			}
+		case ">":
+			if comparison <= 0 {
+				return false
+			}
+		case ">=":
+			if comparison < 0 {
+				return false
+			}
+		case "<":
+			if comparison >= 0 {
+				return false
+			}
+		case "<=":
+			if comparison > 0 {
+				return false
+			}
+		case "~>":
+			if comparison < 0 || compareGemVersionStrings(version, gemRequirementUpperBound(target)) >= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func availableGemSpecifications(name string) []availableGemSpecification {
+	seen := map[string]bool{}
+	result := []availableGemSpecification{}
+	addLibPath := func(libPath string) {
+		libPath = filepath.Clean(libPath)
+		if info, err := os.Stat(libPath); err != nil || !info.IsDir() {
+			return
+		}
+		feature := filepath.Join(libPath, "__rgo_gem_spec__.rb")
+		foundName, version, fullPath, ok := gemIdentityFromLoadedFeature(feature)
+		if !ok || foundName != name {
+			return
+		}
+		key := foundName + "\x00" + version + "\x00" + fullPath
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		result = append(result, availableGemSpecification{name: foundName, version: version, fullPath: fullPath})
+	}
+	rubyLib, _ := envString("RUBYLIB")
+	for _, libPath := range filepath.SplitList(rubyLib) {
+		if libPath != "" {
+			addLibPath(libPath)
+		}
+	}
+	if features := loadedFeaturesGlobal(); features != nil && features.Type == object.ValueArray {
+		for _, feature := range features.Data.([]*object.EmeraldValue) {
+			if feature == nil || feature.Type != object.ValueString {
+				continue
+			}
+			foundName, _, fullPath, ok := gemIdentityFromLoadedFeature(stringRawValue(feature))
+			if ok && foundName == name {
+				addLibPath(filepath.Join(fullPath, "lib"))
+			}
+		}
+	}
+	gemPath, _ := envString("GEM_PATH")
+	for _, gemRoot := range filepath.SplitList(gemPath) {
+		if gemRoot == "" {
+			continue
+		}
+		matches, _ := filepath.Glob(filepath.Join(gemRoot, "gems", name+"-*", "lib"))
+		for _, libPath := range matches {
+			addLibPath(libPath)
+		}
+	}
+	return result
+}
+
+func gemIdentityFromLoadedFeature(feature string) (string, string, string, bool) {
+	normalized := filepath.ToSlash(feature)
+	marker := "/gems/"
+	index := strings.LastIndex(normalized, marker)
+	if index < 0 {
+		return "", "", "", false
+	}
+	rest := normalized[index+len(marker):]
+	libIndex := strings.Index(rest, "/lib/")
+	if libIndex < 0 {
+		return "", "", "", false
+	}
+	directory := rest[:libIndex]
+	split := -1
+	for index := len(directory) - 1; index >= 0; index-- {
+		if directory[index] == '-' && index+1 < len(directory) && directory[index+1] >= '0' && directory[index+1] <= '9' {
+			split = index
+			break
+		}
+	}
+	if split <= 0 {
+		return "", "", "", false
+	}
+	name := directory[:split]
+	version := directory[split+1:]
+	fullPath := filepath.FromSlash(normalized[:index+len(marker)] + directory)
+	return name, version, fullPath, true
+}
+
+func gemSpecificationInstanceVariable(receiver *object.EmeraldValue, name string) *object.EmeraldValue {
+	if receiver != nil {
+		if obj, ok := receiver.Data.(*object.Object); ok {
+			if value := obj.GetInstanceVar(name); value != nil {
+				return value
+			}
+		}
+	}
+	return R.NilVal
+}
+
+func gemSpecificationName(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return gemSpecificationInstanceVariable(receiver, "@name")
+}
+
+func gemSpecificationVersion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return gemSpecificationInstanceVariable(receiver, "@version")
+}
+
+func gemSpecificationFullGemPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return gemSpecificationInstanceVariable(receiver, "@full_gem_path")
+}
+
+func gemSpecificationRequirePaths(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return gemSpecificationInstanceVariable(receiver, "@require_paths")
+}
+
+func gemDeprecate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 4 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1..4)", len(args)))
+	}
+	if args[0] == nil || (args[0].Type != object.ValueSymbol && args[0].Type != object.ValueString) {
+		return typeError("method name must be a Symbol or String")
+	}
+	return R.NilVal
+}
+
+func gemVersionCreate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	if args[0] == nil || args[0].Type == object.ValueNil {
+		return R.NilVal
+	}
+	if klass, ok := receiver.Data.(*object.Class); ok && args[0].Class == klass {
+		return args[0]
+	}
+	if CallMethod == nil {
+		return newRuntimeException(R.Classes["RuntimeError"], "method dispatch unavailable")
+	}
+	return CallMethod(receiver, "new", args[0])
+}
+
+func gemRequirementCreate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	if klass, ok := receiver.Data.(*object.Class); ok && args[0] != nil && args[0].Class == klass {
+		return args[0]
+	}
+	if CallMethod == nil {
+		return newRuntimeException(R.Classes["RuntimeError"], "method dispatch unavailable")
+	}
+	return CallMethod(receiver, "new", args[0])
+}
+
+func builtinGemActivate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments (given 0, expected 1+)")
+	}
+	name, ok, viaToStr, errVal := evalCoerceToString(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if !ok {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+	requirements, errVal := gemSpecificationRequirementStrings(args[1:])
+	if errVal != nil {
+		return errVal
+	}
+	for _, candidate := range availableGemSpecifications(name) {
+		if gemVersionSatisfiesRequirements(candidate.version, requirements) {
+			return R.TrueVal
+		}
+	}
+	requirementText := strings.Join(requirements, ", ")
+	return newRuntimeException(R.Classes["LoadError"], "Could not find '"+name+"' ("+requirementText+") among available gems")
+}
+
+func gemVersionInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	version, ok, viaToStr, errVal := evalCoerceToString(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if !ok {
+		return conversionTypeErrorToStringForMode(args[0], viaToStr)
+	}
+	obj, ok := receiver.Data.(*object.Object)
+	if !ok {
+		return typeError("invalid Gem::Version receiver")
+	}
+	obj.SetInstanceVar("@version", rubyString(version))
+	return receiver
+}
+
+func gemVersionToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	obj, ok := receiver.Data.(*object.Object)
+	if !ok {
+		return rubyString("")
+	}
+	if version := obj.GetInstanceVar("@version"); version != nil {
+		return version
+	}
+	return rubyString("")
+}
+
+func gemVersionInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	version := gemVersionToS(receiver).Data.(string)
+	return rubyString("#<Gem::Version \"" + version + "\">")
+}
+
+type gemVersionSegment struct {
+	number  int64
+	text    string
+	numeric bool
+}
+
+func gemVersionSegments(version string) []gemVersionSegment {
+	segments := make([]gemVersionSegment, 0, 8)
+	for index := 0; index < len(version); {
+		if version[index] >= '0' && version[index] <= '9' {
+			end := index + 1
+			for end < len(version) && version[end] >= '0' && version[end] <= '9' {
+				end++
+			}
+			number, _ := strconv.ParseInt(version[index:end], 10, 64)
+			segments = append(segments, gemVersionSegment{number: number, numeric: true})
+			index = end
+			continue
+		}
+		if (version[index] >= 'a' && version[index] <= 'z') || (version[index] >= 'A' && version[index] <= 'Z') {
+			end := index + 1
+			for end < len(version) &&
+				((version[end] >= 'a' && version[end] <= 'z') || (version[end] >= 'A' && version[end] <= 'Z')) {
+				end++
+			}
+			segments = append(segments, gemVersionSegment{text: strings.ToLower(version[index:end])})
+			index = end
+			continue
+		}
+		index++
+	}
+	for len(segments) > 0 && segments[len(segments)-1].numeric && segments[len(segments)-1].number == 0 {
+		segments = segments[:len(segments)-1]
+	}
+	return segments
+}
+
+func gemVersionCompare(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	if args[0] == nil || args[0].Class != R.Classes["Gem::Version"] {
+		return R.NilVal
+	}
+	left := gemVersionSegments(gemVersionToS(receiver).Data.(string))
+	right := gemVersionSegments(gemVersionToS(args[0]).Data.(string))
+	length := len(left)
+	if len(right) > length {
+		length = len(right)
+	}
+	for index := 0; index < length; index++ {
+		l := gemVersionSegment{numeric: true}
+		r := gemVersionSegment{numeric: true}
+		if index < len(left) {
+			l = left[index]
+		}
+		if index < len(right) {
+			r = right[index]
+		}
+		if l.numeric != r.numeric {
+			if l.numeric {
+				return newInt(1)
+			}
+			return newInt(-1)
+		}
+		if l.numeric {
+			if l.number < r.number {
+				return newInt(-1)
+			}
+			if l.number > r.number {
+				return newInt(1)
+			}
+		} else {
+			if l.text < r.text {
+				return newInt(-1)
+			}
+			if l.text > r.text {
+				return newInt(1)
+			}
+		}
+	}
+	return newInt(0)
+}
+
+func gemVersionEqual(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	comparison := gemVersionCompare(receiver, args...)
+	if comparison == nil || comparison.Type != object.ValueInteger {
+		return R.FalseVal
+	}
+	number, ok := comparison.Data.(int64)
+	return boolValue(ok && number == 0)
+}
+
+func gemRequirementInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 1 && args[0] != nil && args[0].Type == object.ValueArray {
+		args = args[0].Data.([]*object.EmeraldValue)
+	}
+	if len(args) == 0 {
+		args = []*object.EmeraldValue{rubyString(">= 0")}
+	}
+	requirements := make([]*object.EmeraldValue, 0, len(args))
+	for _, arg := range args {
+		text, ok, viaToStr, errVal := evalCoerceToString(arg)
+		if errVal != nil {
+			return errVal
+		}
+		if !ok {
+			return conversionTypeErrorToStringForMode(arg, viaToStr)
+		}
+		if _, _, valid := parseGemRequirement(text); !valid {
+			return NewArgumentError("Illformed requirement [" + text + "]")
+		}
+		requirements = append(requirements, rubyString(strings.TrimSpace(text)))
+	}
+	obj, ok := receiver.Data.(*object.Object)
+	if !ok {
+		return typeError("invalid Gem::Requirement receiver")
+	}
+	obj.SetInstanceVar("@requirements", &object.EmeraldValue{Type: object.ValueArray, Data: requirements, Class: R.Classes["Array"]})
+	return receiver
+}
+
+func parseGemRequirement(text string) (string, string, bool) {
+	text = strings.TrimSpace(text)
+	for _, operator := range []string{"~>", ">=", "<=", "!=", "==", "=", ">", "<"} {
+		if strings.HasPrefix(text, operator) {
+			version := strings.TrimSpace(text[len(operator):])
+			return operator, version, version != ""
+		}
+	}
+	if text == "" {
+		return "", "", false
+	}
+	return "=", text, true
+}
+
+func compareGemVersionStrings(left, right string) int64 {
+	leftValue := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(R.Classes["Gem::Version"]), Class: R.Classes["Gem::Version"]}
+	leftValue.Data.(*object.Object).SetInstanceVar("@version", rubyString(left))
+	rightValue := &object.EmeraldValue{Type: object.ValueObject, Data: object.NewObject(R.Classes["Gem::Version"]), Class: R.Classes["Gem::Version"]}
+	rightValue.Data.(*object.Object).SetInstanceVar("@version", rubyString(right))
+	result := gemVersionCompare(leftValue, rightValue)
+	if result == nil || result.Type != object.ValueInteger {
+		return 0
+	}
+	return result.Data.(int64)
+}
+
+func gemRequirementSatisfiedBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 || args[0] == nil || args[0].Class != R.Classes["Gem::Version"] {
+		return NewArgumentError("Need a Gem::Version")
+	}
+	obj, ok := receiver.Data.(*object.Object)
+	if !ok {
+		return R.FalseVal
+	}
+	stored := obj.GetInstanceVar("@requirements")
+	if stored == nil || stored.Type != object.ValueArray {
+		return R.FalseVal
+	}
+	version := gemVersionToS(args[0]).Data.(string)
+	for _, requirement := range stored.Data.([]*object.EmeraldValue) {
+		operator, target, valid := parseGemRequirement(stringRawValue(requirement))
+		if !valid {
+			return R.FalseVal
+		}
+		comparison := compareGemVersionStrings(version, target)
+		satisfied := false
+		switch operator {
+		case "=", "==":
+			satisfied = comparison == 0
+		case "!=":
+			satisfied = comparison != 0
+		case ">":
+			satisfied = comparison > 0
+		case ">=":
+			satisfied = comparison >= 0
+		case "<":
+			satisfied = comparison < 0
+		case "<=":
+			satisfied = comparison <= 0
+		case "~>":
+			satisfied = comparison >= 0 && compareGemVersionStrings(version, gemRequirementUpperBound(target)) < 0
+		}
+		if !satisfied {
+			return R.FalseVal
+		}
+	}
+	return R.TrueVal
+}
+
+func gemRequirementUpperBound(version string) string {
+	parts := strings.Split(version, ".")
+	index := len(parts) - 2
+	if index < 0 {
+		index = 0
+	}
+	number, err := strconv.ParseInt(parts[index], 10, 64)
+	if err != nil {
+		return version
+	}
+	parts[index] = strconv.FormatInt(number+1, 10)
+	parts = parts[:index+1]
+	return strings.Join(parts, ".")
+}
+
+func gemRequirementToS(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	obj, ok := receiver.Data.(*object.Object)
+	if !ok {
+		return rubyString("")
+	}
+	stored := obj.GetInstanceVar("@requirements")
+	if stored == nil || stored.Type != object.ValueArray {
+		return rubyString("")
+	}
+	parts := make([]string, 0, len(stored.Data.([]*object.EmeraldValue)))
+	for _, requirement := range stored.Data.([]*object.EmeraldValue) {
+		parts = append(parts, stringRawValue(requirement))
+	}
+	return rubyString(strings.Join(parts, ", "))
+}
+
+func gemRequirementInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rubyString("#<Gem::Requirement: " + gemRequirementToS(receiver).Data.(string) + ">")
 }
 
 func installMkmfModule(objectClass *object.Class) {
@@ -62431,12 +68068,8 @@ func builtinLoad(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		priorVisibility, hadVisibility := module.InstanceVars["@__visibility"]
 		module.SetInstanceVar("@__visibility", rubyString("private"))
 		result = EvalSourceWithBinding(string(content), &object.RBinding{
-			Self:         wrappedSelf,
-			Locals:       map[string]*object.EmeraldValue{},
-			ClassStack:   []*object.EmeraldValue{wrapModule},
-			Path:         resolvedPath,
-			Line:         1,
-			InstanceVars: map[string]*object.EmeraldValue{},
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             wrappedSelf, ClassStack: []*object.EmeraldValue{wrapModule}, Path: resolvedPath, Line: 1,
 		})
 		if hadVisibility {
 			module.InstanceVars["@__visibility"] = priorVisibility
@@ -62462,14 +68095,14 @@ func loadWrappedTopLevelSelf(wrapModule *object.EmeraldValue) *object.EmeraldVal
 	}
 	copyObject := object.NewObject(mainObject.Class)
 	copyObject.StructValues = append([]*object.EmeraldValue(nil), mainObject.StructValues...)
-	for name, value := range mainObject.InstanceVars {
-		copyObject.InstanceVars[name] = value
+	for name, value := range mainObject.InstanceVarMap() {
+		copyObject.SetInstanceVar(name, value)
 	}
 	for name, value := range mainObject.ClassVars {
-		copyObject.ClassVars[name] = value
+		copyObject.SetClassVar(name, value)
 	}
 	for name, method := range mainObject.SingletonMethods {
-		copyObject.SingletonMethods[name] = method
+		copyObject.SetSingletonMethod(name, method)
 	}
 	copyValue := &object.EmeraldValue{Type: object.ValueObject, Data: copyObject, Class: R.Main.Class}
 	copyObject.SingletonClass = cloneSingletonClass(mainObject.SingletonClass, copyValue)
@@ -64570,7 +70203,14 @@ func builtinRaise(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if causeErr != nil {
 		return causeErr
 	}
-	if !hasCause && previousException != nil && InRescue != nil && InRescue() {
+	if !hasCause && CurrentRescueException != nil {
+		if current := CurrentRescueException(); current != nil && current.Type == object.ValueException &&
+			(len(args) == 0 || args[0] != current) {
+			cause = current
+			hasCause = true
+		}
+	}
+	if !hasCause && InRescue != nil && InRescue() && previousException != nil {
 		cause = previousException
 		hasCause = true
 	}
@@ -65078,7 +70718,7 @@ func lambdaValueFromBlock(block *object.EmeraldValue) *object.EmeraldValue {
 		source := block.Data.(*object.Proc)
 		copy := *source
 		copy.IsLambda = true
-		copy.InstanceVars = make(map[string]*object.EmeraldValue)
+		copy.InstanceVars = nil
 		return &object.EmeraldValue{Type: object.ValueProc, Data: &copy, Class: R.Classes["Proc"]}
 	case object.ValueClosure:
 		closure := block.Data.(*object.Closure)
@@ -65092,7 +70732,6 @@ func lambdaValueFromBlock(block *object.EmeraldValue) *object.EmeraldValue {
 				ClassStack:       closure.ClassStack,
 				Refinements:      append([]*object.EmeraldValue(nil), closure.Refinements...),
 				RefinementsFixed: closure.RefinementsFixed,
-				InstanceVars:     make(map[string]*object.EmeraldValue),
 				AutoSplat:        closure.AutoSplat,
 				IsLambda:         true,
 			},
@@ -65115,16 +70754,8 @@ func builtinBinding(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	}
 	if binding == nil {
 		binding = &object.RBinding{
-			Self:          R.Main,
-			Locals:        map[string]*object.EmeraldValue{},
-			LocalNames:    nil,
-			Constants:     map[string]*object.EmeraldValue{},
-			Method:        "",
-			InstanceVars:  map[string]*object.EmeraldValue{},
-			ClassStack:    nil,
-			ClassVarScope: nil,
-			Path:          currentSourcePath(),
-			Line:          1,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		}
 	}
 	return &object.EmeraldValue{Type: object.ValueBinding, Data: binding, Class: R.Classes["Binding"]}
@@ -65140,14 +70771,8 @@ func builtinLocalVariables(receiver *object.EmeraldValue, args ...*object.Emeral
 	}
 	if binding == nil {
 		binding = &object.RBinding{
-			Self:         R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			Path:         currentSourcePath(),
-			Line:         1,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		}
 	}
 	return bindingLocalVariables(&object.EmeraldValue{
@@ -66482,8 +72107,9 @@ func newIOShimValue(className string) *object.EmeraldValue {
 	}
 	data := &ioShimData{cachedSize: -1, fd: nextIOFd, dupSourceFD: -1, closeOnExec: true, autoclose: true, peerFD: -1, pid: -1, encodingExplicit: false}
 	nextIOFd++
-	if ioDataByFd != nil {
+	if ioDataByFd != nil && className != "StringIO" {
 		ioDataByFd[data.fd] = data
+		data.fdRegistered = true
 	}
 	return &object.EmeraldValue{
 		Type:  object.ValueObject,
@@ -67027,6 +72653,7 @@ func stringIOClassOpen(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		closeResult := ioClose(result)
 		if data := ioShim(result); data != nil {
 			data.stringValue = R.NilVal
+			data.stringValueDirty = false
 		}
 		if closeResult != nil && closeResult.Type == object.ValueException {
 			return closeResult
@@ -67057,7 +72684,7 @@ func stringIOInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	if stringArg == nil || stringArg.Type == object.ValueNil {
 		initialValue = rubyString("")
 		if defaultExternalEncoding != "" {
-			stringEncodings[initialValue] = defaultExternalEncoding
+			initialValue.Encoding = defaultExternalEncoding
 		}
 	} else if stringArg.Type == object.ValueString {
 		initialValue = stringArg
@@ -67457,6 +73084,7 @@ func stringIOString(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if data == nil {
 		return R.NilVal
 	}
+	stringIOEnsureStringValue(data)
 	return data.stringValue
 }
 
@@ -67496,8 +73124,8 @@ func stringIOSetString(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	data.ungetBuffer = ""
 	if data.externalEncoding != "" {
 		stringIOSyncValue(data, next)
-	} else if stringEncodings != nil {
-		stringEncodings[data.stringValue] = stringEncodingName(data.stringValue)
+	} else {
+		data.stringValue.Encoding = stringEncodingName(data.stringValue)
 	}
 	return data.stringValue
 }
@@ -67534,10 +73162,6 @@ func stringIOClosed(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	return boolValue(data != nil && (data.closed || data.readClosed && data.writeClosed))
 }
 
-func stringIOPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return NewNoMethodError("undefined method `path' for an instance of StringIO")
-}
-
 func stringIOExternalEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data := ioShim(receiver); data != nil && data.stringValue != nil && data.stringValue.Type == object.ValueString && !data.stringValue.Frozen {
 		return newEncodingValue(stringEncodingName(data.stringValue))
@@ -67551,7 +73175,7 @@ func stringIOSetEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		return result
 	}
 	if data := ioShim(receiver); data != nil && data.stringValue != nil && data.stringValue.Type == object.ValueString && !data.stringValue.Frozen && data.externalEncoding != "" {
-		stringEncodings[data.stringValue] = data.externalEncoding
+		data.stringValue.Encoding = data.externalEncoding
 	}
 	return result
 }
@@ -67568,7 +73192,7 @@ func stringIOSetEncodingByBOM(receiver *object.EmeraldValue, args ...*object.Eme
 	result := ioSetEncodingByBOM(receiver, args...)
 	if result != nil && result.Type != object.ValueException && result.Type != object.ValueNil {
 		if data := ioShim(receiver); data != nil && data.stringValue != nil && data.stringValue.Type == object.ValueString && !data.stringValue.Frozen {
-			stringEncodings[data.stringValue] = data.externalEncoding
+			data.stringValue.Encoding = data.externalEncoding
 		}
 	}
 	return result
@@ -67580,14 +73204,14 @@ func stringIOBinmode(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return result
 	}
 	if data := ioShim(receiver); data != nil && data.stringValue != nil && data.stringValue.Type == object.ValueString && !data.stringValue.Frozen {
-		stringEncodings[data.stringValue] = "BINARY"
+		data.stringValue.Encoding = "BINARY"
 	}
 	return result
 }
 
 func stringIOMarkLengthReadBinary(result *object.EmeraldValue, args []*object.EmeraldValue) *object.EmeraldValue {
 	if result != nil && result.Type == object.ValueString && len(args) > 0 && args[0] != nil && args[0].Type != object.ValueNil {
-		stringEncodings[result] = "BINARY"
+		result.Encoding = "BINARY"
 	}
 	return result
 }
@@ -67740,9 +73364,9 @@ func stringIOWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if data.ungetBuffer != "" {
 		data.ungetBuffer = ""
 	}
+	buffer := ioEnsurePipeBufferForFD(data.fd)
 	if strings.Contains(data.mode, "a") {
-		content := stringIOBuffer(receiver)
-		data.offset = int64(len(content))
+		data.offset = int64(buffer.Len())
 	}
 
 	pos := int(data.offset)
@@ -67750,13 +73374,25 @@ func stringIOWrite(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		pos = 0
 		data.offset = 0
 	}
-	content := stringIOBuffer(receiver)
+	insert := writeText
+	// StringIO writes in PDF/Gem builders overwhelmingly append at the current
+	// end of the buffer.  Growing the existing bytes.Buffer preserves the same
+	// offset/content semantics while avoiding a full content copy on every
+	// write. Non-tail writes, holes and unget state keep the replacement path
+	// below because they must splice the old contents around the new segment.
+	if data.ungetBuffer == "" && pos == buffer.Len() {
+		_, _ = buffer.WriteString(insert)
+		data.offset = int64(buffer.Len())
+		data.cachedSize = int64(buffer.Len())
+		data.stringValueDirty = true
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(len(insert)), Class: R.Classes["Integer"]}
+	}
+	content := buffer.String()
 	if pos > len(content) {
 		padding := strings.Repeat("\x00", pos-len(content))
 		content += padding
 	}
 	contentLength := len(content)
-	insert := writeText
 	end := pos + len(insert)
 	if end > contentLength {
 		contentLength = end
@@ -67788,7 +73424,7 @@ func stringIOWriteBytes(receiver *object.EmeraldValue, writeText string, byteCou
 	buffer.Reset()
 	_, _ = buffer.WriteString(writeText)
 	data.cachedSize = int64(len(writeText))
-	stringIOSyncValue(data, writeText)
+	data.stringValueDirty = true
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: byteCount, Class: R.Classes["Integer"]}
 }
 
@@ -67874,6 +73510,21 @@ func stringIOBuffer(receiver *object.EmeraldValue) string {
 	return buffer.String()
 }
 
+func stringIOEnsureStringValue(data *ioShimData) {
+	if data == nil || !data.stringValueDirty || data.stringValue == nil || data.stringValue == R.NilVal {
+		return
+	}
+	buffer := ioPipeBufferForFD(data.fd)
+	if buffer == nil {
+		data.stringValue.Data = ""
+		data.cachedSize = 0
+	} else {
+		data.stringValue.Data = buffer.String()
+		data.cachedSize = int64(buffer.Len())
+	}
+	data.stringValueDirty = false
+}
+
 func stringIOSyncValue(data *ioShimData, value string) {
 	if data == nil {
 		return
@@ -67883,10 +73534,9 @@ func stringIOSyncValue(data *ioShimData, value string) {
 	} else {
 		data.stringValue.Data = value
 	}
-	if stringEncodings != nil {
-		if data.externalEncoding != "" {
-			stringEncodings[data.stringValue] = data.externalEncoding
-		}
+	data.stringValueDirty = false
+	if data.externalEncoding != "" {
+		data.stringValue.Encoding = data.externalEncoding
 	}
 }
 
@@ -68661,9 +74311,9 @@ func fileClassRead(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	}
 	if result != nil && result.Type == object.ValueString {
 		if limitWasProvided {
-			stringEncodings[result] = "BINARY"
+			result.Encoding = "BINARY"
 		} else if resultEncoding != "" {
-			stringEncodings[result] = resultEncoding
+			result.Encoding = resultEncoding
 		}
 	}
 	return result
@@ -68683,7 +74333,7 @@ func fileClassBinread(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	if strings.HasPrefix(path, "|") {
 		result := fileClassReadPipe(path, args[1:]...)
 		if result != nil && result.Type == object.ValueString {
-			stringEncodings[result] = "BINARY"
+			result.Encoding = "BINARY"
 		}
 		return result
 	}
@@ -68739,7 +74389,7 @@ func fileClassBinread(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		end = int64(len(content))
 	}
 	result := rubyString(content[offset:end])
-	stringEncodings[result] = "BINARY"
+	result.Encoding = "BINARY"
 	return result
 }
 
@@ -68996,9 +74646,9 @@ func fileClassReadPipe(path string, args ...*object.EmeraldValue) *object.Emeral
 	result := rubyString(output)
 	if result != nil && result.Type == object.ValueString {
 		if resultEncoding != "" {
-			stringEncodings[result] = resultEncoding
+			result.Encoding = resultEncoding
 		} else if limitWasProvided {
-			stringEncodings[result] = "BINARY"
+			result.Encoding = "BINARY"
 		}
 	}
 	return result
@@ -71042,12 +76692,12 @@ func ioReadlines(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 			}
 			line = rubyString(text)
 		}
-		if line != nil && line.Type == object.ValueString && stringEncodings != nil {
+		if line != nil && line.Type == object.ValueString {
 			lineEncoding := defaultExternalEncoding
 			if data := ioShim(receiver); data != nil {
 				lineEncoding = ioStreamResultEncoding(data)
 			}
-			stringEncodings[line] = lineEncoding
+			line.Encoding = lineEncoding
 		}
 		lines = append(lines, line)
 	}
@@ -71599,6 +77249,7 @@ func installTimeLibraryMethods() {
 	if timeClass == nil {
 		return
 	}
+	timeClass.DefineMethod("httpdate", &object.Method{Name: "httpdate", Fn: timeHTTPDate, Arity: 0})
 	timeClass.DefineClassMethod("httpdate", &object.Method{Name: "httpdate", Fn: timeClassHTTPDate, Arity: 1})
 	timeClass.DefineClassMethod("iso8601", &object.Method{Name: "iso8601", Fn: timeClassISO8601, Arity: 1})
 	timeClass.DefineClassMethod("xmlschema", &object.Method{Name: "xmlschema", Fn: timeClassISO8601, Arity: 1})
@@ -71628,6 +77279,14 @@ func timeClassHTTPDate(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		}
 	}
 	return argumentError("not RFC 2616 compliant date: " + input)
+}
+
+func timeHTTPDate(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	t, ok := timeValueFrom(receiver)
+	if !ok {
+		return rubyString("")
+	}
+	return rubyString(t.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"))
 }
 
 func timeClassRFC2822(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -73012,7 +78671,7 @@ func (w *marshalWriter) writeSymbolValue(value *object.EmeraldValue) {
 func (w *marshalWriter) writeEncodedString(value *object.EmeraldValue) {
 	encoding := normalizeEncodingNameForIO(stringEncodingName(value))
 	nonASCII := stringHasNonASCIIByte(value.Data.(string))
-	_, explicitEncoding := stringEncodings[value]
+	explicitEncoding := value.Encoding != ""
 	variables := receiverInstanceVarMap(value)
 	encodingWrapped := encoding == "US-ASCII" || (encoding == "UTF-8" && (nonASCII || explicitEncoding)) || (encoding != "" && encoding != "BINARY" && encoding != "ASCII-8BIT" && encoding != "UTF-8")
 	wrapped := encodingWrapped || len(variables) > 0
@@ -73205,7 +78864,7 @@ func (w *marshalWriter) writeValue(value *object.EmeraldValue) *object.EmeraldVa
 			return typeError("_dump() must return string")
 		}
 		encoding := canonicalEncodingCompatibilityName(stringEncodingName(payload))
-		_, explicitEncoding := stringEncodings[payload]
+		explicitEncoding := payload.Encoding != ""
 		variables := receiverInstanceVarMap(payload)
 		encodingWrapped := encoding == "US-ASCII" || (encoding == "UTF-8" && (stringHasNonASCIIByte(payload.Data.(string)) || explicitEncoding)) || (encoding != "" && encoding != "BINARY" && encoding != "ASCII-8BIT" && encoding != "UTF-8")
 		wrapped := encodingWrapped || len(variables) > 0
@@ -73564,12 +79223,12 @@ func (w *marshalWriter) writeValue(value *object.EmeraldValue) *object.EmeraldVa
 			if isStruct {
 				members = append(members, structFieldsForClass(value.Class)...)
 				if obj != nil {
-					for ivar, item := range obj.InstanceVars {
+					for ivar, item := range obj.InstanceVarMap() {
 						extra[ivar] = item
 					}
 				}
 			} else if obj != nil {
-				for ivar, item := range obj.InstanceVars {
+				for ivar, item := range obj.InstanceVarMap() {
 					field := strings.TrimPrefix(ivar, "@")
 					if _, ok := value.Class.GetMethod(field); ok {
 						members = append(members, field)
@@ -73598,7 +79257,7 @@ func (w *marshalWriter) writeValue(value *object.EmeraldValue) *object.EmeraldVa
 						}
 					}
 				} else if obj != nil {
-					item = obj.InstanceVars["@"+member]
+					item = obj.GetInstanceVar("@" + member)
 				}
 				if errVal := w.writeValue(item); errVal != nil {
 					return errVal
@@ -74745,8 +80404,8 @@ func fileClassPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	pathValue := args[0]
 	if data := ioShim(pathValue); data != nil && data.path != "" {
 		result := rubyString(data.path)
-		if data.pathEncoding != "" && stringEncodings != nil {
-			stringEncodings[result] = data.pathEncoding
+		if data.pathEncoding != "" {
+			result.Encoding = data.pathEncoding
 		}
 		return result
 	}
@@ -74769,9 +80428,7 @@ func fileClassPath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return NewArgumentError("string contains null byte")
 	}
 	result := rubyString(pathValue.Data.(string))
-	if stringEncodings != nil {
-		stringEncodings[result] = stringEncodingName(pathValue)
-	}
+	result.Encoding = stringEncodingName(pathValue)
 	return result
 }
 
@@ -76435,8 +82092,8 @@ func fileInstanceFlock(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 func fileInstancePath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	if data := ioShim(receiver); data != nil && data.path != "" {
 		result := rubyString(data.path)
-		if data.pathEncoding != "" && stringEncodings != nil {
-			stringEncodings[result] = data.pathEncoding
+		if data.pathEncoding != "" {
+			result.Encoding = data.pathEncoding
 		}
 		return result
 	}
@@ -76660,9 +82317,7 @@ func fileInstanceRead(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 				return bufferArg
 			}
 			result := rubyString("")
-			if stringEncodings != nil {
-				stringEncodings[result] = "BINARY"
-			}
+			result.Encoding = "BINARY"
 			return result
 		}
 		if hasLimit {
@@ -76677,9 +82332,7 @@ func fileInstanceRead(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 			return bufferArg
 		}
 		result := rubyString("")
-		if stringEncodings != nil {
-			stringEncodings[result] = resultEncoding
-		}
+		result.Encoding = resultEncoding
 		return result
 	}
 	if !hasLimit {
@@ -76708,18 +82361,16 @@ func fileInstanceRead(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	}
 	if bufferArg != nil {
 		bufferArg.Data = chunk
-		if !hasLimit && stringEncodings != nil {
-			stringEncodings[bufferArg] = resultEncoding
+		if !hasLimit {
+			bufferArg.Encoding = resultEncoding
 		}
 		return bufferArg
 	}
 	result := rubyString(chunk)
-	if stringEncodings != nil {
-		if hasLimit {
-			stringEncodings[result] = "BINARY"
-		} else {
-			stringEncodings[result] = resultEncoding
-		}
+	if hasLimit {
+		result.Encoding = "BINARY"
+	} else {
+		result.Encoding = resultEncoding
 	}
 	return result
 }
@@ -77000,9 +82651,7 @@ func fileInstanceGets(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	}
 	if limit == 0 {
 		result := rubyString("")
-		if stringEncodings != nil {
-			stringEncodings[result] = ioStreamResultEncoding(data)
-		}
+		result.Encoding = ioStreamResultEncoding(data)
 		SetGlobalVariableIfAvailable("$_", result)
 		return result
 	}
@@ -77091,9 +82740,7 @@ func fileInstanceGets(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		result = rubyString(text)
 	}
 	resultEncoding := ioStreamResultEncoding(data)
-	if stringEncodings != nil {
-		stringEncodings[result] = resultEncoding
-	}
+	result.Encoding = resultEncoding
 	SetGlobalVariableIfAvailable("$_", result)
 	data.lineno++
 	lineNumber := &object.EmeraldValue{Type: object.ValueInteger, Data: data.lineno, Class: R.Classes["Integer"]}
@@ -78736,6 +84383,9 @@ func dirEntryList(args []*object.EmeraldValue, includeDots bool) *object.Emerald
 	}
 	if len(args) > 1 && args[len(args)-1] != nil && args[len(args)-1].Type == object.ValueHash {
 		if option, ok := globOptionLookup(valueToHashMap(args[len(args)-1]), "encoding"); ok {
+			if option == nil || option.Type == object.ValueNil {
+				return &object.EmeraldValue{Type: object.ValueArray, Data: values, Class: R.Classes["Array"]}
+			}
 			name := encodingName(option)
 			canonical, found := canonicalEncodingFindName(name)
 			if !found {
@@ -79524,7 +85174,7 @@ func ioDupRootFD(data *ioShimData) int64 {
 }
 
 func ioSyncDupPosition(data *ioShimData) {
-	if data == nil || ioDataByFd == nil {
+	if data == nil || !data.fdRegistered || ioDataByFd == nil {
 		return
 	}
 	rootFD := ioDupRootFD(data)
@@ -79552,7 +85202,7 @@ func setObjectIOWriteCalls(receiver *object.EmeraldValue, calls int64) {
 		if obj.ClassVars == nil {
 			obj.ClassVars = make(map[string]*object.EmeraldValue)
 		}
-		obj.ClassVars["__io_write_calls__"] = &object.EmeraldValue{Type: object.ValueInteger, Data: calls, Class: R.Classes["Integer"]}
+		obj.SetClassVar("__io_write_calls__", &object.EmeraldValue{Type: object.ValueInteger, Data: calls, Class: R.Classes["Integer"]})
 	}
 }
 
@@ -79655,11 +85305,24 @@ func ioReadContentFromShim(data *ioShimData) (string, *object.EmeraldValue) {
 		}
 		return content, nil
 	}
+	if data.hostRead && data.cachedInfo != nil {
+		if info, err := os.Stat(data.path); err == nil &&
+			info.Size() == data.cachedSize &&
+			info.ModTime().Equal(data.cachedInfo.ModTime()) {
+			return data.hostContent, nil
+		}
+	}
 	contentBytes, err := os.ReadFile(data.path)
 	if err != nil {
 		return "", errnoForPathError(err)
 	}
-	return string(contentBytes), nil
+	data.hostContent = string(contentBytes)
+	data.hostRead = true
+	if info, statErr := os.Stat(data.path); statErr == nil {
+		data.cachedSize = info.Size()
+		data.cachedInfo = info
+	}
+	return data.hostContent, nil
 }
 
 func runPendingPopenForRead(data *ioShimData) {
@@ -79868,7 +85531,7 @@ func ioExpect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		values = []*object.EmeraldValue{rubyString(needle)}
 	case pattern != nil && pattern.Type == object.ValueRegexp:
 		r := pattern.Data.(*object.RRegexp)
-		re, err := regexp.Compile(rubyRegexpCompilePattern(r))
+		re, err := compileRubyRegexp(r)
 		if err != nil {
 			return newRuntimeException(R.Classes["RegexpError"], err.Error())
 		}
@@ -80056,9 +85719,7 @@ func ioSysread(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			return args[1]
 		}
 		result := rubyString("")
-		if stringEncodings != nil {
-			stringEncodings[result] = "BINARY"
-		}
+		result.Encoding = "BINARY"
 		return result
 	}
 	if len(args) == 0 || (len(args) > 0 && args[0] != nil && args[0].Type == object.ValueNil) {
@@ -80237,9 +85898,7 @@ func ioGetc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object
 		resultEncoding = data.internalEncoding
 	}
 	result := rubyString(chunk)
-	if stringEncodings != nil {
-		stringEncodings[result] = resultEncoding
-	}
+	result.Encoding = resultEncoding
 	return result
 }
 
@@ -80528,6 +86187,16 @@ func ioEachLine(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		prev := R.NilVal
 		if GetGlobalVariable != nil {
 			prev = GetGlobalVariable("$_")
+		}
+		if IOEachLineCapturedBlock != nil {
+			if result, handled := IOEachLineCapturedBlock(receiver, CurrentBlockValue(), args, func() *object.EmeraldValue {
+				return fileInstanceGets(receiver, args...)
+			}); handled {
+				if prev != nil && GetGlobalVariable != nil {
+					SetGlobalVariableIfAvailable("$_", prev)
+				}
+				return result
+			}
 		}
 		for {
 			value := fileInstanceGets(receiver, args...)
@@ -81626,6 +87295,25 @@ func ioWriteNonblock(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 }
 
 func normalizeEncodingNameForIO(encoding string) string {
+	needsNormalization := len(encoding) >= 4 && strings.EqualFold(encoding[:4], "BOM|")
+	if !needsNormalization {
+		for i := 0; i < len(encoding); i++ {
+			ch := encoding[i]
+			if ch == '_' || ch >= 'a' && ch <= 'z' {
+				needsNormalization = true
+				break
+			}
+		}
+	}
+	if !needsNormalization {
+		return encoding
+	}
+	switch encoding {
+	case "utf-8":
+		return "UTF-8"
+	case "windows-1252", "Windows-1252":
+		return "WINDOWS-1252"
+	}
 	normalized := make([]byte, 0, len(encoding))
 	for i := 0; i < len(encoding); i++ {
 		ch := encoding[i]
@@ -84185,7 +89873,24 @@ func startValueErr(value *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func arraySlice(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	arr := receiver.Data.([]*object.EmeraldValue)
+	if receiver != nil && len(args) == 1 && args[0] != nil && args[0].Type == object.ValueInteger {
+		if region := receiver.LazyArrayRegionValue(); region != nil && region.ElementAt != nil {
+			start, err := arrayIndexIntArg(args[0])
+			if err != nil {
+				return err
+			}
+			if start < 0 {
+				start = region.Length + start
+			}
+			if start < 0 || start >= region.Length {
+				return R.NilVal
+			}
+			if value, ok := region.ElementAt(start); ok {
+				return value
+			}
+		}
+	}
+	arr, _ := valueToArray(receiver)
 	if len(args) < 1 {
 		return R.NilVal
 	}
@@ -84832,9 +90537,25 @@ func arrayEachWithIndex(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	if enumerableCurrentBlock() == nil {
 		return objectToEnum(receiver, rubySymbol("each_with_index"))
 	}
-	arr := receiver.Data.([]*object.EmeraldValue)
-	for i, elem := range arr {
-		CallBlock(elem, &object.EmeraldValue{Type: object.ValueInteger, Data: int64(i), Class: R.Classes["Integer"]})
+	for i := 0; ; i++ {
+		current := receiver.Data.([]*object.EmeraldValue)
+		if i >= len(current) {
+			break
+		}
+		LastBlockResult = nil
+		ForEachClearNext()
+		result := CallBlock(current[i], newInt(int64(i)))
+		if result != nil && result.Type == object.ValueException && LastException == result {
+			return result
+		}
+		if LastBlockResult != nil {
+			control := LastBlockResult
+			LastBlockResult = nil
+			return control
+		}
+		if ForEachConsumeNext() {
+			continue
+		}
 	}
 	return receiver
 }
@@ -85128,6 +90849,13 @@ func arrayReduce(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		acc = current[0]
 		index = 1
 	}
+	if !hasMethod && ArrayReduceCapturedBlock != nil && CurrentBlockValue != nil {
+		if block := CurrentBlockValue(); block != nil {
+			if result, handled := ArrayReduceCapturedBlock(receiver, block, acc, index); handled {
+				return result
+			}
+		}
+	}
 	for {
 		current = receiver.Data.([]*object.EmeraldValue)
 		if index >= len(current) {
@@ -85338,11 +91066,21 @@ func arraySortBy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if BlockGivenCheck == nil || !BlockGivenCheck() || CallBlock == nil {
 		arr := receiver.Data.([]*object.EmeraldValue)
 		values := append([]*object.EmeraldValue(nil), arr...)
-		return newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
+		enum := newSizedGeneratorEnumerator(int64(len(arr)), func() ([]*object.EmeraldValue, *object.EmeraldValue) {
 			return values, nil
 		})
+		if data, ok := enum.Data.(*enumeratorData); ok {
+			data.eachWithBlock = func(block *object.EmeraldValue) *object.EmeraldValue {
+				return arraySortByWithBlock(receiver, block)
+			}
+		}
+		return enum
 	}
-	result, control := sortedArrayByBlock(receiver)
+	return arraySortByWithBlock(receiver, CurrentBlockValue())
+}
+
+func arraySortByWithBlock(receiver, block *object.EmeraldValue) *object.EmeraldValue {
+	result, control := sortedArrayByBlock(receiver, block)
 	if control != nil {
 		return control
 	}
@@ -85366,7 +91104,7 @@ func arraySortByBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen array")
 	}
-	result, control := sortedArrayByBlock(receiver)
+	result, control := sortedArrayByBlock(receiver, CurrentBlockValue())
 	if control != nil {
 		return control
 	}
@@ -85374,7 +91112,7 @@ func arraySortByBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	return receiver
 }
 
-func sortedArrayByBlock(receiver *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
+func sortedArrayByBlock(receiver, block *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue) {
 	arr := receiver.Data.([]*object.EmeraldValue)
 	type kv struct {
 		orig  *object.EmeraldValue
@@ -85388,7 +91126,7 @@ func sortedArrayByBlock(receiver *object.EmeraldValue) ([]*object.EmeraldValue, 
 		}
 		elem := current[i]
 		previousException := LastException
-		sortK := CallBlock(elem)
+		sortK := CallBlockWithArgs(block, elem)
 		if LastBlockResult != nil {
 			result := LastBlockResult
 			LastBlockResult = nil
@@ -85404,7 +91142,11 @@ func sortedArrayByBlock(receiver *object.EmeraldValue) ([]*object.EmeraldValue, 
 	}
 	for i := 0; i < len(pairs)-1; i++ {
 		for j := 0; j < len(pairs)-i-1; j++ {
-			if compareValues(pairs[j].sortK, pairs[j+1].sortK) > 0 {
+			comparison, errVal := arrayNaturalCompare(pairs[j].sortK, pairs[j+1].sortK)
+			if errVal != nil {
+				return nil, errVal
+			}
+			if comparison > 0 {
 				pairs[j], pairs[j+1] = pairs[j+1], pairs[j]
 			}
 		}
@@ -86339,7 +92081,7 @@ func currentSpecSharedVars() map[string]*object.EmeraldValue {
 	values := make(map[string]*object.EmeraldValue)
 	if mainObj, ok := R.Main.Data.(*object.Object); ok {
 		for _, name := range []string{"@method", "@object"} {
-			if value, exists := mainObj.InstanceVars[name]; exists {
+			if value := mainObj.GetInstanceVar(name); value != nil {
 				values[name] = value
 			}
 		}
@@ -86580,7 +92322,7 @@ func exceptionMessageMatches(exception *object.EmeraldValue, expected *object.Em
 		if !ok || pattern == nil {
 			return false
 		}
-		re, err := regexp.Compile(rubyRegexpCompilePattern(pattern))
+		re, err := compileRubyRegexp(pattern)
 		if err != nil {
 			return false
 		}
@@ -87276,7 +93018,7 @@ func RegisterMspec() {
 			if len(args) == 0 {
 				return R.NilVal
 			}
-			return evaluateIncludeMatcher(expectationPayload(receiver), &includeMatcher{Expected: args})
+			return evaluateIncludeMatcher(expectationPayload(receiver), &includeMatcher{Expected: append([]*object.EmeraldValue(nil), args...)})
 		},
 	})
 
@@ -87544,7 +93286,7 @@ func RegisterMspec() {
 			}
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
-				Data:  &includeMatcher{Expected: args},
+				Data:  &includeMatcher{Expected: append([]*object.EmeraldValue(nil), args...)},
 				Class: R.Classes["Expectation"],
 			}
 		},
@@ -87556,7 +93298,7 @@ func RegisterMspec() {
 		Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
-				Data:  &includeMatcher{Expected: args},
+				Data:  &includeMatcher{Expected: append([]*object.EmeraldValue(nil), args...)},
 				Class: R.Classes["Expectation"],
 			}
 		},
@@ -87613,7 +93355,7 @@ func RegisterMspec() {
 			}
 			argf := newArgfValue(args[0].Data.([]*object.EmeraldValue))
 			if mainObj, ok := R.Main.Data.(*object.Object); ok {
-				mainObj.InstanceVars["@argf"] = argf
+				mainObj.SetInstanceVar("@argf", argf)
 			}
 			if BlockGivenCheck != nil && BlockGivenCheck() && CurrentBlockValue != nil && CallBlockWithArgs != nil {
 				return CallBlockWithArgs(CurrentBlockValue())
@@ -87787,7 +93529,7 @@ func RegisterMspec() {
 		},
 	}
 	if mainObj, ok := R.Main.Data.(*object.Object); ok {
-		mainObj.SingletonMethods["test"] = testMethod
+		mainObj.SetSingletonMethod("test", testMethod)
 	}
 
 	objClass.DefineMethod("before", &object.Method{
@@ -88153,7 +93895,7 @@ func RegisterMspec() {
 			}
 			return &object.EmeraldValue{
 				Type:  object.ValueObject,
-				Data:  &computedByMatcher{Method: method, Args: args[1:]},
+				Data:  &computedByMatcher{Method: method, Args: append([]*object.EmeraldValue(nil), args[1:]...)},
 				Class: R.Classes["Expectation"],
 			}
 		},
@@ -88243,15 +93985,15 @@ func RegisterMspec() {
 			if len(args) > 1 {
 				contextObj, ok := (receiver.Data).(*object.Object)
 				if ok {
-					contextObj.InstanceVars["@method"] = args[1]
+					contextObj.SetInstanceVar("@method", args[1])
 					if len(args) > 2 {
-						contextObj.InstanceVars["@object"] = args[2]
+						contextObj.SetInstanceVar("@object", args[2])
 					}
 				}
 				if mainObj, ok := R.Main.Data.(*object.Object); ok {
-					mainObj.InstanceVars["@method"] = args[1]
+					mainObj.SetInstanceVar("@method", args[1])
 					if len(args) > 2 {
-						mainObj.InstanceVars["@object"] = args[2]
+						mainObj.SetInstanceVar("@object", args[2])
 					}
 				}
 				if objectClass := R.Classes["Object"]; objectClass != nil {
@@ -88561,15 +94303,16 @@ func runSpecExample(example *specExample) {
 		fmt.Printf("  ✓ %s\n", example.Description)
 	}
 	if mainObj, ok := R.Main.Data.(*object.Object); ok {
-		delete(mainObj.InstanceVars, "@method")
-		delete(mainObj.InstanceVars, "@object")
+		variables := mainObj.InstanceVarMap()
+		delete(variables, "@method")
+		delete(variables, "@object")
 		for _, ctx := range specRunner.Contexts {
 			for name, value := range ctx.SharedVars {
-				mainObj.InstanceVars[name] = value
+				mainObj.SetInstanceVar(name, value)
 			}
 		}
 		for name, value := range example.SharedVars {
-			mainObj.InstanceVars[name] = value
+			mainObj.SetInstanceVar(name, value)
 		}
 	}
 	beforeFails := specRunner.FailCount
@@ -88723,6 +94466,28 @@ func exceptionMessage(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		return CallMethod(receiver, "to_s")
 	}
 	return exceptionToS(receiver)
+}
+
+func exceptionInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	exc, ok := receiver.Data.(*object.RException)
+	if !ok || exc == nil {
+		return receiver
+	}
+	if len(args) == 0 {
+		return receiver
+	}
+	exc.MessageValue = args[0]
+	if args[0] == nil || args[0].Type == object.ValueNil {
+		exc.Message = receiver.Class.Name
+	} else if text, errVal := toStringValue(args[0]); errVal == nil {
+		exc.Message = text
+	} else {
+		return errVal
+	}
+	return receiver
 }
 
 func exceptionCause(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -89453,7 +95218,6 @@ func procValueFromCallable(block *object.EmeraldValue, class *object.Class) *obj
 		return &object.EmeraldValue{
 			Type: object.ValueProc,
 			Data: &object.Proc{
-				InstanceVars: make(map[string]*object.EmeraldValue),
 				Native: func(args ...*object.EmeraldValue) *object.EmeraldValue {
 					return methodCall(methodValue, args...)
 				},
@@ -89467,7 +95231,6 @@ func procValueFromCallable(block *object.EmeraldValue, class *object.Class) *obj
 		return &object.EmeraldValue{
 			Type: object.ValueProc,
 			Data: &object.Proc{
-				InstanceVars: make(map[string]*object.EmeraldValue),
 				Native: func(args ...*object.EmeraldValue) *object.EmeraldValue {
 					if len(args) == 0 || CallMethod == nil {
 						return R.NilVal
@@ -89490,7 +95253,10 @@ func procValueFromBlock(block *object.EmeraldValue, class *object.Class) *object
 	case object.ValueProc:
 		source := block.Data.(*object.Proc)
 		copy := *source
-		copy.InstanceVars = make(map[string]*object.EmeraldValue)
+		if copy.Origin == nil {
+			copy.Origin = source
+		}
+		copy.InstanceVars = nil
 		if !copy.IsLambda && copy.ReturnOwnerID == 0 && CurrentFrameID != nil {
 			copy.ReturnOwnerID = CurrentFrameID()
 		}
@@ -89507,7 +95273,6 @@ func procValueFromBlock(block *object.EmeraldValue, class *object.Class) *object
 				ClassStack:       closure.ClassStack,
 				Refinements:      append([]*object.EmeraldValue(nil), closure.Refinements...),
 				RefinementsFixed: closure.RefinementsFixed,
-				InstanceVars:     make(map[string]*object.EmeraldValue),
 				AutoSplat:        true,
 				IsLambda:         false,
 				ReturnOwnerID:    closure.ReturnOwnerID,
@@ -89526,11 +95291,13 @@ func procClassAllocate(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 func procHash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	h := fnv.New64a()
 	proc, _ := receiver.Data.(*object.Proc)
-	identity := fmt.Sprintf("%p:%p", proc.Fn, proc.Env)
-	if proc.Native != nil {
-		identity += fmt.Sprintf(":%x", reflect.ValueOf(proc.Native).Pointer())
+	if proc == nil {
+		return newInt(0)
 	}
-	_, _ = h.Write([]byte(identity))
+	if proc.Origin != nil {
+		proc = proc.Origin
+	}
+	_, _ = fmt.Fprintf(h, "%p", proc)
 	return &object.EmeraldValue{Type: object.ValueInteger, Data: int64(h.Sum64()), Class: R.Classes["Integer"]}
 }
 
@@ -89602,14 +95369,8 @@ func procBinding(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	if binding == nil {
 		binding = &object.RBinding{
-			Self:         R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			Path:         currentSourcePath(),
-			Line:         1,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		}
 	}
 	return &object.EmeraldValue{Type: object.ValueBinding, Data: binding, Class: R.Classes["Binding"]}
@@ -89724,11 +95485,10 @@ func newCurriedProc(target *object.EmeraldValue, arity int, collected []*object.
 	stored := append([]*object.EmeraldValue(nil), collected...)
 	procValue := &object.EmeraldValue{Type: object.ValueProc, Class: R.Classes["Proc"]}
 	proc := &object.Proc{
-		InstanceVars: make(map[string]*object.EmeraldValue),
-		IsLambda:     isLambda,
-		CurryTarget:  target,
-		CurryArgs:    stored,
-		CurryArity:   arity,
+		IsLambda:    isLambda,
+		CurryTarget: target,
+		CurryArgs:   stored,
+		CurryArity:  arity,
 	}
 	proc.Native = func(args ...*object.EmeraldValue) *object.EmeraldValue {
 		combined := append(append([]*object.EmeraldValue(nil), stored...), args...)
@@ -89916,7 +95676,11 @@ func methodToProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		return R.NilVal
 	}
 	method := receiver.Data.(*object.Method)
-	binding := &object.RBinding{Self: method.Receiver, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}}
+	binding := &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+		Self:             method.Receiver,
+		Constants:        map[string]*object.EmeraldValue{},
+	}
 	if fn, ok := method.Fn.(*object.Function); ok && fn != nil {
 		binding.Path = fn.SourcePath
 		binding.Line = fn.DefinitionLine
@@ -89930,7 +95694,6 @@ func methodToProc(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 			NativeArity:    method.Arity,
 			HasNativeArity: true,
 			IsLambda:       true,
-			InstanceVars:   make(map[string]*object.EmeraldValue),
 			SourceMethod:   method,
 			Binding:        binding,
 		},
@@ -90026,9 +95789,8 @@ func composedProc(isLambda bool, fn func(args ...*object.EmeraldValue) *object.E
 	return &object.EmeraldValue{
 		Type: object.ValueProc,
 		Data: &object.Proc{
-			InstanceVars: make(map[string]*object.EmeraldValue),
-			Native:       fn,
-			IsLambda:     isLambda,
+			Native:   fn,
+			IsLambda: isLambda,
 		},
 		Class: R.Classes["Proc"],
 	}
@@ -90560,6 +96322,7 @@ func bindingValue(receiver *object.EmeraldValue) *object.RBinding {
 		return nil
 	}
 	if binding, ok := receiver.Data.(*object.RBinding); ok {
+		binding.MaterializeLocals()
 		return binding
 	}
 	return nil
@@ -90630,8 +96393,12 @@ func bindingLocalVariables(receiver *object.EmeraldValue, args ...*object.Emeral
 	seen := map[string]struct{}{}
 	filter := map[string]struct{}(nil)
 	for current := binding; current != nil; current = current.Parent {
+		current.MaterializeLocals()
 		inherited := map[string]struct{}(nil)
 		if current.ShareAllLocals && current.Parent != nil {
+			for parent := current.Parent; parent != nil; parent = parent.Parent {
+				parent.MaterializeLocals()
+			}
 			inherited = make(map[string]struct{})
 			for parent := current.Parent; parent != nil; parent = parent.Parent {
 				for _, name := range parent.LocalNames {
@@ -90716,6 +96483,7 @@ func bindingLocalVariableDefined(receiver *object.EmeraldValue, args ...*object.
 			return err
 		}
 		for current := binding; current != nil; current = current.Parent {
+			current.MaterializeLocals()
 			if _, ok := current.Locals[name]; ok {
 				return R.TrueVal
 			}
@@ -90752,8 +96520,9 @@ func bindingLocalVariableGet(receiver *object.EmeraldValue, args ...*object.Emer
 		return err
 	}
 	for current := binding; current != nil; current = current.Parent {
+		current.MaterializeLocals()
 		if value, ok := current.Locals[name]; ok {
-			return value
+			return object.DereferenceBindingValue(value)
 		}
 		if bindingHasLocalName(current.LocalNames, name) {
 			return R.NilVal
@@ -90854,35 +96623,29 @@ func bindingHasLocalName(localNames []string, name string) bool {
 func cloneBindingData(binding *object.RBinding) *object.RBinding {
 	if binding == nil {
 		return &object.RBinding{
-			Self:         R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			Path:         currentSourcePath(),
-			Line:         1,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		}
 	}
+	binding.MaterializeLocals()
 	clone := &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{
+			Locals: make(map[string]*object.EmeraldValue, len(binding.Locals)), LocalNames: append([]string{}, binding.LocalNames...),
+			InstanceVars: map[string]*object.EmeraldValue{}, ShareAllLocals: false, SharedLocals: bindingSharedLocals(binding),
+		},
 		Self:                    binding.Self,
 		Block:                   binding.Block,
 		AllowAnonymousBlockPass: binding.AllowAnonymousBlockPass,
 		EvalReturnTargetID:      binding.EvalReturnTargetID,
-		Locals:                  make(map[string]*object.EmeraldValue, len(binding.Locals)),
-		LocalNames:              append([]string{}, binding.LocalNames...),
 		Constants:               binding.Constants,
 		Method:                  binding.Method,
 		BacktraceLabel:          binding.BacktraceLabel,
-		InstanceVars:            map[string]*object.EmeraldValue{},
 		ClassStack:              append([]*object.EmeraldValue(nil), binding.ClassStack...),
 		ClassVarScope:           binding.ClassVarScope,
 		Refinements:             append([]*object.EmeraldValue(nil), binding.Refinements...),
 		Path:                    binding.Path,
 		Line:                    binding.Line,
-		ShareAllLocals:          false,
 		Parent:                  binding,
-		SharedLocals:            bindingSharedLocals(binding),
 	}
 	for name, value := range binding.Locals {
 		clone.Locals[name] = value
@@ -90902,17 +96665,8 @@ func cloneBindingData(binding *object.RBinding) *object.RBinding {
 func cloneBindingDataForEval(binding *object.RBinding) *object.RBinding {
 	if binding == nil {
 		return &object.RBinding{
-			Self:           R.Main,
-			Locals:         map[string]*object.EmeraldValue{},
-			LocalNames:     nil,
-			Constants:      map[string]*object.EmeraldValue{},
-			Method:         "",
-			InstanceVars:   map[string]*object.EmeraldValue{},
-			ClassStack:     nil,
-			ClassVarScope:  nil,
-			Path:           currentSourcePath(),
-			Line:           1,
-			ShareAllLocals: true,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, ShareAllLocals: true},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: currentSourcePath(), Line: 1,
 		}
 	}
 	clone := cloneBindingData(binding)
@@ -90922,6 +96676,9 @@ func cloneBindingDataForEval(binding *object.RBinding) *object.RBinding {
 }
 
 func bindingSharedLocals(binding *object.RBinding) map[string]struct{} {
+	if binding != nil {
+		binding.MaterializeLocals()
+	}
 	if binding == nil || len(binding.LocalNames) == 0 {
 		return nil
 	}
@@ -90946,7 +96703,14 @@ func mergeBindingData(dst, src *object.RBinding) {
 		dst.LocalNames = []string{}
 	}
 	for name, value := range src.Locals {
-		dst.Locals[name] = value
+		existing := dst.Locals[name]
+		liveCell := false
+		if existing != nil {
+			_, liveCell = existing.Data.(object.BindingCell)
+		}
+		if !liveCell {
+			dst.Locals[name] = value
+		}
 		if SetCapturedBindingLocal != nil {
 			SetCapturedBindingLocal(dst, name, value)
 		}
@@ -90976,10 +96740,12 @@ func propagateSharedBindingLocals(binding *object.RBinding) {
 		return
 	}
 	for current := binding; current != nil; current = current.Parent {
+		current.MaterializeLocals()
 		parent := current.Parent
 		if parent == nil {
 			continue
 		}
+		parent.MaterializeLocals()
 		if parent.Locals == nil {
 			parent.Locals = map[string]*object.EmeraldValue{}
 		}
@@ -91019,11 +96785,13 @@ func syncSharedBindingLocalsFromParents(binding *object.RBinding) {
 	if binding == nil || binding.Parent == nil {
 		return
 	}
+	binding.MaterializeLocals()
 	syncSharedBindingLocalsFromParents(binding.Parent)
 	parent := binding.Parent
 	if parent == nil {
 		return
 	}
+	parent.MaterializeLocals()
 	if binding.Locals == nil {
 		binding.Locals = map[string]*object.EmeraldValue{}
 	}
@@ -91353,36 +97121,28 @@ func evalSourceWithBindingArgs(source string, sourceValue *object.EmeraldValue, 
 func cloneBindingWithLocation(binding *object.RBinding, path string, line int64) *object.RBinding {
 	if binding == nil {
 		return &object.RBinding{
-			Self:         R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Constants:    map[string]*object.EmeraldValue{},
-			Method:       "",
-			InstanceVars: map[string]*object.EmeraldValue{},
-			ClassStack:   nil,
-			Path:         path,
-			Line:         line,
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: path, Line: line,
 		}
 	}
 	cloned := &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{
+			Locals: make(map[string]*object.EmeraldValue, len(binding.Locals)), LocalNames: append([]string(nil), binding.LocalNames...),
+			InstanceVars: map[string]*object.EmeraldValue{}, ShareAllLocals: binding.ShareAllLocals, SharedLocals: map[string]struct{}{},
+		},
 		Self:                    binding.Self,
 		Block:                   binding.Block,
 		AllowAnonymousBlockPass: binding.AllowAnonymousBlockPass,
 		EvalReturnTargetID:      binding.EvalReturnTargetID,
-		Locals:                  make(map[string]*object.EmeraldValue, len(binding.Locals)),
-		LocalNames:              append([]string(nil), binding.LocalNames...),
 		Constants:               binding.Constants,
 		Method:                  binding.Method,
 		BacktraceLabel:          binding.BacktraceLabel,
-		InstanceVars:            map[string]*object.EmeraldValue{},
 		ClassStack:              append([]*object.EmeraldValue(nil), binding.ClassStack...),
 		ClassVarScope:           binding.ClassVarScope,
 		Refinements:             append([]*object.EmeraldValue(nil), binding.Refinements...),
 		Path:                    path,
 		Line:                    line,
-		ShareAllLocals:          binding.ShareAllLocals,
 		Parent:                  binding,
-		SharedLocals:            map[string]struct{}{},
 	}
 	for name := range binding.SharedLocals {
 		cloned.SharedLocals[name] = struct{}{}
@@ -91542,7 +97302,7 @@ func moduleAppendFeatures(receiver *object.EmeraldValue, args ...*object.Emerald
 	switch target.Type {
 	case object.ValueClass:
 		if classIncludesModule(target.Data.(*object.Class), module) {
-			return NewArgumentError("cyclic include detected")
+			return receiver
 		}
 		target.Data.(*object.Class).Include(module)
 	case object.ValueModule:
@@ -91566,7 +97326,7 @@ func appendFeaturesForInclude(receiver *object.EmeraldValue, mixin *object.Emera
 		return typeError("Cannot include refinement")
 	}
 	if CallMethod != nil && mixin.Type == object.ValueModule {
-		return CallMethod(mixin, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "append_features", Class: R.Classes["Symbol"]}, receiver)
+		return CallMethod(mixin, "__send__", &object.EmeraldValue{Type: object.ValueSymbol, Data: "append_features", Class: R.Classes["Symbol"]}, receiver)
 	}
 	switch receiver.Type {
 	case object.ValueClass:
@@ -91841,6 +97601,10 @@ func appendUsedRefinement(receiver, refinement *object.EmeraldValue) {
 		}
 	}
 	*used = append(*used, refinement)
+	// Refinement activation changes the effective method lookup graph.  Treat
+	// it like any other method-table mutation so generation-keyed speculative
+	// plans (including per-closure refinement checks) cannot remain stale.
+	object.BumpMethodGeneration()
 }
 
 func RefinedMethod(refinery, receiver *object.EmeraldValue, name string) (*object.Method, bool) {
@@ -92100,17 +97864,7 @@ func moduleExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if receiver.Type != object.ValueModule {
 		return R.NilVal
 	}
-	module := receiver.Data.(*object.Module)
-	for _, arg := range args {
-		if arg.Type == object.ValueModule {
-			mixin := arg.Data.(*object.Module)
-			if mixin.IsRefinement {
-				return typeError("Cannot extend refinement")
-			}
-			module.Extend(mixin)
-		}
-	}
-	return R.NilVal
+	return objectExtend(receiver, args...)
 }
 
 func moduleExtendObject(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -92127,17 +97881,10 @@ func moduleExtendObject(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	module := receiver.Data.(*object.Module)
 	switch target.Type {
 	case object.ValueObject:
-		_, ok := target.Data.(*object.Object)
-		if !ok {
-			return R.NilVal
-		}
 		singleton := methodSingletonClass(target)
-		if singleton.Type == object.ValueClass {
+		if singleton != nil && singleton.Type == object.ValueClass {
 			cls := singleton.Data.(*object.Class)
 			cls.Include(module)
-			for name, constant := range module.Constants {
-				cls.DefineConstant(name, constant)
-			}
 		}
 	case object.ValueClass:
 		class := target.Data.(*object.Class)
@@ -92149,9 +97896,6 @@ func moduleExtendObject(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		} else {
 			class.Extend(module)
 		}
-		for name, constant := range module.Constants {
-			class.DefineConstant(name, constant)
-		}
 	default:
 		singleton := methodSingletonClass(target)
 		if singleton == nil || singleton.Type != object.ValueClass {
@@ -92159,9 +97903,6 @@ func moduleExtendObject(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 		}
 		cls := singleton.Data.(*object.Class)
 		cls.Include(module)
-		for name, constant := range module.Constants {
-			cls.DefineConstant(name, constant)
-		}
 	}
 	return target
 }
@@ -92219,7 +97960,7 @@ func prependFeaturesForPrepend(receiver *object.EmeraldValue, mixin *object.Emer
 		return typeError("Cannot prepend refinement")
 	}
 	if CallMethod != nil {
-		return CallMethod(mixin, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "prepend_features", Class: R.Classes["Symbol"]}, receiver)
+		return CallMethod(mixin, "__send__", &object.EmeraldValue{Type: object.ValueSymbol, Data: "prepend_features", Class: R.Classes["Symbol"]}, receiver)
 	}
 	if receiver.Type == object.ValueClass {
 		receiver.Data.(*object.Class).Prepend(mixin.Data.(*object.Module))
@@ -92257,7 +97998,7 @@ func callIncludedHook(mixin *object.EmeraldValue, target *object.EmeraldValue) *
 	if mixin != nil && mixin.Type == object.ValueClass && mixin.Data == R.Classes["Kernel"] {
 		return nil
 	}
-	hook := CallMethod(mixin, "send", &object.EmeraldValue{Type: object.ValueSymbol, Data: "included", Class: R.Classes["Symbol"]}, target)
+	hook := CallMethod(mixin, "__send__", &object.EmeraldValue{Type: object.ValueSymbol, Data: "included", Class: R.Classes["Symbol"]}, target)
 	if hook != nil && hook.Type == object.ValueException && !isNoMethodError(hook) {
 		return hook
 	}
@@ -92265,27 +98006,10 @@ func callIncludedHook(mixin *object.EmeraldValue, target *object.EmeraldValue) *
 }
 
 func classExtend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	if receiver.Type != object.ValueClass {
+	if receiver == nil || receiver.Type != object.ValueClass {
 		return R.NilVal
 	}
-	class := receiver.Data.(*object.Class)
-	for _, arg := range args {
-		if arg.Type == object.ValueModule {
-			module := arg.Data.(*object.Module)
-			if module.IsRefinement {
-				return typeError("Cannot extend refinement")
-			}
-			singleton := methodSingletonClass(receiver)
-			if singleton != nil && singleton.Type == object.ValueClass {
-				singletonClass := singleton.Data.(*object.Class)
-				singletonClass.Include(module)
-				class.SingletonClass = singletonClass
-			} else {
-				class.Extend(module)
-			}
-		}
-	}
-	return R.NilVal
+	return objectExtend(receiver, args...)
 }
 
 func classPrepend(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

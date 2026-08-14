@@ -81,6 +81,24 @@ func pathnameEmpty(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	return boolValue(len(entries) == 0)
 }
 
+func pathnameExist(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	path, _ := pathnameString(receiver)
+	_, err := os.Stat(path)
+	return boolValue(err == nil)
+}
+
+func pathnameFile(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	path, _ := pathnameString(receiver)
+	info, err := os.Stat(path)
+	return boolValue(err == nil && info.Mode().IsRegular())
+}
+
+func pathnameDirectory(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	path, _ := pathnameString(receiver)
+	info, err := os.Stat(path)
+	return boolValue(err == nil && info.IsDir())
+}
+
 func pathnameJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	result, ok := pathnameString(receiver)
 	if !ok {
@@ -103,6 +121,14 @@ func pathnameJoin(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 func pathnameParent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	path, _ := pathnameString(receiver)
 	return pathnameValue(filepath.Dir(filepath.Clean(path)))
+}
+
+func pathnameCleanpath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) > 1 {
+		return argumentError("wrong number of arguments")
+	}
+	path, _ := pathnameString(receiver)
+	return pathnameValue(filepath.Clean(path))
 }
 
 func pathnameRealpath(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {

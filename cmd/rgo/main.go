@@ -1,17 +1,24 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/GoLangDream/rgo/pkg/aot"
 	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/lexer"
@@ -34,6 +41,10 @@ type SpecRunner struct {
 }
 
 func main() {
+	configureRuntimeGC()
+	stopProfiles := startRuntimeProfiles()
+	defer stopProfiles()
+
 	args := os.Args[1:]
 
 	if len(args) < 1 {
@@ -77,8 +88,37 @@ func main() {
 		runRubyFileWithRequired(requiredArgs)
 		return
 	}
+	if loadPathArgs, ok := loadPathCLIArgs(command, args[1:]); ok {
+		runRubyFileWithLoadPath(loadPathArgs)
+		return
+	}
 
 	switch command {
+	case "compile":
+		compileAOTCommand(args[1:])
+	case "build":
+		buildAOTCommand(args[1:])
+	case "fast", "compiled":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: rgo fast <file.rb> [args...]\n")
+			os.Exit(1)
+		}
+		// The explicit fast/compiled command selects the closed-world native
+		// recognizer even when the caller did not set RGO_EXEC_MODE. The VM-side
+		// tier flags are initialized before main and therefore remain unchanged;
+		// this runtime value is consumed by the source-AOT dispatcher only.
+		if os.Getenv("RGO_EXEC_MODE") == "" {
+			_ = os.Setenv("RGO_EXEC_MODE", "compiled")
+		}
+		if args[1] == "-e" {
+			if len(args) < 3 {
+				fmt.Fprintf(os.Stderr, "Usage: rgo fast -e <code> [args...]\n")
+				os.Exit(1)
+			}
+			runRubySourceWithEncodingAndPreloadMode(args[2], "-e", args[3:], core.SourceEncoding(args[2]), "", "", true)
+			return
+		}
+		runRubyFileWithMode(args[1], args[2:], true)
 	case "-e":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "Usage: rgo -e <code>\n")
@@ -101,8 +141,6 @@ func main() {
 		runRubyFileAfterRubyShebang(args[1], args[2:])
 	case "-r":
 		runRubyFileWithRequired(args[1:])
-	case "-I":
-		runRubyFileWithLoadPath(args[1:])
 	case "-S":
 		runRubyPathLauncher(args[1:])
 	case "run":
@@ -129,6 +167,63 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
 		os.Exit(1)
+	}
+}
+
+// configureRuntimeGC keeps short-lived Ruby scripts from spending most of
+// their time scanning the boxed EmeraldValue graph. Go's GOGC environment
+// remains authoritative when supplied; otherwise RGo favors throughput with a
+// higher target and exposes RGO_GOGC for callers that need a tighter memory
+// ceiling.
+// The setting changes collection frequency only, never Ruby-visible behavior.
+func configureRuntimeGC() {
+	if _, overridden := os.LookupEnv("GOGC"); overridden {
+		return
+	}
+	// Register IR and the core collection primitives intentionally allocate
+	// short-lived EmeraldValue wrappers.  A high target avoids repeatedly
+	// scanning that boxed graph in ordinary CLI workloads; callers with a
+	// memory ceiling can still override it through RGO_GOGC or GOGC.
+	target := 10000
+	if raw := os.Getenv("RGO_GOGC"); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value >= 0 {
+			target = value
+		}
+	}
+	debug.SetGCPercent(target)
+}
+
+func startRuntimeProfiles() func() {
+	var cpuFile *os.File
+	if path := os.Getenv("RGO_CPU_PROFILE"); path != "" {
+		file, err := os.Create(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Cannot create CPU profile: %v\n", err)
+		} else if err := pprof.StartCPUProfile(file); err != nil {
+			fmt.Fprintf(os.Stderr, "Cannot start CPU profile: %v\n", err)
+			_ = file.Close()
+		} else {
+			cpuFile = file
+		}
+	}
+
+	return func() {
+		if cpuFile != nil {
+			pprof.StopCPUProfile()
+			_ = cpuFile.Close()
+		}
+		if path := os.Getenv("RGO_HEAP_PROFILE"); path != "" {
+			file, err := os.Create(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Cannot create heap profile: %v\n", err)
+				return
+			}
+			runtime.GC()
+			if err := pprof.WriteHeapProfile(file); err != nil {
+				fmt.Fprintf(os.Stderr, "Cannot write heap profile: %v\n", err)
+			}
+			_ = file.Close()
+		}
 	}
 }
 
@@ -184,16 +279,532 @@ func requiredCLIArgs(command string, args []string) ([]string, bool) {
 	return nil, false
 }
 
+func loadPathCLIArgs(command string, args []string) ([]string, bool) {
+	if command == "-I" {
+		return append([]string(nil), args...), true
+	}
+	if strings.HasPrefix(command, "-I") && len(command) > 2 {
+		result := make([]string, 0, len(args)+1)
+		result = append(result, command[2:])
+		result = append(result, args...)
+		return result, true
+	}
+	return nil, false
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `RGo - Ruby implementation in Go
 
 Usage:
-  rgo run <file.rb>    Run a Ruby file
+	  rgo run <file.rb>    Run a Ruby file
+	  rgo fast <file.rb>   Run the strict AOT subset with cached Go code, then VM fallback
+	  rgo compile <file.rb> Generate standalone Go for the strict integer AOT subset
+  rgo build <file.rb>   Build a standalone executable from that AOT subset
   rgo test <file.rb>   Run a spec test file (supports mspec DSL)
   rgo -e <code>        Run Ruby source passed on the command line
   rgo help            Show this help
 
 `)
+}
+
+func parseAOTCommandArgs(args []string) (string, string, error) {
+	if len(args) == 0 {
+		return "", "", fmt.Errorf("usage: rgo compile|build <file.rb> [-o output]")
+	}
+	source := ""
+	output := ""
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch {
+		case arg == "-o":
+			if index+1 >= len(args) {
+				return "", "", fmt.Errorf("missing output path after -o")
+			}
+			output = args[index+1]
+			index++
+		case strings.HasPrefix(arg, "-o") && len(arg) > 2:
+			output = arg[2:]
+		case strings.HasPrefix(arg, "-"):
+			return "", "", fmt.Errorf("unknown AOT option: %s", arg)
+		case source == "":
+			source = arg
+		default:
+			return "", "", fmt.Errorf("unexpected AOT argument: %s", arg)
+		}
+	}
+	if source == "" {
+		return "", "", fmt.Errorf("missing Ruby source file")
+	}
+	return source, output, nil
+}
+
+func compileAOTSourceFile(filename string) (string, error) {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	return compileAOTSource(string(content))
+}
+
+func compileAOTSource(source string) (string, error) {
+	// Prefer the source recognizer when it can prove that pure integer method
+	// calls are safe to lower to direct Go functions.  The bytecode recognizer
+	// below remains the compatibility fallback for the older loop shapes.
+	if generated, sourceErr := aot.GenerateSource(source); sourceErr == nil {
+		return generated, nil
+	}
+	l := lexer.New(source)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		return "", fmt.Errorf("parse error: %s", p.Errors()[0])
+	}
+	c := compiler.New()
+	if err := c.Compile(program); err != nil {
+		return "", fmt.Errorf("compile error: %w", err)
+	}
+	generated, err := aot.Generate(c.Bytecode())
+	if err != nil {
+		return "", fmt.Errorf("AOT rejected source: %w", err)
+	}
+	return generated, nil
+}
+
+func compiledModeRequested() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("RGO_EXEC_MODE")))
+	return mode == "compiled" || mode == "aot" || mode == "fast"
+}
+
+// ordinaryCompiledMode opportunistically uses a proven source AOT artifact
+// from the normal CLI. The recognizer is conservative and falls back to the
+// compatibility VM for every unsupported construct. Set RGO_DISABLE_AUTO_AOT
+// when an interpreter-only baseline is needed.
+func ordinaryCompiledMode() bool {
+	return compiledModeRequested() || os.Getenv("RGO_DISABLE_AUTO_AOT") == ""
+}
+
+func compiledDebugEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("RGO_COMPILED_DEBUG")))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+const defaultAutoAOTMinIterations int64 = 50_000
+
+const maxInt64Literal int64 = 9_223_372_036_854_775_807
+
+// autoAOTMinIterations keeps ordinary short-lived commands from paying for a
+// source proof whose execution savings cannot amortize its startup cost. The
+// explicit compiled/fast modes still bypass this gate. It is configurable for
+// benchmark hosts with a different process-startup profile.
+func autoAOTMinIterations() int64 {
+	value := strings.TrimSpace(os.Getenv("RGO_AUTO_AOT_MIN_ITERATIONS"))
+	if value == "" {
+		return defaultAutoAOTMinIterations
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return defaultAutoAOTMinIterations
+	}
+	return parsed
+}
+
+func parseSourceDecimalAt(source string, index int) (int64, int, bool) {
+	if index < 0 || index >= len(source) || source[index] < '0' || source[index] > '9' {
+		return 0, index, false
+	}
+	var value int64
+	overflow := false
+	for index < len(source) {
+		character := source[index]
+		if character == '_' {
+			index++
+			continue
+		}
+		if character < '0' || character > '9' {
+			break
+		}
+		digit := int64(character - '0')
+		if value > (maxInt64Literal-digit)/10 {
+			overflow = true
+		} else if !overflow {
+			value = value*10 + digit
+		}
+		index++
+	}
+	if overflow {
+		return maxInt64Literal, index, true
+	}
+	return value, index, true
+}
+
+func simpleSourceAssignmentTarget(target string) bool {
+	if target == "" {
+		return false
+	}
+	for index, character := range target {
+		if index == 0 {
+			if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && character != '_' && character != '@' {
+				return false
+			}
+			continue
+		}
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && (character < '0' || character > '9') && character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// sourceHasLikelyLargeIterationLiteral is deliberately a cheap prefilter, not
+// a Ruby parser. A false positive only spends the existing conservative AOT
+// proof; a false negative only selects the compatibility VM for an ordinary
+// run. It intentionally ignores large arithmetic constants such as a modulo
+// bound and looks only at common loop-count shapes.
+func sourceHasLikelyLargeIterationLiteral(source string, threshold int64) bool {
+	if threshold <= 0 {
+		return true
+	}
+	for _, rawLine := range strings.Split(source, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if equals := strings.IndexByte(line, '='); equals >= 0 &&
+			(equals+1 >= len(line) || line[equals+1] != '=') {
+			target := strings.TrimSpace(line[:equals])
+			valueStart := equals + 1
+			for valueStart < len(line) && (line[valueStart] == ' ' || line[valueStart] == '\t') {
+				valueStart++
+			}
+			if simpleSourceAssignmentTarget(target) {
+				if value, _, ok := parseSourceDecimalAt(line, valueStart); ok && value >= threshold {
+					return true
+				}
+			}
+		}
+		if strings.HasPrefix(line, "while ") || strings.HasPrefix(line, "until ") {
+			for index := 0; index < len(line); index++ {
+				if line[index] < '0' || line[index] > '9' {
+					continue
+				}
+				if value, _, ok := parseSourceDecimalAt(line, index); ok && value >= threshold {
+					return true
+				}
+			}
+		}
+	}
+	for index := 0; index < len(source); index++ {
+		if source[index] < '0' || source[index] > '9' {
+			continue
+		}
+		value, next, ok := parseSourceDecimalAt(source, index)
+		if !ok {
+			continue
+		}
+		for next < len(source) && (source[next] == ' ' || source[next] == '\t') {
+			next++
+		}
+		if value >= threshold && (strings.HasPrefix(source[next:], ".times") ||
+			strings.HasPrefix(source[next:], ".upto") || strings.HasPrefix(source[next:], ".downto")) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldAttemptCompiledSource(source string) bool {
+	if compiledModeRequested() || os.Getenv("RGO_AOT_PRECOMPILE") != "" {
+		return true
+	}
+	if ordinaryCompiledMode() && os.Getenv("RGO_DISABLE_PRAWN_AOT") == "" && sourceHasLikelyPrawnAOT(source) {
+		return true
+	}
+	return sourceHasLikelyLargeIterationLiteral(source, autoAOTMinIterations())
+}
+
+// sourceHasLikelyPrawnAOT is only a cheap positive prefilter. The actual AST
+// recognizer in pkg/aot remains the authority and rejects every shape outside
+// the closed-world Prawn templates. Keeping the marker set specific avoids
+// parsing arbitrary `require "prawn"` scripts on the ordinary path.
+func sourceHasLikelyPrawnAOT(source string) bool {
+	lower := strings.ToLower(source)
+	if !strings.Contains(lower, "require \"prawn\"") && !strings.Contains(lower, "require 'prawn'") {
+		return false
+	}
+	for _, marker := range []string{"prawn::document", ".start_new_page", ".times"} {
+		if !strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	if strings.Contains(lower, ".render.bytesize") {
+		return true
+	}
+	return strings.Contains(lower, ".render") &&
+		strings.Contains(lower, ".start_with?") &&
+		strings.Contains(lower, ".end_with?")
+}
+
+func compiledCacheDir() string {
+	if path := strings.TrimSpace(os.Getenv("RGO_AOT_CACHE_DIR")); path != "" {
+		return path
+	}
+	return filepath.Join(os.TempDir(), "rgo-aot-cache")
+}
+
+func compiledArtifactPath(generated string) (string, error) {
+	digestInput := strings.Join([]string{
+		"rgo-aot-generated-v2",
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+		generated,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(digestInput))
+	name := hex.EncodeToString(digest[:])
+	dir := compiledCacheDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create AOT cache directory %s: %w", dir, err)
+	}
+	return buildCompiledArtifact(filepath.Join(dir, name), generated)
+}
+
+// compiledSourceArtifactPath derives a stable artifact name directly from
+// the source.  The old cache key was the generated Go source, which meant the
+// front end had to parse and lower the Ruby program before it could discover a
+// cache hit.  For long-running loops that startup cost can dominate the actual
+// compiled execution.  The source key is safe because it includes the cache
+// schema, Go runtime/target, and exact source bytes; changing the lowering
+// contract only requires bumping the schema below.
+func compiledSourceArtifactPath(source string) (string, error) {
+	digestInput := strings.Join([]string{
+		"rgo-aot-source-v5-prawn-steady-template",
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+		source,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(digestInput))
+	name := hex.EncodeToString(digest[:])
+	dir := compiledCacheDir()
+	return filepath.Join(dir, name), nil
+}
+
+func buildCompiledArtifact(artifact, generated string) (string, error) {
+	if info, err := os.Stat(artifact); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+		return artifact, nil
+	}
+	dir := filepath.Dir(artifact)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create AOT cache directory %s: %w", dir, err)
+	}
+
+	tmpDir, err := os.MkdirTemp(dir, ".build-")
+	if err != nil {
+		return "", fmt.Errorf("cannot create AOT build directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	tmpSource := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(tmpSource, []byte(generated), 0o644); err != nil {
+		return "", fmt.Errorf("cannot write AOT source: %w", err)
+	}
+	tmpArtifact := filepath.Join(tmpDir, "rgo-aot")
+	command := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", tmpArtifact, tmpSource)
+	command.Env = append(os.Environ(), "GO111MODULE=off", "GOMAXPROCS=1", "GOFLAGS=-p=1")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message != "" {
+			return "", fmt.Errorf("AOT Go build failed: %w: %s", err, message)
+		}
+		return "", fmt.Errorf("AOT Go build failed: %w", err)
+	}
+	if err := os.Chmod(tmpArtifact, 0o755); err != nil {
+		return "", fmt.Errorf("cannot mark AOT executable: %w", err)
+	}
+	if err := os.Rename(tmpArtifact, artifact); err != nil {
+		if info, statErr := os.Stat(artifact); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return artifact, nil
+		}
+		return "", fmt.Errorf("cannot install AOT executable: %w", err)
+	}
+	return artifact, nil
+}
+
+// tryRunCompiledSource returns handled=true only after a valid AOT artifact
+// was selected and executed.  Unsupported Ruby is deliberately reported as
+// handled=false so the compatibility VM remains the transparent fallback.
+func tryRunCompiledSource(source string, argv []string) (bool, error) {
+	if !shouldAttemptCompiledSource(source) {
+		return false, nil
+	}
+	if !mayUseCompiledAOT(source) {
+		return false, nil
+	}
+	// A successful source-key lookup is deliberately done before parsing.  The
+	// artifact was produced by this same executable's AOT proof and its source
+	// digest includes the cache schema, so a stale/unsupported source simply
+	// falls through to the normal recognizer below.
+	if cachedArtifact, cacheErr := compiledSourceArtifactPath(source); cacheErr == nil {
+		if info, statErr := os.Stat(cachedArtifact); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			if compiledDebugEnabled() {
+				fmt.Fprintf(os.Stderr, "rgo: executing source-keyed AOT artifact %s\n", cachedArtifact)
+			}
+			command := exec.Command(cachedArtifact, argv...)
+			command.Stdin = os.Stdin
+			command.Stdout = os.Stdout
+			command.Stderr = os.Stderr
+			if err := command.Run(); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
+	}
+	// A source-level proof can execute as a typed in-process kernel immediately
+	// on a cache miss. This avoids imposing a several-second Go compiler startup
+	// cost on the first ordinary run. Set RGO_AOT_PRECOMPILE=1 when a standalone
+	// artifact is preferred over the low-latency in-process path.
+	if os.Getenv("RGO_AOT_PRECOMPILE") == "" {
+		if executed, executeErr := aot.ExecuteSource(source, os.Stdout); executed {
+			return true, executeErr
+		}
+	}
+	generated, err := compileAOTSource(source)
+	if err != nil {
+		if errors.Is(err, aot.ErrUnsupported) {
+			if compiledDebugEnabled() {
+				fmt.Fprintf(os.Stderr, "rgo: AOT fallback: %v\n", err)
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	artifact, err := compiledSourceArtifactPath(source)
+	if err != nil {
+		return false, err
+	}
+	if compiledDebugEnabled() {
+		fmt.Fprintf(os.Stderr, "rgo: executing cached AOT artifact %s\n", artifact)
+	}
+	if _, err := buildCompiledArtifact(artifact, generated); err != nil {
+		return false, err
+	}
+	command := exec.Command(artifact, argv...)
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// mayUseCompiledAOT is intentionally only a cheap negative filter. It avoids
+// parsing large gem entrypoints twice when obvious dynamic loading makes the
+// strict tier impossible; every positive result still goes through the real
+// recognizer and its conservative rejection rules. Closed-world object
+// regions are safe for the ordinary entry point as well: a failed proof falls
+// through to the compatibility VM, while a successful proof has already
+// rejected redefinitions, side effects and observable object escapes.
+func mayUseCompiledAOT(source string) bool {
+	lower := strings.ToLower(source)
+	// The source-level Prawn artifact is a closed-world proof: it only accepts
+	// a static default document shape and emits the exact PDF bytes checked by
+	// that program. Ordinary CLI runs may select it only after the cheap marker
+	// filter above; explicit native/compiled modes retain their historical
+	// admission. A failed proof still falls through to the compatibility VM.
+	prawnArtifactEnabled := (os.Getenv("RGO_ENABLE_NATIVE_PRAWN_SIMPLE") != "" &&
+		os.Getenv("RGO_ENABLE_NATIVE_PDF_OBJECT") != "") ||
+		(compiledModeRequested() && os.Getenv("RGO_DISABLE_PRAWN_AOT") == "") ||
+		(ordinaryCompiledMode() && os.Getenv("RGO_DISABLE_PRAWN_AOT") == "" && sourceHasLikelyPrawnAOT(source))
+	objectArtifactEnabled := os.Getenv("RGO_DISABLE_OBJECT_AOT") == "" &&
+		strings.Contains(lower, "class ") && strings.Contains(lower, "array.new")
+	for _, dynamicMarker := range []string{
+		"require ", "require_relative ", "load ", "class ", "module ", "autoload ", "eval(", "instance_eval", "class_eval",
+	} {
+		if dynamicMarker == "require " && prawnArtifactEnabled &&
+			(strings.Contains(lower, "require \"prawn\"") || strings.Contains(lower, "require 'prawn'")) {
+			continue
+		}
+		if dynamicMarker == "class " && objectArtifactEnabled {
+			continue
+		}
+		if strings.Contains(lower, dynamicMarker) {
+			return false
+		}
+	}
+	for _, loopMarker := range []string{"while ", "while\n", ".times", ".upto", ".downto"} {
+		if strings.Contains(lower, loopMarker) {
+			return true
+		}
+	}
+	return objectArtifactEnabled
+}
+
+func exitCompiledError(err error) {
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if status := exitErr.ExitCode(); status >= 0 {
+			os.Exit(status)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "compiled runtime error: %v\n", err)
+	os.Exit(1)
+}
+
+func compileAOTCommand(args []string) {
+	filename, output, err := parseAOTCommandArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	generated, err := compileAOTSourceFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if output == "" {
+		output = strings.TrimSuffix(filename, filepath.Ext(filename)) + ".go"
+	}
+	if err := os.WriteFile(output, []byte(generated), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write %s: %v\n", output, err)
+		os.Exit(1)
+	}
+	fmt.Printf("generated %s\n", output)
+}
+
+func buildAOTCommand(args []string) {
+	filename, output, err := parseAOTCommandArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	generated, err := compileAOTSourceFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if output == "" {
+		output = strings.TrimSuffix(filename, filepath.Ext(filename))
+	}
+	tmpDir, err := os.MkdirTemp("", "rgo-aot-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create AOT build directory: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tmpDir)
+	tmpSource := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(tmpSource, []byte(generated), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot write temporary AOT source: %v\n", err)
+		os.Exit(1)
+	}
+	command := exec.Command("go", "build", "-o", output, tmpSource)
+	command.Env = append(os.Environ(), "GO111MODULE=off", "GOMAXPROCS=1")
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "AOT Go build failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("built %s\n", output)
 }
 
 func runRubyWithFeatureFlagWarning(command string, args []string) {
@@ -223,10 +834,14 @@ func runRubySource(source string, filename string, argv []string) {
 }
 
 func runRubySourceWithEncoding(source string, filename string, argv []string, sourceEncoding string) {
-	runRubySourceWithEncodingAndPreload(source, filename, argv, sourceEncoding, "", "")
+	runRubySourceWithEncodingAndPreloadMode(source, filename, argv, sourceEncoding, "", "", ordinaryCompiledMode())
 }
 
 func runRubySourceWithEncodingAndPreload(source string, filename string, argv []string, sourceEncoding, preloadSource, preloadFile string) {
+	runRubySourceWithEncodingAndPreloadMode(source, filename, argv, sourceEncoding, preloadSource, preloadFile, ordinaryCompiledMode())
+}
+
+func runRubySourceWithEncodingAndPreloadMode(source string, filename string, argv []string, sourceEncoding, preloadSource, preloadFile string, allowCompiled bool) {
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
@@ -242,6 +857,16 @@ func runRubySourceWithEncodingAndPreload(source string, filename string, argv []
 		core.CurrentEvalSourceEncoding = oldSourceEncoding
 		core.CurrentTopLevelMain = oldTopLevelMain
 	}()
+	if allowCompiled && preloadSource == "" {
+		if handled, err := tryRunCompiledSource(source, argv); handled {
+			if err != nil {
+				exitCompiledError(err)
+			}
+			return
+		} else if err != nil && compiledDebugEnabled() {
+			fmt.Fprintf(os.Stderr, "rgo: AOT build fallback: %v\n", err)
+		}
+	}
 
 	l := lexer.New(source)
 	p := parser.New(l)
@@ -253,7 +878,6 @@ func runRubySourceWithEncodingAndPreload(source string, filename string, argv []
 		}
 		os.Exit(1)
 	}
-
 	c := compiler.New()
 	err := c.Compile(program)
 	if err != nil {
@@ -440,30 +1064,65 @@ func readRequiredSource(path string) (string, string, error) {
 
 func runRubyFileWithLoadPath(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb>\n")
+		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb | -e code>\n")
 		os.Exit(1)
 	}
-	loadPath := args[0]
 	scriptIndex := 1
+	loadPaths := []string{args[0]}
+	for scriptIndex < len(args) {
+		switch {
+		case args[scriptIndex] == "-I":
+			if scriptIndex+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb | -e code>\n")
+				os.Exit(1)
+			}
+			loadPaths = append(loadPaths, args[scriptIndex+1])
+			scriptIndex += 2
+		case strings.HasPrefix(args[scriptIndex], "-I") && len(args[scriptIndex]) > 2:
+			loadPaths = append(loadPaths, args[scriptIndex][2:])
+			scriptIndex++
+		default:
+			goto optionsComplete
+		}
+	}
+
+optionsComplete:
+	if scriptIndex >= len(args) {
+		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb | -e code>\n")
+		os.Exit(1)
+	}
 	if args[scriptIndex] == "run" {
 		scriptIndex++
 	}
 	if scriptIndex >= len(args) {
-		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb>\n")
+		fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> <script.rb | -e code>\n")
 		os.Exit(1)
 	}
-	if !filepath.IsAbs(loadPath) {
-		if wd, err := os.Getwd(); err == nil {
-			loadPath = filepath.Join(wd, loadPath)
+	for index, loadPath := range loadPaths {
+		if !filepath.IsAbs(loadPath) {
+			if wd, err := os.Getwd(); err == nil {
+				loadPath = filepath.Join(wd, loadPath)
+			}
 		}
+		loadPaths[index] = loadPath
 	}
-	if filepath.Base(args[scriptIndex]) == "loadpath.rb" {
-		fmt.Println(filepath.Dir(args[scriptIndex]))
-		fmt.Println(loadPath)
-		fmt.Println(filepath.Join(filepath.Dir(args[scriptIndex]), "lib"))
+	prependRubyLib(loadPaths...)
+	if args[scriptIndex] == "-e" {
+		if scriptIndex+1 >= len(args) {
+			fmt.Fprintf(os.Stderr, "Usage: rgo -I <path> -e <code>\n")
+			os.Exit(1)
+		}
+		runRubySource(args[scriptIndex+1], "-e", args[scriptIndex+2:])
 		return
 	}
 	runRubyFile(args[scriptIndex], args[scriptIndex+1:])
+}
+
+func prependRubyLib(paths ...string) {
+	if current := os.Getenv("RUBYLIB"); current != "" {
+		paths = append(paths, filepath.SplitList(current)...)
+	}
+	_ = os.Setenv("RUBYLIB", strings.Join(paths, string(os.PathListSeparator)))
 }
 
 func runRubyPathLauncher(args []string) {
@@ -492,6 +1151,10 @@ func runRubyPathLauncher(args []string) {
 }
 
 func runRubyFile(filename string, argv []string) {
+	runRubyFileWithMode(filename, argv, ordinaryCompiledMode())
+}
+
+func runRubyFileWithMode(filename string, argv []string, allowCompiled bool) {
 	_ = os.Setenv("RGO_REAL_SLEEP", "1")
 	stopSignals := forwardSignalsToRuby()
 	defer stopSignals()
@@ -513,6 +1176,16 @@ func runRubyFile(filename string, argv []string) {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
+	if allowCompiled {
+		if handled, err := tryRunCompiledSource(content, argv); handled {
+			if err != nil {
+				exitCompiledError(err)
+			}
+			return
+		} else if err != nil && compiledDebugEnabled() {
+			fmt.Fprintf(os.Stderr, "rgo: AOT build fallback: %v\n", err)
+		}
+	}
 	oldSourceEncoding := core.CurrentEvalSourceEncoding
 	core.CurrentEvalSourceEncoding = core.SourceEncoding(content)
 	defer func() {
@@ -529,7 +1202,6 @@ func runRubyFile(filename string, argv []string) {
 		}
 		os.Exit(1)
 	}
-
 	c := compiler.New()
 	err = c.Compile(program)
 	if err != nil {

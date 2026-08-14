@@ -76,6 +76,40 @@ func parseWithErrors(input string) []string {
 	return p.Errors()
 }
 
+func TestParseQualifiedUppercaseMethodCall(t *testing.T) {
+	expr := parseExpr(t, `UpperMethod::Build(42)`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "Build" {
+		t.Fatalf("expected Build MethodCall, got %T %#v", expr, expr)
+	}
+	receiver, ok := call.Receiver.(*ast.Constant)
+	if !ok || receiver.Name != "UpperMethod" {
+		t.Fatalf("expected UpperMethod receiver, got %T %#v", call.Receiver, call.Receiver)
+	}
+}
+
+func TestParsePercentSymbolArrayAsBareCallArgument(t *testing.T) {
+	expr := parseExpr(t, `Set.new %i[get post]`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "new" || len(call.Args) != 1 {
+		t.Fatalf("expected Set.new with one argument, got %T %#v", expr, expr)
+	}
+	array, ok := call.Args[0].(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 2 {
+		t.Fatalf("expected two-element symbol array argument, got %T %#v", call.Args[0], call.Args[0])
+	}
+}
+
+func TestParseMultilineHashValueOmissionBeforeClosingBrace(t *testing.T) {
+	parse(t, `def options(type, optional, default)
+  {
+    type:,
+    optional:,
+    default:
+  }.compact
+end`)
+}
+
 func TestPercentWordsDecodeEscapedBackslash(t *testing.T) {
 	expr := parseExpr(t, `%w[\\]`)
 	array, ok := expr.(*ast.ArrayLiteral)
@@ -300,6 +334,45 @@ func TestParenthesizedSuperHasExplicitSingleExpressionArgument(t *testing.T) {
 	}
 }
 
+func TestSuperSeparatesKeywordSplatAndStaticKeywordArguments(t *testing.T) {
+	program := parse(t, `def value(x, **options); super(x, **options, enabled: true); end`)
+	statement := program.Statements[0].(*ast.ExpressionStatement)
+	definition := statement.Expression.(*ast.DefExpression)
+	bodyStatement := definition.Body.Statements[0].(*ast.ExpressionStatement)
+	superExpression := bodyStatement.Expression.(*ast.SuperExpression)
+	if superExpression.ImplicitArgs || len(superExpression.Args) != 2 || len(superExpression.KeywordArgs) != 1 {
+		t.Fatalf("expected positional, keyword splat and static keyword, got implicit=%v args=%d keywords=%d",
+			superExpression.ImplicitArgs, len(superExpression.Args), len(superExpression.KeywordArgs))
+	}
+}
+
+func TestBareSuperContinuesKeywordArgumentsAfterCommaAndNewline(t *testing.T) {
+	program := parse(t, `def initialize(config_path:, key_path:, env_key:)
+  super content_path: config_path, key_path: key_path,
+    env_key: env_key
+end`)
+	statement := program.Statements[0].(*ast.ExpressionStatement)
+	definition := statement.Expression.(*ast.DefExpression)
+	bodyStatement := definition.Body.Statements[0].(*ast.ExpressionStatement)
+	superExpression := bodyStatement.Expression.(*ast.SuperExpression)
+	if superExpression.ImplicitArgs || len(superExpression.KeywordArgs) != 3 {
+		t.Fatalf("expected three explicit super keyword arguments, implicit=%v keywords=%d",
+			superExpression.ImplicitArgs, len(superExpression.KeywordArgs))
+	}
+}
+
+func TestParseSuperDoBlockInsideIfBranch(t *testing.T) {
+	parse(t, `def call(*args)
+  if args.empty?
+    :empty
+  else
+    super(*args) do
+      :value
+    end
+  end
+end`)
+}
+
 func TestKeywordAndHasLowerPrecedenceThanAssignment(t *testing.T) {
 	expr := parseExpr(t, `x = 1 and y = 2`)
 	logical, ok := expr.(*ast.InfixExpression)
@@ -329,6 +402,39 @@ func TestUndefParsesEveryCommaSeparatedMethod(t *testing.T) {
 	undef, ok := parseExpr(t, `undef :first, :second`).(*ast.UndefExpression)
 	if !ok || len(undef.Methods) != 2 {
 		t.Fatalf("expected two undef methods, got %T: %s", undef, undef.String())
+	}
+}
+
+func TestUndefPreservesPostfixIf(t *testing.T) {
+	expr := parseExpr(t, `undef :missing if private_method_defined? :missing`)
+	conditional, ok := expr.(*ast.IfExpression)
+	if !ok || conditional.Consequent == nil || len(conditional.Consequent.Statements) != 1 {
+		t.Fatalf("expected postfix IfExpression, got %T %#v", expr, expr)
+	}
+	statement := conditional.Consequent.Statements[0].(*ast.ExpressionStatement)
+	undef, ok := statement.Expression.(*ast.UndefExpression)
+	if !ok || len(undef.Methods) != 1 || undef.Methods[0].Value != ":missing" {
+		t.Fatalf("expected one conditional undef method, got %T %#v", statement.Expression, statement.Expression)
+	}
+}
+
+func TestUndefPreservesSetterMethodName(t *testing.T) {
+	undef, ok := parseExpr(t, `undef context=`).(*ast.UndefExpression)
+	if !ok || len(undef.Methods) != 1 || undef.Methods[0].Value != "context=" {
+		t.Fatalf("expected setter method name, got %T %#v", undef, undef)
+	}
+}
+
+func TestParseArraySplatEndingWithMultilineDoBlock(t *testing.T) {
+	array, ok := parseExpr(t, `[:html, :attrs, *attrs.sort_by do |attr|
+  [attr[2].to_s, n += 1]
+end]`).(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 3 {
+		t.Fatalf("expected three array elements, got %T: %v", array, array)
+	}
+	splat, ok := array.Elements[2].(*ast.SplatExpression)
+	if !ok || !isBlockMethodCall(splat) {
+		t.Fatalf("expected splatted block call, got %T: %v", array.Elements[2], array.Elements[2])
 	}
 }
 
@@ -873,6 +979,80 @@ func TestParseTernaryWithNewlineConsequent(t *testing.T) {
 	parse(t, "true ?\n [1, 2] : [3]")
 }
 
+func TestParseArrayElementTernaryConditionEndingInArrayLiteral(t *testing.T) {
+	expr := parseExpr(t, `[
+  @seconds == [0] ? nil : (@seconds || ["*"]).join(","),
+  2
+].compact`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "compact" {
+		t.Fatalf("expected compact call on array literal, got %T (%v)", expr, expr)
+	}
+	array, ok := call.Receiver.(*ast.ArrayLiteral)
+	if !ok || len(array.Elements) != 2 {
+		t.Fatalf("expected two array elements, got %T (%v)", call.Receiver, call.Receiver)
+	}
+	if _, ok := array.Elements[0].(*ast.TernaryExpression); !ok {
+		t.Fatalf("expected first element to be ternary, got %T (%v)", array.Elements[0], array.Elements[0])
+	}
+}
+
+func TestParseTernaryWithColonOnFollowingLine(t *testing.T) {
+	parse(t, `formatter = inline ? HTMLInline.new(theme)
+                   : HTML.new`)
+}
+
+func TestParseMultilineTernaryWithProcBlocks(t *testing.T) {
+	parse(t, `proc { |a, p| unbound_method.bind(a).call(*p) }`)
+	parse(t, `wrapper = block.arity.zero? ?
+  proc { |a, _p| unbound_method.bind(a).call } :
+  proc { |a, p| unbound_method.bind(a).call(*p) }`)
+}
+
+func TestParseKeywordNamedMethodAndLineLeadingBooleanOr(t *testing.T) {
+	parse(t, `class Pager
+  def next
+    42
+  end
+
+  def skip?(options)
+    options == {} ||
+      options[:except] ||
+      options[:only]
+  end
+end`)
+}
+
+func TestParseReturnNamedMethod(t *testing.T) {
+	parse(t, `class Clock
+  def return(&block)
+    block.call
+  end
+end`)
+}
+
+func TestParseBareYieldAsFirstCommandArgument(t *testing.T) {
+	parse(t, `assert yield, message`)
+}
+
+func TestParseMultilineGroupedExpressionFollowedByModulo(t *testing.T) {
+	parse(t, `checksum = (
+  7 * (values[0] + values[3]) +
+    3 * (values[1] + values[4])
+) % 10`)
+}
+
+func TestParseMultiplicationByGroupedTernaryWithNestedAssignment(t *testing.T) {
+	expr := parseExpr(t, `25 * ((page = page - 1) < 0 ? 0 : page)`)
+	product, ok := expr.(*ast.InfixExpression)
+	if !ok || product.Operator != "*" {
+		t.Fatalf("expected multiplication, got %T (%v)", expr, expr)
+	}
+	if _, ok := product.Right.(*ast.TernaryExpression); !ok {
+		t.Fatalf("expected grouped ternary on the right, got %T (%v)", product.Right, product.Right)
+	}
+}
+
 func TestParseCaseWhenThenInsideBlock(t *testing.T) {
 	input := `a.fill do |i|
   case i
@@ -959,8 +1139,71 @@ func TestParseRaiseWithExceptionClassAndMessage(t *testing.T) {
 	}
 }
 
+func TestParseRaiseWithScopedExceptionAndKeywordOptions(t *testing.T) {
+	program := parse(t, `raise Pundit::NotAuthorizedError, query: :update?, record: record, policy: policy`)
+	raise, ok := program.Statements[0].(*ast.RaiseExpression)
+	if !ok {
+		t.Fatalf("expected RaiseExpression, got %T", program.Statements[0])
+	}
+	if _, ok := raise.Error.(*ast.ConstantResolution); !ok {
+		t.Fatalf("expected scoped exception class, got %T %#v", raise.Error, raise.Error)
+	}
+	options, ok := raise.Message.(*ast.HashLiteral)
+	if !ok || len(options.Order) != 3 || !raise.MessageIsKeyword {
+		t.Fatalf("expected three keyword options as the message, got %T %#v", raise.Message, raise)
+	}
+	if raise.Backtrace != nil || raise.Keyword != nil {
+		t.Fatalf("unexpected extra raise arguments: %#v", raise)
+	}
+}
+
+func TestParseForInsideProcInsideCaseKeepsCaseElse(t *testing.T) {
+	parse(t, `callback = case next_state
+when Array
+  proc do
+    for item in next_state do
+      next values.pop if item == :pop
+      values << item
+    end
+  end
+else
+  raise "invalid"
+end`)
+}
+
+func TestParsePercentRegexpDelimiterInsideInterpolationString(t *testing.T) {
+	expr := parseExpr(t, `pattern = %r'\b(?:#{keywords.join('|')})\b'`)
+	assignment, ok := expr.(*ast.AssignExpression)
+	if !ok {
+		t.Fatalf("expected assignment, got %T", expr)
+	}
+	regexp, ok := assignment.Value.(*ast.RegexpLiteral)
+	if !ok {
+		t.Fatalf("expected regexp value, got %T", assignment.Value)
+	}
+	if regexp.Pattern != `\b(?:#{keywords.join('|')})\b` || !regexp.Interpolates {
+		t.Fatalf("unexpected interpolated regexp: %#v", regexp)
+	}
+}
+
 func TestParseRaiseWithPostfixUnless(t *testing.T) {
 	parse(t, `raise "subprocesses leaked" unless leaked.empty?`)
+}
+
+func TestParseRaiseClassAndMessageWithPostfixIf(t *testing.T) {
+	expr := parseExpr(t, `raise RuntimeError, "blocked" if frozen?`)
+	conditional, ok := expr.(*ast.IfExpression)
+	if !ok || conditional.Consequent == nil || len(conditional.Consequent.Statements) != 1 {
+		t.Fatalf("expected postfix IfExpression, got %T %#v", expr, expr)
+	}
+	statement, ok := conditional.Consequent.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected consequent ExpressionStatement, got %T", conditional.Consequent.Statements[0])
+	}
+	raise, ok := statement.Expression.(*ast.RaiseExpression)
+	if !ok || raise.Error == nil || raise.Message == nil {
+		t.Fatalf("expected raise class and message, got %T %#v", statement.Expression, statement.Expression)
+	}
 }
 
 func TestParseRaiseUnlessModifierDoesNotConsumeFollowingBlockStatements(t *testing.T) {
@@ -1441,6 +1684,30 @@ func TestParseTripleEqualsMethodDefinition(t *testing.T) {
 end`)
 }
 
+func TestParseModuleKeywordAsExplicitReceiverMethodName(t *testing.T) {
+	parse(t, `def self.module(*namespaces, default: :nominal, **aliases)
+  [namespaces, default, aliases]
+end`)
+}
+
+func TestParseKeywordArgumentInConstantIndexCall(t *testing.T) {
+	call, ok := parseExpr(t, `TypeClass[value, fn: callable]`).(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "[]" || len(call.Args) != 2 {
+		t.Fatalf("expected constant [] call with two arguments, got %T %#v", call, call)
+	}
+	hash, ok := call.Args[1].(*ast.HashLiteral)
+	if !ok || hash.Token.Type != lexer.COLON || len(hash.Pairs) != 1 {
+		t.Fatalf("expected implicit keyword hash, got %T %#v", call.Args[1], call.Args[1])
+	}
+}
+
+func TestParseKeywordArgumentInDynamicIndexCall(t *testing.T) {
+	call, ok := parseExpr(t, `constructor_type[value, fn: callable]`).(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "[]" || len(call.Args) != 2 {
+		t.Fatalf("expected dynamic [] call with keyword hash, got %T %#v", call, call)
+	}
+}
+
 func TestParseRaiseWithPostfixIfInGroupedExpression(t *testing.T) {
 	parse(t, `(raise if 2 + 2 == 3; /a/)`)
 }
@@ -1450,6 +1717,7 @@ func TestParseThenAsMethodName(t *testing.T) {
 }
 
 func TestParseYieldAsMethodName(t *testing.T) {
+	parse(t, `def yield(source = nil); source; end`)
 	expr := parseExpr(t, "Fiber.yield")
 	call, ok := expr.(*ast.MethodCall)
 	if !ok {
@@ -1575,6 +1843,24 @@ func TestParseInstanceVariableSingletonMethodDefinition(t *testing.T) {
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(program.Statements))
 	}
+}
+
+func TestKeywordParameterNamedIfDoesNotShadowControlFlowIf(t *testing.T) {
+	parse(t, `class State
+  def initialize(values, if: nil)
+    filtered = values.select do |value|
+      value
+    end
+
+    if (found = filtered.detect do |value|
+      value
+    end)
+      found
+    elsif filtered.empty?
+      nil
+    end
+  end
+end`)
 }
 
 func TestParseUnparenthesizedMethodParameters(t *testing.T) {
@@ -1806,6 +2092,13 @@ func TestParseEndlessRangeIndexArgument(t *testing.T) {
 	parse(t, `/a/.match("a")[3..].should == []`)
 }
 
+func TestParseEndlessRangeIndexAsKeywordArgumentValue(t *testing.T) {
+	parse(t, `new(value: content.to_s[2..], private: private)`)
+	parse(t, `def parts
+  @value.split(DOT)[1..]
+end`)
+}
+
 func TestParseRangeWithMethodCallBounds(t *testing.T) {
 	parse(t, `(RangeSpecs::TenfoldSucc.new(0)..RangeSpecs::TenfoldSucc.new(100)).should be_false`)
 }
@@ -1816,6 +2109,10 @@ func TestParseEndlessRangeAssignment(t *testing.T) {
 
 func TestParseExclusiveEndlessRangeAssignment(t *testing.T) {
 	parse(t, `range = (@x...)`)
+}
+
+func TestParseRangeWithCompoundAssignmentEndpoint(t *testing.T) {
+	parse(t, `values = (@index...@index += count).to_a`)
 }
 
 func TestParseBeginlessRangeAssignment(t *testing.T) {
@@ -1933,6 +2230,22 @@ func TestParseArrayLiteralWithBlockCallAndLambdaElements(t *testing.T) {
 	parse(t, `[Proc.new{}, -> {}, proc {}].each { |p| p.binding }`)
 }
 
+func TestParseArrayEndingWithBlockCallBeforeCaseElse(t *testing.T) {
+	parse(t, `case value
+when 1
+  [true, items.any? { |item| item }]
+else
+  [false, false]
+end`)
+}
+
+func TestParseMultilineArrayEndingWithNestedArray(t *testing.T) {
+	parse(t, `[
+  first,
+  value == [3, 0.25]
+]`)
+}
+
 func TestParseMultilineNestedArrayLiteral(t *testing.T) {
 	parse(t, `[[:TEXT, "Posts: "],
   [:OPEN, "<%="],
@@ -2037,6 +2350,63 @@ func TestParseSquigglyHeredocWithTrailingFluentDot(t *testing.T) {
 
 func TestParseSquigglyHeredocWithMarkerLineSuffix(t *testing.T) {
 	parse(t, "eval(<<~CODE).should == nil\n  10\nCODE\n")
+}
+
+func TestParseHeredocAssignmentBeforeConditional(t *testing.T) {
+	parse(t, `def file_collision_help(block_given)
+  help = <<-HELP
+text
+  HELP
+  if block_given
+    help << <<-HELP
+more
+    HELP
+  end
+  help
+end`)
+}
+
+func TestParseEmbeddedDocumentBetweenStatements(t *testing.T) {
+	parse(t, `before
+=begin
+This is documentation, not Ruby = ]
+=end
+after`)
+}
+
+func TestParseMultilineRescueExceptionListWithTernary(t *testing.T) {
+	parse(t, `begin
+  work
+rescue IOError, EOFError,
+       Errno::ECONNRESET,
+       defined?(OpenSSL::SSL) ? OpenSSL::SSL::SSLError : IOError,
+       Timeout::Error => exception
+  exception
+end`)
+}
+
+func TestParseSingleQuotedHeredocWithPunctuationDelimiter(t *testing.T) {
+	parse(t, "target.class_eval <<-'end;', __FILE__, __LINE__ + 1\n  def value\n    1\n  end\nend;\n")
+}
+
+func TestParseTernaryWithBareYieldConsequent(t *testing.T) {
+	parse(t, `value = (block_given? && default.nil?) ? yield : default`)
+}
+
+func TestParseBlockCallAsIfCondition(t *testing.T) {
+	parse(t, `if wait_until(timeout) { generation.status != :waiting }
+  generation.status == :fulfilled
+else
+  false
+end`)
+}
+
+func TestParseConstantResolutionBareKeywordArguments(t *testing.T) {
+	parse(t, `DEBUGGER__::start no_sigint_hook: true, nonstop: true`)
+}
+
+func TestParsePercentCommandLiteralDotChain(t *testing.T) {
+	parse(t, `%x{printf 42}.to_i`)
 }
 
 func TestParseIndentedHeredocWithKeywordArgumentInsideBlock(t *testing.T) {
@@ -2746,6 +3116,139 @@ func TestParseMethodCallOnIndexInsideArrayLiteral(t *testing.T) {
 	}
 }
 
+func TestParseMethodCallOnQualifiedConstantIndexInsideArrayLiteral(t *testing.T) {
+	expr := parseExpr(t, `[[key, Schema::Path[key].to_a.join(DOT)]]`)
+	outer, ok := expr.(*ast.ArrayLiteral)
+	if !ok || len(outer.Elements) != 1 {
+		t.Fatalf("expected one-element outer ArrayLiteral, got %T (%v)", expr, expr)
+	}
+	inner, ok := outer.Elements[0].(*ast.ArrayLiteral)
+	if !ok || len(inner.Elements) != 2 {
+		t.Fatalf("expected two-element inner ArrayLiteral, got %T (%v)", outer.Elements[0], outer.Elements[0])
+	}
+	call, ok := inner.Elements[1].(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "join" {
+		t.Fatalf("expected chained join call, got %T (%v)", inner.Elements[1], inner.Elements[1])
+	}
+}
+
+func TestParseDefaultParameterWithParenthesizedCallChain(t *testing.T) {
+	program := parse(t, `def build(value=Factory.new(1).build); value; end`)
+	definition, ok := program.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected expression statement, got %T", program.Statements[0])
+	}
+	method, ok := definition.Expression.(*ast.DefExpression)
+	if !ok || len(method.ParamDefaults) != 1 {
+		t.Fatalf("expected method with one default, got %T", definition.Expression)
+	}
+	call, ok := method.ParamDefaults[0].(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "build" {
+		t.Fatalf("expected chained build default, got %T (%v)", method.ParamDefaults[0], method.ParamDefaults[0])
+	}
+}
+
+func TestParseHashRocketValuesWithBraceBlocks(t *testing.T) {
+	parse(t, `HOOKS = {
+  :before => Hash.new { BeforeHook },
+  :after => Hash.new { AfterHook }
+}`)
+}
+
+func TestParseInfixAfterIfExpressionEnd(t *testing.T) {
+	expr := parseExpr(t, `(if true; 1; else; 2; end) || 3`)
+	if _, ok := expr.(*ast.InfixExpression); !ok {
+		t.Fatalf("expected infix expression, got %T", expr)
+	}
+	parse(t, `def value; if true; 1; else; 2; end || 3; end`)
+}
+
+func TestParseImplicitHashRocketValueOnNextLine(t *testing.T) {
+	parse(t, `deprecate(
+  "old",
+  :message =>
+    "use " \
+    "new"
+)`)
+}
+
+func TestParseGroupedParenthesizedCallWithBraceBlock(t *testing.T) {
+	parse(t, `def ascending(metadata)
+  return unless (group = metadata.fetch(:group) { metadata[:parent] })
+  group
+end`)
+}
+
+func TestParseDefaultParameterWithNestedBraceBlockCall(t *testing.T) {
+	parse(t, `def register(name, strategy=Custom.new(Proc.new { |value| yield value }))
+  return if name == :global
+  strategy
+end`)
+}
+
+func TestParseExtendAsMethodName(t *testing.T) {
+	parse(t, `def extend(mod, *filters)
+  [mod, filters]
+end`)
+}
+
+func TestParseCaseAndExponentiationAsMethodNames(t *testing.T) {
+	parse(t, `def case(*args)
+  args
+end
+
+def **(a, b)
+  [a, b]
+end
+
+def %(other)
+  other
+end`)
+}
+
+func TestParseIndexWithBraceBlockArgumentBeforeNewline(t *testing.T) {
+	parse(t, `def sorted(input)
+  if input.empty?
+    Hash[input.sort_by { |key, _value| key.to_s }]
+  else
+    input
+  end
+end`)
+}
+
+func TestParseConstantIndexWithSplattedMappedAndInjectedBlock(t *testing.T) {
+	parse(t, `def stringify(arg)
+  case arg
+  when Hash
+    Hash[
+      *arg.map { |key, value|
+        [key, value]
+      }.inject([]) { |result, pair| result + pair }]
+  else
+    arg
+  end
+end`)
+}
+
+func TestParseMultilineGroupedBooleanWithParenthesizedCalls(t *testing.T) {
+	parse(t, `def compatible?(matcher)
+  (
+    !matcher.respond_to?(:failure_message) &&
+    matcher.respond_to?(:legacy_failure_message)
+  ) || (
+    !matcher.respond_to?(:failure_message_when_negated) &&
+    matcher.respond_to?(:legacy_negative_failure_message)
+  )
+end`)
+}
+
+func TestParseCallWithGroupedBlockPassBeforeNewline(t *testing.T) {
+	parse(t, `def substitute(host, method, block, *args)
+  expectation = host.__send__(method, *args, &(@implementation || block))
+  @customizations.each { |customization| customization.call(expectation) }
+end`)
+}
+
 // === helpers ===
 
 func assertIntLit(t *testing.T, expr ast.Expression, expected int64) {
@@ -3238,6 +3741,23 @@ func TestParseArrayKeyHashRocketAsCallArgument(t *testing.T) {
 	}
 }
 
+func TestParseArrayKeyHashRocketAsBareCallArgument(t *testing.T) {
+	expr := parseExpr(t, `receiver.delegate [:start, :clean] => :strategy`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		if match, isMatch := expr.(*ast.PatternMatchExpression); isMatch {
+			t.Fatalf("expected MethodCall, got PatternMatchExpression with left %T", match.Left)
+		}
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected one argument, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[0].(*ast.HashLiteral); !ok {
+		t.Fatalf("expected argument to be HashLiteral, got %T", call.Args[0])
+	}
+}
+
 func TestParseHashRocketValueOnFollowingLine(t *testing.T) {
 	parse(t, `{
 	  @class_file =>
@@ -3257,11 +3777,58 @@ func TestParseHashRocketWithConstantResolutionCallKey(t *testing.T) {
 	parse(t, `{ObjectSpaceFixtures::ObjectToBeFound.new(:hash_key) => :value}`)
 }
 
+func TestParseHashRocketWithTopLevelConstantKey(t *testing.T) {
+	parse(t, `{::String => :str, ::Array => :array}`)
+}
+
 func TestParseHashRocketWithMethodCallKey(t *testing.T) {
 	parse(t, `{
   1.minute => 60,
   1.hour + 15.minutes => 4500
 }`)
+}
+
+func TestParseHashRocketWithStringMethodCallKey(t *testing.T) {
+	parse(t, `{ ">".b => '\u003e'.b }`)
+}
+
+func TestParseHashRocketWithRegexpKey(t *testing.T) {
+	parse(t, `{/features/ => "Cucumber Features"}`)
+}
+
+func TestParseBareRaiseAsKeywordParameterDefault(t *testing.T) {
+	parse(t, `def trigger(event, range: raise, conflict: nil, **arguments); end`)
+}
+
+func TestParseSelfAsMethodDefinitionName(t *testing.T) {
+	parse(t, `def self(token); token; end`)
+}
+
+func TestParseThenOnLineAfterIfCondition(t *testing.T) {
+	parse(t, "value = Array.new.push(if true\nthen :yes\nelse :no\nend)")
+}
+
+func TestParseGroupedOrBareRaiseFollowedByCall(t *testing.T) {
+	parse(t, `def character_offset(source, byte_offset); (source.byteslice(0, byte_offset) or raise).length; end`)
+}
+
+func TestParseGroupedSequenceEndingInNextWithOuterModifier(t *testing.T) {
+	parse(t, `[1].each do |value|; (count += 1; next) if value; end`)
+}
+
+func TestParseGroupedSequenceEndingInNextInsideLogicalExpression(t *testing.T) {
+	parse(t, `loop do
+  ready || (advance; next)
+  break
+end`)
+}
+
+func TestParseHashValueBlockCallFollowedByPair(t *testing.T) {
+	parse(t, `{ a: lambda { |x| x }, b: 1 }`)
+}
+
+func TestParseBareArrowLambdaArgumentInsideBlock(t *testing.T) {
+	parse(t, `Builder.new { run ->(env) { env } }`)
 }
 
 func TestParseMethodCallBlockWithUnaryMinusExpression(t *testing.T) {
@@ -3296,8 +3863,36 @@ func TestParseHashLiteralWithTrailingComma(t *testing.T) {
 	parse(t, "h = {a: 1, b: 2,}")
 }
 
+func TestParseHashLabelsWithoutSpaces(t *testing.T) {
+	parse(t, `h = {a:1,text:"x",items:[true,nil]}`)
+}
+
 func TestParseHashLiteralWithEmptyGroupedKeyAndValue(t *testing.T) {
 	parse(t, "h = {() => ()}")
+}
+
+func TestParseHashLiteralWithArrayCallChainKey(t *testing.T) {
+	parse(t, `h = {[224, 71].pack("U*") => :home}`)
+}
+
+func TestParseCaseProcConditionsKeepClauseBodies(t *testing.T) {
+	expr := parseExpr(t, `case "a"
+when proc { |value| value == "a" }
+  :matched
+when proc { |value| value == "b" }
+  :other
+else
+  :missing
+end`)
+	caseExpr, ok := expr.(*ast.CaseExpression)
+	if !ok {
+		t.Fatalf("expected CaseExpression, got %T", expr)
+	}
+	if len(caseExpr.Clauses) != 2 ||
+		caseExpr.Clauses[0].Body == nil || len(caseExpr.Clauses[0].Body.Statements) != 1 ||
+		caseExpr.Clauses[1].Body == nil || len(caseExpr.Clauses[1].Body.Statements) != 1 {
+		t.Fatalf("unexpected Proc case clause bodies: %s", caseExpr.String())
+	}
 }
 
 func TestParseHashLiteralWithQuotedLabelKey(t *testing.T) {
@@ -3436,6 +4031,10 @@ func TestParseGroupedPostfixIfWithTrailingCall(t *testing.T) {
 	parse(t, "(123 if true).should == 123")
 }
 
+func TestGroupedBraceBlockCallCanHavePostfixIfOutsideParentheses(t *testing.T) {
+	parse(t, `machines << (owner.state_machine(name) {}) if enabled`)
+}
+
 func TestParseGroupedPostfixUnlessWithTrailingCall(t *testing.T) {
 	parse(t, "(123 unless false).should == 123")
 }
@@ -3533,6 +4132,17 @@ ensure
 end`)
 }
 
+func TestParseImplicitEnsureBraceBlockWithModifierInsideClass(t *testing.T) {
+	parse(t, `class EnsureModifierSpec
+  def run(call_method)
+    Symbol.class_eval { undef :call } if call_method
+    yield
+  ensure
+    Symbol.instance_eval { define_method(:call, call_method) } if call_method
+  end
+end`)
+}
+
 func TestParseSuperWithBraceBlock(t *testing.T) {
 	parse(t, `super { break 1 }`)
 }
@@ -3621,6 +4231,18 @@ func TestParseBareSuperWithInfixOperatorTerminates(t *testing.T) {
 
 func TestParseBareSuperAtArrayElementEndTerminates(t *testing.T) {
 	parse(t, `["m", super]`)
+}
+
+func TestParseBareSuperAsFirstBareCallArgument(t *testing.T) {
+	expr := parseExpr(t, `Regexp.union super, Regexp.union(%w(one two))`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "union" || len(call.Args) != 2 {
+		t.Fatalf("expected Regexp.union with two arguments, got %T %#v", expr, expr)
+	}
+	superArg, ok := call.Args[0].(*ast.SuperExpression)
+	if !ok || !superArg.ImplicitArgs {
+		t.Fatalf("expected implicit super first argument, got %T %#v", call.Args[0], call.Args[0])
+	}
 }
 
 func TestParseBareSuperWithShiftOperatorTerminates(t *testing.T) {
@@ -3787,6 +4409,13 @@ end`)
 	}
 }
 
+func TestParseMethodDefinitionWithDefaultAfterNewline(t *testing.T) {
+	parse(t, `def normalize_component(component, character_class=
+    CharacterClassesRegexps::RESERVED_AND_UNRESERVED,
+    leave_encoded='')
+end`)
+}
+
 func TestParseMethodDefinitionWithConstantReceiver(t *testing.T) {
 	program := parse(t, `def TARGET.defs_method
   self
@@ -3807,6 +4436,22 @@ func TestParseMultiAssignWithIndexTargets(t *testing.T) {
 
 func TestParseMultiAssignWithGroupedAccessorTargets(t *testing.T) {
 	parse(t, `(object.a, object.b), c = [:a, :b], nil`)
+}
+
+func TestParseParenthesizedMultiAssignTargets(t *testing.T) {
+	expr := parseExpr(t, `(before, after) = [:first, :last]`)
+	assignment, ok := expr.(*ast.MultiAssignExpression)
+	if !ok {
+		t.Fatalf("expected MultiAssignExpression, got %T", expr)
+	}
+	if len(assignment.Targets) != 2 {
+		t.Fatalf("expected two targets, got %d", len(assignment.Targets))
+	}
+	for i, target := range assignment.Targets {
+		if _, ok := target.(*ast.Identifier); !ok {
+			t.Fatalf("target %d should be an identifier, got %T", i, target)
+		}
+	}
 }
 
 func TestParseMultiAssignWithNestedGroupedTargets(t *testing.T) {
@@ -3941,6 +4586,147 @@ func TestParseBareCallArgumentsAcrossNewlineAfterComma(t *testing.T) {
              ERB::Util.xml_name_escape("#{unsafe_char * 2}#{safe_char}#{unsafe_char}")`)
 }
 
+func TestParseBareCallStringArgumentsAcrossNewlinesAfterCommas(t *testing.T) {
+	expr := parseExpr(t, `fail ::Concurrent::ConcurrentUpdateError,
+     "update failed",
+     "retry the update"`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "fail" {
+		t.Fatalf("expected fail MethodCall, got %T: %s", expr, expr.String())
+	}
+	if len(call.Args) != 3 {
+		t.Fatalf("expected 3 args, got %d: %s", len(call.Args), call.String())
+	}
+}
+
+func TestParseExtendWithScopedConstantArgument(t *testing.T) {
+	expr := parseExpr(t, `extend Utility::EngineDetector`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "extend" || len(call.Args) != 1 {
+		t.Fatalf("expected one-argument extend call, got %T: %s", expr, expr.String())
+	}
+	if _, ok := call.Args[0].(*ast.ConstantResolution); !ok {
+		t.Fatalf("expected scoped constant argument, got %T: %s", call.Args[0], call.Args[0].String())
+	}
+}
+
+func TestParseBareCallWithTopLevelConstantArgument(t *testing.T) {
+	expr := parseExpr(t, `left.merge ::Net::HTTPResponse::CODE_TO_OBJ`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "merge" || len(call.Args) != 1 {
+		t.Fatalf("expected one-argument merge call, got %T: %s", expr, expr.String())
+	}
+	resolution, ok := call.Args[0].(*ast.ConstantResolution)
+	if !ok || resolution.Name == nil || resolution.Name.Value != "CODE_TO_OBJ" {
+		t.Fatalf("expected top-level constant argument, got %T: %s", call.Args[0], call.Args[0].String())
+	}
+}
+
+func TestParseConstantResolutionAfterMethodCallWithoutSpace(t *testing.T) {
+	expr := parseExpr(t, `factory.build::Result`)
+	resolution, ok := expr.(*ast.ConstantResolution)
+	if !ok || resolution.Name == nil || resolution.Name.Value != "Result" {
+		t.Fatalf("expected constant resolution, got %T: %s", expr, expr.String())
+	}
+	if _, ok := resolution.Left.(*ast.MethodCall); !ok {
+		t.Fatalf("expected method call receiver, got %T: %s", resolution.Left, resolution.Left.String())
+	}
+}
+
+func TestParseEndMethodCallInIfModifierDoesNotCloseDefinition(t *testing.T) {
+	program := parse(t, `class LengthLike
+  def initialize(options)
+    if range = true
+      options[:maximum] = 1 if range.end
+    end
+    options[:minimum] = 1
+  end
+end`)
+	stmt := program.Statements[0].(*ast.ExpressionStatement)
+	classExpr := stmt.Expression.(*ast.ClassExpression)
+	if len(classExpr.Body.Statements) != 1 {
+		t.Fatalf("expected only the method definition in class body, got %d statements", len(classExpr.Body.Statements))
+	}
+}
+
+func TestParseScopedSingletonDefinitionWithKeywordMethodName(t *testing.T) {
+	expr := parseExpr(t, `def Flags::true()
+  true
+end`)
+	definition, ok := expr.(*ast.DefExpression)
+	if !ok || definition.Receiver == nil || definition.Name == nil || definition.Name.Value != "true" {
+		t.Fatalf("expected Flags::true singleton definition, got %T: %s", expr, expr.String())
+	}
+}
+
+func TestParseMultilineWhenConditionsAfterComma(t *testing.T) {
+	expr := parseExpr(t, `case :ancestor
+when :following, :following_sibling,
+     :ancestor, :ancestor_or_self
+  :matched
+else
+  :other
+end`)
+	caseExpr, ok := expr.(*ast.CaseExpression)
+	if !ok || len(caseExpr.Clauses) != 1 || len(caseExpr.Clauses[0].Conditions) != 4 {
+		t.Fatalf("expected four multiline when conditions, got %T: %s", expr, expr.String())
+	}
+}
+
+func TestParseBareCallArgumentEndsBeforeLogicalAnd(t *testing.T) {
+	expr := parseExpr(t, `arg.respond_to? :read and arg.respond_to? :eof?`)
+	infix, ok := expr.(*ast.InfixExpression)
+	if !ok || infix.Operator != "and" {
+		t.Fatalf("expected top-level logical and, got %T: %s", expr, expr.String())
+	}
+	left, ok := infix.Left.(*ast.MethodCall)
+	if !ok || left.Method == nil || left.Method.Value != "respond_to?" || len(left.Args) != 1 {
+		t.Fatalf("expected one-argument respond_to? call, got %T: %s", infix.Left, infix.Left.String())
+	}
+}
+
+func TestParseBareDefinedEndsBeforeLogicalAnd(t *testing.T) {
+	expr := parseExpr(t, `used if defined? parent and parent`)
+	modifier, ok := expr.(*ast.IfExpression)
+	if !ok || !modifier.Modifier {
+		t.Fatalf("expected if modifier, got %T: %s", expr, expr.String())
+	}
+	infix, ok := modifier.Condition.(*ast.InfixExpression)
+	if !ok || infix.Operator != "and" {
+		t.Fatalf("expected logical and outside defined?, got %T: %s", modifier.Condition, modifier.Condition.String())
+	}
+	if _, ok := infix.Left.(*ast.DefinedExpression); !ok {
+		t.Fatalf("expected defined? on left side, got %T: %s", infix.Left, infix.Left.String())
+	}
+}
+
+func TestParseKeywordNamedMethodDefinitionAndCall(t *testing.T) {
+	parse(t, `class MaybeValue
+  def or(other)
+    other
+  end
+
+  def then(*args, &block)
+    args
+  end
+
+  def rescue(&block)
+    self.then(block)
+  end
+end
+
+value = MaybeValue.new
+[value.or(1), value.then(2), value.rescue {}]`)
+}
+
+func TestParseMethodDefinitionPassedToBareCallKeepsNestedDoBlock(t *testing.T) {
+	parse(t, `internal def collect(items)
+  items.each do |item|
+    consume(item)
+  end
+end`)
+}
+
 func TestParseReceiverBareCallWithMultipleArguments(t *testing.T) {
 	parse(t, `Regexp.send @method, /hi/, Regexp::IGNORECASE`)
 }
@@ -3988,6 +4774,29 @@ rescue
 end.resume`)
 }
 
+func TestParseImplicitBeginRescueElseEnsureInNestedBlock(t *testing.T) {
+	program := parse(t, `1.times do
+  Object.new do
+    :body
+  rescue StandardError
+    :rescued
+  else
+    :successful
+  ensure
+    :ensured
+  end
+end`)
+	outerCall := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	innerCall := outerCall.Block.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.MethodCall)
+	beginExpr := innerCall.Block.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.BeginExpression)
+	if beginExpr.Else == nil || len(beginExpr.Else.Statements) != 1 {
+		t.Fatalf("expected one implicit rescue else statement, got %#v", beginExpr.Else)
+	}
+	if beginExpr.Ensure == nil || len(beginExpr.Ensure.Statements) != 1 {
+		t.Fatalf("expected one implicit rescue ensure statement, got %#v", beginExpr.Ensure)
+	}
+}
+
 func TestParseYieldWithParenthesizedArguments(t *testing.T) {
 	program := parse(t, `def m(a, b, c)
   yield(a, b, c)
@@ -4018,6 +4827,27 @@ end`)
 	}
 	if len(yield.KeywordArgs) != 1 {
 		t.Fatalf("expected 1 yield keyword arg, got %d", len(yield.KeywordArgs))
+	}
+}
+
+func TestParseYieldWithAnonymousRestForwarding(t *testing.T) {
+	program := parse(t, `def capture(*, **)
+  yield(*, **)
+end`)
+	defn := program.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.DefExpression)
+	stmt := defn.Body.Statements[0].(*ast.ExpressionStatement)
+	yield := stmt.Expression.(*ast.YieldExpression)
+
+	if len(yield.Args) != 2 {
+		t.Fatalf("expected positional and keyword splats, got %d args", len(yield.Args))
+	}
+	first, ok := yield.Args[0].(*ast.SplatExpression)
+	if !ok || first.Token.Type != lexer.MULTIPLY {
+		t.Fatalf("expected anonymous positional splat, got %#v", yield.Args[0])
+	}
+	second, ok := yield.Args[1].(*ast.SplatExpression)
+	if !ok || second.Token.Type != lexer.POW {
+		t.Fatalf("expected anonymous keyword splat, got %#v", yield.Args[1])
 	}
 }
 
@@ -4107,6 +4937,57 @@ end`)
 	want := "{ released_at : ^ ( Time.new( 2010 ) .. Time.new( 2020 ) ) }"
 	if match.Pattern != want {
 		t.Fatalf("expected pattern %q, got %q", want, match.Pattern)
+	}
+}
+
+func TestParsePatternGuardEndingWithBraceBlock(t *testing.T) {
+	expr := parseExpr(t, `case []
+in String then :string
+in Array if [].all? { _1 in String | Integer }
+  :array
+else
+  :other
+end`)
+	caseExpr, ok := expr.(*ast.CaseExpression)
+	if !ok || len(caseExpr.Clauses) != 2 || caseExpr.Else == nil {
+		t.Fatalf("expected two guarded case clauses and an else, got %T: %s", expr, expr.String())
+	}
+}
+
+func TestParseMethodContinuesAfterDoBlockEndingWithOrAssignHash(t *testing.T) {
+	expr := parseExpr(t, `module M
+  def self.capture(defaults: nil, **kw)
+    defaults.each_pair do |key, value|
+      @values[key] ||= {}
+    end
+    kw
+  end
+end`)
+	moduleExpr, ok := expr.(*ast.ModuleExpression)
+	if !ok || len(moduleExpr.Body.Statements) != 1 {
+		t.Fatalf("expected module containing only the method, got %T: %s", expr, expr.String())
+	}
+	stmt, ok := moduleExpr.Body.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected method expression statement, got %T", moduleExpr.Body.Statements[0])
+	}
+	method, ok := stmt.Expression.(*ast.DefExpression)
+	if !ok || len(method.Body.Statements) != 2 {
+		t.Fatalf("expected method to continue after do block, got %T: %s", stmt.Expression, stmt.Expression.String())
+	}
+}
+
+func TestParseSafeNavigationChainStartingOnNextLine(t *testing.T) {
+	expr := parseExpr(t, `value
+  &.strip
+  &.upcase`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || !call.Safe || call.Method.Value != "upcase" {
+		t.Fatalf("expected multiline safe-navigation chain, got %T: %s", expr, expr.String())
+	}
+	receiver, ok := call.Receiver.(*ast.MethodCall)
+	if !ok || !receiver.Safe || receiver.Method.Value != "strip" {
+		t.Fatalf("expected safe strip receiver, got %T: %s", call.Receiver, call.Receiver.String())
 	}
 }
 
@@ -4200,6 +5081,17 @@ func TestParseCatchBraceBlockWithSemicolonExpressions(t *testing.T) {
 	}
 	if catchExpr.Body == nil || len(catchExpr.Body.Statements) != 2 {
 		t.Fatalf("expected two catch body statements, got %#v", catchExpr.Body)
+	}
+}
+
+func TestParseCatchWithExplicitBlockPass(t *testing.T) {
+	expr := parseExpr(t, "catch(:halt, &block)")
+	catchExpr, ok := expr.(*ast.CatchExpression)
+	if !ok {
+		t.Fatalf("expected CatchExpression, got %T", expr)
+	}
+	if !catchExpr.HasBlock || catchExpr.BlockPass == nil || catchExpr.Label == nil || catchExpr.Label.String() != ":halt" {
+		t.Fatalf("expected catch label and explicit block pass, got %#v", catchExpr)
 	}
 }
 
@@ -4357,6 +5249,17 @@ func TestParseMultiAssignmentWithSplatTarget(t *testing.T) {
 	parse(t, "a, b, *c = yield()")
 }
 
+func TestParseMultiAssignmentWithTrailingAnonymousSplatTarget(t *testing.T) {
+	expr := parseExpr(t, "other, * = node")
+	assignment, ok := expr.(*ast.MultiAssignExpression)
+	if !ok {
+		t.Fatalf("expected MultiAssignExpression, got %T", expr)
+	}
+	if len(assignment.Targets) != 2 {
+		t.Fatalf("expected two targets, got %d", len(assignment.Targets))
+	}
+}
+
 func TestParseConsecutiveNestedDestructuredBlockParams(t *testing.T) {
 	parse(t, `describe "taking nested |a, ((b, c), d)|" do
   it "destructures" do
@@ -4410,6 +5313,70 @@ func TestParseKeywordArgNamedPrepend(t *testing.T) {
 	parse(t, `concerning(:Foo, prepend: true) { }`)
 }
 
+func TestParsePositionalParameterNamedPrepend(t *testing.T) {
+	parse(t, `def fold(prepend = 0)
+  prepend = 1
+  prepend
+end`)
+}
+
+func TestParseDefaultParameterContinuesAfterGroupedOperand(t *testing.T) {
+	parse(t, `def detailed(highlight_no_color: (ENV["NO_COLOR"] || "") != "")
+  highlight_no_color
+end`)
+}
+
+func TestParseSingleLineMethodEndingWithBraceBlock(t *testing.T) {
+	parse(t, `class Config
+  def to_h; data.to_h { [_1, send(_1)] } end
+end`)
+}
+
+func TestParseConstantAssignmentWithSingleLineDoBlock(t *testing.T) {
+	parse(t, `module Types
+  TABLE = Hash.new do |hash, type| type => Proc | nil; safe { type } end
+end`)
+}
+
+func TestParseRationalComparisonInModifierCondition(t *testing.T) {
+	parse(t, `value = (hash.fetch(key.to_r, nil) if key.respond_to?(:to_r) && key.to_r != 0r) || nil`)
+}
+
+func TestParseRationalHashRocketKey(t *testing.T) {
+	parse(t, `{0.4r => true}`)
+}
+
+func TestParseScalarRightwardPatternAssignment(t *testing.T) {
+	expr := parseExpr(t, `type => Proc | nil`)
+	if _, ok := expr.(*ast.PatternMatchExpression); !ok {
+		t.Fatalf("expected rightward PatternMatchExpression, got %T", expr)
+	}
+}
+
+func TestParseBareUppercasePredicateAsMethodCall(t *testing.T) {
+	expr := parseExpr(t, `Integer?`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "Integer?" {
+		t.Fatalf("expected uppercase predicate method call, got %T %#v", expr, expr)
+	}
+}
+
+func TestParseReservedInWhenAndElseMethodDefinitions(t *testing.T) {
+	parse(t, `class ReservedMethods
+  def in(value)
+    value
+  end
+
+  def when(value)
+    value
+  end
+
+  def else(value)
+    value
+  end
+end`)
+}
+
 func TestParseKeywordArgNamedUndef(t *testing.T) {
 	expr := parseExpr(t, `value.encode(undef: :replace)`)
 	call, ok := expr.(*ast.MethodCall)
@@ -4448,6 +5415,25 @@ func TestParseCallKeywordShorthandArgs(t *testing.T) {
 		if ident.Value != kw.Name {
 			t.Fatalf("expected shorthand %s value to reference %s, got %s", kw.Name, kw.Name, ident.Value)
 		}
+	}
+}
+
+func TestParseIndexKeywordShorthandArgs(t *testing.T) {
+	parse(t, `Command[tag:, name: "IDLE"]`)
+}
+
+func TestParseIndexMergesMultipleKeywordArguments(t *testing.T) {
+	expr := parseExpr(t, `registry[value, complete: complete, registered: registered]`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected positional value and one keyword hash, got %d args", len(call.Args))
+	}
+	hash, ok := call.Args[1].(*ast.HashLiteral)
+	if !ok || len(hash.Pairs) != 2 {
+		t.Fatalf("expected merged two-entry keyword hash, got %#v", call.Args[1])
 	}
 }
 
@@ -4718,6 +5704,24 @@ func TestParseForwardArgumentsCall(t *testing.T) {
 	parse(t, "bar(...)")
 }
 
+func TestParseMultilineAnonymousBlockForwardingArgument(t *testing.T) {
+	parse(t, `def forward(&)
+  target(
+    :value,
+    &
+  )
+end`)
+}
+
+func TestParseMultilineKeywordOnlyMethodParameters(t *testing.T) {
+	parse(t, `def initialize(
+  namespace_separator: ".",
+  resolver: Object.new,
+  registry: Object.new
+)
+end`)
+}
+
 func TestParseForwardArgumentsMethodCapturesAllArgumentKinds(t *testing.T) {
 	expr := parseExpr(t, `def forward(...); target(...); end`)
 	definition, ok := expr.(*ast.DefExpression)
@@ -4743,12 +5747,247 @@ func TestParseMatchOperatorMethodDefinition(t *testing.T) {
 end`)
 }
 
+func TestParseUnaryBooleanOperatorMethodDefinitions(t *testing.T) {
+	parse(t, `class Predicate
+  def !
+    :negated
+  end
+
+  def ~
+    :inverted
+  end
+end`)
+}
+
 func TestParseEndlessMethodDefinition(t *testing.T) {
 	parse(t, `def greet(person) = "Hi, ".dup.concat person`)
 }
 
+func TestParseKeywordMethodNamesUsedByGems(t *testing.T) {
+	parse(t, `def defined?; true; end`)
+	parse(t, `def options.alias(from, to) = [from, to]`)
+	parse(t, `def options.alias(from, to) = (dict = topdict(from) ; dict[to] = dict[from])`)
+	parse(t, `def options.topdict(name) = (name.length > 1 ? top.long : top.short)
+def options.alias(from, to) = (dict = topdict(from) ; dict[to] = dict[from])`)
+}
+
+func TestParseReservedBooleanOperatorKeywordLabels(t *testing.T) {
+	parse(t, `visitor.(not: true, and: false, or: true)`)
+	parse(t, `{not: true, and: false, or: true}`)
+}
+
+func TestParseMultilineCallChainAfterNestedFinalDoubleSplatArgument(t *testing.T) {
+	parse(t, `options = opts.update(
+  path: path, **tokens, **lookup_options(input: input)
+).to_h`)
+}
+
+func TestParseSafeNavigationCallShorthand(t *testing.T) {
+	parse(t, `before_steps[name]&.each { |step| step&.(result) }`)
+	parse(t, `steps[name]&.(result)`)
+}
+
+func TestParseAliasSetterAndBracketMethodNames(t *testing.T) {
+	parse(t, `alias multipart_part_limit= multipart_file_limit=`)
+	parse(t, `alias [] fetch`)
+	parse(t, `alias []= store`)
+}
+
+func TestParseReservedKeywordParameterNames(t *testing.T) {
+	parse(t, `def delegate(to: nil, private: nil); [to, private]; end`)
+	parse(t, `->(private: nil) { private }`)
+	parse(t, `proc { |private: nil| private }`)
+	parse(t, `def translate(raise: false); translate_key(:key, raise); raise Disabled if false; end`)
+	parse(t, `def translate_key(key, throw, raise); handle_exception((throw && :throw || raise && :raise), key); end`)
+	parse(t, `def call_class(method, public, safe); [method, public, safe]; end`)
+}
+
+func TestParseRequiredPositionalParametersAfterOptionalParameter(t *testing.T) {
+	parse(t, `def ruby_version(version = RUBY_VERSION, comparison, major, minor, patch); end`)
+}
+
+func TestParseRaiseWithExplicitBacktrace(t *testing.T) {
+	parse(t, `raise error, "message", error.backtrace`)
+	parse(t, `raise UnexpectedError, "message", error.backtrace, cause: error`)
+	parse(t, `raise Error,
+  "first line" \
+  " second line"`)
+}
+
+func TestParseMultilinePostfixConditionsUsedByMinitest(t *testing.T) {
+	parse(t, `opts.on "--bisect" if
+  File.basename($0).match?(/minitest/)`)
+	parse(t, `filtered_results.reject!(&:skipped?) unless
+  options[:verbose] or options[:show_skips]`)
+	parse(t, `opts.on "--bisect" if
+  File.basename($0).match?(/minitest/)
+
+opts.on "--include PATTERN" do |value|
+  options[:include] = value
+end
+
+def opts.topdict(name) = (name.length > 1 ? top.long : top.short)
+def opts.alias(from, to) = (dict = topdict(from) ; dict[to] = dict[from])`)
+	parse(t, `def self.process_args args = []
+  OptionParser.new do |opts|
+    def opts.alias(from, to) = (dict = topdict(from) ; dict[to] = dict[from])
+  end
+end`)
+	parse(t, `def self.process_args args = []
+  options = { :io => $stdout }
+  OptionParser.new do |opts|
+    opts.on "-s", "--seed SEED", Integer, "seed" do |m|
+      options[:seed] = m
+    end
+    opts.on "--bisect" if
+      File.basename($0).match?(/minitest/)
+    opts.on "-i", "--include PATTERN" do |a|
+      options[:include] = a
+    end
+    opts.on "-e", "--exclude PATTERN" do |a|
+      options[:exclude] = a
+    end
+    def opts.topdict(name) = (name.length > 1 ? top.long : top.short)
+    def opts.alias(from, to) = (dict = topdict(from) ; dict[to] = dict[from])
+  end
+end`)
+	parse(t, `extra << "skipped" if
+  results.any?(&:skipped?) unless
+  options[:verbose]    or
+  options[:show_skips] or
+  ENV["MT_NO_SKIP_MSG"]`)
+	parse(t, `class SummaryReporter
+  def summary
+    extra << "skipped" if
+      results.any?(&:skipped?) unless
+      options[:verbose]    or
+      options[:show_skips] or
+      ENV["MT_NO_SKIP_MSG"]
+    "summary" % [count, extra.join]
+  end
+end
+class CompositeReporter
+end`)
+	parse(t, `class SummaryReporter < StatisticsReporter
+  def start
+    super
+    self.sync = io.respond_to? :"sync="
+    self.old_sync, io.sync = io.sync, true if self.sync
+  end
+end`)
+	parse(t, `class SummaryReporter < StatisticsReporter
+  def aggregated_results io
+    filtered_results = results.dup
+    filtered_results.reject!(&:skipped?) unless
+      options[:verbose] or options[:show_skips]
+    filtered_results.each_with_index { |result, i|
+      next if skip.include? result.result_code
+      io.puts "%s" % [result]
+    }
+    io
+  end
+end`)
+	parse(t, `class SummaryReporter < StatisticsReporter
+  def start
+    super
+    self.sync = io.respond_to? :"sync="
+    self.old_sync, io.sync = io.sync, true if self.sync
+  end
+
+  def report
+    super
+    io.puts unless options[:verbose]
+    aggregated_results io
+  end
+
+  def statistics
+    "Finished in %.6fs" % [total_time]
+  end
+
+  def aggregated_results io
+    filtered_results = results.dup
+    filtered_results.reject!(&:skipped?) unless
+      options[:verbose] or options[:show_skips]
+    filtered_results.each_with_index { |result, i|
+      next if skip.include? result.result_code
+      io.puts "%s" % [result]
+    }
+    io
+  end
+
+  def summary
+    extra = []
+    extra << "warnings" if options[:Werror]
+    extra << "skipped" if
+      results.any?(&:skipped?) unless
+      options[:verbose] or
+      options[:show_skips] or
+      ENV["MT_NO_SKIP_MSG"]
+    "summary" % [extra.join]
+  end
+end
+
+class CompositeReporter
+end`)
+	parse(t, `value = if system "gdiff", __FILE__, __FILE__ then
+  "gdiff -u"
+elsif system "diff", __FILE__, __FILE__ then
+  "diff -u"
+else
+  nil
+end`)
+}
+
+func TestParseNestedIfAssignmentBeforeOuterElsif(t *testing.T) {
+	parse(t, `if values
+  entry = if deep
+    transform(entry)
+  else
+    interpolate(entry)
+  end
+elsif entry.is_a?(String)
+  raise Error
+end`)
+}
+
+func TestParseWhileConditionEndingInNegatedParenthesizedCall(t *testing.T) {
+	parse(t, `class Queue
+  def swim(k)
+    while k > 1 && ! ordered?(k / 2, k) do
+      k = k / 2
+    end
+  end
+end`)
+}
+
 func TestParsePrivateEndlessMethodDefinition(t *testing.T) {
 	parse(t, `private def instance_variables_to_inspect = []`)
+}
+
+func TestParsePrivateMethodDefinitionContainingBlockParameters(t *testing.T) {
+	parse(t, `private def define_autoloads_for_dir(dir, mod, external:)
+  fs.ls(dir) do |basename, abspath, ftype|
+    [basename, abspath, ftype]
+  end
+end`)
+	parse(t, `private def visit_file(cref, file)
+  if autoload_path = cref.autoload? || registered?(cref)
+    if extension?(autoload_path)
+      shadowed_files << file
+    else
+      promote(file)
+    end
+  elsif cref.defined?
+    shadowed_files << file
+    if location = cref.location
+      log(location)
+    else
+      log(file)
+    end
+  else
+    define_autoload(cref, file)
+  end
+end`)
 }
 
 func TestParseSuperForwardArguments(t *testing.T) {
@@ -4793,6 +6032,56 @@ end`)
 	if defExpr.Receiver == nil {
 		t.Fatal("expected singleton receiver")
 	}
+}
+
+func TestParseForAsSingletonMethodName(t *testing.T) {
+	parse(t, `class Timestamp
+  def self.for(value, offset = :preserve)
+    value
+  end
+end`)
+}
+
+func TestParseMultilineDefaultMethodParameters(t *testing.T) {
+	parse(t, `def timezone(identifier, latitude = nil,
+             longitude = nil, description = nil)
+  [identifier, latitude, longitude, description]
+end`)
+}
+
+func TestParseCommandWrappedMethodDefinitionInsideConditional(t *testing.T) {
+	parse(t, `if RUBY_VERSION >= "3.0.0"
+  def method_missing(name, *args, **kwargs, &block)
+  end
+elsif RUBY_VERSION >= "2.7.0"
+  ruby2_keywords def method_missing(name, *args, &block)
+  end
+else
+  def method_missing(name, *args, &block)
+  end
+end`)
+}
+
+func TestParseMultilineMultiAssignmentValue(t *testing.T) {
+	parse(t, `magic, version, count =
+  ["TZif", "2", 1]`)
+}
+
+func TestParseMultilineMultiAssignmentValuesSeparatedAfterComma(t *testing.T) {
+	parse(t, `inflated,
+plain =
+  entries.select { |_, value| value[:inflated] }.freeze,
+  entries.select { |_, value| !value[:inflated] }.freeze`)
+}
+
+func TestParseIncludeAsMethodName(t *testing.T) {
+	parse(t, `def include(*filenames)
+  filenames.each { |filename| include(filename.to_s) }
+end`)
+	parse(t, `def prepend(*args, &block)
+  resolve
+  @items.send(:prepend, *args, &block)
+end`)
 }
 
 func TestParseParenthesizedLiteralSingletonMethodDefinition(t *testing.T) {
@@ -5004,6 +6293,12 @@ func TestParseEndlessRangeStepEndMethodChain(t *testing.T) {
 	parse(t, `(1...).step(1).end.should == nil`)
 }
 
+func TestParseBeginKeywordMethodNameBeforeComparison(t *testing.T) {
+	parse(t, `if result[0].begin == 0 && result[0].end == -1
+  raise "invalid range"
+end`)
+}
+
 func TestParseDefinedWithoutParentheses(t *testing.T) {
 	parse(t, `(defined? a = 10).should == "assignment"`)
 	parse(t, `(not defined? qqq).should == true`)
@@ -5028,6 +6323,248 @@ func TestParseKeywordLiteralMethodNameAfterDot(t *testing.T) {
 	if call.Method == nil || call.Method.Value != "false" {
 		t.Fatalf("expected false method name, got %#v", call.Method)
 	}
+}
+
+func TestParseCaseKeywordMethodNameAfterDot(t *testing.T) {
+	parse(t, `Sequel.case({filter => 1}, nil)`)
+	parse(t, `Sequel.case({{expression => nil} => null_order}, 1)`)
+	parse(t, `Sequel./(left, Sequel.*(right, 2))`)
+}
+
+func TestParseIfWithAssignedCallsInGroupedBooleanOperand(t *testing.T) {
+	parse(t, `if (v0 = values[0]).is_a?(Array) && ((v1 = values[1]).is_a?(Array) || v1.is_a?(Dataset) || v1.is_a?(LiteralString))
+  [v0, v1]
+end`)
+}
+
+func TestPostfixIfDoesNotConsumeOuterIfEnd(t *testing.T) {
+	program := parse(t, `def adjust(sub)
+  if sub.length == 1 && (range = sub.first).is_a?(Range)
+    value = range.end
+    value -= 1 if range.exclude_end? && value.is_a?(Integer)
+    value
+  else
+    2
+  end
+end`)
+	if len(program.Statements) != 1 {
+		t.Fatalf("expected one definition, got %d statements", len(program.Statements))
+	}
+	expr := program.Statements[0].(*ast.ExpressionStatement).Expression
+	definition := expr.(*ast.DefExpression)
+	outer := definition.Body.Statements[0].(*ast.ExpressionStatement).Expression.(*ast.IfExpression)
+	if outer.Alternative == nil {
+		t.Fatal("expected postfix if to preserve outer if alternative")
+	}
+}
+
+func TestParseNegatedBraceBlockCallBeforeBooleanInfix(t *testing.T) {
+	parse(t, `if !keys.any?{|key| opts[key]} && opts[:uri]
+  opts
+end`)
+}
+
+func TestParseBraceBlockCallBeforeBooleanOr(t *testing.T) {
+	expr := parseExpr(t, `yield_value{1} || []`)
+	infix, ok := expr.(*ast.InfixExpression)
+	if !ok {
+		t.Fatalf("expected InfixExpression, got %T (%v)", expr, expr)
+	}
+	if call, ok := infix.Left.(*ast.MethodCall); !ok || call.Block == nil {
+		t.Fatalf("expected block call on left, got %T (%v)", infix.Left, infix.Left)
+	}
+}
+
+func TestParseParenthesizedRaiseArguments(t *testing.T) {
+	program := parse(t, `raise(ArgumentError, "bad")`)
+	raise, ok := program.Statements[0].(*ast.RaiseExpression)
+	if !ok {
+		t.Fatalf("expected RaiseExpression, got %T", program.Statements[0])
+	}
+	if raise.Error == nil || raise.Message == nil {
+		t.Fatalf("expected error and message arguments, got %#v", raise)
+	}
+}
+
+func TestParseParenthesizedRaiseArgumentsWithTrailingComma(t *testing.T) {
+	program := parse(t, `options[:bounds] || raise(
+  ArgumentError,
+  "missing bounds",
+)
+
+next_value`)
+	statement := program.Statements[0].(*ast.ExpressionStatement)
+	infix, ok := statement.Expression.(*ast.InfixExpression)
+	if !ok {
+		t.Fatalf("expected InfixExpression, got %T", statement.Expression)
+	}
+	raise, ok := infix.Right.(*ast.RaiseExpression)
+	if !ok || raise.Error == nil || raise.Message == nil || raise.Backtrace != nil {
+		t.Fatalf("expected two raise arguments and no backtrace, got %T (%#v)", infix.Right, raise)
+	}
+	if len(program.Statements) != 2 {
+		t.Fatalf("expected following statement after blank line, got %d", len(program.Statements))
+	}
+}
+
+func TestParseMultilineParenthesizedRaiseArgument(t *testing.T) {
+	program := parse(t, `raise(
+  "unexpected value "\
+    "type is #{value.class}"
+)`)
+	raise, ok := program.Statements[0].(*ast.RaiseExpression)
+	if !ok || raise.Error == nil {
+		t.Fatalf("expected raise with a multiline argument, got %T (%#v)", program.Statements[0], raise)
+	}
+}
+
+func TestParseParenthesizedRaiseWithNestedCallBeforeMethodEnd(t *testing.T) {
+	parse(t, `def fail_with(message)
+  raise(ArgumentError.new(message).tap { |error| error.set_backtrace(caller(1)) })
+end`)
+}
+
+func TestParseParenthesizedRaiseWithNestedCallAndPostfixUnless(t *testing.T) {
+	parse(t, `def validate(args)
+  raise(ArgumentError.new("wrong arguments")) unless args.empty?
+end`)
+}
+
+func TestParseTripleNestedParenthesizedCallBeforeDotChain(t *testing.T) {
+	parse(t, `pluralize(underscore(demodulize(name))).to_sym`)
+}
+
+func TestParseBareRaiseAsTernaryBranch(t *testing.T) {
+	parse(t, `raise_on_failure ? raise : value`)
+}
+
+func TestParseRegexpAfterAndKeyword(t *testing.T) {
+	parse(t, `if parameters and /\Aq=([\d.]+)/ =~ parameters
+  quality = 1
+end`)
+}
+
+func TestParseRegexpAfterElseOnSameLine(t *testing.T) {
+	parse(t, `case value; when 1 then /one/; else /other/o; end`)
+}
+
+func TestIndexAssignmentStringKeyMatchingParameterRemainsLiteral(t *testing.T) {
+	standalone := parse(t, `hash["href"]`)
+	standaloneStatement := standalone.Statements[0].(*ast.ExpressionStatement)
+	standaloneIndex, ok := standaloneStatement.Expression.(*ast.IndexExpression)
+	if !ok {
+		t.Fatalf("expected standalone index expression, got %T", standaloneStatement.Expression)
+	}
+	if literal, ok := standaloneIndex.Index.(*ast.StringLiteral); !ok || literal.Value != "href" {
+		t.Fatalf("expected standalone string literal index, got %T: %v", standaloneIndex.Index, standaloneIndex.Index)
+	}
+
+	source := `def assign_link(hash, href); hash["href"] = href; end`
+	l := lexer.New(source)
+	p := New(l)
+	program := p.ParseProgram()
+	if len(p.Errors()) > 0 {
+		t.Fatalf("parse errors: %v", p.Errors())
+	}
+	definition, ok := program.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected definition expression statement, got %T", program.Statements[0])
+	}
+	def, ok := definition.Expression.(*ast.DefExpression)
+	if !ok || len(def.Body.Statements) == 0 {
+		t.Fatalf("expected method definition body, got %T", definition.Expression)
+	}
+	statement, ok := def.Body.Statements[0].(*ast.ExpressionStatement)
+	if !ok {
+		t.Fatalf("expected assignment expression statement, got %T", def.Body.Statements[0])
+	}
+	assign, ok := statement.Expression.(*ast.AssignExpression)
+	if !ok {
+		t.Fatalf("expected index assignment, got %T", statement.Expression)
+	}
+	if literal, ok := assign.Index.(*ast.StringLiteral); !ok || literal.Value != "href" {
+		t.Fatalf("expected string literal index, got %T: %v", assign.Index, assign.Index)
+	}
+}
+
+func TestParseLowPrecedenceNotAssignmentCondition(t *testing.T) {
+	parse(t, `if not data = write_session(request)
+  warn(data)
+elsif deferred
+  defer
+end`)
+}
+
+func TestParseVisibilityKeywordSetterMethodName(t *testing.T) {
+	parse(t, `def public=(value)
+  value
+end`)
+}
+
+func TestInfixRightHandIfConsumesItsOwnEndBeforeOuterElsif(t *testing.T) {
+	parse(t, `if protocol == 3
+  prelude << if pass
+    ["HELLO", pass]
+  else
+    ["HELLO"]
+  end
+elsif pass
+  prelude << ["AUTH", pass]
+end`)
+}
+
+func TestParseIndexArgumentEndingInDoBlock(t *testing.T) {
+	parse(t, `Hash[reply.map do |key, value|
+  [key, value]
+end]`)
+	parse(t, `reply = Hash[reply.map do |key, value|
+  [key, value]
+end]`)
+	parse(t, `def redis_info(reply, command)
+  send_command([]) do |reply|
+    if reply.is_a?(String)
+      if command && command.to_s == "commandstats"
+        reply = Hash[reply.map do |key, value|
+          [key, Hash[value]]
+        end]
+      end
+    end
+    reply
+  end
+end`)
+	parse(t, `Hash[reply.map do |key, value|
+  value = value.split(",").map { |entry| entry.split("=") }
+  [key[/^prefix_(.*)$/, 1], Hash[value]]
+end]`)
+}
+
+func TestParseParenthesizedCallWithAddedZipMapExpressions(t *testing.T) {
+	parse(t, `_join_table_dataset(opts).where(left_keys.zip(left_primary_keys.map{|key| get_column_value(key)}) + right_keys.zip(opts.right_primary_key_methods.map{|key| object.get_column_value(key)})).delete`)
+}
+
+func TestParseNestedParenthesizedCallAtEndOfHashArgument(t *testing.T) {
+	parse(t, `clone(:with=>((options[:with]||EMPTY_ARRAY) + [Hash[opts].merge!(:recursive=>true, :name=>name, :dataset=>nonrecursive.union(recursive, {:all=>opts[:union_all] != false, :from_self=>false}))]).freeze)`)
+}
+
+func TestParseGroupedTernaryHashRocketKey(t *testing.T) {
+	parse(t, `{(keys.length == 1 ? keys.first : keys)=>object.select(*methods).exclude(source.from_value_pairs(methods.zip([]), :OR))}`)
+}
+
+func TestParseCaseBranchWithAssignedBraceBlockCallCondition(t *testing.T) {
+	parse(t, `records.each do |record|
+	  case key
+	  when Array
+	    if (value = key.map{|part| record.get_column_value(part)}) && value.all?
+	      id_map[value] << record
+	    end
+	  when Symbol
+	    if value = record.get_column_value(key)
+	      id_map[value] << record
+	    end
+	  else
+	    raise Error, "unsupported"
+	  end
+	end`)
 }
 
 func TestParseForKeywordMethodNameAfterDot(t *testing.T) {
@@ -5069,6 +6606,33 @@ func TestParseInKeywordMethodNameAfterDot(t *testing.T) {
 	}
 }
 
+func TestParseSuperKeywordMethodNameAfterDot(t *testing.T) {
+	expr := parseExpr(t, `method.super`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok {
+		t.Fatalf("expected MethodCall, got %T", expr)
+	}
+	if call.Method == nil || call.Method.Value != "super" {
+		t.Fatalf("expected super method name, got %#v", call.Method)
+	}
+}
+
+func TestParseSuperKeywordMethodDefinition(t *testing.T) {
+	parse(t, `class MethodWrapper
+  def super(times = 1)
+    times
+  end
+end`)
+}
+
+func TestParsePrivateRedoKeywordMethodDefinition(t *testing.T) {
+	parse(t, `class LineEditor
+  private def redo(key)
+    key
+  end
+end`)
+}
+
 func TestParseLShiftOperatorMethodNameAfterDot(t *testing.T) {
 	expr := parseExpr(t, `y.<<(1)`)
 	call, ok := expr.(*ast.MethodCall)
@@ -5103,6 +6667,17 @@ func TestParseAliasKeywordMethodNameAfterDot(t *testing.T) {
 	}
 	if inner.Method == nil || inner.Method.Value != "alias" {
 		t.Fatalf("expected alias method name, got %#v", inner.Method)
+	}
+}
+
+func TestParseAliasUnaryOperatorMethodName(t *testing.T) {
+	expr := parseExpr(t, `alias -@ opposite`)
+	aliasExpr, ok := expr.(*ast.AliasExpression)
+	if !ok {
+		t.Fatalf("expected AliasExpression, got %T", expr)
+	}
+	if aliasExpr.New.String() != "-@" || aliasExpr.Old.String() != "opposite" {
+		t.Fatalf("unexpected unary alias: %v", aliasExpr)
 	}
 }
 
@@ -5293,5 +6868,36 @@ end
 	`)
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected one outer describe statement, got %d", len(program.Statements))
+	}
+}
+
+func TestKeywordNotCanBeCalledAfterDot(t *testing.T) {
+	expr := parseExpr(t, `relation.where.not(discarded_at: nil)`)
+	notCall, ok := expr.(*ast.MethodCall)
+	if !ok || notCall.Method == nil || notCall.Method.Value != "not" {
+		t.Fatalf("expected dotted not method call, got %#v", expr)
+	}
+	whereCall, ok := notCall.Receiver.(*ast.MethodCall)
+	if !ok || whereCall.Method == nil || whereCall.Method.Value != "where" {
+		t.Fatalf("expected where receiver, got %#v", notCall.Receiver)
+	}
+}
+
+func TestInequalityOperatorCanBeCalledAfterSafeNavigation(t *testing.T) {
+	expr := parseExpr(t, `table_name&.!= node.left.relation.name`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || !call.Safe || call.Method == nil || call.Method.Value != "!=" {
+		t.Fatalf("expected safe-navigation inequality call, got %#v", expr)
+	}
+}
+
+func TestBareCallSplatCanBeFollowedByKeywordArgument(t *testing.T) {
+	expr := parseExpr(t, `delegate *Counter::OPTIONS, to: :counter`)
+	call, ok := expr.(*ast.MethodCall)
+	if !ok || call.Method == nil || call.Method.Value != "delegate" {
+		t.Fatalf("expected delegate call, got %#v", expr)
+	}
+	if len(call.Args) != 1 || len(call.KeywordArgs) != 1 || call.KeywordArgs[0].Name != "to" {
+		t.Fatalf("unexpected delegate arguments: %#v", call)
 	}
 }

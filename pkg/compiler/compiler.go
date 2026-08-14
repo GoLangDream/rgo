@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -16,6 +17,77 @@ import (
 	"github.com/GoLangDream/rgo/pkg/parser"
 	"github.com/GoLangDream/rgo/pkg/parser/ast"
 )
+
+func splitKeywordSplatArgs(args []ast.Expression) ([]ast.Expression, []*ast.SplatExpression) {
+	positional := make([]ast.Expression, 0, len(args))
+	keywordSplats := make([]*ast.SplatExpression, 0)
+	for _, arg := range args {
+		if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+			keywordSplats = append(keywordSplats, splat)
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	if len(keywordSplats) > 0 {
+		filtered := positional[:0]
+		for _, arg := range positional {
+			hash, ok := arg.(*ast.HashLiteral)
+			if ok && (hash.Token.Type == lexer.ARROW || hash.Token.Type == lexer.COLON) {
+				keywordSplats = append(keywordSplats, &ast.SplatExpression{Token: hash.Token, Value: hash})
+				continue
+			}
+			filtered = append(filtered, arg)
+		}
+		positional = filtered
+		sort.SliceStable(keywordSplats, func(i, j int) bool {
+			return tokenBefore(keywordSplats[i].Token, keywordSplats[j].Token)
+		})
+	}
+	return positional, keywordSplats
+}
+
+func tokenBefore(left, right lexer.Token) bool {
+	if left.Line != right.Line {
+		return left.Line < right.Line
+	}
+	return left.Column < right.Column
+}
+
+func (c *Compiler) compileKeywordArgumentHash(keywords []*ast.KeywordArg, splats []*ast.SplatExpression) error {
+	c.emit(OpHash, 0)
+	keywordIndex := 0
+	splatIndex := 0
+	for keywordIndex < len(keywords) || splatIndex < len(splats) {
+		useKeyword := splatIndex >= len(splats) ||
+			(keywordIndex < len(keywords) && tokenBefore(keywords[keywordIndex].Token, splats[splatIndex].Token))
+		if useKeyword {
+			keyword := keywords[keywordIndex]
+			if err := c.Compile(keyword.Value); err != nil {
+				return err
+			}
+			c.EmitConstant(&object.EmeraldValue{
+				Type:  object.ValueSymbol,
+				Data:  normalizedStaticSymbolName(keyword.Name),
+				Class: core.R.Classes["Symbol"],
+			})
+			c.emit(OpHash, 1)
+			c.Emit(OpHashMerge)
+			keywordIndex++
+			continue
+		}
+
+		splat := splats[splatIndex]
+		if _, isNil := splat.Value.(*ast.NilExpression); !isNil {
+			if err := c.Compile(splat.Value); err != nil {
+				return err
+			}
+			c.Emit(OpHashMerge)
+		}
+		splatIndex++
+	}
+	c.Emit(OpMarkKeywordHash)
+	return nil
+}
 
 func negateNumericLiteralCallReceiver(call *ast.MethodCall) (*ast.MethodCall, bool) {
 	if call == nil || call.Receiver == nil {
@@ -46,12 +118,13 @@ func negateNumericLiteralCallReceiver(call *ast.MethodCall) (*ast.MethodCall, bo
 }
 
 const (
-	ScopeGlobal    = "global"
-	ScopeLocal     = "local"
-	ScopeBuiltin   = "builtin"
-	ScopeFree      = "free"
-	ScopeOuter     = "outer"
-	ScopeOuterFree = "outer_free"
+	ScopeGlobal            = "global"
+	ScopeLocal             = "local"
+	ScopeBuiltin           = "builtin"
+	ScopeFree              = "free"
+	ScopeOuter             = "outer"
+	ScopeOuterFree         = "outer_free"
+	anonymousRestLocalName = "__rgo_anonymous_rest"
 )
 
 type Symbol struct {
@@ -199,6 +272,7 @@ type CompilationScope struct {
 
 type Compiler struct {
 	constants          []*object.EmeraldValue
+	integerConstants   map[int64]int
 	scopes             []CompilationScope
 	scopeIndex         int
 	symbolTable        *SymbolTable
@@ -229,11 +303,12 @@ func New() *Compiler {
 	}
 
 	return &Compiler{
-		constants:      []*object.EmeraldValue{},
-		scopes:         []CompilationScope{mainScope},
-		symbolTable:    symbolTable,
-		implicitIt:     map[*SymbolTable]bool{},
-		sourceEncoding: core.CurrentEvalSourceEncoding,
+		constants:        []*object.EmeraldValue{},
+		integerConstants: map[int64]int{},
+		scopes:           []CompilationScope{mainScope},
+		symbolTable:      symbolTable,
+		implicitIt:       map[*SymbolTable]bool{},
+		sourceEncoding:   core.CurrentEvalSourceEncoding,
 	}
 }
 
@@ -352,6 +427,18 @@ func (c *Compiler) globalSymbolIndex(name string) int {
 	}
 	sym := root.DefineGlobal(name)
 	return sym.Index
+}
+
+func (c *Compiler) splatValue(splat *ast.SplatExpression) ast.Expression {
+	if splat == nil {
+		return nil
+	}
+	if ident, ok := splat.Value.(*ast.Identifier); ok && ident.Value == "_" && splat.Token.Literal == "*" {
+		if _, exists := c.symbolTable.Resolve(anonymousRestLocalName); exists {
+			return &ast.Identifier{Token: ident.Token, Value: anonymousRestLocalName}
+		}
+	}
+	return splat.Value
 }
 
 func (c *Compiler) Compile(node interface{}) error {
@@ -984,6 +1071,10 @@ func (c *Compiler) Compile(node interface{}) error {
 			c.Emit(OpFalse)
 		}
 	case *ast.ArrayLiteral:
+		if literal := c.compileLargeImmutableArrayLiteral(node); literal != nil {
+			c.EmitConstant(literal)
+			break
+		}
 		hasSplat := false
 		for _, element := range node.Elements {
 			if _, ok := element.(*ast.SplatExpression); ok {
@@ -1015,6 +1106,33 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.emit(OpArray, len(node.Elements))
 	case *ast.HashLiteral:
 		keys := node.Order
+		hasSplat := false
+		for _, key := range keys {
+			if splat, ok := key.(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+				hasSplat = true
+				break
+			}
+		}
+		if hasSplat {
+			c.emit(OpHash, 0)
+			for _, key := range keys {
+				if splat, ok := key.(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+					if err := c.Compile(splat.Value); err != nil {
+						return err
+					}
+				} else {
+					if err := c.Compile(node.Pairs[key]); err != nil {
+						return err
+					}
+					if err := c.Compile(key); err != nil {
+						return err
+					}
+					c.emit(OpHash, 1)
+				}
+				c.Emit(OpHashMerge)
+			}
+			break
+		}
 		for i := len(keys) - 1; i >= 0; i-- {
 			if err := c.Compile(node.Pairs[keys[i]]); err != nil {
 				return err
@@ -1138,7 +1256,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		if (node.Token.Type == lexer.OR_ASSIGN || node.Token.Type == lexer.AND_ASSIGN) && !isConstantName(node.Name.Value) {
-			if err := c.compileAssignmentCurrentValue(node.Name); err != nil {
+			if err := c.compileAssignmentCurrentValue(node.Name, true); err != nil {
 				return err
 			}
 			c.Emit(OpDup)
@@ -1161,7 +1279,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 
 		if op, ok := compoundAssignmentOpcode(node.Token.Type); ok {
-			if err := c.compileAssignmentCurrentValue(node.Name); err != nil {
+			if err := c.compileAssignmentCurrentValue(node.Name, false); err != nil {
 				return err
 			}
 			if err := c.Compile(node.Value); err != nil {
@@ -1417,6 +1535,8 @@ func (c *Compiler) Compile(node interface{}) error {
 				break
 			}
 		}
+		var keywordSplats []*ast.SplatExpression
+		args, keywordSplats = splitKeywordSplatArgs(args)
 
 		splatCount := 0
 		for i, arg := range args {
@@ -1432,7 +1552,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		if splatCount > 1 {
 			for i, arg := range args {
 				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.MULTIPLY {
-					if err := c.Compile(splat.Value); err != nil {
+					if err := c.Compile(c.splatValue(splat)); err != nil {
 						return err
 					}
 					c.Emit(OpSplatToArray)
@@ -1456,7 +1576,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				compileArg := arg
 				assignmentSplat := false
 				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type != lexer.BIT_AND {
-					compileArg = splat.Value
+					compileArg = c.splatValue(splat)
 					if splat.Token.Type == lexer.MULTIPLY && node.Assignment && i == len(args)-1 {
 						assignmentSplat = true
 					} else if splat.Token.Type == lexer.MULTIPLY && splatIndex == 255 {
@@ -1478,27 +1598,16 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		sendOp := OpSend
 		if len(args) > 0 {
-			if hash, ok := args[len(args)-1].(*ast.HashLiteral); ok && hash.Token.Type == lexer.ARROW {
-				sendOp = OpSendWithKeywords
-			}
-			if splat, ok := args[len(args)-1].(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
+			if hash, ok := args[len(args)-1].(*ast.HashLiteral); ok &&
+				(hash.Token.Type == lexer.ARROW || hash.Token.Type == lexer.COLON) {
 				sendOp = OpSendWithKeywords
 			}
 		}
-		if len(node.KeywordArgs) > 0 {
+		if len(node.KeywordArgs) > 0 || len(keywordSplats) > 0 {
 			sendOp = OpSendWithKeywords
-			for i := len(node.KeywordArgs) - 1; i >= 0; i-- {
-				kwa := node.KeywordArgs[i]
-				if err := c.Compile(kwa.Value); err != nil {
-					return err
-				}
-				c.EmitConstant(&object.EmeraldValue{
-					Type:  object.ValueSymbol,
-					Data:  normalizedStaticSymbolName(kwa.Name),
-					Class: core.R.Classes["Symbol"],
-				})
+			if err := c.compileKeywordArgumentHash(node.KeywordArgs, keywordSplats); err != nil {
+				return err
 			}
-			c.emit(OpHash, len(node.KeywordArgs))
 			argCount++
 		}
 		if node.Assignment {
@@ -1567,12 +1676,7 @@ func (c *Compiler) Compile(node interface{}) error {
 				Class: core.R.Classes["Symbol"],
 			})
 		}
-		methodNameIdx := c.addConstant(&object.EmeraldValue{
-			Type:  object.ValueString,
-			Data:  "undef_method",
-			Class: core.R.Classes["String"],
-		})
-		c.emit(OpSend, methodNameIdx, 0, len(node.Methods), 255)
+		c.emit(OpUndef, len(node.Methods))
 	case *ast.AliasExpression:
 		c.Emit(OpSelf)
 		c.EmitConstant(&object.EmeraldValue{
@@ -1619,8 +1723,12 @@ func (c *Compiler) Compile(node interface{}) error {
 		c.defineParameterPatternLocals(node.ParamPatterns)
 
 		anonymousRestParam := node.RestParam != nil && node.RestParam.Value == "_" && node.RestParam.Token.Literal == "*"
-		if node.RestParam != nil && !anonymousRestParam {
-			c.symbolTable.Define(node.RestParam.Value)
+		if node.RestParam != nil {
+			if anonymousRestParam {
+				c.symbolTable.Define(anonymousRestLocalName)
+			} else {
+				c.symbolTable.Define(node.RestParam.Value)
+			}
 		}
 
 		for _, kp := range node.KeywordParams {
@@ -1698,6 +1806,7 @@ func (c *Compiler) Compile(node interface{}) error {
 		fnObj := &object.Function{
 			Name:                  node.Name.Value,
 			SourcePath:            core.CurrentSpecFile,
+			SourceAbsolutePath:    core.CurrentSpecFileAbsolute,
 			EvalSource:            core.CurrentEvalSource,
 			SourceEncoding:        c.sourceEncoding,
 			DefinitionLine:        int64(node.Token.Line),
@@ -1717,6 +1826,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			KeywordRestOnly:       node.KeywordRestOnly,
 			RejectBlock:           node.RejectBlock,
 			FreeVarNames:          freeVarNames(free),
+			DefinitionVisibility:  node.Visibility,
 		}
 		if node.KeywordRestParam != nil {
 			fnObj.KeywordRestParam = node.KeywordRestParam.Value
@@ -1725,7 +1835,9 @@ func (c *Compiler) Compile(node interface{}) error {
 			fnObj.HasRestParam = true
 			fnObj.AnonymousRestParam = anonymousRestParam
 			fnObj.RestParamIndex = node.RestParamIndex
-			if !anonymousRestParam {
+			if anonymousRestParam {
+				fnObj.RestParamName = anonymousRestLocalName
+			} else {
 				fnObj.RestParamName = node.RestParam.Value
 			}
 		}
@@ -1829,6 +1941,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			Data: &object.Function{
 				Name:               node.Name.Value + "#body",
 				SourcePath:         core.CurrentSpecFile,
+				SourceAbsolutePath: core.CurrentSpecFileAbsolute,
 				EvalSource:         core.CurrentEvalSource,
 				SourceEncoding:     c.sourceEncoding,
 				Instructions:       instructions,
@@ -1883,16 +1996,17 @@ func (c *Compiler) Compile(node interface{}) error {
 		bodyFn := &object.EmeraldValue{
 			Type: object.ValueFunction,
 			Data: &object.Function{
-				Name:           node.Name.Value + "#body",
-				SourcePath:     core.CurrentSpecFile,
-				EvalSource:     core.CurrentEvalSource,
-				SourceEncoding: c.sourceEncoding,
-				Instructions:   instructions,
-				LineMap:        lineMap,
-				NumLocals:      numLocals,
-				GlobalNames:    c.globalNamesCopy(),
-				LocalNames:     localNames,
-				FreeVarNames:   freeVarNames(c.symbolTable.FreeSymbols),
+				Name:               node.Name.Value + "#body",
+				SourcePath:         core.CurrentSpecFile,
+				SourceAbsolutePath: core.CurrentSpecFileAbsolute,
+				EvalSource:         core.CurrentEvalSource,
+				SourceEncoding:     c.sourceEncoding,
+				Instructions:       instructions,
+				LineMap:            lineMap,
+				NumLocals:          numLocals,
+				GlobalNames:        c.globalNamesCopy(),
+				LocalNames:         localNames,
+				FreeVarNames:       freeVarNames(c.symbolTable.FreeSymbols),
 			},
 			Class: core.R.Classes["Class"],
 		}
@@ -1933,17 +2047,18 @@ func (c *Compiler) Compile(node interface{}) error {
 			instructions := c.LeaveScope()
 
 			fnObj := &object.Function{
-				Name:              "__block__",
-				SourcePath:        core.CurrentSpecFile,
-				EvalSource:        core.CurrentEvalSource,
-				SourceEncoding:    c.sourceEncoding,
-				Params:            identifierNames(node.Params),
-				ParamLocalIndices: paramIndices,
-				Instructions:      instructions,
-				LineMap:           lineMap,
-				NumLocals:         numLocals,
-				LocalNames:        localNames,
-				FreeVarNames:      freeVarNames(free),
+				Name:               "__block__",
+				SourcePath:         core.CurrentSpecFile,
+				SourceAbsolutePath: core.CurrentSpecFileAbsolute,
+				EvalSource:         core.CurrentEvalSource,
+				SourceEncoding:     c.sourceEncoding,
+				Params:             identifierNames(node.Params),
+				ParamLocalIndices:  paramIndices,
+				Instructions:       instructions,
+				LineMap:            lineMap,
+				NumLocals:          numLocals,
+				LocalNames:         localNames,
+				FreeVarNames:       freeVarNames(free),
 			}
 
 			fn := &object.EmeraldValue{
@@ -2032,6 +2147,12 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		// Jump out if condition is TRUE (opposite of while)
 		jumpTruthyPos := c.emit(OpJumpTruthy, 9999)
+
+		c.scopes[c.scopeIndex].breakTarget = -1
+		c.scopes[c.scopeIndex].nextPatchPos = []int{}
+		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
+
+		setWhileEndPos := c.emit(OpSetWhileEnd, 0)
 		bodyStart := len(c.currentInstructions())
 		previousRedoTarget := c.scopes[c.scopeIndex].redoTarget
 		previousNextPatchTarget := c.scopes[c.scopeIndex].nextPatchTarget
@@ -2046,9 +2167,23 @@ func (c *Compiler) Compile(node interface{}) error {
 
 		afterBody := len(c.currentInstructions())
 		c.changeOperand(jumpTruthyPos, afterBody)
+		c.changeOperand(setWhileEndPos, afterBody)
+
+		c.scopes[c.scopeIndex].breakTarget = afterBody
 
 		// until returns nil in Ruby
 		c.Emit(OpNil)
+
+		endOfUntil := len(c.currentInstructions())
+		for _, patchPos := range c.scopes[c.scopeIndex].nextPatchPos {
+			c.changeOperand(patchPos, loopStart)
+		}
+		for _, patchPos := range c.scopes[c.scopeIndex].breakValuePatchPos {
+			c.changeOperand(patchPos, endOfUntil)
+		}
+		c.scopes[c.scopeIndex].breakTarget = -1
+		c.scopes[c.scopeIndex].nextPatchPos = []int{}
+		c.scopes[c.scopeIndex].breakValuePatchPos = []int{}
 		c.scopes[c.scopeIndex].nextPatchTarget = previousNextPatchTarget
 		c.scopes[c.scopeIndex].redoTarget = previousRedoTarget
 	case *ast.ForExpression:
@@ -2102,37 +2237,52 @@ func (c *Compiler) Compile(node interface{}) error {
 		}
 	case *ast.YieldExpression:
 		if len(node.Args) > 0 || len(node.KeywordArgs) > 0 {
-			splatIndex := -1
-			for i, arg := range node.Args {
-				compileArg := arg
-				if splat, ok := arg.(*ast.SplatExpression); ok {
-					compileArg = splat.Value
-					if splat.Token.Type == lexer.MULTIPLY && splatIndex < 0 {
-						splatIndex = i
-					}
-				}
-				if err := c.Compile(compileArg); err != nil {
-					return err
-				}
-				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.POW {
-					c.Emit(OpMarkKeywordHash)
+			args, keywordSplats := splitKeywordSplatArgs(node.Args)
+			splatCount := 0
+			for _, arg := range args {
+				if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.MULTIPLY {
+					splatCount++
 				}
 			}
-			argCount := len(node.Args)
-			if len(node.KeywordArgs) > 0 {
-				for i := len(node.KeywordArgs) - 1; i >= 0; i-- {
-					kwa := node.KeywordArgs[i]
-					if err := c.Compile(kwa.Value); err != nil {
+			splatIndex := -1
+			argCount := len(args)
+			if splatCount > 1 {
+				for i, arg := range args {
+					if splat, ok := arg.(*ast.SplatExpression); ok && splat.Token.Type == lexer.MULTIPLY {
+						if err := c.Compile(c.splatValue(splat)); err != nil {
+							return err
+						}
+						c.Emit(OpSplatToArray)
+					} else {
+						if err := c.Compile(arg); err != nil {
+							return err
+						}
+						c.emit(OpArray, 1)
+					}
+					if i > 0 {
+						c.Emit(OpAdd)
+					}
+				}
+				splatIndex = 0
+				argCount = 1
+			} else {
+				for i, arg := range args {
+					compileArg := arg
+					if splat, ok := arg.(*ast.SplatExpression); ok {
+						compileArg = c.splatValue(splat)
+						if splat.Token.Type == lexer.MULTIPLY && splatIndex < 0 {
+							splatIndex = i
+						}
+					}
+					if err := c.Compile(compileArg); err != nil {
 						return err
 					}
-					c.EmitConstant(&object.EmeraldValue{
-						Type:  object.ValueSymbol,
-						Data:  normalizedStaticSymbolName(kwa.Name),
-						Class: core.R.Classes["Symbol"],
-					})
 				}
-				c.emit(OpHash, len(node.KeywordArgs))
-				c.Emit(OpMarkKeywordHash)
+			}
+			if len(node.KeywordArgs) > 0 || len(keywordSplats) > 0 {
+				if err := c.compileKeywordArgumentHash(node.KeywordArgs, keywordSplats); err != nil {
+					return err
+				}
 				argCount++
 			}
 			if splatIndex >= 0 {
@@ -2154,15 +2304,33 @@ func (c *Compiler) Compile(node interface{}) error {
 			if err := c.Compile(node.Message); err != nil {
 				return err
 			}
+			argCount := 2
+			if node.Backtrace != nil {
+				if err := c.Compile(node.Backtrace); err != nil {
+					return err
+				}
+				argCount++
+			}
 			op := OpSend
-			if node.MessageIsKeyword {
+			if node.Keyword != nil {
+				if err := c.Compile(node.Keyword); err != nil {
+					return err
+				}
+				c.Emit(OpMarkKeywordHash)
+				argCount++
+				op = OpSendWithKeywords
+			} else if node.MessageIsKeyword {
 				op = OpSendWithKeywords
 			}
 			c.emit(op, c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
 				Data:  "raise",
 				Class: core.R.Classes["String"],
-			}), 0, 2, 255)
+			}), 0, argCount, 255)
+			// Kernel#raise returns the constructed exception value. OpSend normally
+			// propagates it, while OpRaise also guarantees raise remains non-returning
+			// in expression-value contexts such as a postfix conditional.
+			c.Emit(OpRaise)
 			return nil
 		}
 		if node.Error != nil {
@@ -2212,7 +2380,7 @@ func (c *Compiler) Compile(node interface{}) error {
 			return err
 		}
 	case *ast.SplatExpression:
-		if err := c.Compile(node.Value); err != nil {
+		if err := c.Compile(c.splatValue(node)); err != nil {
 			return err
 		}
 		c.Emit(OpSplat)
@@ -2227,8 +2395,9 @@ func (c *Compiler) Compile(node interface{}) error {
 				break
 			}
 		}
+		var keywordSplats []*ast.SplatExpression
+		args, keywordSplats = splitKeywordSplatArgs(args)
 		splatIndex := 255
-		hasKeywords := false
 		for i, arg := range args {
 			compileArg := arg
 			if splat, ok := arg.(*ast.SplatExpression); ok {
@@ -2237,12 +2406,23 @@ func (c *Compiler) Compile(node interface{}) error {
 					if splatIndex == 255 {
 						splatIndex = i
 					}
-				} else if splat.Token.Type == lexer.POW {
-					compileArg = splat.Value
-					hasKeywords = true
 				}
 			}
 			if err := c.Compile(compileArg); err != nil {
+				return err
+			}
+		}
+		separateKeywordHash := len(node.KeywordArgs) > 0 || len(keywordSplats) > 0
+		keywordHashInArgs := false
+		if len(args) > 0 {
+			if hash, ok := args[len(args)-1].(*ast.HashLiteral); ok &&
+				(hash.Token.Type == lexer.ARROW || hash.Token.Type == lexer.COLON) {
+				keywordHashInArgs = true
+			}
+		}
+		hasKeywords := separateKeywordHash || keywordHashInArgs
+		if separateKeywordHash {
+			if err := c.compileKeywordArgumentHash(node.KeywordArgs, keywordSplats); err != nil {
 				return err
 			}
 		}
@@ -2262,6 +2442,9 @@ func (c *Compiler) Compile(node interface{}) error {
 			blockArg |= 2
 		}
 		argCount := len(args)
+		if separateKeywordHash {
+			argCount++
+		}
 		if node.ImplicitArgs {
 			argCount = 255
 		}
@@ -2437,11 +2620,41 @@ func (c *Compiler) compileDefinedExpression(node *ast.DefinedExpression) {
 		return
 	}
 	if resolution, ok := node.Expression.(*ast.ConstantResolution); ok {
+		if constant, directConstant := resolution.Left.(*ast.Constant); directConstant {
+			leftNameIdx := c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  constant.Name,
+				Class: core.R.Classes["String"],
+			})
+			c.emit(OpDefinedConstant, leftNameIdx)
+			c.Emit(OpDup)
+			leftDefined := c.emit(OpJumpNotNil, 0)
+			missingDone := c.emit(OpJump, 0)
+
+			c.changeOperand(leftDefined, len(c.currentInstructions()))
+			c.Emit(OpPop)
+			c.emit(OpGetConstant, leftNameIdx)
+			c.emit(OpDefined, c.addConstant(&object.EmeraldValue{
+				Type:  object.ValueString,
+				Data:  resolution.Name.Value,
+				Class: core.R.Classes["String"],
+			}))
+			c.changeOperand(missingDone, len(c.currentInstructions()))
+			return
+		}
 		if resolution.Left != nil {
-			if err := c.Compile(resolution.Left); err != nil {
-				c.Emit(OpNil)
-				return
-			}
+			c.compileDefinedGuarded(func() error {
+				if err := c.Compile(resolution.Left); err != nil {
+					return err
+				}
+				c.emit(OpDefined, c.addConstant(&object.EmeraldValue{
+					Type:  object.ValueString,
+					Data:  resolution.Name.Value,
+					Class: core.R.Classes["String"],
+				}))
+				return nil
+			})
+			return
 		} else {
 			c.emit(OpGetConstant, c.addConstant(&object.EmeraldValue{
 				Type:  object.ValueString,
@@ -2633,6 +2846,15 @@ func (c *Compiler) definePatternLocals(pattern string) {
 }
 
 func (c *Compiler) Bytecode() *Bytecode {
+	for _, constant := range c.constants {
+		if constant == nil || constant.Type != object.ValueFunction {
+			continue
+		}
+		if fn, ok := constant.Data.(*object.Function); ok && fn != nil {
+			fn.Constants = c.constants
+			rewriteFastLocalLoads(fn)
+		}
+	}
 	return &Bytecode{
 		Instructions: c.currentInstructions(),
 		LineMap:      c.currentLineMapCopy(),
@@ -2640,6 +2862,43 @@ func (c *Compiler) Bytecode() *Bytecode {
 		NumLocals:    c.symbolTable.MaxSymbols,
 		GlobalNames:  c.globalNamesCopy(),
 		LocalNames:   c.localNames(),
+	}
+}
+
+func rewriteFastLocalLoads(fn *object.Function) {
+	if fn == nil || !fn.MethodBody || len(fn.Instructions) == 0 {
+		return
+	}
+	positions := make([]int, 0, len(fn.Instructions)/2)
+	captured := make(map[byte]bool)
+	for position := 0; position < len(fn.Instructions); {
+		positions = append(positions, position)
+		op := Opcode(fn.Instructions[position])
+		if op == OpGetLocalCell && position+1 < len(fn.Instructions) {
+			captured[fn.Instructions[position+1]] = true
+		}
+		definition, ok := definitions[op]
+		if !ok {
+			return
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		position += width
+	}
+	for index, position := range positions {
+		if Opcode(fn.Instructions[position]) != OpGetLocal || position+1 >= len(fn.Instructions) {
+			continue
+		}
+		local := fn.Instructions[position+1]
+		if captured[local] {
+			continue
+		}
+		if index+1 < len(positions) && Opcode(fn.Instructions[positions[index+1]]) == OpConstant {
+			continue
+		}
+		fn.Instructions[position] = byte(OpGetLocalFast)
 	}
 }
 
@@ -2717,8 +2976,12 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 		paramLocalIndices[i] = c.symbolTable.DefineParameter(param.Value).Index
 	}
 	anonymousRestParam := block.RestParam != nil && block.RestParam.Value == "_" && block.RestParam.Token.Literal == "*"
-	if block.RestParam != nil && !anonymousRestParam {
-		c.symbolTable.Define(block.RestParam.Value)
+	if block.RestParam != nil {
+		if anonymousRestParam {
+			c.symbolTable.Define(anonymousRestLocalName)
+		} else {
+			c.symbolTable.Define(block.RestParam.Value)
+		}
 	}
 	for i, param := range params[restIndex:] {
 		paramLocalIndices[restIndex+i] = c.symbolTable.DefineParameter(param.Value).Index
@@ -2807,6 +3070,7 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 	fnObj := &object.Function{
 		Name:                  "__block__",
 		SourcePath:            core.CurrentSpecFile,
+		SourceAbsolutePath:    core.CurrentSpecFileAbsolute,
 		EvalSource:            core.CurrentEvalSource,
 		SourceEncoding:        c.sourceEncoding,
 		DefinitionLine:        int64(block.Token.Line),
@@ -2836,7 +3100,9 @@ func (c *Compiler) compileBlockAsClosureWithLocalNamesInternal(block *ast.BlockE
 		fnObj.HasRestParam = true
 		fnObj.AnonymousRestParam = anonymousRestParam
 		fnObj.RestParamIndex = restIndex
-		if !anonymousRestParam {
+		if anonymousRestParam {
+			fnObj.RestParamName = anonymousRestLocalName
+		} else {
 			fnObj.RestParamName = block.RestParam.Value
 		}
 	}
@@ -2947,6 +3213,18 @@ func blockNumberedParameterCount(block *ast.BlockExpression) int {
 	return max
 }
 
+// BlockNumberedParameterCount returns the highest implicit numbered parameter
+// used directly by block, excluding nested block scopes.
+func BlockNumberedParameterCount(block *ast.BlockExpression) int {
+	return blockNumberedParameterCount(block)
+}
+
+// BlockUsesBareIt reports whether a block directly references Ruby's implicit
+// "it" parameter, excluding nested block scopes.
+func BlockUsesBareIt(block *ast.BlockExpression) bool {
+	return block != nil && statementsUseBareIt(block.Statements)
+}
+
 func expressionNumberedParameterCount(expr ast.Expression) int {
 	switch node := expr.(type) {
 	case nil:
@@ -2954,6 +3232,22 @@ func expressionNumberedParameterCount(expr ast.Expression) int {
 	case *ast.Identifier:
 		if len(node.Value) == 2 && node.Value[0] == '_' && node.Value[1] >= '1' && node.Value[1] <= '9' {
 			return int(node.Value[1] - '0')
+		}
+	case *ast.StringLiteral:
+		if node.Interpolates {
+			return interpolationNumberedParameterCount(node.Value)
+		}
+	case *ast.StringConcatExpression:
+		max := 0
+		for _, part := range node.Parts {
+			if part.Interpolates {
+				max = maxInt(max, interpolationNumberedParameterCount(part.Value))
+			}
+		}
+		return max
+	case *ast.SymbolLiteral:
+		if node.Token.AllowsInterpolation {
+			return interpolationNumberedParameterCount(node.Value)
 		}
 	case *ast.MethodCall:
 		max := expressionNumberedParameterCount(node.Receiver)
@@ -2969,6 +3263,8 @@ func expressionNumberedParameterCount(expr ast.Expression) int {
 		return max
 	case *ast.AssignExpression:
 		return maxInt(expressionNumberedParameterCount(node.Target), maxInt(expressionNumberedParameterCount(node.Index), expressionNumberedParameterCount(node.Value)))
+	case *ast.IndexExpression:
+		return maxInt(expressionNumberedParameterCount(node.Left), maxInt(expressionNumberedParameterCount(node.Index), expressionNumberedParameterCount(node.End)))
 	case *ast.InfixExpression:
 		return maxInt(expressionNumberedParameterCount(node.Left), expressionNumberedParameterCount(node.Right))
 	case *ast.PrefixExpression:
@@ -2994,6 +3290,23 @@ func expressionNumberedParameterCount(expr ast.Expression) int {
 		return maxInt(expressionNumberedParameterCount(node.Condition), maxInt(expressionNumberedParameterCount(node.Consequent), expressionNumberedParameterCount(node.Alternative)))
 	}
 	return 0
+}
+
+func interpolationNumberedParameterCount(value string) int {
+	max := 0
+	for _, part := range splitStringInterpolation(value) {
+		if !part.isExpr {
+			continue
+		}
+		lex := lexer.New(part.text)
+		for token := lex.NextToken(); token.Type != lexer.EOF; token = lex.NextToken() {
+			if token.Type == lexer.IDENT && len(token.Literal) == 2 &&
+				token.Literal[0] == '_' && token.Literal[1] >= '1' && token.Literal[1] <= '9' {
+				max = maxInt(max, int(token.Literal[1]-'0'))
+			}
+		}
+	}
+	return max
 }
 
 func maxInt(left, right int) int {
@@ -3242,7 +3555,7 @@ func (c *Compiler) compileBeginExpression(node *ast.BeginExpression) error {
 
 func (c *Compiler) compileCatchExpression(node *ast.CatchExpression) error {
 	if !node.HasBlock {
-		c.EmitConstant(core.NewLocalJumpError("no block given"))
+		c.EmitConstant(core.NewLocalJumpErrorObject("no block given"))
 		c.Emit(OpRaise)
 		return nil
 	}
@@ -3256,10 +3569,24 @@ func (c *Compiler) compileCatchExpression(node *ast.CatchExpression) error {
 	afterBody := len(c.currentInstructions())
 	c.changeOperand(afterBody-3, afterBody)
 
-	if err := c.compileBlockAsValue(node.Body); err != nil {
-		return err
+	if node.BlockPass != nil {
+		callToken := node.Token
+		callToken.Type = lexer.IDENT
+		callToken.Literal = "call"
+		if err := c.Compile(&ast.MethodCall{
+			Token:    callToken,
+			Receiver: node.BlockPass,
+			Method:   &ast.Identifier{Token: callToken, Value: "call"},
+		}); err != nil {
+			return err
+		}
+	} else {
+		if err := c.compileBlockAsValue(node.Body); err != nil {
+			return err
+		}
 	}
 
+	c.Emit(OpEndCatch)
 	endPos := len(c.currentInstructions())
 	c.changeOperand(afterBody-3, endPos)
 
@@ -3282,6 +3609,17 @@ func (c *Compiler) EmitConstant(v *object.EmeraldValue) int {
 }
 
 func (c *Compiler) addConstant(v *object.EmeraldValue) int {
+	if v != nil && v.Type == object.ValueInteger && v.BigIntValue() == nil {
+		if value, ok := v.Data.(int64); ok {
+			if index, exists := c.integerConstants[value]; exists {
+				return index
+			}
+			index := len(c.constants)
+			c.constants = append(c.constants, v)
+			c.integerConstants[value] = index
+			return index
+		}
+	}
 	c.constants = append(c.constants, v)
 	return len(c.constants) - 1
 }
@@ -3659,6 +3997,55 @@ type Bytecode struct {
 	LocalNames   map[string]int
 }
 
+const largeImmutableArrayLiteralThreshold = 64
+
+func (c *Compiler) compileLargeImmutableArrayLiteral(node *ast.ArrayLiteral) *object.EmeraldValue {
+	if node == nil || len(node.Elements) < largeImmutableArrayLiteralThreshold {
+		return nil
+	}
+	elements := make([]*object.EmeraldValue, len(node.Elements))
+	for index, element := range node.Elements {
+		value, ok := c.compileImmutableLiteralValue(element)
+		if !ok {
+			return nil
+		}
+		elements[index] = value
+	}
+	return &object.EmeraldValue{
+		Type:    object.ValueArray,
+		Data:    elements,
+		Class:   core.R.Classes["Array"],
+		Literal: true,
+	}
+}
+
+func (c *Compiler) compileImmutableLiteralValue(expression ast.Expression) (*object.EmeraldValue, bool) {
+	switch node := expression.(type) {
+	case *ast.IntegerLiteral:
+		value := &object.EmeraldValue{Type: object.ValueInteger, Data: node.Value, Class: core.R.Classes["Integer"]}
+		return core.RememberULEBPackIntegerLiteral(value, node.Token.Literal), true
+	case *ast.FloatLiteral:
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: node.Value, Class: core.R.Classes["Float"]}, true
+	case *ast.SymbolLiteral:
+		return &object.EmeraldValue{Type: object.ValueSymbol, Data: strings.TrimPrefix(node.Value, ":"), Class: core.R.Classes["Symbol"]}, true
+	case *ast.Boolean:
+		if node.Value {
+			return core.R.TrueVal, true
+		}
+		return core.R.FalseVal, true
+	case *ast.NilExpression:
+		return core.R.NilVal, true
+	case *ast.PrefixExpression:
+		integer, ok := node.Right.(*ast.IntegerLiteral)
+		if !ok || node.Operator != "-" {
+			return nil, false
+		}
+		return &object.EmeraldValue{Type: object.ValueInteger, Data: -integer.Value, Class: core.R.Classes["Integer"]}, true
+	default:
+		return nil, false
+	}
+}
+
 func (c *Compiler) compileParameterDefault(name string, expr ast.Expression) error {
 	if expr == nil {
 		return nil
@@ -4015,27 +4402,32 @@ func expressionsContainSplat(expressions []ast.Expression) bool {
 }
 
 func expandForwardArguments(args []ast.Expression) []ast.Expression {
-	if len(args) != 1 {
-		return args
+	for i, arg := range args {
+		forward, ok := arg.(*ast.SplatExpression)
+		if !ok || forward.Token.Type != lexer.DOT3 {
+			continue
+		}
+		positionalToken := forward.Token
+		positionalToken.Type = lexer.MULTIPLY
+		positionalToken.Literal = "*"
+		keywordToken := forward.Token
+		keywordToken.Type = lexer.POW
+		keywordToken.Literal = "**"
+		blockToken := forward.Token
+		blockToken.Type = lexer.BIT_AND
+		blockToken.Literal = "&"
+		expanded := []ast.Expression{
+			&ast.SplatExpression{Token: positionalToken, Value: &ast.Identifier{Token: positionalToken, Value: "__rgo_forward_args"}},
+			&ast.SplatExpression{Token: keywordToken, Value: &ast.Identifier{Token: keywordToken, Value: "__rgo_forward_kwargs"}},
+			&ast.SplatExpression{Token: blockToken, Value: &ast.Identifier{Token: blockToken, Value: "__rgo_forward_block"}},
+		}
+		result := make([]ast.Expression, 0, len(args)+2)
+		result = append(result, args[:i]...)
+		result = append(result, expanded...)
+		result = append(result, args[i+1:]...)
+		return result
 	}
-	forward, ok := args[0].(*ast.SplatExpression)
-	if !ok || forward.Token.Type != lexer.DOT3 {
-		return args
-	}
-	positionalToken := forward.Token
-	positionalToken.Type = lexer.MULTIPLY
-	positionalToken.Literal = "*"
-	keywordToken := forward.Token
-	keywordToken.Type = lexer.POW
-	keywordToken.Literal = "**"
-	blockToken := forward.Token
-	blockToken.Type = lexer.BIT_AND
-	blockToken.Literal = "&"
-	return []ast.Expression{
-		&ast.SplatExpression{Token: positionalToken, Value: &ast.Identifier{Token: positionalToken, Value: "__rgo_forward_args"}},
-		&ast.SplatExpression{Token: keywordToken, Value: &ast.Identifier{Token: keywordToken, Value: "__rgo_forward_kwargs"}},
-		&ast.SplatExpression{Token: blockToken, Value: &ast.Identifier{Token: blockToken, Value: "__rgo_forward_block"}},
-	}
+	return args
 }
 
 func (c *Compiler) compileLogicalSendAssignment(receiver ast.Expression, getter, setter string, args []ast.Expression, value ast.Expression, operator lexer.TokenType, safe bool) error {
@@ -4144,7 +4536,7 @@ func (c *Compiler) emitVariableAssignmentStore(name *ast.Identifier) error {
 	return nil
 }
 
-func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
+func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier, allowUndefined bool) error {
 	if name == nil {
 		c.Emit(OpNil)
 		return nil
@@ -4154,7 +4546,11 @@ func (c *Compiler) compileAssignmentCurrentValue(name *ast.Identifier) error {
 		return nil
 	}
 	if len(name.Value) > 1 && name.Value[0] == '@' && name.Value[1] == '@' {
-		c.emit(OpGetClassVar, c.addConstant(&object.EmeraldValue{
+		op := OpGetClassVar
+		if allowUndefined {
+			op = OpGetClassVarOrNil
+		}
+		c.emit(op, c.addConstant(&object.EmeraldValue{
 			Type:  object.ValueString,
 			Data:  name.Value,
 			Class: core.R.Classes["String"],
@@ -4236,16 +4632,17 @@ func (c *Compiler) compileExpressionThunk(expr ast.Expression) error {
 	fn := &object.EmeraldValue{
 		Type: object.ValueFunction,
 		Data: &object.Function{
-			Name:           "__scoped_const_rhs__",
-			SourcePath:     core.CurrentSpecFile,
-			EvalSource:     core.CurrentEvalSource,
-			SourceEncoding: c.sourceEncoding,
-			Instructions:   instructions,
-			LineMap:        lineMap,
-			NumLocals:      numLocals,
-			GlobalNames:    c.globalNamesCopy(),
-			LocalNames:     localNames,
-			FreeVarNames:   freeVarNames(free),
+			Name:               "__scoped_const_rhs__",
+			SourcePath:         core.CurrentSpecFile,
+			SourceAbsolutePath: core.CurrentSpecFileAbsolute,
+			EvalSource:         core.CurrentEvalSource,
+			SourceEncoding:     c.sourceEncoding,
+			Instructions:       instructions,
+			LineMap:            lineMap,
+			NumLocals:          numLocals,
+			GlobalNames:        c.globalNamesCopy(),
+			LocalNames:         localNames,
+			FreeVarNames:       freeVarNames(free),
 		},
 		Class: core.R.Classes["Class"],
 	}
@@ -4626,6 +5023,8 @@ func (c *Compiler) forBodyCollectAssignedLocalNamesFromStatement(stmt ast.Statem
 		}
 	case *ast.RaiseExpression:
 		c.forBodyCollectAssignedLocalNamesFromExpression(node.Error, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Message, names)
+		c.forBodyCollectAssignedLocalNamesFromExpression(node.Backtrace, names)
 	case *ast.RedoExpression:
 	case *ast.RetryExpression:
 	}
@@ -4646,7 +5045,9 @@ func (c *Compiler) forBodyCollectAssignedLocalNamesFromExpression(expr ast.Expre
 	}
 	switch node := expr.(type) {
 	case *ast.AssignExpression:
-		c.forBodyAddAssignedLocalName(node.Name, names)
+		if node.Target == nil && node.Index == nil {
+			c.forBodyAddAssignedLocalName(node.Name, names)
+		}
 		c.forBodyCollectAssignedLocalNamesFromExpression(node.Target, names)
 		c.forBodyCollectAssignedLocalNamesFromExpression(node.Index, names)
 		c.forBodyCollectAssignedLocalNamesFromExpression(node.End, names)
@@ -5082,8 +5483,12 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		paramLocalIndices[i] = c.symbolTable.DefineParameter(param.Value).Index
 	}
 	anonymousRestParam := node.RestParam != nil && node.RestParam.Value == "_" && node.RestParam.Token.Literal == "*"
-	if node.RestParam != nil && !anonymousRestParam {
-		c.symbolTable.Define(node.RestParam.Value)
+	if node.RestParam != nil {
+		if anonymousRestParam {
+			c.symbolTable.Define(anonymousRestLocalName)
+		} else {
+			c.symbolTable.Define(node.RestParam.Value)
+		}
 	}
 	for i, param := range params[restIndex:] {
 		paramLocalIndices[restIndex+i] = c.symbolTable.DefineParameter(param.Value).Index
@@ -5148,6 +5553,7 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 	fnObj := &object.Function{
 		Name:                  "__lambda__",
 		SourcePath:            core.CurrentSpecFile,
+		SourceAbsolutePath:    core.CurrentSpecFileAbsolute,
 		EvalSource:            core.CurrentEvalSource,
 		SourceEncoding:        c.sourceEncoding,
 		Params:                identifierNames(params),
@@ -5175,7 +5581,9 @@ func (c *Compiler) compileProcLiteral(node *ast.ProcLiteral) error {
 		fnObj.HasRestParam = true
 		fnObj.AnonymousRestParam = anonymousRestParam
 		fnObj.RestParamIndex = restIndex
-		if !anonymousRestParam {
+		if anonymousRestParam {
+			fnObj.RestParamName = anonymousRestLocalName
+		} else {
 			fnObj.RestParamName = node.RestParam.Value
 		}
 	}

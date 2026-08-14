@@ -44,6 +44,7 @@ typedef struct {
   onig_search_fn search;
   onig_error_code_to_str_fn error_string;
   OnigEncoding utf8;
+  OnigEncoding ascii;
   OnigSyntaxType* ruby_syntax;
   int loaded;
 } rgo_onig_api;
@@ -68,11 +69,13 @@ static int rgo_load_onig(void) {
   RGO_DLSYM(search, onig_search_fn, "onig_search");
   RGO_DLSYM(error_string, onig_error_code_to_str_fn, "onig_error_code_to_str");
   rgo_onig.utf8 = (OnigEncoding)dlsym(rgo_onig.handle, "OnigEncodingUTF8");
+  rgo_onig.ascii = (OnigEncoding)dlsym(rgo_onig.handle, "OnigEncodingASCII");
   rgo_onig.ruby_syntax = (OnigSyntaxType*)dlsym(rgo_onig.handle, "OnigSyntaxRuby");
 #undef RGO_DLSYM
   if (rgo_onig.new_regex == NULL || rgo_onig.free_regex == NULL ||
       rgo_onig.region_new == NULL || rgo_onig.region_free == NULL ||
-      rgo_onig.search == NULL || rgo_onig.utf8 == NULL || rgo_onig.ruby_syntax == NULL) {
+      rgo_onig.search == NULL || rgo_onig.utf8 == NULL || rgo_onig.ascii == NULL ||
+      rgo_onig.ruby_syntax == NULL) {
     dlclose(rgo_onig.handle);
     memset(&rgo_onig, 0, sizeof(rgo_onig));
     rgo_onig.loaded = -1;
@@ -82,20 +85,17 @@ static int rgo_load_onig(void) {
   return 1;
 }
 
-static int rgo_onig_search(const unsigned char* pattern, int pattern_len,
-                           const unsigned char* source, int source_len,
-                           unsigned int options, int** begins, int** ends,
-                           int* count, char** error_message) {
-  *begins = NULL;
-  *ends = NULL;
-  *count = 0;
+static int rgo_onig_compile(const unsigned char* pattern, int pattern_len,
+                            unsigned int options, int ascii_encoding,
+                            OnigRegex* regex, char** error_message) {
+  *regex = NULL;
   *error_message = NULL;
   if (!rgo_load_onig()) return -2;
 
-  OnigRegex regex = NULL;
   OnigErrorInfo error_info;
-  int rc = rgo_onig.new_regex(&regex, pattern, pattern + pattern_len, options,
-                              rgo_onig.utf8, rgo_onig.ruby_syntax, &error_info);
+  OnigEncoding encoding = ascii_encoding ? rgo_onig.ascii : rgo_onig.utf8;
+  int rc = rgo_onig.new_regex(regex, pattern, pattern + pattern_len, options,
+                              encoding, rgo_onig.ruby_syntax, &error_info);
   if (rc < 0) {
     if (rgo_onig.error_string != NULL) {
       unsigned char buffer[256];
@@ -104,10 +104,19 @@ static int rgo_onig_search(const unsigned char* pattern, int pattern_len,
     }
     return -1;
   }
+  return 1;
+}
+
+static int rgo_onig_search_compiled(OnigRegex regex,
+                                    const unsigned char* source, int source_len,
+                                    int** begins, int** ends, int* count) {
+  *begins = NULL;
+  *ends = NULL;
+  *count = 0;
 
   OnigRegion* region = rgo_onig.region_new();
-  rc = rgo_onig.search(regex, source, source + source_len, source,
-                       source + source_len, region, 0);
+  int rc = rgo_onig.search(regex, source, source + source_len, source,
+                           source + source_len, region, 0);
   if (rc >= 0 && region != NULL && region->num_regs > 0) {
     *count = region->num_regs;
     *begins = (int*)malloc(sizeof(int) * region->num_regs);
@@ -123,8 +132,20 @@ static int rgo_onig_search(const unsigned char* pattern, int pattern_len,
     (*ends)[0] = rc;
   }
   if (region != NULL) rgo_onig.region_free(region, 1);
-  rgo_onig.free_regex(regex);
   return rc >= 0 ? 1 : 0;
+}
+
+static int rgo_onig_match_compiled(OnigRegex regex,
+                                   const unsigned char* source, int source_len) {
+  OnigRegion* region = rgo_onig.region_new();
+  int rc = rgo_onig.search(regex, source, source + source_len, source,
+                           source + source_len, region, 0);
+  if (region != NULL) rgo_onig.region_free(region, 1);
+  return rc >= 0 ? 1 : 0;
+}
+
+static void rgo_onig_free_regex(OnigRegex regex) {
+  if (regex != NULL && rgo_onig.free_regex != NULL) rgo_onig.free_regex(regex);
 }
 
 static int rgo_int_at(int* values, int index) { return values[index]; }
@@ -132,19 +153,29 @@ static int rgo_int_at(int* values, int index) { return values[index]; }
 import "C"
 
 import (
+	"sync"
 	"unsafe"
 )
 
-func onigRegexpSearch(pattern, source, options string) ([]int, bool, string) {
-	patternBytes := C.CBytes([]byte(pattern))
-	sourceBytes := C.CBytes([]byte(source))
-	defer C.free(patternBytes)
-	defer C.free(sourceBytes)
+type onigRegexpCacheKey struct {
+	pattern string
+	flags   uint32
+	ascii   bool
+}
 
-	var begins *C.int
-	var ends *C.int
-	var count C.int
-	var errorMessage *C.char
+type onigCompiledRegexp struct {
+	regex C.OnigRegex
+	mu    sync.Mutex
+}
+
+const onigRegexpCacheLimit = 2048
+
+var (
+	onigRegexpCacheMu sync.RWMutex
+	onigRegexpCache   = make(map[onigRegexpCacheKey]*onigCompiledRegexp)
+)
+
+func onigRegexpFlags(options string) (C.uint, bool) {
 	flags := C.uint(0)
 	if regexpHasBehaviorOption(options, 'i') {
 		flags |= 1
@@ -155,27 +186,92 @@ func onigRegexpSearch(pattern, source, options string) ([]int, bool, string) {
 	if regexpHasBehaviorOption(options, 'm') {
 		flags |= 4
 	}
-	rc := C.rgo_onig_search(
-		(*C.uchar)(patternBytes), C.int(len(pattern)),
-		(*C.uchar)(sourceBytes), C.int(len(source)), flags,
-		&begins, &ends, &count, &errorMessage,
+	ascii := regexpHasBehaviorOption(options, 'n') || regexpHasBehaviorOption(options, 's')
+	return flags, ascii
+}
+
+func compileOnigRegexp(pattern, options string) (*onigCompiledRegexp, bool, string) {
+	flags, ascii := onigRegexpFlags(options)
+	key := onigRegexpCacheKey{pattern: pattern, flags: uint32(flags), ascii: ascii}
+	onigRegexpCacheMu.RLock()
+	compiled := onigRegexpCache[key]
+	onigRegexpCacheMu.RUnlock()
+	if compiled != nil {
+		return compiled, true, ""
+	}
+
+	patternBytes := C.CBytes([]byte(pattern))
+	defer C.free(patternBytes)
+
+	var regex C.OnigRegex
+	var errorMessage *C.char
+	asciiEncoding := C.int(0)
+	if ascii {
+		asciiEncoding = 1
+	}
+	rc := C.rgo_onig_compile(
+		(*C.uchar)(patternBytes), C.int(len(pattern)), flags, asciiEncoding,
+		&regex, &errorMessage,
 	)
-	if begins != nil {
-		defer C.free(unsafe.Pointer(begins))
-	}
-	if ends != nil {
-		defer C.free(unsafe.Pointer(ends))
-	}
 	errText := ""
 	if errorMessage != nil {
 		errText = C.GoString(errorMessage)
 		C.free(unsafe.Pointer(errorMessage))
 	}
 	if rc != 1 {
-		if rc == 0 || rc == -1 {
+		if rc == -1 {
 			return nil, true, errText
 		}
 		return nil, false, errText
+	}
+
+	candidate := &onigCompiledRegexp{regex: regex}
+	onigRegexpCacheMu.Lock()
+	if existing := onigRegexpCache[key]; existing != nil {
+		compiled = existing
+	} else if len(onigRegexpCache) < onigRegexpCacheLimit {
+		onigRegexpCache[key] = candidate
+		compiled = candidate
+	}
+	onigRegexpCacheMu.Unlock()
+	if compiled != candidate {
+		C.rgo_onig_free_regex(regex)
+	}
+	if compiled == nil {
+		return candidate, false, ""
+	}
+	return compiled, true, ""
+}
+
+func onigRegexpSearch(pattern, source, options string) ([]int, bool, string) {
+	compiled, cached, errText := compileOnigRegexp(pattern, options)
+	if compiled == nil {
+		return nil, cached, errText
+	}
+	if !cached {
+		defer C.rgo_onig_free_regex(compiled.regex)
+	}
+
+	sourceBytes := C.CBytes([]byte(source))
+	defer C.free(sourceBytes)
+	var begins *C.int
+	var ends *C.int
+	var count C.int
+	compiled.mu.Lock()
+	rc := C.rgo_onig_search_compiled(
+		compiled.regex,
+		(*C.uchar)(sourceBytes), C.int(len(source)),
+		&begins, &ends, &count,
+	)
+	compiled.mu.Unlock()
+	if begins != nil {
+		defer C.free(unsafe.Pointer(begins))
+	}
+	if ends != nil {
+		defer C.free(unsafe.Pointer(ends))
+	}
+	if rc != 1 {
+		return nil, true, ""
 	}
 	indices := make([]int, int(count)*2)
 	for i := 0; i < int(count); i++ {
@@ -183,4 +279,24 @@ func onigRegexpSearch(pattern, source, options string) ([]int, bool, string) {
 		indices[i*2+1] = int(C.rgo_int_at(ends, C.int(i)))
 	}
 	return indices, true, ""
+}
+
+func onigRegexpMatchQ(pattern, source, options string) (bool, bool, string) {
+	compiled, cached, errText := compileOnigRegexp(pattern, options)
+	if compiled == nil {
+		return false, cached, errText
+	}
+	if !cached {
+		defer C.rgo_onig_free_regex(compiled.regex)
+	}
+
+	sourceBytes := C.CBytes([]byte(source))
+	defer C.free(sourceBytes)
+	compiled.mu.Lock()
+	matched := C.rgo_onig_match_compiled(
+		compiled.regex,
+		(*C.uchar)(sourceBytes), C.int(len(source)),
+	) == 1
+	compiled.mu.Unlock()
+	return matched, true, ""
 }

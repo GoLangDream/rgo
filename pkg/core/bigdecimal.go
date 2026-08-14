@@ -332,8 +332,8 @@ func bigDecimalFromValue(value *object.EmeraldValue) (*bigDecimalData, bool) {
 		return parseBigDecimal(value.Data.(string))
 	case object.ValueInteger:
 		coefficient := new(big.Int)
-		if value.BigInt != nil {
-			coefficient.Set(value.BigInt)
+		if bigInteger := value.BigIntValue(); bigInteger != nil {
+			coefficient.Set(bigInteger)
 		} else {
 			coefficient.SetInt64(value.Data.(int64))
 		}

@@ -77,7 +77,21 @@ func installOpenSSLX509(openssl *object.Module) {
 	rsaClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: opensslRSAClassNew, Arity: -1})
 	rsaClass.DefineMethod("public_key", &object.Method{Name: "public_key", Fn: opensslRSAPublicKey, Arity: 0})
 	pkeyModule.Constants["RSA"] = &object.EmeraldValue{Type: object.ValueClass, Data: rsaClass, Class: R.Classes["Class"]}
+
+	ecClass := object.NewClass("OpenSSL::PKey::EC")
+	ecClass.SuperClass = R.Classes["Object"]
+	ecPointClass := object.NewClass("OpenSSL::PKey::EC::Point")
+	ecPointClass.SuperClass = R.Classes["Object"]
+	ecClass.DefineConstant("Point", &object.EmeraldValue{Type: object.ValueClass, Data: ecPointClass, Class: R.Classes["Class"]})
+	pkeyModule.Constants["EC"] = &object.EmeraldValue{Type: object.ValueClass, Data: ecClass, Class: R.Classes["Class"]}
+
+	pkeyError := object.NewClass("OpenSSL::PKey::PKeyError")
+	pkeyError.SuperClass = R.Classes["StandardError"]
+	pkeyModule.Constants["PKeyError"] = &object.EmeraldValue{Type: object.ValueClass, Data: pkeyError, Class: R.Classes["Class"]}
 	openssl.Constants["PKey"] = &object.EmeraldValue{Type: object.ValueModule, Data: pkeyModule, Class: R.Classes["Module"]}
+	R.Classes["OpenSSL::PKey::EC"] = ecClass
+	R.Classes["OpenSSL::PKey::EC::Point"] = ecPointClass
+	R.Classes["OpenSSL::PKey::PKeyError"] = pkeyError
 
 	x509Module := object.NewModule("OpenSSL::X509")
 	nameError := object.NewClass("OpenSSL::X509::NameError")

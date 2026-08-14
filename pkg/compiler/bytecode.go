@@ -26,6 +26,8 @@ func Make(op Opcode, operands ...int) Instructions {
 		}
 		width := def.OperandWidths[i]
 		switch width {
+		case 4:
+			binary.BigEndian.PutUint32(instruction[offset:], uint32(o))
 		case 2:
 			binary.BigEndian.PutUint16(instruction[offset:], uint16(o))
 		case 1:

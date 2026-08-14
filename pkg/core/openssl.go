@@ -32,6 +32,15 @@ func installOpenSSLModule(objectClass *object.Class) {
 	randomModule.DefineMethod("random_bytes", &object.Method{Name: "random_bytes", Fn: opensslRandomBytes, Arity: -1})
 	randomModule.DefineMethod("pseudo_bytes", &object.Method{Name: "pseudo_bytes", Fn: opensslRandomBytes, Arity: -1})
 	openssl.Constants["Random"] = &object.EmeraldValue{Type: object.ValueModule, Data: randomModule, Class: R.Classes["Module"]}
+	cipherClass := object.NewClass("OpenSSL::Cipher")
+	cipherClass.SuperClass = R.Classes["Object"]
+	cipherClass.DefineClassMethod("ciphers", &object.Method{Name: "ciphers", Fn: opensslCipherCiphers, Arity: 0})
+	cipherErrorClass := object.NewClass("OpenSSL::Cipher::CipherError")
+	cipherErrorClass.SuperClass = R.Classes["StandardError"]
+	cipherClass.DefineConstant("CipherError", classEmeraldValue(cipherErrorClass))
+	openssl.Constants["Cipher"] = classEmeraldValue(cipherClass)
+	R.Classes["OpenSSL::Cipher"] = cipherClass
+	R.Classes["OpenSSL::Cipher::CipherError"] = cipherErrorClass
 	installOpenSSLSSL(openssl)
 	installOpenSSLDigest(openssl)
 	installOpenSSLKDF(openssl)
@@ -42,13 +51,40 @@ func installOpenSSLModule(objectClass *object.Class) {
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "OpenSSL", value)
 }
 
+func opensslCipherCiphers(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+}
+
 func installOpenSSLSSL(openssl *object.Module) {
 	sslModule := object.NewModule("OpenSSL::SSL")
+	for name, mode := range map[string]int64{
+		"VERIFY_NONE":                 0x00,
+		"VERIFY_PEER":                 0x01,
+		"VERIFY_FAIL_IF_NO_PEER_CERT": 0x02,
+		"VERIFY_CLIENT_ONCE":          0x04,
+		"VERIFY_POST_HANDSHAKE":       0x08,
+	} {
+		sslModule.Constants[name] = NewIntegerValue(mode)
+	}
+	sslErrorClass := object.NewClass("OpenSSL::SSL::SSLError")
+	sslErrorClass.SuperClass = R.Classes["StandardError"]
+	sslModule.Constants["SSLError"] = classEmeraldValue(sslErrorClass)
+	R.Classes["OpenSSL::SSL::SSLError"] = sslErrorClass
+	for _, name := range []string{"SSLErrorWaitReadable", "SSLErrorWaitWritable"} {
+		klass := object.NewClass("OpenSSL::SSL::" + name)
+		klass.SuperClass = sslErrorClass
+		sslModule.Constants[name] = classEmeraldValue(klass)
+		R.Classes[klass.Name] = klass
+	}
 	contextClass := object.NewClass("OpenSSL::SSL::SSLContext")
 	contextClass.SuperClass = R.Classes["Object"]
 	contextClass.DefineMethod("set_params", &object.Method{Name: "set_params", Fn: opensslSSLContextSetParams, Arity: -1})
 	contextValue := classEmeraldValue(contextClass)
 	sslModule.Constants["SSLContext"] = contextValue
+	socketClass := object.NewClass("OpenSSL::SSL::SSLSocket")
+	socketClass.SuperClass = R.Classes["Object"]
+	sslModule.Constants["SSLSocket"] = classEmeraldValue(socketClass)
+	R.Classes["OpenSSL::SSL::SSLSocket"] = socketClass
 	openssl.Constants["SSL"] = &object.EmeraldValue{Type: object.ValueModule, Data: sslModule, Class: R.Classes["Module"]}
 	R.Classes["OpenSSL::SSL::SSLContext"] = contextClass
 }
@@ -67,9 +103,9 @@ func installOpenSSLDigest(openssl *object.Module) {
 	digestClass := object.NewClass("OpenSSL::Digest")
 	digestClass.SuperClass = R.Classes["Object"]
 	digestClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: opensslDigestClassNew, Arity: -1})
-	digestClass.DefineClassMethod("digest", &object.Method{Name: "digest", Fn: opensslDigestClassDigest, Arity: 2})
-	digestClass.DefineClassMethod("hexdigest", &object.Method{Name: "hexdigest", Fn: opensslDigestClassHexdigest, Arity: 2})
-	digestClass.DefineClassMethod("base64digest", &object.Method{Name: "base64digest", Fn: opensslDigestClassBase64digest, Arity: 2})
+	digestClass.DefineClassMethod("digest", &object.Method{Name: "digest", Fn: opensslDigestClassDigest, Arity: -1})
+	digestClass.DefineClassMethod("hexdigest", &object.Method{Name: "hexdigest", Fn: opensslDigestClassHexdigest, Arity: -1})
+	digestClass.DefineClassMethod("base64digest", &object.Method{Name: "base64digest", Fn: opensslDigestClassBase64digest, Arity: -1})
 	defineOpenSSLDigestInstanceMethods(digestClass)
 
 	digestError := object.NewClass("OpenSSL::Digest::DigestError")
@@ -78,9 +114,6 @@ func installOpenSSLDigest(openssl *object.Module) {
 
 	for i := range digestAlgorithms {
 		spec := &digestAlgorithms[i]
-		if spec.name == "MD5" {
-			continue
-		}
 		klass := object.NewClass("OpenSSL::Digest::" + spec.name)
 		klass.SuperClass = digestClass
 		klass.SetInstanceVar("@__rgo_digest_spec", &object.EmeraldValue{Type: object.ValueObject, Data: spec, Class: R.Classes["Object"]})
@@ -110,7 +143,7 @@ func defineOpenSSLDigestInstanceMethods(klass *object.Class) {
 func opensslDigestSpecByName(raw string) *digestAlgorithmSpec {
 	name := strings.ToUpper(strings.ReplaceAll(raw, "-", ""))
 	for i := range digestAlgorithms {
-		if digestAlgorithms[i].name != "MD5" && digestAlgorithms[i].name == name {
+		if digestAlgorithms[i].name == name {
 			return &digestAlgorithms[i]
 		}
 	}
@@ -193,15 +226,29 @@ func opensslDigestName(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 	return stringWithEncoding(state.spec.name, "US-ASCII")
 }
 
-func opensslDigestClassResult(args []*object.EmeraldValue, mode string) *object.EmeraldValue {
-	if len(args) != 2 {
-		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 2)", len(args)))
+func opensslDigestClassResult(receiver *object.EmeraldValue, args []*object.EmeraldValue, mode string) *object.EmeraldValue {
+	var spec *digestAlgorithmSpec
+	var dataArg *object.EmeraldValue
+	if klass, ok := receiver.Data.(*object.Class); ok {
+		spec = digestAlgorithmSpecFromClass(klass)
 	}
-	spec, errVal := opensslDigestSpecArgument(args[0])
-	if errVal != nil {
-		return errVal
+	if spec != nil {
+		if len(args) != 1 {
+			return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+		}
+		dataArg = args[0]
+	} else {
+		if len(args) != 2 {
+			return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 2)", len(args)))
+		}
+		var errVal *object.EmeraldValue
+		spec, errVal = opensslDigestSpecArgument(args[0])
+		if errVal != nil {
+			return errVal
+		}
+		dataArg = args[1]
 	}
-	raw, stringErr := opensslStringArgument(args[1])
+	raw, stringErr := opensslStringArgument(dataArg)
 	if stringErr != nil {
 		return stringErr
 	}
@@ -217,15 +264,15 @@ func opensslDigestClassResult(args []*object.EmeraldValue, mode string) *object.
 }
 
 func opensslDigestClassDigest(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return opensslDigestClassResult(args, "raw")
+	return opensslDigestClassResult(receiver, args, "raw")
 }
 
 func opensslDigestClassHexdigest(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return opensslDigestClassResult(args, "hex")
+	return opensslDigestClassResult(receiver, args, "hex")
 }
 
 func opensslDigestClassBase64digest(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
-	return opensslDigestClassResult(args, "base64")
+	return opensslDigestClassResult(receiver, args, "base64")
 }
 
 func opensslHMACResult(args []*object.EmeraldValue, asHex bool) *object.EmeraldValue {

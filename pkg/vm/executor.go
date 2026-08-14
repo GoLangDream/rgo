@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
@@ -25,17 +27,114 @@ import (
 
 const StackSize = 2048
 const MaxFrames = 1024
+const maxReusableFiberStacks = 4
 
 var DevMode = os.Getenv("RGO_DEV") == "1"
 
 var CurrentVM *VM
 var sendTraceDepth int64
+
 var debugSendTraceEnabled = os.Getenv("RGO_DEBUG_SEND_TRACE") == "1"
 var debugForLoopEnabled = os.Getenv("RGO_DEBUG_FOR_LOOP") == "1"
+var deferCaughtExceptionBacktrace = os.Getenv("RGO_DISABLE_DEFERRED_EXCEPTION_BACKTRACE") == ""
+var integerLoopOptimizationEnabled = os.Getenv("RGO_DISABLE_INTEGER_LOOP") == ""
+var integerBitAndSeriesEnabled = os.Getenv("RGO_DISABLE_INTEGER_BITAND_SERIES") == ""
+var directAttributeAccessorEnabled = os.Getenv("RGO_DISABLE_DIRECT_ATTRIBUTE_ACCESSOR") == ""
+var directAttributeCompareEnabled = os.Getenv("RGO_DISABLE_DIRECT_ATTRIBUTE_COMPARE") == ""
+var optionalInstanceFallbackReaderEnabled = os.Getenv("RGO_DISABLE_OPTIONAL_INSTANCE_FALLBACK_READER") == ""
+var integerBlockSingleArgEnabled = os.Getenv("RGO_DISABLE_INTEGER_BLOCK_SINGLE_ARG") == ""
+var integerTimesCapturedBlockEnabled = os.Getenv("RGO_DISABLE_INTEGER_TIMES_CAPTURED_BLOCK") == ""
+var integerTimesCapturedCallEnabled = os.Getenv("RGO_DISABLE_INTEGER_TIMES_CAPTURED_CALL") == ""
+var arrayEachCapturedBlockEnabled = os.Getenv("RGO_DISABLE_ARRAY_EACH_CAPTURED_BLOCK") == ""
+var arrayMapCapturedBlockEnabled = os.Getenv("RGO_DISABLE_ARRAY_MAP_CAPTURED_BLOCK") == ""
+var arrayFindCapturedBlockEnabled = os.Getenv("RGO_DISABLE_ARRAY_FIND_CAPTURED_BLOCK") == ""
+var integerRangeCapturedBlockEnabled = os.Getenv("RGO_DISABLE_INTEGER_RANGE_CAPTURED_BLOCK") == ""
+var integerRangeLinearBlockEnabled = os.Getenv("RGO_DISABLE_INTEGER_RANGE_LINEAR_BLOCK") == ""
+var integerLoopCachedFunctionPlanEnabled = os.Getenv("RGO_DISABLE_INTEGER_LOOP_CACHED_FUNCTION_PLAN") == ""
+var integerFunctionKernelEnabled = os.Getenv("RGO_DISABLE_INTEGER_FUNCTION_KERNEL") == ""
+var integerBitMixRawLoopEnabled = os.Getenv("RGO_DISABLE_INTEGER_BIT_MIX_RAW_LOOP") == ""
+var nativeInvokeFastEnabled = os.Getenv("RGO_DISABLE_NATIVE_INVOKE_FAST") == ""
+var arrayNewConstructorBatchEnabled = os.Getenv("RGO_DISABLE_ARRAY_NEW_CONSTRUCTOR_BATCH") == ""
+var registerIRIntegerLinearLazyResultEnabled = os.Getenv("RGO_DISABLE_REGISTER_IR_INTEGER_LINEAR_LAZY_RESULT") == ""
+var lazyStringArrayEachConsumerEnabled = os.Getenv("RGO_DISABLE_LAZY_STRING_ARRAY_EACH_CONSUMER") == ""
+
+var objectSpaceIndependentValuesEnabled = os.Getenv("RGO_DISABLE_OBJECTSPACE_INDEPENDENT_VALUES") == ""
+var cachedRubyBytecodeFrameEnabled = os.Getenv("RGO_DISABLE_CACHED_RUBY_BYTECODE_FRAME") == ""
+var cachedFixedAritySendEnabled = os.Getenv("RGO_DISABLE_CACHED_FIXED_ARITY_SEND") == ""
+var enumerableEachWithObjectFrameReuseEnabled = os.Getenv("RGO_DISABLE_ENUMERABLE_EACH_WITH_OBJECT_FRAME_REUSE") == ""
+var hotSendCacheEnabled = os.Getenv("RGO_DISABLE_HOT_SEND_CACHE") == ""
+var caseDispatchEnabled = os.Getenv("RGO_DISABLE_CASE_DISPATCH") == ""
+var caseDispatchConstantCacheEnabled = os.Getenv("RGO_DISABLE_CASE_DISPATCH_CONSTANT_CACHE") == ""
+var caseDispatchClassCacheEnabled = os.Getenv("RGO_DISABLE_CASE_DISPATCH_CLASS_CACHE") == ""
+var statefulBlockFastEnabled = os.Getenv("RGO_DISABLE_STATEFUL_BLOCK_FAST") == ""
+var procClosureCacheEnabled = os.Getenv("RGO_DISABLE_PROC_CLOSURE_CACHE") == ""
+var forwardableFastEnabled = os.Getenv("RGO_DISABLE_FORWARDABLE_FAST") == ""
+var arrayNewConstructorLazyEnabled = os.Getenv("RGO_DISABLE_ARRAY_NEW_CONSTRUCTOR_LAZY") == ""
+var hashIntegerMapRegionEnabled = os.Getenv("RGO_DISABLE_HASH_INTEGER_MAP_REGION") == ""
+
+// Compact object layouts are a closed-world optimization owned by the
+// object package.  Keep the VM-side check in one place so child VMs can share
+// the same allocation arena without duplicating the environment policy.
+func CompactObjectLayoutsEnabled() bool {
+	return object.CompactObjectLayouts
+}
+
+// Reusing a framed block pays a fixed preflight cost (closure shape, plan and
+// receiver guards).  Very small arrays are dominated by that cost, especially
+// in object-heavy Gem code where the same helper is called with one- or two-
+// element tuples.  Keep the batch tier for genuinely repeated callbacks and
+// let the already-cheap single-call entries handle short arrays.
+const registerIRBatchBlockMinElements = 4
+const registerIRSmallFramedBlockMinElements = 2
+
+// Implicit self sends retain their call-kind in Register IR so Array's framed
+// callback tier can reuse a Frame for Ruby bare-method calls. Keep a narrow
+// diagnostic switch for A/B measurements and compatibility investigations.
+var registerIRImplicitFramedBlockEnabled = os.Getenv("RGO_DISABLE_REGISTER_IR_IMPLICIT_FRAMED_BLOCK") == ""
+var registerIRSmallFramedBlockEnabled = os.Getenv("RGO_DISABLE_REGISTER_IR_SMALL_FRAMED_BLOCK") == ""
+var singleFramedBlockEnabled = os.Getenv("RGO_DISABLE_SINGLE_FRAMED_BLOCK") == ""
+var arrayBytecodeBlockReuseEnabled = os.Getenv("RGO_DISABLE_ARRAY_BYTECODE_BLOCK_REUSE") == ""
+var integerTimesBytecodeBlockReuseEnabled = os.Getenv("RGO_DISABLE_INTEGER_TIMES_BYTECODE_BLOCK_REUSE") == ""
+var ioEachLineCapturedBlockEnabled = os.Getenv("RGO_DISABLE_IO_EACH_LINE_BLOCK") == ""
+
+// Simple parameter patterns are the compiler's metadata for ordinary named
+// parameters (`|value|`); only nameless/child/rest patterns require the full
+// destructuring binder.
+func simpleBlockParameterPatterns(fn *object.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if fn.SimpleBlockPatternChecked {
+		return fn.SimpleBlockPatternEligible
+	}
+	eligible := true
+	for _, pattern := range fn.ParamPatterns {
+		if pattern == nil {
+			continue
+		}
+		if pattern.Name == "" || len(pattern.Children) != 0 || pattern.Rest != nil || pattern.RestIndex != 0 {
+			eligible = false
+			break
+		}
+	}
+	fn.SimpleBlockPatternEligible = eligible
+	fn.SimpleBlockPatternChecked = true
+	return eligible
+}
 
 type closureCell struct {
 	slot  **object.EmeraldValue
 	value *object.EmeraldValue
+}
+
+func (cell *closureCell) BindingValue() *object.EmeraldValue {
+	if cell == nil {
+		return nil
+	}
+	if cell.slot != nil && *cell.slot != nil {
+		return *cell.slot
+	}
+	return cell.value
 }
 
 func CallBlock(args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -43,6 +142,13 @@ func CallBlock(args ...*object.EmeraldValue) *object.EmeraldValue {
 		return core.R.NilVal
 	}
 	return CurrentVM.callBlock(CurrentVM.currentBlock, args...)
+}
+
+func CallBlockOne(arg *object.EmeraldValue) *object.EmeraldValue {
+	if CurrentVM == nil || CurrentVM.currentBlock == nil {
+		return core.R.NilVal
+	}
+	return CurrentVM.callBlockOneExplicit(CurrentVM.currentBlock, arg)
 }
 
 func init() {
@@ -69,24 +175,34 @@ type Frame struct {
 	DefinedByDefineMethod  bool
 	IsLambda               bool
 	CapturedBindings       []*object.RBinding
+	ClosureBindingSite     int
+	ClosureBinding         *object.RBinding
+	ClosureBindings        map[int]*object.RBinding
+	CapturedLocalValues    []*object.EmeraldValue
 	TraceSelf              *object.EmeraldValue
 	TraceDefinedClass      *object.EmeraldValue
 	TraceMethodID          string
 	TraceCalleeID          string
 	TraceParameters        *object.EmeraldValue
+	BacktraceReceiver      *object.EmeraldValue
+	BacktraceMethod        *object.Method
+	BacktraceOwner         *object.Class
 	InstructionException   *object.EmeraldValue
 	InstructionSnapshotSet bool
+	SendArgStorage         [4]*object.EmeraldValue
 
-	BlockBreakAddr int
-	WhileStart     int
-	WhileEnd       int
-	BlockBreak     bool
-	BlockBreakVal  *object.EmeraldValue
-	BlockNextVal   *object.EmeraldValue
-	Returned       bool
-	TraceLine      int64
-	ExecutionLine  int64
-	RetryRescue    *ActiveRescue
+	BlockBreakAddr         int
+	WhileStart             int
+	WhileEnd               int
+	BlockBreak             bool
+	BlockBreakVal          *object.EmeraldValue
+	BlockNextVal           *object.EmeraldValue
+	Returned               bool
+	TraceLine              int64
+	ExecutionLine          int64
+	RetryRescue            *ActiveRescue
+	bytecodeSendCacheTable []*registerIRSendCache
+	integerLoopDisabled    map[int]bool
 }
 
 type RescueHandler struct {
@@ -107,6 +223,7 @@ type ActiveRescue struct {
 	EnsureOffset      int
 	EnsureEndOffset   int
 	Frame             *Frame
+	Exception         *object.EmeraldValue
 	PreviousException *object.EmeraldValue
 	RescueStackDepth  int
 }
@@ -208,13 +325,17 @@ type methodCacheEntry struct {
 	owner      *object.Class
 }
 
+// hotSendEntry is a tiny VM-local polymorphic cache for ordinary sends. The
+// cache is deliberately independent from the bytecode/Register IR call-site
+// caches: vm.send has no stable bytecode site for native callbacks and helper
+// paths, so a handful of recent class/name pairs avoids repeatedly resolving
+// the same alternating dispatch sequence. Every entry is invalidated by the
+// global method generation and still passes the existing singleton/refinement
+// receiver guard before it can be used.
 type invocationMetadata struct {
-	superStart        *object.Class
-	superModule       *object.Module
-	superAfterClass   bool
-	label             string
-	traceDefinedClass *object.EmeraldValue
-	traceMethodID     string
+	superStart      *object.Class
+	superModule     *object.Module
+	superAfterClass bool
 }
 
 type integerFunctionStep struct {
@@ -226,11 +347,246 @@ type integerFunctionStep struct {
 type integerFunctionPlan struct {
 	steps   []integerFunctionStep
 	usesAdd bool
+	kernel  integerFunctionKernel
+}
+
+type integerFunctionKernelKind uint8
+
+const (
+	integerFunctionKernelNone integerFunctionKernelKind = iota
+	integerFunctionKernelBitMix
+)
+
+type integerFunctionKernel struct {
+	kind     integerFunctionKernelKind
+	multiply int64
+	shift    int64
+	mask     int64
+}
+
+type affineIntegerExpression struct {
+	factor int64
+	offset int64
+}
+
+func sameMethodFunction(left, right interface{}) bool {
+	if left == nil || right == nil || reflect.TypeOf(left) != reflect.TypeOf(right) {
+		return false
+	}
+	switch leftFn := left.(type) {
+	case *object.Function:
+		rightFn, _ := right.(*object.Function)
+		return leftFn == rightFn
+	}
+	leftValue := reflect.ValueOf(left)
+	rightValue := reflect.ValueOf(right)
+	if leftValue.Kind() == reflect.Func {
+		return leftValue.Pointer() == rightValue.Pointer()
+	}
+	return false
 }
 
 type integerFunctionCacheEntry struct {
 	plan      *integerFunctionPlan
 	supported bool
+}
+
+var instructionExceptionSnapshotNotNeeded = [256]bool{
+	compiler.OpTrue:              true,
+	compiler.OpFalse:             true,
+	compiler.OpNil:               true,
+	compiler.OpPop:               true,
+	compiler.OpJumpNotTruthy:     true,
+	compiler.OpJumpNotNil:        true,
+	compiler.OpJumpTruthy:        true,
+	compiler.OpFlipFlopGet:       true,
+	compiler.OpFlipFlopSet:       true,
+	compiler.OpJumpLocalPresent:  true,
+	compiler.OpGetLocal:          true,
+	compiler.OpGetLocalFast:      true,
+	compiler.OpGetInstanceVar:    true,
+	compiler.OpSetLocal:          true,
+	compiler.OpGetLocalCell:      true,
+	compiler.OpGetFree:           true,
+	compiler.OpSetFree:           true,
+	compiler.OpGetFreeCell:       true,
+	compiler.OpGetOuter:          true,
+	compiler.OpSetOuter:          true,
+	compiler.OpGetOuterFree:      true,
+	compiler.OpSetOuterFree:      true,
+	compiler.OpGetOuterCell:      true,
+	compiler.OpGetOuterFreeCell:  true,
+	compiler.OpSelf:              true,
+	compiler.OpDup:               true,
+	compiler.OpSwap:              true,
+	compiler.OpEnterForEach:      true,
+	compiler.OpExitForEach:       true,
+	compiler.OpSetWhileEnd:       true,
+	compiler.OpPatternCacheClear: true,
+	compiler.OpGetMatchCapture:   true,
+	compiler.OpBlockGiven:        true,
+	compiler.OpDefinedYield:      true,
+}
+
+var simpleOpcodeFastPath = [256]bool{
+	compiler.OpConstant:       true,
+	compiler.OpPop:            true,
+	compiler.OpTrue:           true,
+	compiler.OpFalse:          true,
+	compiler.OpNil:            true,
+	compiler.OpSelf:           true,
+	compiler.OpGetLocal:       true,
+	compiler.OpGetLocalFast:   true,
+	compiler.OpSetLocal:       true,
+	compiler.OpGetLocalCell:   true,
+	compiler.OpGetInstanceVar: true,
+	compiler.OpSetInstanceVar: true,
+	compiler.OpGetFree:        true,
+	compiler.OpSetFree:        true,
+	compiler.OpGetFreeCell:    true,
+	compiler.OpJumpNotTruthy:  true,
+	compiler.OpJumpNotNil:     true,
+	compiler.OpJumpTruthy:     true,
+	compiler.OpIndex:          true,
+	compiler.OpIndexAssign:    true,
+	compiler.OpDup:            true,
+	compiler.OpSwap:           true,
+}
+
+type leafMethodPlanKind uint8
+
+const (
+	leafMethodUnsupported leafMethodPlanKind = iota
+	leafMethodInstanceReader
+	leafMethodInstanceWriter
+	leafMethodAttributeIntegerCompare
+	leafMethodInstanceFallbackIndex
+	leafMethodOptionalInstanceReader
+	leafMethodOptionalInstanceFallbackReader
+	leafMethodRescueLiteral
+	leafMethodRescueEncoding
+	leafMethodRescueEncodeLiteral
+	leafMethodRegisterIR
+	leafMethodCaseDispatch
+)
+
+type caseDispatchBranch struct {
+	constantName string
+	entryIP      int
+	pattern      *object.EmeraldValue
+	target       *object.Class
+	direct       *object.EmeraldValue
+	// registerIR is a branch-local plan compiled from the clause body.  It is
+	// deliberately independent of the case predicate: the predicate has
+	// already been proven by caseDispatchStart, so the hot path can execute
+	// only the selected body and avoid the callee bytecode frame/dispatch loop.
+	registerIR *registerIRPlan
+	checked    bool
+}
+
+type caseDispatchPlan struct {
+	generation         uint64
+	local              int
+	param              int
+	skipIP             int
+	branches           []caseDispatchBranch
+	constantGeneration uint64
+	constantsChecked   bool
+	constantsBuiltin   bool
+	// classEntries memoizes the first matching builtin branch for each concrete
+	// receiver class.  The predicate set is generation-checked above, so class
+	// ancestry only needs to be walked once per class instead of once per branch
+	// on every call (large `case value; when Class` methods are common in gems).
+	classEntries  map[*object.Class]int
+	branchEntries map[int]*caseDispatchBranch
+}
+
+type leafMethodPlan struct {
+	kind                  leafMethodPlanKind
+	name                  string
+	secondaryName         string
+	indexKey              *object.EmeraldValue
+	registerIR            *registerIRPlan
+	caseDispatch          *caseDispatchPlan
+	optionalDefault       *object.EmeraldValue
+	optionalTruthy        bool
+	optionalGuard         *object.Method
+	optionalFallbackName  string
+	optionalFallbackValue *object.EmeraldValue
+	rescueLiteral         *object.EmeraldValue
+	rescueConstantName    string
+	rescueDefaultName     string
+	rescueEncodeGuard     *object.Method
+	rescueErrorClasses    []*object.Class
+	rescueEncodeLiteral   *object.EmeraldValue
+	runtime               *leafMethodRuntimeCache
+}
+
+// leafMethodRuntimeCache holds only generation-scoped facts for a leaf plan.
+// The plan itself is copied into several call-site caches, so keeping this
+// mutable state behind a pointer lets all copies share the warm result without
+// weakening the method/constant redefinition guards.
+type leafMethodRuntimeCache struct {
+	optionalGuardGeneration uint64
+	optionalGuardChecked    bool
+	optionalGuardSafe       bool
+
+	constantVM            *VM
+	constantGeneration    uint64
+	constantChecked       bool
+	constantSafe          bool
+	rescueConstant        *object.EmeraldValue
+	rescueDefaultEncoding *object.EmeraldValue
+
+	encodeVM         *VM
+	encodeGeneration uint64
+	encodeChecked    bool
+	encodeSafe       bool
+	encodeFn         func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue
+}
+
+// blockLeafPlanCacheKey separates the stable bytecode identity from the
+// lexical constant table attached to a runtime closure.  functionWithConstants
+// intentionally makes a shallow Function copy for each closure creation; the
+// first bytecode slot remains shared by those views and is therefore a stable
+// template identity without increasing the hot Function object size.
+type blockLeafPlanCacheKey struct {
+	template     *byte
+	constantSlot **object.EmeraldValue
+	constantLen  int
+	constantCap  int
+}
+
+type blockLeafPlanCacheEntry struct {
+	key  blockLeafPlanCacheKey
+	plan leafMethodPlan
+}
+
+func makeBlockLeafPlanCacheKey(fn *object.Function) blockLeafPlanCacheKey {
+	if fn == nil {
+		return blockLeafPlanCacheKey{}
+	}
+	var template *byte
+	if len(fn.Instructions) > 0 {
+		template = &fn.Instructions[0]
+	}
+	var slot **object.EmeraldValue
+	if len(fn.Constants) > 0 {
+		slot = &fn.Constants[0]
+	}
+	return blockLeafPlanCacheKey{
+		template:     template,
+		constantSlot: slot,
+		constantLen:  len(fn.Constants),
+		constantCap:  cap(fn.Constants),
+	}
+}
+
+type attributeIntegerCompareRuntimePlan struct {
+	generation           uint64
+	class                *object.Class
+	primaryInstanceVar   string
+	secondaryInstanceVar string
 }
 
 type integerLocalUpdatePlan struct {
@@ -239,10 +595,55 @@ type integerLocalUpdatePlan struct {
 }
 
 type integerLoopStep struct {
-	op    compiler.Opcode
+	op                 compiler.Opcode
+	local              int
+	value              int64
+	fn                 *object.Function
+	plan               *integerFunctionPlan
+	integerKernel      integerFunctionKernel
+	integerGeneration  uint64
+	typedPlan          *typedSSAPlan
+	typedGeneration    uint64
+	typedReferenceCall bool
+	argc               uint8
+	// receiverLocal is used by the typed-loop parser for stack values that
+	// are object receivers rather than integer operands.  -2 means an
+	// ordinary integer value, -1 is `self`, and a non-negative value names a
+	// stable local receiver.  Keeping this metadata in the step lets the
+	// runtime preserve the stack shape without boxing the receiver each
+	// iteration; the integer callee itself is proven receiver-independent.
+	receiverLocal int
+}
+
+type staticIntegerExpression struct {
+	op          compiler.Opcode
+	local       int
+	value       int64
+	isConstant  bool
+	left, right *staticIntegerExpression
+}
+
+type staticIntegerAssignment struct {
 	local int
-	value int64
+	expr  *staticIntegerExpression
+}
+
+type requireLoadPathCache struct {
+	currentDir string
+	values     []string
+	paths      []string
+	resolved   map[string]string
+	valid      bool
+}
+
+type rubyMethodCount struct {
 	fn    *object.Function
+	count uint64
+}
+
+type rubyMethodProfile struct {
+	mu     sync.Mutex
+	counts map[*object.Function]uint64
 }
 
 type VM struct {
@@ -275,6 +676,7 @@ type VM struct {
 	threadDepth               int
 	fiberDepth                int
 	procCallDepth             int
+	procCallKeywordSyntax     bool
 	nextFrameID               int
 
 	rescueStack           []*RescueHandler
@@ -298,20 +700,219 @@ type VM struct {
 	pendingEscapedThrowHandler *CatchHandler
 	pendingEscapedThrowValue   *object.EmeraldValue
 
-	nativeSingletonMethods map[interface{}]map[string]*object.Method
-	methodCache            map[methodCacheKey]methodCacheEntry
-	fusedIntegerGeneration uint64
-	fusedIntegerOps        bool
-	integerFunctionCache   map[*object.Function]integerFunctionCacheEntry
+	nativeSingletonMethods                      map[interface{}]map[string]*object.Method
+	methodCache                                 map[methodCacheKey]methodCacheEntry
+	hotSendClass                                *object.Class
+	hotSendName                                 string
+	hotSendGeneration                           uint64
+	hotSendMethod                               *object.Method
+	hotSendOwner                                *object.Class
+	hotSendNativeFn                             func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue
+	bytecodeSendTables                          map[*object.Function][]*registerIRSendCache
+	fusedIntegerGeneration                      uint64
+	fusedIntegerOps                             uint16
+	fusedFloatGeneration                        uint64
+	fusedFloatOps                               uint16
+	fusedStringGeneration                       uint64
+	fusedStringOps                              uint8
+	registerIRInlineDepth                       uint8
+	integerFunctionCache                        map[*object.Function]integerFunctionCacheEntry
+	typedIntegerMethods                         map[*object.Function]typedIntegerMethodEntry
+	typedIntegerArrayReduceShapes               map[*object.Function]typedIntegerArrayReduceShape
+	typedHotFunctions                           map[*object.Function]typedHotFunctionEntry
+	typedSSAFunctions                           map[*object.Function]typedSSAEntry
+	typedSSAReferenceFunctions                  map[*object.Function]typedSSAEntry
+	typedSSABlockFunctions                      map[*object.Function]typedSSAEntry
+	typedSSACallDepth                           uint8
+	typedSSARequireTrustedNativeReferenceCalls  bool
+	typedStringValueBatch                       *core.StringValueBatch
+	typedStringValueScratch                     *core.StringValueScratch
+	typedStringScratchStored                    bool
+	typedSSAReferenceCallCache                  map[typedSSAReferenceCallKey]typedSSAReferenceCallEntry
+	typedSSAReferenceClassCallCache             map[typedSSAReferenceClassCallKey]typedSSAReferenceCallEntry
+	typedSSABatchCallTemplates                  map[*object.Function]typedSSABatchCallTemplate
+	typedHashDirectPlans                        map[*object.Function]*registerIRPlan
+	hashIntegerMapLazyCalls                     map[*object.Function]uint8
+	typedSSABatchCallCount                      uint64
+	typedSSABatchCalleePlanMisses               uint64
+	typedSSABatchPrimitiveCandidates            uint64
+	typedSSABatchPrimitiveReferenceRejects      uint64
+	typedSSABatchPrimitiveOpRejects             uint64
+	typedSSABatchPrimitivePlans                 uint64
+	typedSSABatchPrimitiveElements              uint64
+	typedSSABatchFieldReduceAttempts            uint64
+	typedSSABatchFieldReduceHits                uint64
+	nativePrawnSimpleStates                     map[*object.EmeraldValue]*nativePrawnSimpleState
+	nativePrawnTextBuiltinGeneration            uint64
+	nativePrawnTextBuiltinsChecked              bool
+	nativePrawnUnscaledBuiltinsOK               bool
+	nativePrawnKernBuiltinsOK                   bool
+	nativePrawnComputeBuiltinsOK                bool
+	nativePrawnTextStateBuiltinGeneration       uint64
+	nativePrawnTextStateBuiltinsChecked         bool
+	nativePrawnTextStateBuiltinsOK              bool
+	nativePrawnTextModesGeneration              uint64
+	nativePrawnTextModesChecked                 bool
+	nativePrawnTextModesOK                      bool
+	nativePrawnFormattedGeneration              uint64
+	nativePrawnFormattedChecked                 bool
+	nativePrawnFormattedOK                      bool
+	nativePrawnAFMDependenciesGeneration        uint64
+	nativePrawnAFMDependenciesChecked           bool
+	nativePrawnAFMDependenciesOK                bool
+	nativePrawnFontMetricDependenciesGeneration uint64
+	nativePrawnFontMetricDependenciesChecked    bool
+	nativePrawnFontMetricDependenciesOK         bool
+	nativePrawnLineWrapProofs                   map[*object.Method]nativePrawnLineWrapMethodProof
+	nativePrawnLineWrapProofGeneration          uint64
+	nativePrawnLineWrapConstantsChecked         bool
+	nativePrawnLineWrapConstantsOK              bool
+	nativePrawnFragmentProcessTextProofs        map[*object.Method]nativePrawnFragmentProcessTextProof
+	nativePrawnFragmentProcessTextGeneration    uint64
+	nativeAFMGlyphTables                        map[*object.EmeraldValue][]int64
+	nativeAFMKernTables                         map[*object.RHash]nativeAFMKernTable
+	leafMethodCache                             map[*object.Function]leafMethodPlan
+	constructorPlanCache                        map[*object.Class]compiledConstructorPlan
+	aggressiveIRCache                           map[*object.Function]*registerIRPlan
+	blockLeafPlanCache                          map[*byte]blockLeafPlanCacheEntry
+	blockLeafPlanVariants                       map[blockLeafPlanCacheKey]leafMethodPlan
+	typedHotArrayLeafPlanKey                    blockLeafPlanCacheKey
+	typedHotArrayLeafPlan                       leafMethodPlan
+	typedHotArrayLeafPlanReady                  bool
+	typedHotArrayEffectfulIntegerCache          typedHotArrayEffectfulIntegerCache
+	forwardableDelegators                       map[*object.Function]forwardableDelegatorPlan
+	statefulBlockTables                         map[*object.RHash]map[[2]int64]*object.EmeraldValue
+	statefulBlockEligible                       map[*object.Function]bool
+	simpleBlockBinding                          map[*object.Function]bool
+	simpleDestructurePair                       map[*object.Function]bool
+	keywordMethodCache                          map[*object.Function]*registerIRPlan
+	attributeCompareCache                       map[*object.Function]attributeIntegerCompareRuntimePlan
+	attributeCompareOff                         bool
+	sourceLineCache                             map[*object.Function][]int64
+	rubyMethodProfile                           *rubyMethodProfile
+	nativePDFConstructorConstantGeneration      uint64
+	nativePDFFilterListClass                    *object.Class
+	nativePDFStreamClass                        *object.Class
+	nativePDFReferenceClass                     *object.Class
+	nativePDFObjectStoreClass                   *object.Class
+	nativePDFGraphicStateClass                  *object.Class
+	nativePDFGraphicStateStackClass             *object.Class
+	nativePDFDocumentStateClass                 *object.Class
+	nativePDFRendererClass                      *object.Class
+	nativePDFPageClass                          *object.Class
+	nativePrawnConstructorConstantGeneration    uint64
+	nativePrawnConstructorConstantChecked       bool
+	nativePrawnBoundingBoxClass                 *object.Class
+	nativePrawnDefaultAFMTemplate               *object.EmeraldValue
+	nativePrawnDefaultAFMTemplateClass          *object.Class
+	nativePrawnDefaultAFMTemplateGeneration     uint64
 
 	freezeStringLiterals bool
 	chillStringLiterals  bool
 	sourceEncoding       string
 	frozenStringCache    map[string]*object.EmeraldValue
+	frozenLiteralCache   map[*object.EmeraldValue]*object.EmeraldValue
+	requireLoadPathCache *requireLoadPathCache
 	threadCoroutines     map[*object.EmeraldValue]*threadCoroutine
 	fiberCoroutines      map[*object.EmeraldValue]*fiberCoroutine
+	fiberStackPool       [][]*object.EmeraldValue
 	threadSpecialGlobals map[string]*object.EmeraldValue
 	unhandledException   *object.EmeraldValue
+	objectArena          *object.ValueArena
+}
+
+type forwardableDelegatorPlan struct {
+	accessor string
+	target   string
+	valid    bool
+}
+
+type constructorValueSource struct {
+	kind          uint8
+	index         uint8
+	value         *object.EmeraldValue
+	mutableString bool
+}
+
+const (
+	constructorSourceInvalid uint8 = iota
+	constructorSourceParam
+	constructorSourceLiteral
+	constructorSourceSelf
+)
+
+type constructorStore struct {
+	name   string
+	source constructorValueSource
+	slot   int
+}
+
+type compiledConstructorPlan struct {
+	fn     *object.Function
+	stores []constructorStore
+}
+
+type arrayNewConstructorPlan struct {
+	class       *object.Class
+	blockFn     *object.Function
+	constructor compiledConstructorPlan
+	sources     [4]constructorValueSource
+	args        [4]uint8
+	argc        int
+}
+
+// lazyObjectArrayPayload is owned by a deferred Array.new constructor region.
+// It contains only the already-proven constructor plan; no Ruby value or
+// ObjectSpace weak handle is allocated until materialization is required.
+type lazyObjectArrayPayload struct {
+	vm     *VM
+	plan   *arrayNewConstructorPlan
+	length int
+}
+
+func (payload *lazyObjectArrayPayload) materialize() []*object.EmeraldValue {
+	if payload == nil || payload.vm == nil || payload.plan == nil || payload.length < 0 {
+		return nil
+	}
+	values := make([]*object.EmeraldValue, payload.length)
+	if core.ObjectSpaceTrackingEnabled() && objectSpaceIndependentValuesEnabled {
+		object.FillObjectValuesWithIndependentValues(values, payload.plan.class)
+	} else if core.ObjectSpaceTrackingEnabled() {
+		for index := range values {
+			values[index] = object.NewObjectValue(payload.plan.class)
+		}
+	} else {
+		object.FillObjectValues(values, payload.plan.class)
+	}
+	var callArgs [4]*object.EmeraldValue
+	for index := int64(0); index < int64(payload.length); index++ {
+		for argIndex := 0; argIndex < payload.plan.argc; argIndex++ {
+			source := payload.plan.sources[payload.plan.args[argIndex]]
+			if source.kind == constructorSourceParam {
+				callArgs[argIndex] = core.NewIntegerValue(index)
+			} else if source.mutableString {
+				value, ok := payload.vm.directRegisterIRConstantValue(source.value, payload.plan.blockFn)
+				if !ok {
+					values = values[:index]
+					core.TrackObjectSpaceValues(values)
+					return values
+				}
+				callArgs[argIndex] = value
+			} else {
+				callArgs[argIndex] = source.value
+			}
+		}
+		result, executed := payload.vm.executeCompiledConstructor(payload.plan.constructor, values[index], callArgs[:payload.plan.argc])
+		if !executed || result != nil && result.Type == object.ValueException {
+			// The admission proof contains only direct stores, so this is not
+			// expected. Returning the completed prefix is safer than exposing a
+			// partially initialized object as if it were a successful element.
+			values = values[:index]
+			break
+		}
+	}
+	core.TrackObjectSpaceValues(values)
+	return values
 }
 
 type nativeBacktraceFrame struct {
@@ -333,10 +934,16 @@ func (vm *VM) SetInstructionLimit(limit uint64) {
 
 func (vm *VM) SetFreezeStringLiterals(enabled bool) {
 	vm.freezeStringLiterals = enabled
+	if vm != nil {
+		annotateStringLiteralMode(vm.constants, vm.freezeStringLiterals, vm.chillStringLiterals)
+	}
 }
 
 func (vm *VM) SetChillStringLiterals(enabled bool) {
 	vm.chillStringLiterals = enabled
+	if vm != nil {
+		annotateStringLiteralMode(vm.constants, vm.freezeStringLiterals, vm.chillStringLiterals)
+	}
 }
 
 func SourceFreezesStringLiterals(source string) bool {
@@ -397,30 +1004,77 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 	}
 
 	vm := &VM{
-		parent:                 parent,
-		constants:              bytecode.Constants,
-		globals:                make([]*object.EmeraldValue, 100),
-		globalNames:            bytecode.GlobalNames,
-		bytecodeGlobalNames:    bytecode.GlobalNames,
-		rubyConsts:             make(map[string]*object.EmeraldValue),
-		stack:                  make([]*object.EmeraldValue, StackSize),
-		sp:                     1 + bytecode.NumLocals,
-		frames:                 []*Frame{mainFrame},
-		fp:                     0,
-		nextFrameID:            2,
-		instructions:           bytecode.Instructions,
-		sourceEncoding:         core.CurrentEvalSourceEncoding,
-		autoloading:            make(map[string]bool),
-		nativeSingletonMethods: make(map[interface{}]map[string]*object.Method),
-		methodCache:            make(map[methodCacheKey]methodCacheEntry),
-		integerFunctionCache:   make(map[*object.Function]integerFunctionCacheEntry),
-		frozenStringCache:      make(map[string]*object.EmeraldValue),
-		threadCoroutines:       make(map[*object.EmeraldValue]*threadCoroutine),
-		fiberCoroutines:        make(map[*object.EmeraldValue]*fiberCoroutine),
-		isRoot:                 parent == nil,
+		parent:                               parent,
+		constants:                            bytecode.Constants,
+		globals:                              make([]*object.EmeraldValue, 100),
+		globalNames:                          bytecode.GlobalNames,
+		bytecodeGlobalNames:                  bytecode.GlobalNames,
+		rubyConsts:                           make(map[string]*object.EmeraldValue),
+		stack:                                make([]*object.EmeraldValue, StackSize),
+		sp:                                   1 + bytecode.NumLocals,
+		frames:                               []*Frame{mainFrame},
+		fp:                                   0,
+		nextFrameID:                          2,
+		instructions:                         bytecode.Instructions,
+		sourceEncoding:                       core.CurrentEvalSourceEncoding,
+		autoloading:                          make(map[string]bool),
+		nativeSingletonMethods:               make(map[interface{}]map[string]*object.Method),
+		methodCache:                          make(map[methodCacheKey]methodCacheEntry),
+		bytecodeSendTables:                   make(map[*object.Function][]*registerIRSendCache),
+		integerFunctionCache:                 make(map[*object.Function]integerFunctionCacheEntry),
+		typedIntegerMethods:                  make(map[*object.Function]typedIntegerMethodEntry),
+		typedIntegerArrayReduceShapes:        make(map[*object.Function]typedIntegerArrayReduceShape),
+		typedHotFunctions:                    make(map[*object.Function]typedHotFunctionEntry),
+		typedSSAFunctions:                    make(map[*object.Function]typedSSAEntry),
+		typedSSAReferenceFunctions:           make(map[*object.Function]typedSSAEntry),
+		typedSSABlockFunctions:               make(map[*object.Function]typedSSAEntry),
+		typedSSAReferenceCallCache:           make(map[typedSSAReferenceCallKey]typedSSAReferenceCallEntry),
+		typedSSAReferenceClassCallCache:      make(map[typedSSAReferenceClassCallKey]typedSSAReferenceCallEntry),
+		typedSSABatchCallTemplates:           make(map[*object.Function]typedSSABatchCallTemplate),
+		typedHashDirectPlans:                 make(map[*object.Function]*registerIRPlan),
+		nativePrawnSimpleStates:              make(map[*object.EmeraldValue]*nativePrawnSimpleState),
+		nativePrawnLineWrapProofs:            make(map[*object.Method]nativePrawnLineWrapMethodProof),
+		nativePrawnFragmentProcessTextProofs: make(map[*object.Method]nativePrawnFragmentProcessTextProof),
+		nativeAFMGlyphTables:                 make(map[*object.EmeraldValue][]int64),
+		nativeAFMKernTables:                  make(map[*object.RHash]nativeAFMKernTable),
+		leafMethodCache:                      make(map[*object.Function]leafMethodPlan),
+		constructorPlanCache:                 make(map[*object.Class]compiledConstructorPlan),
+		aggressiveIRCache:                    make(map[*object.Function]*registerIRPlan),
+		blockLeafPlanCache:                   make(map[*byte]blockLeafPlanCacheEntry),
+		blockLeafPlanVariants:                make(map[blockLeafPlanCacheKey]leafMethodPlan),
+		forwardableDelegators:                make(map[*object.Function]forwardableDelegatorPlan),
+		statefulBlockTables:                  make(map[*object.RHash]map[[2]int64]*object.EmeraldValue),
+		statefulBlockEligible:                make(map[*object.Function]bool),
+		simpleBlockBinding:                   make(map[*object.Function]bool),
+		simpleDestructurePair:                make(map[*object.Function]bool),
+		keywordMethodCache:                   make(map[*object.Function]*registerIRPlan),
+		attributeCompareCache:                make(map[*object.Function]attributeIntegerCompareRuntimePlan),
+		attributeCompareOff:                  os.Getenv("RGO_DISABLE_ATTRIBUTE_COMPARE_PLAN") != "",
+		sourceLineCache:                      make(map[*object.Function][]int64),
+		frozenStringCache:                    make(map[string]*object.EmeraldValue),
+		frozenLiteralCache:                   make(map[*object.EmeraldValue]*object.EmeraldValue),
+		requireLoadPathCache:                 &requireLoadPathCache{},
+		threadCoroutines:                     make(map[*object.EmeraldValue]*threadCoroutine),
+		fiberCoroutines:                      make(map[*object.EmeraldValue]*fiberCoroutine),
+		isRoot:                               parent == nil,
+	}
+	// The arena retains every slot until the VM is discarded.  That is useful
+	// only for a caller that can prove an object region is long-lived; keeping
+	// it opt-in avoids turning short-lived allocation-heavy programs into a GC
+	// regression.
+	if CompactObjectLayoutsEnabled() && os.Getenv("RGO_OBJECT_ARENA") != "" {
+		if parent != nil {
+			vm.objectArena = parent.objectArena
+		} else {
+			vm.objectArena = object.NewValueArena()
+		}
+		object.ActiveValueArena = vm.objectArena
 	}
 	if parent != nil {
 		vm.instructionLimit = parent.instructionLimit
+		vm.rubyMethodProfile = parent.rubyMethodProfile
+	} else if os.Getenv("RGO_PROFILE_RUBY_METHODS") != "" {
+		vm.rubyMethodProfile = &rubyMethodProfile{counts: make(map[*object.Function]uint64)}
 	}
 	if parent == nil {
 		core.InitializeRuntimeModules()
@@ -428,14 +1082,8 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		vm.rubyConsts["TOPLEVEL_BINDING"] = &object.EmeraldValue{
 			Type: object.ValueBinding,
 			Data: &object.RBinding{
-				Self:         core.R.Main,
-				Locals:       map[string]*object.EmeraldValue{},
-				LocalNames:   nil,
-				Constants:    map[string]*object.EmeraldValue{},
-				Method:       "",
-				InstanceVars: map[string]*object.EmeraldValue{},
-				Path:         core.CurrentSpecFile,
-				Line:         1,
+				RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+				Self:             core.R.Main, Constants: map[string]*object.EmeraldValue{}, Method: "", Path: core.CurrentSpecFile, Line: 1,
 			},
 			Class: core.R.Classes["Binding"],
 		}
@@ -448,7 +1096,12 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		vm.rubyConsts = parent.rubyConsts
 		vm.autoloading = parent.autoloading
 		vm.nativeSingletonMethods = parent.nativeSingletonMethods
+		vm.nativePrawnDefaultAFMTemplate = parent.nativePrawnDefaultAFMTemplate
+		vm.nativePrawnDefaultAFMTemplateClass = parent.nativePrawnDefaultAFMTemplateClass
+		vm.nativePrawnDefaultAFMTemplateGeneration = parent.nativePrawnDefaultAFMTemplateGeneration
 		vm.frozenStringCache = parent.frozenStringCache
+		vm.frozenLiteralCache = parent.frozenLiteralCache
+		vm.requireLoadPathCache = parent.requireLoadPathCache
 	} else {
 		vm.SetTopLevelConstant("ARGF", vm.rubyConsts["ARGF"])
 		argv := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}
@@ -482,6 +1135,7 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 }
 
 func (vm *VM) SetTopLevelConstant(name string, value *object.EmeraldValue) {
+	object.BumpConstantGeneration()
 	vm.rubyConsts[name] = value
 	objectClass := core.R.Classes["Object"]
 	if objectClass != nil {
@@ -665,7 +1319,7 @@ func (vm *VM) threadBacktraceFrames(thread *object.EmeraldValue) []object.RBackt
 
 func (vm *VM) freshFiberExecutionContext(caller vmExecutionContext) vmExecutionContext {
 	return vmExecutionContext{
-		stack:                make([]*object.EmeraldValue, StackSize),
+		stack:                vm.acquireFiberStack(),
 		fp:                   -1,
 		threadDepth:          caller.threadDepth,
 		fiberDepth:           1,
@@ -674,6 +1328,28 @@ func (vm *VM) freshFiberExecutionContext(caller vmExecutionContext) vmExecutionC
 		sourceEncoding:       caller.sourceEncoding,
 		threadSpecialGlobals: caller.threadSpecialGlobals,
 	}
+}
+
+func (vm *VM) acquireFiberStack() []*object.EmeraldValue {
+	last := len(vm.fiberStackPool) - 1
+	if last < 0 {
+		return make([]*object.EmeraldValue, StackSize)
+	}
+	stack := vm.fiberStackPool[last]
+	vm.fiberStackPool[last] = nil
+	vm.fiberStackPool = vm.fiberStackPool[:last]
+	return stack
+}
+
+func (vm *VM) releaseFiberStack(context *vmExecutionContext) {
+	stack := context.stack
+	context.stack = nil
+	if cap(stack) != StackSize || len(vm.fiberStackPool) >= maxReusableFiberStacks {
+		return
+	}
+	stack = stack[:StackSize]
+	clear(stack)
+	vm.fiberStackPool = append(vm.fiberStackPool, stack)
 }
 
 func (vm *VM) runFiberBlock(fiber, block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -708,6 +1384,7 @@ func (vm *VM) runFiberBlock(fiber, block *object.EmeraldValue, args ...*object.E
 	if event.suspended {
 		return core.NewFiberSuspension(event.result)
 	}
+	vm.releaseFiberStack(&coroutine.context)
 	delete(vm.fiberCoroutines, fiber)
 	return event.result
 }
@@ -839,10 +1516,17 @@ func (vm *VM) updateCapturedBindingLocal(frame *Frame, index int, value *object.
 		if binding == nil {
 			continue
 		}
-		if binding.Locals == nil {
-			binding.Locals = make(map[string]*object.EmeraldValue)
+		if index >= 0 && index < len(binding.CompactLocalValues) {
+			binding.CompactLocalValues[index] = value
 		}
-		binding.Locals[name] = value
+		if binding.RBindingExpanded == nil || binding.Locals == nil {
+			continue
+		}
+		if existing := binding.Locals[name]; existing == nil {
+			binding.Locals[name] = value
+		} else if _, liveCell := existing.Data.(object.BindingCell); !liveCell {
+			binding.Locals[name] = value
+		}
 		known := false
 		for _, localName := range binding.LocalNames {
 			if localName == name {
@@ -882,7 +1566,20 @@ func (vm *VM) setCapturedBindingLocal(binding *object.RBinding, name string, val
 		if slot < 0 || slot >= vm.sp {
 			continue
 		}
-		vm.stack[slot] = value
+		if current := vm.stack[slot]; current != nil {
+			if currentCell, liveCell := current.Data.(*closureCell); liveCell {
+				if value != nil {
+					if valueCell, sameCell := value.Data.(*closureCell); sameCell && valueCell == currentCell {
+						continue
+					}
+				}
+				setClosureValue(&vm.stack[slot], value)
+			} else {
+				vm.stack[slot] = value
+			}
+		} else {
+			vm.stack[slot] = value
+		}
 		if _, topLevel := vm.topLevelLocalName(frame, index); topLevel {
 			if topLevelBinding := vm.topLevelBindingData(); topLevelBinding != nil {
 				if topLevelBinding.Locals == nil {
@@ -915,7 +1612,7 @@ func (vm *VM) handlePendingNonLocalReturn(frame *Frame) bool {
 	if base < frame.Bp+1 {
 		base = frame.Bp + 1
 	}
-	vm.sp = base
+	vm.setStackPointer(base)
 	vm.push(value)
 	frame.Returned = true
 	return true
@@ -940,7 +1637,7 @@ func (vm *VM) handlePendingNonLocalBreak(frame *Frame) bool {
 			if vm.routeBreakThroughEnsure(frame, value, frame.WhileEnd) {
 				return false
 			}
-			vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+			vm.setStackPointer(frame.Bp + 1 + frame.Fn.NumLocals)
 			vm.push(value)
 			if value == nil || value.Type == object.ValueNil {
 				frame.Ip = frame.WhileEnd - 1
@@ -956,7 +1653,7 @@ func (vm *VM) handlePendingNonLocalBreak(frame *Frame) bool {
 	if frame.Fn != nil {
 		base += frame.Fn.NumLocals
 	}
-	vm.sp = base
+	vm.setStackPointer(base)
 	vm.push(value)
 	frame.Returned = true
 	return true
@@ -1011,6 +1708,524 @@ func cloneMethodMap(methods map[string]*object.Method) map[string]*object.Method
 	return copy
 }
 
+func compileConstructorTemplate(fn *object.Function, plan *registerIRPlan) (compiledConstructorPlan, bool) {
+	if fn == nil || !registerIRConstructorPlan(plan) {
+		return compiledConstructorPlan{}, false
+	}
+	var registers [16]constructorValueSource
+	stores := make([]constructorStore, 0, 4)
+	for index, instruction := range plan.instructions {
+		switch instruction.op {
+		case registerIRLoadParam:
+			if instruction.param >= 16 {
+				return compiledConstructorPlan{}, false
+			}
+			registers[instruction.dst] = constructorValueSource{kind: constructorSourceParam, index: instruction.param}
+		case registerIRLoadLiteral:
+			if !registerIRImmutableLiteral(instruction.value) {
+				return compiledConstructorPlan{}, false
+			}
+			registers[instruction.dst] = constructorValueSource{kind: constructorSourceLiteral, value: instruction.value}
+		case registerIRLoadSelf:
+			registers[instruction.dst] = constructorValueSource{kind: constructorSourceSelf}
+		case registerIRMove:
+			registers[instruction.dst] = registers[instruction.left]
+		case registerIRSwap:
+			registers[instruction.left], registers[instruction.right] = registers[instruction.right], registers[instruction.left]
+		case registerIRStoreInstanceVar:
+			if instruction.name == "" || registers[instruction.left].kind == constructorSourceInvalid {
+				return compiledConstructorPlan{}, false
+			}
+			stores = append(stores, constructorStore{name: instruction.name, source: registers[instruction.left], slot: -1})
+		case registerIRReturn:
+			if index != len(plan.instructions)-1 || len(stores) == 0 {
+				return compiledConstructorPlan{}, false
+			}
+		default:
+			return compiledConstructorPlan{}, false
+		}
+	}
+	return compiledConstructorPlan{fn: fn, stores: stores}, true
+}
+
+func (vm *VM) executeCompiledConstructor(plan compiledConstructorPlan, receiver *object.EmeraldValue, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || plan.fn == nil || receiver == nil || len(args) != len(plan.fn.Params) {
+		return nil, false
+	}
+	data, objectOK := receiver.Data.(*object.Object)
+	for _, store := range plan.stores {
+		var value *object.EmeraldValue
+		switch store.source.kind {
+		case constructorSourceParam:
+			if int(store.source.index) >= len(args) {
+				return nil, false
+			}
+			value = args[store.source.index]
+		case constructorSourceLiteral:
+			value = store.source.value
+		case constructorSourceSelf:
+			value = receiver
+		default:
+			return nil, false
+		}
+		if value == nil {
+			value = core.R.NilVal
+		}
+		if objectOK && store.slot >= 0 {
+			if data.InstanceVars == nil {
+				data.SetInlineInstanceVarFast(store.slot, store.name, value)
+				continue
+			}
+			if data.SetInlineInstanceVar(store.slot, store.name, value) {
+				continue
+			}
+		}
+		if objectOK {
+			data.SetInstanceVar(store.name, value)
+			continue
+		}
+		if result := core.SetDynamicInstanceVar(receiver, store.name, value); result != nil {
+			return result, true
+		}
+	}
+	return core.R.NilVal, true
+}
+
+func (vm *VM) cachedCompiledConstructor(cls *object.Class, fn *object.Function, plan *registerIRPlan) (compiledConstructorPlan, bool) {
+	if vm == nil || cls == nil || fn == nil || !registerIRConstructorPlan(plan) {
+		return compiledConstructorPlan{}, false
+	}
+	constructor, found := vm.constructorPlanCache[cls]
+	if found && constructor.fn == fn {
+		return constructor, true
+	}
+	var compiled bool
+	constructor, compiled = compileConstructorTemplate(fn, plan)
+	if !compiled {
+		return compiledConstructorPlan{}, false
+	}
+	for index := range constructor.stores {
+		if slot, ok := cls.EnsureInstanceVarSlot(constructor.stores[index].name); ok {
+			constructor.stores[index].slot = slot
+		}
+	}
+	vm.constructorPlanCache[cls] = constructor
+	return constructor, true
+}
+
+// constructorRegisterIRPlan supplements the leaf-plan classifier for the
+// common one-parameter attr-writer shape.  That classifier intentionally
+// keeps a dedicated instance-writer plan for ordinary dispatch, while the
+// constructor tier needs the equivalent straight-line IR to compile its
+// ivar stores into a reusable allocation plan.
+func constructorRegisterIRPlan(fn *object.Function, plan leafMethodPlan) (*registerIRPlan, bool) {
+	if fn == nil {
+		return nil, false
+	}
+	if plan.kind == leafMethodRegisterIR && plan.registerIR != nil {
+		return plan.registerIR, registerIRConstructorPlan(plan.registerIR)
+	}
+	if plan.kind != leafMethodInstanceWriter {
+		return nil, false
+	}
+	compiled, ok := compileRegisterIR(fn)
+	if !ok || !registerIRConstructorPlan(compiled) {
+		return nil, false
+	}
+	return compiled, true
+}
+
+func (vm *VM) cachedConstructorForFunction(cls *object.Class, fn *object.Function, plan leafMethodPlan) (compiledConstructorPlan, *registerIRPlan, bool) {
+	if vm == nil || cls == nil || fn == nil {
+		return compiledConstructorPlan{}, nil, false
+	}
+	if constructor, found := vm.constructorPlanCache[cls]; found && constructor.fn == fn {
+		return constructor, nil, true
+	}
+	constructorIR, ok := constructorRegisterIRPlan(fn, plan)
+	if !ok {
+		return compiledConstructorPlan{}, nil, false
+	}
+	constructor, found := vm.cachedCompiledConstructor(cls, fn, constructorIR)
+	return constructor, constructorIR, found
+}
+
+// fastClassNewFramedRegisterIREligible admits the common non-trivial
+// initializer shape after Class#new has already proved its exact positional
+// call protocol.  Unlike the allocation-only constructor template, this tier
+// keeps a real Frame so ordinary sends, allocations, constants, and exception
+// results retain the normal Ruby semantics.  The block guard is intentional:
+// classNew must preserve a block for initialize, and this entry is only used
+// when no block is present.
+func fastClassNewFramedRegisterIREligible(vm *VM, fn *object.Function, method *object.Method, plan leafMethodPlan, args []*object.EmeraldValue) bool {
+	if vm == nil || fn == nil || method == nil || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		vm.currentBlock != nil || method.DispatchOwner != nil || method.Ruby2Keywords || method.DefinedByDefineMethod ||
+		methodUsesRefinements(method) || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) != 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.RejectKeywords || fn.RejectBlock ||
+		!simpleBlockParameterPatterns(fn) || registerIRPlanMayDeopt(plan.registerIR) ||
+		!registerIRPlanSafeForActiveRescues(plan.registerIR, vm) {
+		return false
+	}
+	return true
+}
+
+// prepareBatchCompactConstructor admits the default-mode object layout only
+// for the already-proven closed-world constructor batch. Direct Object
+// subclasses with at most four fixed ivar stores can keep those fields in the
+// Object payload without allocating one map per element. Classes with user
+// ancestors, too many fields, or a process-wide compact mode retain their
+// existing representation and semantics.
+func prepareBatchCompactConstructor(cls *object.Class, constructor *compiledConstructorPlan) bool {
+	if object.CompactObjectLayouts || cls == nil || constructor == nil ||
+		cls.IsSingleton || cls.SuperClass != core.R.Classes["Object"] || len(constructor.stores) == 0 {
+		return false
+	}
+	names := make([]string, 0, len(constructor.stores))
+	for _, store := range constructor.stores {
+		names = append(names, store.name)
+	}
+	if !cls.PrepareBatchInstanceVarLayout(names) {
+		return false
+	}
+	for index := range constructor.stores {
+		slot, ok := cls.EnsureInstanceVarSlot(constructor.stores[index].name)
+		if !ok {
+			return false
+		}
+		constructor.stores[index].slot = slot
+	}
+	return true
+}
+
+// fastClassNew is the VM side of core.FastClassNew.  classNew calls this only
+// after its builtin branches have been eliminated, so the remaining work is a
+// user-defined object allocation plus a closed-world straight-line
+// initializer.  The method-generation and VM-state guards mirror the direct
+// Register IR tier; a miss leaves the original Class#new implementation
+// untouched.
+func (vm *VM) fastClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !registerIRDirectNoFrameEnabled || receiver == nil || receiver.Type != object.ValueClass ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 || len(vm.rescueStack) != 0 ||
+		vm.currentBlock != nil || !fastClassNewClassEligible(receiver) {
+		return nil, false
+	}
+	cls, ok := receiver.Data.(*object.Class)
+	if !ok || cls == nil || cls.IsSingleton {
+		return nil, false
+	}
+	method, methodOwner, found := cls.GetMethodWithOwner("initialize")
+	if !found || method == nil || method.DispatchOwner != nil || method.Ruby2Keywords || methodUsesRefinements(method) {
+		return nil, false
+	}
+	if cls.Name == "Prawn::Document::BoundingBox" {
+		if result, handled := vm.executeNativePrawnClassNew(receiver, args...); handled {
+			return result, true
+		}
+	}
+	if cls.Name == "Prawn::Document" {
+		if result, handled := vm.executeNativePrawnDocumentClassNew(receiver, args...); handled {
+			return result, true
+		}
+	}
+	if result, handled := vm.executeNativePDFClassNew(receiver, args...); handled {
+		return result, true
+	}
+	fn, ok := method.Fn.(*object.Function)
+	if !ok || fn == nil || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) != 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.RejectKeywords || fn.RejectBlock ||
+		methodArityError(fn, len(args)) != nil {
+		return nil, false
+	}
+	plan, found := vm.leafMethodCache[fn]
+	if !found {
+		plan = buildLeafMethodPlan(fn)
+		vm.leafMethodCache[fn] = plan
+	}
+	constructor, constructorIR, constructorFound := vm.cachedConstructorForFunction(cls, fn, plan)
+	if constructorFound {
+		obj := object.NewObjectValue(cls)
+		core.TrackObjectSpaceValue(obj)
+		if result, executed := vm.executeCompiledConstructor(constructor, obj, args); executed {
+			if result != nil && result.Type == object.ValueException {
+				return result, true
+			}
+			return obj, true
+		}
+		if constructorIR != nil {
+			result, executed := vm.executeRegisterIRDirectNoFrameWithFreeMode(
+				constructorIR, fn, obj, args, object.CurrentMethodGeneration(), nil, false)
+			if executed {
+				if result != nil && result.Type == object.ValueException {
+					return result, true
+				}
+				return obj, true
+			}
+		}
+	}
+	if !fastClassNewFramedRegisterIREligible(vm, fn, method, plan, args) {
+		return nil, false
+	}
+	obj := object.NewObjectValue(cls)
+	core.TrackObjectSpaceValue(obj)
+	result, executed := vm.executeRegisterIR(plan.registerIR, fn, obj, args, "initialize", method, methodOwner, true)
+	if !executed {
+		return nil, false
+	}
+	if shouldPropagateExceptionValue(result) {
+		return result, true
+	}
+	return obj, true
+}
+
+// fastClassNewDirect is used at a normal `Class#new` send site, before the
+// generic classNew body runs. Builtin value classes have specialized allocation
+// semantics (Array, Hash, String, Exception, Struct, ...), so only a class
+// whose entire ancestor chain is outside that set may enter this ABI.
+func fastClassNewClassEligible(receiver *object.EmeraldValue) bool {
+	if receiver == nil || receiver.Type != object.ValueClass {
+		return false
+	}
+	cls, ok := receiver.Data.(*object.Class)
+	if !ok || cls == nil {
+		return false
+	}
+	for current := cls; current != nil; current = current.SuperClass {
+		if current == core.R.Classes["Object"] || current == core.R.Classes["BasicObject"] {
+			// These are ordinary ancestors for user classes. Only the classes
+			// themselves use special allocation semantics and must be rejected.
+			if cls == current {
+				return false
+			}
+			continue
+		}
+		if current == core.R.Classes["Array"] || current == core.R.Classes["Hash"] ||
+			current == core.R.Classes["String"] || current == core.R.Classes["Regexp"] ||
+			current == core.R.Classes["Range"] || current == core.R.Classes["Set"] ||
+			current == core.R.Classes["Struct"] || current == core.R.Classes["Module"] ||
+			current == core.R.Classes["Exception"] {
+			return false
+		}
+	}
+	return true
+}
+
+func (vm *VM) fastClassNewDirect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if !fastClassNewClassEligible(receiver) {
+		return nil, false
+	}
+	return vm.fastClassNew(receiver, args...)
+}
+
+// prepareArrayNewConstructorPlan proves the common allocation shape
+// `Array.new(n) { UserClass.new(literal_or_index) }`. It removes one block
+// binder, one Class#new send, and one constructor-plan lookup per element while
+// retaining the ordinary Array.new implementation for every less constrained
+// block. The fused body has no user send after the class/initializer guards,
+// so a generation change cannot replay a partial iteration.
+func (vm *VM) prepareArrayNewConstructorPlan(length int64, block *object.EmeraldValue) (*arrayNewConstructorPlan, bool) {
+	return vm.prepareArrayNewConstructorPlanMode(length, block, false)
+}
+
+func (vm *VM) prepareArrayNewConstructorPlanMode(length int64, block *object.EmeraldValue, allowMutableString bool) (*arrayNewConstructorPlan, bool) {
+	if vm == nil || !arrayNewConstructorBatchEnabled || !registerIRDirectNoFrameEnabled || block == nil || length < 0 ||
+		core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() || vm.instructionLimit != 0 || DevMode ||
+		len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 || len(vm.rescueStack) != 0 {
+		return nil, false
+	}
+	if length == 0 {
+		return nil, true
+	}
+	var fn *object.Function
+	var autoSplat bool
+	switch block.Type {
+	case object.ValueClosure:
+		closure, _ := block.Data.(*object.Closure)
+		if closure == nil || len(closure.Refinements) != 0 {
+			return nil, false
+		}
+		fn = closure.Fn
+		autoSplat = closure.AutoSplat
+	case object.ValueProc:
+		proc, _ := block.Data.(*object.Proc)
+		if proc == nil || proc.Native != nil || proc.IsLambda || len(proc.Refinements) != 0 {
+			return nil, false
+		}
+		fn = proc.Fn
+		autoSplat = proc.AutoSplat
+	default:
+		return nil, false
+	}
+	if fn == nil || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) != 0 || fn.KeywordRestParam != "" ||
+		fn.KeywordRestOnly || fn.RejectKeywords || fn.RejectBlock || len(fn.Params) > 1 || !simpleBlockParameterPatterns(fn) ||
+		autoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	blockPlan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || blockPlan.kind != leafMethodRegisterIR || blockPlan.registerIR == nil {
+		return nil, false
+	}
+	ir := blockPlan.registerIR
+	if ir.sendCount != 1 || ir.hasBranches || ir.hasImplicitSends || !ir.blockReturn || len(ir.instructions) < 3 {
+		return nil, false
+	}
+	last := len(ir.instructions) - 1
+	if ir.instructions[last].op != registerIRReturn || ir.instructions[last-1].op != registerIRSend {
+		return nil, false
+	}
+	send := ir.instructions[last-1]
+	if send.name != "new" || send.blockPresent || send.splatIndex != 255 || send.opcode != compiler.OpSend || send.argc > 4 {
+		return nil, false
+	}
+	classLoad := ir.instructions[0]
+	if classLoad.op != registerIRLoadConstant || classLoad.name == "" || send.left != classLoad.dst {
+		return nil, false
+	}
+	classValue, ok := vm.topLevelConstantValue(classLoad.name)
+	if !ok {
+		classValue, ok = vm.qualifiedConstantValue(classLoad.name)
+	}
+	if !ok || classValue == nil || classValue.Type != object.ValueClass || !fastClassNewClassEligible(classValue) {
+		return nil, false
+	}
+	newMethod, _, fallback := vm.lookupMethodForSend(classValue, "new", nil, false, true)
+	if fallback != nil || !core.IsBuiltinClassNewMethod(newMethod) {
+		return nil, false
+	}
+	cls, _ := classValue.Data.(*object.Class)
+	if cls == nil {
+		return nil, false
+	}
+	method, _, found := cls.GetMethodWithOwner("initialize")
+	if !found || method == nil || method.DispatchOwner != nil || methodUsesRefinements(method) {
+		return nil, false
+	}
+	initFn, ok := method.Fn.(*object.Function)
+	if !ok || initFn == nil || len(send.args) < int(send.argc) {
+		return nil, false
+	}
+	initPlan, found := vm.leafMethodCache[initFn]
+	if !found {
+		initPlan = buildLeafMethodPlan(initFn)
+		vm.leafMethodCache[initFn] = initPlan
+	}
+	constructor, _, found := vm.cachedConstructorForFunction(cls, initFn, initPlan)
+	if !found || int(send.argc) != len(initFn.Params) {
+		return nil, false
+	}
+	prepareBatchCompactConstructor(cls, &constructor)
+	var sources [4]constructorValueSource
+	for index := 1; index < last-1; index++ {
+		instruction := ir.instructions[index]
+		switch instruction.op {
+		case registerIRLoadLiteral:
+			if !registerIRImmutableLiteral(instruction.value) {
+				return nil, false
+			}
+			sources[instruction.dst] = constructorValueSource{kind: constructorSourceLiteral, value: instruction.value}
+		case registerIRLoadConstantValue:
+			if !allowMutableString || instruction.value == nil || instruction.value.Type != object.ValueString ||
+				fn.StringLiteralModeSet || vm.freezeStringLiterals || vm.chillStringLiterals {
+				return nil, false
+			}
+			sources[instruction.dst] = constructorValueSource{kind: constructorSourceLiteral, value: instruction.value, mutableString: true}
+		case registerIRLoadParam:
+			if instruction.param >= uint8(len(fn.Params)) {
+				return nil, false
+			}
+			sources[instruction.dst] = constructorValueSource{kind: constructorSourceParam, index: instruction.param}
+		case registerIRLoadLocal:
+			if len(fn.ParamLocalIndices) != 1 || instruction.param != uint8(fn.ParamLocalIndices[0]) {
+				return nil, false
+			}
+			sources[instruction.dst] = constructorValueSource{kind: constructorSourceParam, index: 0}
+		case registerIRMove:
+			sources[instruction.dst] = sources[instruction.left]
+		default:
+			return nil, false
+		}
+	}
+	for index := 0; index < int(send.argc); index++ {
+		if sources[send.args[index]].kind == constructorSourceInvalid {
+			return nil, false
+		}
+	}
+	return &arrayNewConstructorPlan{class: cls, blockFn: fn, constructor: constructor, sources: sources, args: send.args, argc: int(send.argc)}, true
+}
+
+// tryExecuteArrayNewConstructorBlock fuses the common allocation shape and
+// retains the ordinary Array.new implementation for every less constrained
+// block.
+func (vm *VM) tryExecuteArrayNewConstructorBlock(length int64, block *object.EmeraldValue) ([]*object.EmeraldValue, *object.EmeraldValue, bool) {
+	plan, ok := vm.prepareArrayNewConstructorPlan(length, block)
+	if !ok {
+		return nil, nil, false
+	}
+	if length == 0 {
+		return []*object.EmeraldValue{}, nil, true
+	}
+	values := make([]*object.EmeraldValue, int(length))
+	if core.ObjectSpaceTrackingEnabled() && objectSpaceIndependentValuesEnabled {
+		object.FillObjectValuesWithIndependentValues(values, plan.class)
+	} else if core.ObjectSpaceTrackingEnabled() {
+		for index := range values {
+			values[index] = object.NewObjectValue(plan.class)
+		}
+	} else {
+		object.FillObjectValues(values, plan.class)
+	}
+	generation := object.CurrentMethodGeneration()
+	var callArgs [4]*object.EmeraldValue
+	for index := int64(0); index < length; index++ {
+		for argIndex := 0; argIndex < plan.argc; argIndex++ {
+			source := plan.sources[plan.args[argIndex]]
+			if source.kind == constructorSourceParam {
+				callArgs[argIndex] = core.NewIntegerValue(index)
+			} else {
+				callArgs[argIndex] = source.value
+			}
+		}
+		if object.CurrentMethodGeneration() != generation {
+			core.TrackObjectSpaceValues(values[:index])
+			return nil, nil, false
+		}
+		obj := values[index]
+		result, executed := vm.executeCompiledConstructor(plan.constructor, obj, callArgs[:plan.argc])
+		if !executed || result != nil && result.Type == object.ValueException {
+			core.TrackObjectSpaceValues(values[:index])
+			return nil, result, true
+		}
+		values[index] = obj
+	}
+	core.TrackObjectSpaceValues(values)
+	return values, nil, true
+}
+
+// tryExecuteArrayNewConstructorLazyBlock defers the proven constructor until
+// Array#map, indexing, reflection, or ObjectSpace actually observes an
+// element. The region is semantically transparent because materialization
+// executes the captured constructor plan, while the common immediate typed
+// map can consume constructor fields without allocating objects at all.
+func (vm *VM) tryExecuteArrayNewConstructorLazyBlock(length int64, block *object.EmeraldValue) (*object.LazyArrayRegion, *object.EmeraldValue, bool) {
+	if !arrayNewConstructorLazyEnabled {
+		return nil, nil, false
+	}
+	plan, ok := vm.prepareArrayNewConstructorPlanMode(length, block, true)
+	if !ok {
+		return nil, nil, false
+	}
+	if length == 0 {
+		return nil, nil, true
+	}
+	payload := &lazyObjectArrayPayload{vm: vm, plan: plan, length: int(length)}
+	return &object.LazyArrayRegion{
+		Length:           int(length),
+		Payload:          payload,
+		Materialize:      payload.materialize,
+		MethodGeneration: object.CurrentMethodGeneration(),
+	}, nil, true
+}
+
 func restoreMethodMap(target, snapshot map[string]*object.Method) {
 	for name := range target {
 		delete(target, name)
@@ -1023,6 +2238,24 @@ func restoreMethodMap(target, snapshot map[string]*object.Method) {
 func (vm *VM) installCoreHooks() {
 	CurrentVM = vm
 	core.CallBlock = CallBlock
+	core.CallBlockOne = CallBlockOne
+	core.IntegerTimesCapturedBlock = vm.tryExecuteIntegerTimesCapturedBlock
+	core.IOEachLineCapturedBlock = vm.tryExecuteIOEachLineCapturedBlock
+	core.StringEachByteCapturedBlock = vm.tryExecuteStringEachByteCapturedBlock
+	core.IntegerTimesLinearBlock = vm.tryExecuteIntegerTimesLinearBlock
+	core.ArrayEachCapturedBlock = vm.tryExecuteArrayEachCapturedBlock
+	core.ArrayMapCapturedBlock = vm.tryExecuteArrayMapCapturedBlock
+	core.EnumerableFindCapturedBlock = vm.tryExecuteArrayFindCapturedBlock
+	core.ArrayReduceCapturedBlock = vm.tryExecuteArrayReduceCapturedBlock
+	core.HashEachTypedCall = vm.tryExecuteHashTypedCall
+	core.HashEachCapturedBlock = vm.tryExecuteHashIntegerReduceBlock
+	core.HashEachFramedBlock = vm.tryExecuteHashFramedIRBlock
+	core.EnumerableEachWithObjectCapturedBlock = vm.tryExecuteEnumerableEachWithObjectBytecodeBlock
+	core.HashMapCapturedBlock = vm.tryExecuteHashIntegerMapBlock
+	core.ArrayNewCapturedBlock = vm.tryExecuteArrayNewConstructorBlock
+	core.ArrayNewCapturedLazyBlock = vm.tryExecuteArrayNewConstructorLazyBlock
+	core.IntegerRangeCapturedBlock = vm.tryExecuteIntegerRangeCapturedBlock
+	core.IntegerRangeLinearBlock = vm.tryExecuteIntegerRangeLinearBlock
 	core.CallMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.send(receiver, method, args)
 	}
@@ -1044,10 +2277,11 @@ func (vm *VM) installCoreHooks() {
 		if invoked.OriginalName != "" {
 			dispatchName = invoked.OriginalName
 		}
-		return vm.invokeMethod(receiver, "bind", dispatchName, args, invoked, owner)
+		return vm.invokeMethod(receiver, "bind", dispatchName, args, invoked, owner, false)
 	}
+	core.FastClassNew = vm.fastClassNew
 	core.CallPublicMethod = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
-		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, true)
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, true, false)
 		if fallback != nil {
 			return fallback
 		}
@@ -1057,7 +2291,7 @@ func (vm *VM) installCoreHooks() {
 		if methodObj.Visibility == "private" || methodObj.Visibility == "protected" {
 			return core.NewNoMethodErrorForVisibility(receiver, method, methodObj.Visibility, args)
 		}
-		return vm.invokeMethod(receiver, "public_send", method, args, methodObj, methodOwner)
+		return vm.invokeMethod(receiver, "public_send", method, args, methodObj, methodOwner, false)
 	}
 	core.CallMethodBypass = func(receiver *object.EmeraldValue, method string, args ...*object.EmeraldValue) *object.EmeraldValue {
 		prev := vm.visibilityBypass
@@ -1115,11 +2349,17 @@ func (vm *VM) installCoreHooks() {
 		return vm.getGlobalByName(name)
 	}
 	core.SetConstantName = func(container *object.EmeraldValue, name string, value *object.EmeraldValue) {
-		if container == nil || container.Type != object.ValueClass {
+		if container == nil || container.Type != object.ValueClass && container.Type != object.ValueModule {
 			return
 		}
-		if class := container.Data.(*object.Class); class != nil && class.Name == "Object" {
-			vm.rubyConsts[name] = value
+		// Qualified constants participate in the same speculative lookup plans as
+		// top-level constants. Invalidate all of them on any class/module write;
+		// only Object's short name is mirrored in rubyConsts.
+		object.BumpConstantGeneration()
+		if container.Type == object.ValueClass {
+			if class := container.Data.(*object.Class); class != nil && class.Name == "Object" {
+				vm.rubyConsts[name] = value
+			}
 		}
 	}
 	core.GetConstantName = func(name string) *object.EmeraldValue {
@@ -1132,6 +2372,7 @@ func (vm *VM) installCoreHooks() {
 		return nil
 	}
 	core.RemoveConstantName = func(container *object.EmeraldValue, name string) {
+		object.BumpConstantGeneration()
 		qualified := qualifiedConstantName(container, name)
 		delete(vm.rubyConsts, qualified)
 		if container != nil && container.Type == object.ValueClass {
@@ -1204,6 +2445,12 @@ func (vm *VM) installCoreHooks() {
 	core.GlobalVariableNames = vm.globalVariableNames
 	core.InRescue = func() bool {
 		return len(vm.activeRescues) > 0
+	}
+	core.CurrentRescueException = func() *object.EmeraldValue {
+		if len(vm.activeRescues) == 0 {
+			return nil
+		}
+		return vm.activeRescues[len(vm.activeRescues)-1].Exception
 	}
 	core.CallBlockWithArgs = func(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 		return vm.callBlock(block, args...)
@@ -1297,6 +2544,9 @@ func (vm *VM) installCoreHooks() {
 			vm.frames[vm.fp].BlockBreakVal = nil
 		}
 	}
+	core.NonLocalReturnPending = func() bool {
+		return vm.pendingReturnTargetID > 0 && vm.pendingReturnValue != nil
+	}
 	core.EnterThreadBlock = func() {
 		vm.threadDepth++
 	}
@@ -1371,6 +2621,9 @@ func (vm *VM) setGlobalByName(name string, value *object.EmeraldValue) {
 
 func (vm *VM) getGlobalByName(name string) *object.EmeraldValue {
 	resolvedName := core.ResolveGlobalAlias(name)
+	if value, derived := core.MatchDataDerivedGlobal(vm.currentMatchDataGlobal(), resolvedName); derived {
+		return value
+	}
 	if vm.threadSpecialGlobals != nil && isThreadSpecialGlobal(resolvedName) {
 		return vm.threadSpecialGlobals[resolvedName]
 	}
@@ -1384,6 +2637,20 @@ func (vm *VM) getGlobalByName(name string) *object.EmeraldValue {
 	if !ok && resolvedName == "$?" {
 		idx, ok = vm.globalNames["?"]
 	}
+	if !ok || idx < 0 || idx >= len(vm.globals) {
+		return nil
+	}
+	return vm.globals[idx]
+}
+
+func (vm *VM) currentMatchDataGlobal() *object.EmeraldValue {
+	if vm.threadSpecialGlobals != nil {
+		return vm.threadSpecialGlobals["$~"]
+	}
+	if vm.globalNames == nil {
+		return nil
+	}
+	idx, ok := vm.globalNames["$~"]
 	if !ok || idx < 0 || idx >= len(vm.globals) {
 		return nil
 	}
@@ -1707,7 +2974,7 @@ func (vm *VM) receiverRespondsTo(receiver *object.EmeraldValue, method string) b
 	if receiver == nil || receiver.Type == object.ValueNil {
 		return false
 	}
-	methodObj, _, fallback := vm.lookupMethodForSend(receiver, method, nil, false)
+	methodObj, _, fallback := vm.lookupMethodForSend(receiver, method, nil, false, false)
 	return fallback == nil && methodObj != nil
 }
 
@@ -1736,10 +3003,21 @@ func (vm *VM) loadPathGlobal() *object.EmeraldValue {
 	}
 	siteLib := &object.EmeraldValue{Type: object.ValueString, Data: "/tmp", Class: core.R.Classes["String"]}
 	core.SetDynamicInstanceVar(siteLib, "@gem_prelude_index", core.R.TrueVal)
-	entries := []*object.EmeraldValue{
-		{Type: object.ValueString, Data: "lib", Class: core.R.Classes["String"]},
-		siteLib,
+	entries := make([]*object.EmeraldValue, 0, 4)
+	seen := make(map[string]bool)
+	if rubyLib := os.Getenv("RUBYLIB"); rubyLib != "" {
+		for _, path := range filepath.SplitList(rubyLib) {
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			entries = append(entries, &object.EmeraldValue{Type: object.ValueString, Data: path, Class: core.R.Classes["String"]})
+		}
 	}
+	if !seen["lib"] {
+		entries = append(entries, &object.EmeraldValue{Type: object.ValueString, Data: "lib", Class: core.R.Classes["String"]})
+	}
+	entries = append(entries, siteLib)
 	value := &object.EmeraldValue{Type: object.ValueArray, Data: entries, Class: core.R.Classes["Array"]}
 	vm.setGlobalByName("$:", value)
 	vm.setGlobalByName("$LOAD_PATH", value)
@@ -1810,6 +3088,12 @@ func (vm *VM) currentExceptionBacktraceGlobal() *object.EmeraldValue {
 func (vm *VM) Run() error {
 	if vm.isRoot {
 		defer core.RunAtExitHooks()
+		if vm.rubyMethodProfile != nil {
+			defer vm.reportRubyMethodCounts()
+		}
+		if typedSSABatchProfileEnabled {
+			defer vm.reportTypedSSABatchStats()
+		}
 	}
 	vm.instructionCount = 0
 
@@ -1827,15 +3111,31 @@ func (vm *VM) Run() error {
 		}
 
 		op := compiler.Opcode(instructions[frame.Ip])
-		vm.fireTracePointLine(frame, op)
+		traceLineActive := false
+		if core.AnyTracePointActive() {
+			traceLineActive = vm.fireTracePointLine(frame, op)
+		}
 
-		frame.InstructionException = core.LastException
-		frame.InstructionSnapshotSet = true
-		err := vm.execute(op, frame)
+		// A snapshot is only observable when an exception is already pending:
+		// raiseException uses it to distinguish re-raising the same value from
+		// a fresh raise. The overwhelmingly common nil state needs neither the
+		// pointer store nor the boolean write; keep the trace path intact because
+		// a TracePoint callback can change exception state during the instruction.
+		if traceLineActive || !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+			frame.InstructionException = core.LastException
+			frame.InstructionSnapshotSet = true
+		}
+		var err error
+		if vm.instructionLimit == 0 && !DevMode && !traceLineActive && simpleOpcodeFastPath[op] {
+			err = vm.executeSimpleOpcode(op, frame)
+		} else {
+			err = vm.execute(op, frame)
+		}
 		if err != nil {
 			return err
 		}
-		if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
+		if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+			(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
 			break
 		}
 		if vm.sp > frame.Bp {
@@ -1859,6 +3159,81 @@ func (vm *VM) Run() error {
 	}
 
 	return nil
+}
+
+func (vm *VM) reportRubyMethodCounts() {
+	vm.rubyMethodProfile.mu.Lock()
+	defer vm.rubyMethodProfile.mu.Unlock()
+	profilePlans := os.Getenv("RGO_PROFILE_RUBY_METHOD_PLANS") != ""
+	profileOpcodeSequence := os.Getenv("RGO_PROFILE_RUBY_METHOD_OPCODE_SEQUENCE") != ""
+	counts := make([]rubyMethodCount, 0, len(vm.rubyMethodProfile.counts))
+	for fn, count := range vm.rubyMethodProfile.counts {
+		counts = append(counts, rubyMethodCount{fn: fn, count: count})
+	}
+	sort.Slice(counts, func(i, j int) bool { return counts[i].count > counts[j].count })
+	if len(counts) > 40 {
+		counts = counts[:40]
+	}
+	for _, entry := range counts {
+		path := entry.fn.SourcePath
+		if path == "" {
+			path = "(eval)"
+		}
+		fmt.Fprintf(os.Stderr, "RGO_RUBY_METHOD %d %s:%d %s", entry.count, path, entry.fn.DefinitionLine, entry.fn.Name)
+		if os.Getenv("RGO_PROFILE_RUBY_METHOD_BYTECODE") != "" {
+			fmt.Fprintf(os.Stderr, " bytecode=%x", entry.fn.Instructions)
+		}
+		if profilePlans {
+			plan := buildLeafMethodPlan(entry.fn)
+			fmt.Fprintf(os.Stderr, " plan=%s", leafMethodPlanKindName(plan.kind))
+			if plan.kind == leafMethodRegisterIR && plan.registerIR != nil {
+				fmt.Fprintf(os.Stderr, " ir_ops=%d sends=%d frame=%t branches=%t", len(plan.registerIR.instructions), plan.registerIR.sendCount, plan.registerIR.requiresFrame, plan.registerIR.hasBranches)
+				if os.Getenv("RGO_DEBUG_DIRECT_PLANS") != "" {
+					fmt.Fprintf(os.Stderr, " direct_safe=%t direct_kind=%d", registerIRPlanSafeForDirectNoFrame(plan.registerIR), plan.registerIR.directFastKind)
+					if !registerIRPlanSafeForDirectNoFrame(plan.registerIR) {
+						fmt.Fprintf(os.Stderr, " direct_reject=%s", registerIRDirectNoFrameUnsupportedOp(plan.registerIR))
+					}
+				}
+			} else if plan.kind == leafMethodCaseDispatch && plan.caseDispatch != nil {
+				fmt.Fprintf(os.Stderr, " branches=%d", len(plan.caseDispatch.branches))
+			} else if plan.kind == leafMethodUnsupported {
+				fmt.Fprintf(os.Stderr, " opcodes=%s", registerIRUnsupportedOpcodeSummary(entry.fn))
+				if profileOpcodeSequence {
+					fmt.Fprintf(os.Stderr, " sequence=%s", registerIROpcodeSequence(entry.fn))
+				}
+			}
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
+func leafMethodPlanKindName(kind leafMethodPlanKind) string {
+	switch kind {
+	case leafMethodInstanceReader:
+		return "instance_reader"
+	case leafMethodInstanceWriter:
+		return "instance_writer"
+	case leafMethodAttributeIntegerCompare:
+		return "attribute_integer_compare"
+	case leafMethodInstanceFallbackIndex:
+		return "instance_fallback_index"
+	case leafMethodOptionalInstanceReader:
+		return "optional_instance_reader"
+	case leafMethodOptionalInstanceFallbackReader:
+		return "optional_instance_fallback_reader"
+	case leafMethodRescueLiteral:
+		return "rescue_literal"
+	case leafMethodRescueEncoding:
+		return "rescue_encoding"
+	case leafMethodRescueEncodeLiteral:
+		return "rescue_encode_literal"
+	case leafMethodRegisterIR:
+		return "register_ir"
+	case leafMethodCaseDispatch:
+		return "case_dispatch"
+	default:
+		return "unsupported"
+	}
 }
 
 func (vm *VM) UnhandledException() *object.EmeraldValue {
@@ -1930,27 +3305,28 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidNumberedParameterSyntax(source); message != "" {
+	maskedSource := maskRubyStringLiterals(source)
+	if message := invalidNumberedParameterSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidPatternMatchingSyntax(source); message != "" {
+	if message := invalidPatternMatchingSyntaxMasked(source, maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidSpacedMethodCallArgumentListSyntax(source); message != "" {
+	if message := invalidSpacedMethodCallArgumentListSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidRescueSyntax(source); message != "" {
+	if message := invalidRescueSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidReadOnlyMatchGlobalAssignmentSyntax(source); message != "" {
+	if message := invalidReadOnlyMatchGlobalAssignmentSyntaxMasked(source, maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), message)
 		core.LastException = exc
 		return exc
@@ -1964,7 +3340,7 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 	p := parser.New(l)
 	program := p.ParseProgram()
 	if len(p.Errors()) > 0 {
-		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), strings.Join(p.Errors(), "\n"))
+		exc := newSyntaxErrorForBinding(vm.currentFrameBinding(), evalSyntaxErrorMessage(p.Errors()))
 		core.LastException = exc
 		return exc
 	}
@@ -2000,6 +3376,10 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 	runErr := child.Run()
 	core.SetCurrentMethodVisibility(visibilityTarget, previousVisibility)
 	core.CurrentEvalSourceEncoding = previousSourceEncoding
+	// A separately evaluated file cannot transfer block break/next state into
+	// the caller. Leaving the child VM's global marker set can make the first
+	// Ruby method invoked after require return that stale value.
+	core.LastBlockResult = nil
 	if child.escapedThrowHandler != nil {
 		if parent != nil {
 			parent.installCoreHooks()
@@ -2033,6 +3413,9 @@ func (vm *VM) evalSource(source string) *object.EmeraldValue {
 }
 
 func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *object.EmeraldValue {
+	if binding != nil {
+		binding.MaterializeLocals()
+	}
 	if result, handled := vm.evalTopLevelInclude(source, binding); handled {
 		return result
 	}
@@ -2056,35 +3439,44 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidNumberedParameterSyntax(source); message != "" {
+	maskedSource := maskRubyStringLiterals(source)
+	if message := invalidNumberedParameterSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(binding, message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidPatternMatchingSyntax(source); message != "" {
+	if message := invalidPatternMatchingSyntaxMasked(source, maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(binding, message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidSpacedMethodCallArgumentListSyntax(source); message != "" {
+	if message := invalidSpacedMethodCallArgumentListSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(binding, message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidRescueSyntax(source); message != "" {
+	if message := invalidRescueSyntaxMasked(maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(binding, message)
 		core.LastException = exc
 		return exc
 	}
-	if message := invalidReadOnlyMatchGlobalAssignmentSyntax(source); message != "" {
+	if message := invalidReadOnlyMatchGlobalAssignmentSyntaxMasked(source, maskedSource); message != "" {
 		exc := newSyntaxErrorForBinding(binding, message)
 		core.LastException = exc
 		return exc
 	}
 
 	oldSpecFile := core.CurrentSpecFile
+	oldSpecFileAbsolute := core.CurrentSpecFileAbsolute
 	if binding != nil && binding.Path != "" {
 		core.CurrentSpecFile = binding.Path
+		core.CurrentSpecFileAbsolute = binding.Path
+		if absolute, err := filepath.Abs(binding.Path); err == nil {
+			core.CurrentSpecFileAbsolute = absolute
+		}
+		if realPath, err := filepath.EvalSymlinks(core.CurrentSpecFileAbsolute); err == nil {
+			core.CurrentSpecFileAbsolute = realPath
+		}
 	}
 	childClassStack := append([]*object.EmeraldValue(nil), vm.classStack...)
 	if binding != nil && len(binding.ClassStack) > 0 {
@@ -2101,6 +3493,7 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	parent := CurrentVM
 	defer func() {
 		core.CurrentSpecFile = oldSpecFile
+		core.CurrentSpecFileAbsolute = oldSpecFileAbsolute
 		if parent != nil {
 			parent.installCoreHooks()
 		}
@@ -2121,7 +3514,7 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	}
 	program := p.ParseProgram()
 	if len(p.Errors()) > 0 {
-		exc := newSyntaxErrorForBinding(binding, strings.Join(p.Errors(), "\n"))
+		exc := newSyntaxErrorForBinding(binding, evalSyntaxErrorMessage(p.Errors()))
 		core.LastException = exc
 		return exc
 	}
@@ -2139,7 +3532,9 @@ func (vm *VM) evalSourceWithBinding(source string, binding *object.RBinding) *ob
 	}
 	c.SetEvalTopLevelReturn(true)
 	if err := c.Compile(program); err != nil {
-		return core.R.NilVal
+		exc := newSyntaxErrorForBinding(binding, err.Error())
+		core.LastException = exc
+		return exc
 	}
 	core.FireTracePointScriptCompiled(binding, source)
 
@@ -2342,7 +3737,9 @@ type dynamicSyntaxContext struct {
 	braceBlockDepth         int
 	loopDepth               int
 	rescueDepth             int
+	numberedParameterBlock  bool
 	allowAnonymousBlockPass bool
+	lexicalItBound          bool
 }
 
 func validateDynamicSyntax(program *ast.Program) string {
@@ -2497,6 +3894,10 @@ func invalidPercentRegexpSyntax(source string) bool {
 
 func invalidIndexAssignmentSyntax(source string) string {
 	for i := 0; i < len(source); i++ {
+		if end := percentRegexpLiteralEnd(source, i); end >= i {
+			i = end
+			continue
+		}
 		if source[i] != '[' {
 			continue
 		}
@@ -2519,6 +3920,56 @@ func invalidIndexAssignmentSyntax(source string) string {
 		i = end
 	}
 	return ""
+}
+
+func percentRegexpLiteralEnd(source string, start int) int {
+	if start+2 >= len(source) || source[start] != '%' || source[start+1] != 'r' {
+		return -1
+	}
+	open := source[start+2]
+	if open == ' ' || open == '\t' || open == '\n' || open == '\r' ||
+		(open >= 'A' && open <= 'Z') || (open >= 'a' && open <= 'z') ||
+		(open >= '0' && open <= '9') {
+		return -1
+	}
+	close := open
+	paired := true
+	switch open {
+	case '(':
+		close = ')'
+	case '[':
+		close = ']'
+	case '{':
+		close = '}'
+	case '<':
+		close = '>'
+	default:
+		paired = false
+	}
+	depth := 1
+	escaped := false
+	for i := start + 3; i < len(source); i++ {
+		ch := source[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if paired && ch == open {
+			depth++
+			continue
+		}
+		if ch == close {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func matchingBracket(source string, start int) int {
@@ -2589,12 +4040,38 @@ func assignmentOperatorAfter(source string, pos int) string {
 }
 
 func containsBlockPassArg(content string) bool {
+	quote := byte(0)
+	escaped := false
 	for i := 0; i < len(content); i++ {
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if content[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if content[i] == quote {
+				quote = 0
+			}
+			continue
+		}
+		if content[i] == '\'' || content[i] == '"' {
+			quote = content[i]
+			continue
+		}
 		if content[i] != '&' {
 			continue
 		}
 		if i+1 < len(content) && content[i+1] == '&' {
 			i++
+			continue
+		}
+		if i > 0 && content[i-1] == '$' {
+			continue
+		}
+		if i > 0 && content[i-1] == ':' {
 			continue
 		}
 		return true
@@ -2605,6 +4082,9 @@ func containsBlockPassArg(content string) bool {
 func containsKeywordArgInIndex(content string) bool {
 	for i := 1; i < len(content); i++ {
 		if content[i] != ':' {
+			continue
+		}
+		if (i > 0 && content[i-1] == ':') || (i+1 < len(content) && content[i+1] == ':') {
 			continue
 		}
 		j := i - 1
@@ -2625,7 +4105,18 @@ func containsKeywordArgInIndex(content string) bool {
 }
 
 func invalidNumberedParameterSyntax(source string) string {
-	code := maskRubyStringLiterals(source)
+	return invalidNumberedParameterSyntaxMasked(maskRubyStringLiterals(source))
+}
+
+func invalidNumberedParameterSyntaxMasked(code string) string {
+	// Most required Ruby files contain neither numbered parameters nor the
+	// implicit `it` block parameter.  Avoid two replacement regexes and two
+	// full-source searches when the cheap token scan proves there is no
+	// candidate.  The scan is deliberately conservative: a false positive
+	// only keeps the old validation path, never skips a possible error.
+	if !containsNumberedParameterCandidate(code) && !containsRubyItToken(code) {
+		return ""
+	}
 	code = numberedParameterLabelPattern.ReplaceAllString(code, `${1}__numbered_label__:`)
 	code = specItDeclarationPattern.ReplaceAllString(code, `${1}__spec_it__ ${2}`)
 	if !numberedParameterPattern.MatchString(code) && !itParameterPattern.MatchString(code) {
@@ -2634,34 +4125,30 @@ func invalidNumberedParameterSyntax(source string) string {
 	if numberedParameterAssignmentPattern.MatchString(code) {
 		return "_1 is reserved for numbered parameter"
 	}
-	if numberedParameterNestedPattern.MatchString(code) {
-		return "numbered parameter is already used in outer block"
-	}
 	if itBeforeNumberedParameterPattern.MatchString(code) {
 		return "numbered parameters are not allowed when 'it' is already used"
 	}
 	if numberedBeforeItParameterPattern.MatchString(code) {
 		return "'it' is not allowed when a numbered parameter is already used"
 	}
-	if numberedParameterExplicitParamsPattern.MatchString(code) {
-		return "ordinary parameter is defined"
-	}
-	if itParameterExplicitParamsPattern.MatchString(code) {
-		return "ordinary parameter is defined"
-	}
 	return ""
 }
 
 func invalidPatternMatchingSyntax(source string) string {
-	code := maskRubyStringLiterals(source)
-	if !regexp.MustCompile(`(?m)^\s*in\b`).MatchString(code) {
+	return invalidPatternMatchingSyntaxMasked(source, maskRubyStringLiterals(source))
+}
+
+func invalidPatternMatchingSyntaxMasked(source, code string) string {
+	if !containsPatternInClauseLine(code) {
 		return ""
 	}
+	if !patternInLinePattern.MatchString(code) {
+		return ""
+	}
+	if message := mixedCaseClauseSyntaxError(code); message != "" {
+		return message
+	}
 	switch {
-	case patternWhenBeforeInPattern.MatchString(code):
-		return "unexpected 'in'"
-	case patternInBeforeWhenPattern.MatchString(code):
-		return "unexpected 'when'"
 	case patternCalculationPattern.MatchString(code):
 		return "expected a delimiter after the patterns of an `in` clause"
 	case hasDuplicatePatternVariable(code):
@@ -2681,8 +4168,47 @@ func invalidPatternMatchingSyntax(source string) string {
 	}
 }
 
+func mixedCaseClauseSyntaxError(code string) string {
+	inCase := false
+	sawWhen := false
+	sawIn := false
+	for _, line := range strings.Split(code, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if patternCaseKeywordPattern.MatchString(trimmed) {
+			inCase = true
+			sawWhen = false
+			sawIn = false
+			continue
+		}
+		if !inCase {
+			continue
+		}
+		switch {
+		case patternWhenClausePattern.MatchString(trimmed):
+			if sawIn {
+				return "unexpected 'when'"
+			}
+			sawWhen = true
+		case patternInClausePattern.MatchString(trimmed):
+			if sawWhen {
+				return "unexpected 'in'"
+			}
+			sawIn = true
+		case patternEndClausePattern.MatchString(trimmed):
+			inCase = false
+		}
+	}
+	return ""
+}
+
 func invalidSpacedMethodCallArgumentListSyntax(source string) string {
-	code := maskRubyStringLiterals(source)
+	return invalidSpacedMethodCallArgumentListSyntaxMasked(maskRubyStringLiterals(source))
+}
+
+func invalidSpacedMethodCallArgumentListSyntaxMasked(code string) string {
+	if !containsSpacedMethodCallCandidate(code) {
+		return ""
+	}
 	for _, line := range strings.Split(code, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
@@ -2701,15 +4227,18 @@ func invalidSpacedMethodCallArgumentListSyntax(source string) string {
 }
 
 func invalidRescueSyntax(source string) string {
-	compact := strings.Join(strings.Fields(source), " ")
-	if strings.Contains(compact, "lambda {") && strings.Contains(compact, " rescue ") {
-		return "Invalid rescue in block"
+	return invalidRescueSyntaxMasked(maskRubyStringLiterals(source))
+}
+
+func invalidRescueSyntaxMasked(masked string) string {
+	if !strings.Contains(masked, "rescue") {
+		return ""
 	}
+	compact := strings.Join(strings.Fields(masked), " ")
 	if strings.Contains(compact, ".+(1 rescue 1)") {
 		return "syntax error, unexpected rescue modifier"
 	}
-	rescueClassExtraArgPattern := regexp.MustCompile(`\brescue\s+[A-Z]\w*(?:::[A-Z]\w*)?\s+([^\s,=][^\s]*)`)
-	for _, line := range strings.Split(maskRubyStringLiterals(source), "\n") {
+	for _, line := range strings.Split(masked, "\n") {
 		if match := rescueClassExtraArgPattern.FindStringSubmatch(line); len(match) > 1 {
 			extra := match[1]
 			if extra != "=>" && !strings.HasPrefix(extra, "=>") {
@@ -2720,17 +4249,122 @@ func invalidRescueSyntax(source string) string {
 	return ""
 }
 
+func containsNumberedParameterCandidate(source string) bool {
+	for index := 0; index+1 < len(source); index++ {
+		if source[index] != '_' || source[index+1] < '1' || source[index+1] > '9' {
+			continue
+		}
+		if index > 0 && isIdentChar(source[index-1]) {
+			continue
+		}
+		if index+2 < len(source) && isIdentChar(source[index+2]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func containsRubyItToken(source string) bool {
+	for offset := 0; offset+2 <= len(source); {
+		relative := strings.Index(source[offset:], "it")
+		if relative < 0 {
+			return false
+		}
+		index := offset + relative
+		beforeOK := index == 0 || !isIdentChar(source[index-1])
+		after := index + 2
+		afterOK := after >= len(source) || (!isIdentChar(source[after]) && source[after] != '?' && source[after] != '!')
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 2
+	}
+	return false
+}
+
+func containsPatternInClauseLine(source string) bool {
+	for _, line := range strings.Split(source, "\n") {
+		trimmed := strings.TrimLeft(line, " \t\r\f")
+		if len(trimmed) >= 2 && trimmed[0] == 'i' && trimmed[1] == 'n' &&
+			(len(trimmed) == 2 || !isIdentChar(trimmed[2])) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSpacedMethodCallCandidate(source string) bool {
+	for _, line := range strings.Split(source, "\n") {
+		for index := 1; index < len(line); index++ {
+			if line[index] != '(' {
+				continue
+			}
+			cursor := index - 1
+			for cursor >= 0 && (line[cursor] == ' ' || line[cursor] == '\t') {
+				cursor--
+			}
+			if cursor < 0 || cursor == index-1 || !isMethodNameChar(line[cursor]) {
+				continue
+			}
+			nameEnd := cursor
+			for cursor >= 0 && isMethodNameChar(line[cursor]) {
+				cursor--
+			}
+			if nameEnd == cursor || !strings.Contains(line[index+1:], ",") {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func isMethodNameChar(ch byte) bool {
+	return isIdentChar(ch) || ch == '?' || ch == '!'
+}
+
 func invalidReadOnlyMatchGlobalAssignmentSyntax(source string) string {
-	if regexp.MustCompile(regexp.QuoteMeta("$'")+`\s*=`).FindStringIndex(source) != nil {
+	return invalidReadOnlyMatchGlobalAssignmentSyntaxMasked(source, maskRubyStringLiterals(source))
+}
+
+func invalidReadOnlyMatchGlobalAssignmentSyntaxMasked(source, code string) string {
+	if hasDirectAssignmentToSpecialGlobal(source, "$'") {
 		return "Can't set variable $'"
 	}
-	code := maskRubyStringLiterals(source)
 	for _, name := range []string{"$&", "$`", "$+"} {
-		if regexp.MustCompile(regexp.QuoteMeta(name)+`\s*=`).FindStringIndex(code) != nil {
+		if hasDirectAssignmentToSpecialGlobal(code, name) {
 			return "Can't set variable " + name
 		}
 	}
 	return ""
+}
+
+func hasDirectAssignmentToSpecialGlobal(source string, name string) bool {
+	for offset := 0; offset < len(source); {
+		relative := strings.Index(source[offset:], name)
+		if relative < 0 {
+			return false
+		}
+		pos := offset + relative + len(name)
+		for pos < len(source) {
+			switch source[pos] {
+			case ' ', '\t', '\r', '\n', '\f':
+				pos++
+			default:
+				goto assignment
+			}
+		}
+	assignment:
+		if pos < len(source) && source[pos] == '=' {
+			next := pos + 1
+			if next == len(source) || (source[next] != '=' && source[next] != '~' && source[next] != '>') {
+				return true
+			}
+		}
+		offset += relative + len(name)
+	}
+	return false
 }
 
 func (vm *VM) checkPatternRuntimeHooks(target *object.EmeraldValue, pattern string) *object.EmeraldValue {
@@ -2857,12 +4491,29 @@ func hasDuplicatePatternHashKey(code string) bool {
 }
 
 func maskRubyStringLiterals(source string) string {
-	out := []byte(source)
+	out := maskRubyHeredocBodies(source)
 	quote := byte(0)
 	escaped := false
 	for i := 0; i < len(out); i++ {
 		ch := out[i]
 		if quote == 0 {
+			if end := rubyPercentLiteralEnd(source, i); end >= i {
+				for j := i; j <= end; j++ {
+					if out[j] != '\n' && out[j] != '\r' {
+						out[j] = ' '
+					}
+				}
+				i = end
+				continue
+			}
+			if ch == '#' {
+				for i < len(out) && out[i] != '\n' && out[i] != '\r' {
+					out[i] = ' '
+					i++
+				}
+				i--
+				continue
+			}
 			if ch == '\'' && i > 0 && i+1 < len(out) && isIdentChar(out[i-1]) && isIdentChar(out[i+1]) {
 				continue
 			}
@@ -2888,36 +4539,198 @@ func maskRubyStringLiterals(source string) string {
 	return string(out)
 }
 
+type rubyHeredocDelimiter struct {
+	value       string
+	allowIndent bool
+}
+
+func maskRubyHeredocBodies(source string) []byte {
+	out := []byte(source)
+	var pending []rubyHeredocDelimiter
+	for lineStart := 0; lineStart < len(source); {
+		lineEnd := strings.IndexByte(source[lineStart:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(source)
+		} else {
+			lineEnd += lineStart
+		}
+		line := strings.TrimSuffix(source[lineStart:lineEnd], "\r")
+		if len(pending) > 0 {
+			candidate := line
+			if pending[0].allowIndent {
+				candidate = strings.TrimLeft(candidate, " \t")
+			}
+			for i := lineStart; i < lineEnd; i++ {
+				if out[i] != '\r' {
+					out[i] = ' '
+				}
+			}
+			if candidate == pending[0].value {
+				pending = pending[1:]
+			}
+		} else {
+			pending = append(pending, rubyHeredocOpeners(line)...)
+		}
+		if lineEnd == len(source) {
+			break
+		}
+		lineStart = lineEnd + 1
+	}
+	return out
+}
+
+func rubyHeredocOpeners(line string) []rubyHeredocDelimiter {
+	var result []rubyHeredocDelimiter
+	quote := byte(0)
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '#' {
+			break
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+			continue
+		}
+		if ch != '<' || i+1 >= len(line) || line[i+1] != '<' {
+			continue
+		}
+		j := i + 2
+		allowIndent := false
+		if j < len(line) && (line[j] == '-' || line[j] == '~') {
+			allowIndent = true
+			j++
+		}
+		if j >= len(line) || line[j] == ' ' || line[j] == '\t' || line[j] == '=' {
+			continue
+		}
+		delimiterQuote := byte(0)
+		if line[j] == '\'' || line[j] == '"' || line[j] == '`' {
+			delimiterQuote = line[j]
+			j++
+		}
+		start := j
+		for j < len(line) && (isIdentChar(line[j]) || line[j] >= 0x80) {
+			j++
+		}
+		if start == j {
+			continue
+		}
+		if delimiterQuote != 0 {
+			if j >= len(line) || line[j] != delimiterQuote {
+				continue
+			}
+			j++
+		}
+		result = append(result, rubyHeredocDelimiter{value: line[start:j], allowIndent: allowIndent})
+		if delimiterQuote != 0 {
+			result[len(result)-1].value = line[start : j-1]
+		}
+		i = j - 1
+	}
+	return result
+}
+
+func rubyPercentLiteralEnd(source string, start int) int {
+	if start >= len(source) || source[start] != '%' {
+		return -1
+	}
+	delimiterIndex := start + 1
+	if delimiterIndex < len(source) && strings.ContainsRune("qQwWiIxrs", rune(source[delimiterIndex])) {
+		delimiterIndex++
+	}
+	if delimiterIndex >= len(source) {
+		return -1
+	}
+	open := source[delimiterIndex]
+	if open == ' ' || open == '\t' || open == '\n' || open == '\r' || isIdentChar(open) {
+		return -1
+	}
+	close := open
+	paired := true
+	switch open {
+	case '(':
+		close = ')'
+	case '[':
+		close = ']'
+	case '{':
+		close = '}'
+	case '<':
+		close = '>'
+	default:
+		paired = false
+	}
+	depth := 1
+	escaped := false
+	for i := delimiterIndex + 1; i < len(source); i++ {
+		ch := source[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if paired && ch == open {
+			depth++
+			continue
+		}
+		if ch == close {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 var (
-	numberedParameterToken                 = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
-	numberedParameterUse                   = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
-	numberedParameterPattern               = regexp.MustCompile(numberedParameterToken)
-	numberedParameterLabelPattern          = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*:`)
-	numberedParameterAssignmentPattern     = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*=`)
-	numberedParameterNestedPattern         = regexp.MustCompile(numberedParameterUse + `[\s\S]*(->|proc\s*\{|\blambda\s*\{)[\s\S]*` + numberedParameterUse)
-	numberedParameterExplicitParamsPattern = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*` + numberedParameterUse + `|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*` + numberedParameterUse + `)`)
-	numberedParameterMethodNamePattern     = regexp.MustCompile(`^_[0-9]+$`)
-	itParameterPattern                     = regexp.MustCompile(`(^|[^A-Za-z0-9_])it([^A-Za-z0-9_?!]|$)`)
-	specItDeclarationPattern               = regexp.MustCompile(`(^|[^A-Za-z0-9_])it\s+("|'|:|do\b)`)
-	itParameterExplicitParamsPattern       = regexp.MustCompile(`(->\s*\([^)]*\)\s*\{[\s\S]*\bit\b|(proc|lambda)\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b|\[[^\]]*\]\.[A-Za-z_][A-Za-z0-9_?!]*\s*\{[^{}]*\|[^|]*\|[\s\S]*\bit\b)`)
-	itBeforeNumberedParameterPattern       = regexp.MustCompile(`\bit\b[\s\S]*(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`)
-	numberedBeforeItParameterPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)[\s\S]*\bit\b`)
-	evalFrozenStringLiteralPattern         = regexp.MustCompile(`(?i)frozen_string_literal\s*:\s*(true|false)`)
-	patternWhenBeforeInPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bwhen\b[\s\S]*\bin\b`)
-	patternInBeforeWhenPattern             = regexp.MustCompile(`(?s)\bcase\b[\s\S]*\bin\b[\s\S]*\bwhen\b`)
-	patternCalculationPattern              = regexp.MustCompile(`(?m)^\s*in\s+[^\n]*\+`)
-	patternArrayPattern                    = regexp.MustCompile(`\[\s*([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
-	patternPinnedArrayPattern              = regexp.MustCompile(`\[\s*\^([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
-	patternAlternationBindingPattern       = regexp.MustCompile(`(?m)^\s*in\s+[\s\S]*\|\s*\[[^\]]*,\s*[A-Za-z][A-Za-z0-9_]*\s*\]`)
-	patternNonSymbolHashKeyPattern         = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"[^"\n]+"\s*=>`)
-	patternInterpolatedHashKeyPattern      = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"#\{[^}\n]+\}"\s*:`)
-	patternHashPattern                     = regexp.MustCompile(`(?m)^\s*in\s+\{([^}\n]*)\}`)
-	patternHashKeyPattern                  = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*:`)
-	spacedMethodCallArgumentListPattern    = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_?!]*)\s+\([^)]*,[^)]*\)`)
+	numberedParameterToken              = `(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`
+	numberedParameterPattern            = regexp.MustCompile(numberedParameterToken)
+	numberedParameterLabelPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*:`)
+	numberedParameterAssignmentPattern  = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]\s*=([^=~>]|$)`)
+	numberedParameterMethodNamePattern  = regexp.MustCompile(`^_[0-9]+$`)
+	itParameterPattern                  = regexp.MustCompile(`(^|[^A-Za-z0-9_])it([^A-Za-z0-9_?!]|$)`)
+	specItDeclarationPattern            = regexp.MustCompile(`(^|[^A-Za-z0-9_])it\s+("|'|:|do\b)`)
+	itBeforeNumberedParameterPattern    = regexp.MustCompile(`\bit\b[\s\S]*(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)`)
+	numberedBeforeItParameterPattern    = regexp.MustCompile(`(^|[^A-Za-z0-9_])_[1-9]([^0-9A-Za-z_]|$)[\s\S]*\bit\b`)
+	evalFrozenStringLiteralPattern      = regexp.MustCompile(`(?i)frozen_string_literal\s*:\s*(true|false)`)
+	patternCalculationPattern           = regexp.MustCompile(`(?m)^\s*in\s+[^\n]*\+`)
+	patternInLinePattern                = regexp.MustCompile(`(?m)^\s*in\b`)
+	patternCaseKeywordPattern           = regexp.MustCompile(`\bcase\b`)
+	patternWhenClausePattern            = regexp.MustCompile(`^when\b`)
+	patternInClausePattern              = regexp.MustCompile(`^in\b`)
+	patternEndClausePattern             = regexp.MustCompile(`^end\b`)
+	patternArrayPattern                 = regexp.MustCompile(`\[\s*([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
+	patternPinnedArrayPattern           = regexp.MustCompile(`\[\s*\^([A-Za-z][A-Za-z0-9_]*)\s*,\s*([A-Za-z][A-Za-z0-9_]*)\s*\]`)
+	patternAlternationBindingPattern    = regexp.MustCompile(`(?m)^\s*in\s+[\s\S]*\|\s*\[[^\]]*,\s*[A-Za-z][A-Za-z0-9_]*\s*\]`)
+	patternNonSymbolHashKeyPattern      = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"[^"\n]+"\s*=>`)
+	patternInterpolatedHashKeyPattern   = regexp.MustCompile(`(?m)^\s*in\s+\{[^}\n]*"#\{[^}\n]+\}"\s*:`)
+	patternHashPattern                  = regexp.MustCompile(`(?m)^\s*in\s+\{([^}\n]*)\}`)
+	patternHashKeyPattern               = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*:`)
+	spacedMethodCallArgumentListPattern = regexp.MustCompile(`(?:^|[=,(;])[ \t]*([A-Za-z_][A-Za-z0-9_?!]*)[ \t]+\([^\n)]*,[^\n)]*\)`)
+	rescueClassExtraArgPattern          = regexp.MustCompile(`\brescue\s+[A-Z]\w*(?:::[A-Z]\w*)?\s+([^\s,=][^\s]*)`)
 )
 
 var spacedCallKeywordExclusions = map[string]bool{
-	"case": true, "if": true, "unless": true, "until": true, "while": true,
+	"case": true, "if": true, "elsif": true, "unless": true, "until": true, "while": true,
+	"and": true, "or": true, "def": true,
 }
 
 func isIdentChar(ch byte) bool {
@@ -3030,19 +4843,39 @@ func validateDynamicExpression(expr ast.Expression, ctx dynamicSyntaxContext) st
 			methodDepth:             ctx.methodDepth + 1,
 			classDepth:              ctx.classDepth,
 			allowAnonymousBlockPass: node.BlockParam != nil && node.BlockParam.Value == "_",
+			lexicalItBound:          false,
 		})
 	case *ast.ClassExpression:
 		nextCtx := ctx
 		nextCtx.classDepth++
+		nextCtx.numberedParameterBlock = false
+		nextCtx.lexicalItBound = false
 		return validateDynamicBlock(node.Body, nextCtx)
 	case *ast.ModuleExpression:
 		nextCtx := ctx
 		nextCtx.classDepth++
+		nextCtx.numberedParameterBlock = false
+		nextCtx.lexicalItBound = false
 		return validateDynamicBlock(node.Body, nextCtx)
 	case *ast.ProcLiteral:
+		usesNumberedParameters := compiler.BlockNumberedParameterCount(node.Body) > 0
+		if usesNumberedParameters && node.ExplicitParams {
+			return "ordinary parameter is defined"
+		}
+		bindsIt := identifiersContain(node.Params, "it") || identifierNamed(node.RestParam, "it") ||
+			identifierNamed(node.KeywordRestParam, "it") || identifierNamed(node.BlockParam, "it") ||
+			keywordParamsContain(node.KeywordParams, "it")
+		if node.ExplicitParams && compiler.BlockUsesBareIt(node.Body) && !bindsIt && !ctx.lexicalItBound {
+			return "ordinary parameter is defined"
+		}
+		if ctx.numberedParameterBlock && usesNumberedParameters {
+			return "numbered parameter is already used in outer block"
+		}
 		nextCtx := ctx
 		nextCtx.blockDepth++
+		nextCtx.numberedParameterBlock = usesNumberedParameters
 		nextCtx.allowAnonymousBlockPass = node.BlockParam != nil && node.BlockParam.Value == "_"
+		nextCtx.lexicalItBound = ctx.lexicalItBound || bindsIt
 		if node.Body != nil && node.Body.Token.Type == lexer.LBRACE {
 			nextCtx.braceBlockDepth++
 		}
@@ -3072,8 +4905,21 @@ func validateDynamicExpression(expr ast.Expression, ctx dynamicSyntaxContext) st
 			}
 		}
 		if node.Block != nil {
+			usesNumberedParameters := compiler.BlockNumberedParameterCount(node.Block) > 0
+			if usesNumberedParameters && node.Block.ExplicitParams {
+				return "ordinary parameter is defined"
+			}
+			bindsIt := blockBindsIt(node.Block)
+			if node.Block.ExplicitParams && compiler.BlockUsesBareIt(node.Block) && !bindsIt && !ctx.lexicalItBound {
+				return "ordinary parameter is defined"
+			}
+			if ctx.numberedParameterBlock && usesNumberedParameters {
+				return "numbered parameter is already used in outer block"
+			}
 			nextCtx := ctx
 			nextCtx.blockDepth++
+			nextCtx.numberedParameterBlock = usesNumberedParameters
+			nextCtx.lexicalItBound = ctx.lexicalItBound || bindsIt
 			if node.Block.Token.Type == lexer.LBRACE {
 				nextCtx.braceBlockDepth++
 			}
@@ -3117,7 +4963,7 @@ func validateDynamicExpression(expr ast.Expression, ctx dynamicSyntaxContext) st
 		nextCtx.loopDepth++
 		return validateDynamicBlock(node.Body, nextCtx)
 	case *ast.BeginExpression:
-		if node.Ensure != nil && ctx.braceBlockDepth > 0 {
+		if node.Ensure != nil && ctx.braceBlockDepth > 0 && node.Token.Type != lexer.BEGIN {
 			return "Invalid ensure in block"
 		}
 		if node.Else != nil && len(node.Rescue) == 0 && node.Ensure == nil {
@@ -3210,6 +5056,45 @@ func isConstantIdentifier(name string) bool {
 	}
 	ch, _ := utf8.DecodeRuneInString(name)
 	return unicode.IsUpper(ch)
+}
+
+func identifierNamed(identifier *ast.Identifier, name string) bool {
+	return identifier != nil && identifier.Value == name
+}
+
+func identifiersContain(identifiers []*ast.Identifier, name string) bool {
+	for _, identifier := range identifiers {
+		if identifierNamed(identifier, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func keywordParamsContain(params []*ast.KeywordParam, name string) bool {
+	for _, param := range params {
+		if param != nil && param.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func blockBindsIt(block *ast.BlockExpression) bool {
+	if block == nil {
+		return false
+	}
+	if identifiersContain(block.Params, "it") || identifierNamed(block.RestParam, "it") ||
+		identifierNamed(block.KeywordRestParam, "it") || identifierNamed(block.BlockParam, "it") ||
+		keywordParamsContain(block.KeywordParams, "it") {
+		return true
+	}
+	for _, name := range block.BlockLocals {
+		if name == "it" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateDynamicBlock(block *ast.BlockExpression, ctx dynamicSyntaxContext) string {
@@ -3519,7 +5404,7 @@ func isRubyIdentChar(c byte) bool {
 func newSyntaxError(message string) *object.EmeraldValue {
 	return &object.EmeraldValue{
 		Type:  object.ValueException,
-		Data:  &object.RException{Message: message},
+		Data:  &object.RException{Message: message, Raised: true},
 		Class: core.R.Classes["SyntaxError"],
 	}
 }
@@ -3538,6 +5423,11 @@ func newSyntaxErrorForBinding(binding *object.RBinding, message string) *object.
 		line = 1
 	}
 	return newSyntaxError(fmt.Sprintf("%s:%d: %s", path, line, message))
+}
+
+func evalSyntaxErrorMessage(errors []string) string {
+	message := strings.Join(errors, "\n")
+	return strings.ReplaceAll(message, "expected end, got EOF", "unexpected end-of-input")
 }
 
 func bindingLocalSlots(vm *VM) map[string]int {
@@ -3609,7 +5499,7 @@ func seedBindingLocals(vm *VM, binding *object.RBinding, slots map[string]int) {
 					vm.stack = append(vm.stack, nil)
 				}
 			}
-			vm.stack[slot] = value
+			vm.stack[slot] = object.DereferenceBindingValue(value)
 			if slot >= vm.sp {
 				vm.sp = slot + 1
 			}
@@ -3722,12 +5612,11 @@ func (vm *VM) resolveRequirePath(path string) string {
 		if c == "" {
 			return
 		}
-		clean := filepath.Clean(c)
-		if _, ok := seen[clean]; ok {
+		if _, ok := seen[c]; ok {
 			return
 		}
-		seen[clean] = struct{}{}
-		candidates = append(candidates, clean)
+		seen[c] = struct{}{}
+		candidates = append(candidates, c)
 	}
 	addRequireCandidates := func(c string) {
 		clean := filepath.Clean(c)
@@ -3749,19 +5638,16 @@ func (vm *VM) resolveRequirePath(path string) string {
 	if !isAbs && !isExplicitRelative && !isDotOrDotDot {
 		entries := core.GetGlobalVariable("$LOAD_PATH")
 		if entries != nil && entries.Type == object.ValueArray {
-			for _, entry := range entries.Data.([]*object.EmeraldValue) {
-				epath, errValue := core.CoercePathValue(entry)
-				if errValue != nil {
-					continue
-				}
-				if canonical, err := filepath.EvalSymlinks(epath); err == nil {
-					epath = canonical
-				}
-				if !filepath.IsAbs(epath) {
-					if absolute, err := filepath.Abs(epath); err == nil {
-						epath = absolute
+			loadPaths := vm.canonicalRequireLoadPaths(entries, currentDir)
+			if cache := vm.requireLoadPathCache; cache != nil && cache.valid {
+				if candidate := cache.resolved[requestPath]; candidate != "" {
+					if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+						return candidate
 					}
+					delete(cache.resolved, requestPath)
 				}
+			}
+			for _, epath := range loadPaths {
 				addRequireCandidates(filepath.Join(epath, requestPath))
 			}
 		}
@@ -3775,10 +5661,72 @@ func (vm *VM) resolveRequirePath(path string) string {
 			continue
 		}
 		_ = file.Close()
+		if !isAbs && !isExplicitRelative && !isDotOrDotDot {
+			if cache := vm.requireLoadPathCache; cache != nil && cache.valid {
+				cache.resolved[requestPath] = candidate
+			}
+		}
 		return candidate
 	}
 
 	return ""
+}
+
+func (vm *VM) canonicalRequireLoadPaths(entries *object.EmeraldValue, currentDir string) []string {
+	values := entries.Data.([]*object.EmeraldValue)
+	cache := vm.requireLoadPathCache
+	if cache != nil && cache.valid && cache.currentDir == currentDir && len(cache.values) == len(values) {
+		matches := true
+		for index, value := range values {
+			if value == nil || value.Type != object.ValueString || value.Data.(string) != cache.values[index] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return cache.paths
+		}
+	}
+
+	rawPaths := make([]string, 0, len(values))
+	cacheable := true
+	for _, value := range values {
+		if value == nil || value.Type != object.ValueString {
+			cacheable = false
+		}
+		path, errValue := core.CoercePathValue(value)
+		if errValue == nil {
+			rawPaths = append(rawPaths, path)
+		}
+	}
+	paths := make([]string, 0, len(rawPaths))
+	for _, path := range rawPaths {
+		if !filepath.IsAbs(path) && currentDir != "" {
+			path = filepath.Join(currentDir, path)
+		}
+		if canonical, err := filepath.EvalSymlinks(path); err == nil {
+			path = canonical
+		}
+		paths = append(paths, filepath.Clean(path))
+	}
+	if cache == nil {
+		return paths
+	}
+	cache.valid = cacheable
+	cache.resolved = make(map[string]string)
+	if !cacheable {
+		cache.currentDir = ""
+		cache.values = nil
+		cache.paths = nil
+		return paths
+	}
+	cache.currentDir = currentDir
+	cache.values = cache.values[:0]
+	for _, value := range values {
+		cache.values = append(cache.values, value.Data.(string))
+	}
+	cache.paths = append(cache.paths[:0], paths...)
+	return cache.paths
 }
 
 func (vm *VM) resolveLoadPath(path string) string {
@@ -3878,6 +5826,13 @@ func (vm *VM) requirePath(path string) (string, *object.EmeraldValue) {
 }
 
 func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.EmeraldValue {
+	if value != nil && value.Type == object.ValueArray && value.Literal {
+		copyValue := *value
+		copyValue.Cold = value.CloneColdData()
+		copyValue.Data = append([]*object.EmeraldValue(nil), value.Data.([]*object.EmeraldValue)...)
+		copyValue.Frozen = false
+		return vm.trackObjectSpaceAllocation(&copyValue, frame)
+	}
 	if value != nil && (value.Type == object.ValueString || value.Type == object.ValueSymbol) {
 		freezeStringLiterals := vm.freezeStringLiterals
 		chillStringLiterals := vm.chillStringLiterals
@@ -3893,6 +5848,9 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 			encoding = value.Encoding
 		}
 		if value.Type == object.ValueString && freezeStringLiterals {
+			if interned := vm.frozenLiteralCache[value]; interned != nil {
+				return interned
+			}
 			if encoding != "" {
 				core.SetStringEncoding(value, encoding)
 			}
@@ -3901,11 +5859,14 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 			value.Literal = true
 			key := encoding + "\x00" + value.Data.(string)
 			if interned := vm.frozenStringCache[key]; interned != nil {
+				vm.frozenLiteralCache[value] = interned
 				return interned
 			}
 			vm.frozenStringCache[key] = value
+			vm.frozenLiteralCache[value] = value
 		} else if value.Type == object.ValueString {
 			mutable := *value
+			mutable.Cold = value.CloneColdData()
 			mutable.Frozen = false
 			mutable.Chilled = chillStringLiterals
 			mutable.Literal = true
@@ -3913,7 +5874,7 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 			if encoding != "" {
 				core.SetStringEncoding(result, encoding)
 			}
-			return result
+			return vm.trackObjectSpaceAllocation(result, frame)
 		} else if encoding != "" {
 			core.SetSymbolEncoding(value, encoding)
 		}
@@ -3921,10 +5882,380 @@ func (vm *VM) constantValue(value *object.EmeraldValue, frame *Frame) *object.Em
 	return value
 }
 
+func (vm *VM) trackObjectSpaceAllocation(value *object.EmeraldValue, frame *Frame) *object.EmeraldValue {
+	if !core.ObjectSpaceAllocationTracing() {
+		return value
+	}
+	path := core.CurrentSpecFile
+	if path == "" {
+		path = "(eval)"
+	}
+	line := int64(1)
+	methodID := ""
+	classPath := ""
+	if frame != nil {
+		if sourceLine := vm.sourceLineForFrame(frame); sourceLine > 0 {
+			line = sourceLine
+		}
+		methodID = frame.MethodName
+		if methodID == "" && frame.Fn != nil && frame.Fn.Name != "__main__" && frame.Fn.Name != "__block__" {
+			methodID = frame.Fn.Name
+		}
+		if frame.Fn != nil && frame.Fn.SourcePath != "" {
+			path = frame.Fn.SourcePath
+		}
+		if frame.Bp >= 0 && frame.Bp < len(vm.stack) {
+			classPath = allocationClassPath(vm.stack[frame.Bp])
+		}
+	}
+	return core.TrackObjectSpaceAllocation(value, path, line, classPath, methodID)
+}
+
+func allocationClassPath(value *object.EmeraldValue) string {
+	if value == nil {
+		return ""
+	}
+	switch value.Type {
+	case object.ValueClass:
+		if class, ok := value.Data.(*object.Class); ok && class != nil {
+			return class.Name
+		}
+	case object.ValueModule:
+		if module, ok := value.Data.(*object.Module); ok && module != nil {
+			return module.Name
+		}
+	default:
+		if value.Class != nil {
+			return value.Class.Name
+		}
+	}
+	return ""
+}
+
+func (vm *VM) executeSimpleOpcode(op compiler.Opcode, frame *Frame) error {
+	switch op {
+	case compiler.OpConstant:
+		idx := vm.readUint16()
+		constants := vm.frameConstants(frame)
+		if idx < 0 || idx >= len(constants) {
+			return fmt.Errorf("invalid constant index %d (constants: %d) at ip=%d", idx, len(constants), vm.frames[vm.fp].Ip)
+		}
+		vm.push(vm.constantValue(constants[idx], frame))
+	case compiler.OpPop:
+		vm.popFrameValue(frame)
+	case compiler.OpTrue:
+		vm.push(core.R.TrueVal)
+	case compiler.OpFalse:
+		vm.push(core.R.FalseVal)
+	case compiler.OpNil:
+		vm.push(core.R.NilVal)
+	case compiler.OpSelf:
+		vm.push(vm.stack[frame.Bp])
+	case compiler.OpGetLocal:
+		constants := vm.frameConstants(frame)
+		if vm.tryFusedIntegerLocalExpression(frame, constants) {
+			break
+		}
+		idx := vm.readUint8()
+		stackIdx := frame.Bp + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
+			return fmt.Errorf("OpGetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", frame.Bp, idx, stackIdx, vm.sp)
+		}
+		if name, ok := vm.topLevelLocalName(frame, idx); ok {
+			if binding := vm.topLevelBindingData(); binding != nil {
+				if value, exists := binding.Locals[name]; exists {
+					vm.stack[stackIdx] = value
+				}
+			}
+		}
+		vm.push(derefClosureValue(vm.stack[stackIdx]))
+	case compiler.OpGetLocalFast:
+		idx := vm.readUint8()
+		stackIdx := frame.Bp + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
+			return fmt.Errorf("OpGetLocalFast: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", frame.Bp, idx, stackIdx, vm.sp)
+		}
+		vm.push(derefClosureValue(vm.stack[stackIdx]))
+	case compiler.OpSetLocal:
+		idx := vm.readUint8()
+		stackIdx := frame.Bp + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
+			return fmt.Errorf("OpSetLocal: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", frame.Bp, idx, stackIdx, vm.sp)
+		}
+		value := vm.peek(0)
+		if current := vm.stack[stackIdx]; current != nil {
+			if _, ok := current.Data.(*closureCell); ok {
+				setClosureValue(&vm.stack[stackIdx], value)
+			} else {
+				vm.stack[stackIdx] = value
+			}
+		} else {
+			vm.stack[stackIdx] = value
+		}
+		if vm.sp <= stackIdx {
+			vm.sp = stackIdx + 1
+		}
+		if name, ok := vm.topLevelLocalName(frame, idx); ok {
+			if binding := vm.topLevelBindingData(); binding != nil {
+				binding.Locals[name] = value
+			}
+		}
+		vm.updateCapturedBindingLocal(frame, int(idx), value)
+	case compiler.OpGetLocalCell:
+		idx := vm.readUint8()
+		stackIdx := frame.Bp + int(idx) + 1
+		if stackIdx >= 0 && stackIdx < len(vm.stack) {
+			var cellValue *object.EmeraldValue
+			if current := vm.stack[stackIdx]; current != nil {
+				if _, ok := current.Data.(*closureCell); ok {
+					cellValue = current
+				}
+			}
+			if cellValue == nil {
+				cellValue = &object.EmeraldValue{Type: object.ValueObject, Data: &closureCell{value: derefClosureValue(vm.stack[stackIdx])}, Class: core.R.Classes["Object"]}
+				vm.stack[stackIdx] = cellValue
+			}
+			if name, ok := vm.topLevelLocalName(frame, int(idx)); ok {
+				if binding := vm.topLevelBindingData(); binding != nil {
+					binding.Locals[name] = cellValue
+				}
+			}
+			vm.push(cellValue)
+		} else {
+			vm.push(core.R.NilVal)
+		}
+	case compiler.OpGetInstanceVar:
+		nameIdx := vm.readUint16()
+		constants := vm.frameConstants(frame)
+		if nameIdx < 0 || nameIdx >= len(constants) || constants[nameIdx] == nil {
+			return fmt.Errorf("OpGetInstanceVar: invalid constant index %d", nameIdx)
+		}
+		name, ok := constants[nameIdx].Data.(string)
+		if !ok {
+			return fmt.Errorf("OpGetInstanceVar: constant %d is not a name", nameIdx)
+		}
+		vm.push(vm.instanceVariableValue(frame, name))
+	case compiler.OpSetInstanceVar:
+		nameIdx := vm.readUint16()
+		constants := vm.frameConstants(frame)
+		if nameIdx < 0 || nameIdx >= len(constants) || constants[nameIdx] == nil {
+			return fmt.Errorf("OpSetInstanceVar: invalid constant index %d", nameIdx)
+		}
+		name, ok := constants[nameIdx].Data.(string)
+		if !ok {
+			return fmt.Errorf("OpSetInstanceVar: constant %d is not a name", nameIdx)
+		}
+		value := vm.peek(0)
+		receiver := vm.stack[frame.Bp]
+		if result := core.SetDynamicInstanceVar(receiver, name, value); result != nil {
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+		}
+	case compiler.OpGetFree:
+		idx := vm.readUint8()
+		if frame.Closure == nil || int(idx) >= len(frame.Closure.Free) {
+			valueCount := 0
+			if frame.Closure != nil {
+				valueCount = len(frame.Closure.Free)
+			}
+			return fmt.Errorf("OpGetFree: index %d out of range for %s at %s:%d (free names %v, values %d)", idx, frame.Fn.Name, frame.Fn.SourcePath, frame.Fn.DefinitionLine, frame.Fn.FreeVarNames, valueCount)
+		}
+		vm.push(derefClosureValue(frame.Closure.Free[idx]))
+	case compiler.OpSetFree:
+		idx := vm.readUint8()
+		if frame.Closure == nil || int(idx) >= len(frame.Closure.Free) {
+			return fmt.Errorf("OpSetFree: index %d out of range", idx)
+		}
+		setClosureValue(&frame.Closure.Free[idx], vm.peek(0))
+	case compiler.OpGetFreeCell:
+		idx := vm.readUint8()
+		if frame.Closure == nil || int(idx) >= len(frame.Closure.Free) {
+			return fmt.Errorf("OpGetFreeCell: index %d out of range", idx)
+		}
+		vm.push(frame.Closure.Free[idx])
+	case compiler.OpDup:
+		vm.push(vm.peek(0))
+	case compiler.OpSwap:
+		if vm.sp >= 2 {
+			vm.stack[vm.sp-1], vm.stack[vm.sp-2] = vm.stack[vm.sp-2], vm.stack[vm.sp-1]
+		}
+	case compiler.OpJumpNotTruthy:
+		pos := vm.readUint16()
+		if !vm.pop().IsTruthy() {
+			frame.Ip = pos - 1
+		}
+	case compiler.OpJumpNotNil:
+		pos := vm.readUint16()
+		if vm.pop().Type != object.ValueNil {
+			frame.Ip = pos - 1
+		}
+	case compiler.OpJumpTruthy:
+		pos := vm.readUint16()
+		if vm.pop().IsTruthy() {
+			frame.Ip = pos - 1
+		}
+	case compiler.OpIndex:
+		index := vm.pop()
+		left := vm.pop()
+		result := vm.index(left, index)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		vm.push(result)
+	case compiler.OpIndexAssign:
+		value := vm.pop()
+		index := vm.pop()
+		left := vm.pop()
+		result := vm.indexAssign(left, index, value)
+		if result != nil && result.Type == object.ValueException {
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, result)
+			return nil
+		}
+		vm.push(value)
+	}
+	return nil
+}
+
+// executeCachedFixedAritySend handles the overwhelmingly common send shape
+// inside a cached fixed-arity Ruby method.  The full OpSend case still owns
+// block forwarding, keyword normalization, splats, setters, and the special
+// include/alias paths.  Keeping those shapes on the normal interpreter path
+// makes this shortcut both small and conservative.
+func (vm *VM) executeCachedFixedAritySend(frame *Frame, op compiler.Opcode, instructions []byte) (bool, error) {
+	if op != compiler.OpSend || frame == nil || frame.Fn == nil {
+		return false, nil
+	}
+	sendIP := frame.Ip
+	if sendIP < 0 || sendIP+5 >= len(instructions) {
+		return false, nil
+	}
+	methodNameIdx := int(instructions[sendIP+1])<<8 | int(instructions[sendIP+2])
+	constants := vm.frameConstants(frame)
+	if methodNameIdx < 0 || methodNameIdx >= len(constants) || constants[methodNameIdx] == nil {
+		return false, nil
+	}
+	methodName, ok := constants[methodNameIdx].Data.(string)
+	if !ok {
+		return false, nil
+	}
+	blockArg := int(instructions[sendIP+3])
+	numArgs := int(instructions[sendIP+4])
+	splatIndex := int(instructions[sendIP+5])
+	if blockArg != 0 || splatIndex != 255 || numArgs < 0 || numArgs > len(frame.SendArgStorage) {
+		return false, nil
+	}
+	if methodName == "include" || methodName == "alias_method" {
+		return false, nil
+	}
+	if vm.sp < numArgs+1 {
+		return false, nil
+	}
+
+	// The operand bytes have been consumed exactly as readUint16/readUint8
+	// would consume them in the normal OpSend case.
+	frame.Ip = sendIP + 5
+	args := frame.SendArgStorage[:numArgs]
+	for index := 0; index < numArgs; index++ {
+		args[numArgs-1-index] = vm.pop()
+	}
+	receiver := vm.pop()
+	previousBlock := vm.currentBlock
+	vm.currentBlock = nil
+	result, cached := vm.executeBytecodeSendCache(frame, sendIP, receiver, methodName, args, 0)
+	if !cached {
+		result = vm.send(receiver, methodName, args)
+	}
+	if vm.pendingEscapedThrowHandler != nil {
+		handler := vm.pendingEscapedThrowHandler
+		value := vm.pendingEscapedThrowValue
+		vm.pendingEscapedThrowHandler = nil
+		vm.pendingEscapedThrowValue = nil
+		vm.currentBlock = previousBlock
+		if vm.routeThrowThroughEnsure(frame, handler, value) {
+			return true, nil
+		}
+		vm.completeThrow(frame, handler, value)
+		return true, nil
+	}
+	vm.consumeCompletedBreakMarker()
+	vm.currentBlock = previousBlock
+	if vm.threadDepth > 0 && core.IsThreadBlockedResult(result) {
+		vm.push(result)
+		frame.Returned = true
+		return true, nil
+	}
+	if core.IsTerminationResult(result) {
+		if vm.raiseException(frame, result) {
+			return true, nil
+		}
+		vm.returnUnhandledException(frame, result)
+		return true, nil
+	}
+	if shouldPropagateExceptionValue(result) {
+		if vm.raiseException(frame, result) {
+			return true, nil
+		}
+		vm.returnUnhandledException(frame, result)
+		return true, nil
+	}
+	vm.push(result)
+	return true, nil
+}
+
+func (vm *VM) instanceVariableValue(frame *Frame, name string) *object.EmeraldValue {
+	if frame == nil || frame.Bp < 0 || frame.Bp >= len(vm.stack) {
+		return core.R.NilVal
+	}
+	receiver := vm.stack[frame.Bp]
+	if receiver == nil {
+		return core.R.NilVal
+	}
+	if obj, ok := receiver.Data.(*object.Object); ok {
+		if value := obj.GetInstanceVar(name); value != nil {
+			return value
+		}
+		return core.R.NilVal
+	}
+	if proc, ok := receiver.Data.(*object.Proc); ok {
+		if value, found := proc.InstanceVars[name]; found {
+			return value
+		}
+		return core.R.NilVal
+	}
+	if module, ok := receiver.Data.(*object.Module); ok {
+		if value, found := module.InstanceVars[name]; found {
+			return value
+		}
+		return core.R.NilVal
+	}
+	if class, ok := receiver.Data.(*object.Class); ok {
+		if value := class.GetInstanceVar(name); value != nil {
+			return value
+		}
+		return core.R.NilVal
+	}
+	if value := core.DynamicInstanceVar(receiver, name); value != nil {
+		return value
+	}
+	return core.R.NilVal
+}
+
 func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	vm.instructionCount++
 	if vm.instructionLimit > 0 && vm.instructionCount > vm.instructionLimit {
-		return fmt.Errorf("instruction limit exceeded at ip=%d, op=%v", frame.Ip, op)
+		path := ""
+		method := frame.MethodName
+		if frame.Fn != nil {
+			path = frame.Fn.SourcePath
+			if method == "" {
+				method = frame.Fn.Name
+			}
+		}
+		return fmt.Errorf("instruction limit exceeded at %s:%d in %s (ip=%d, op=%v)", path, vm.sourceLineForFrame(frame), method, frame.Ip, op)
 	}
 	constants := vm.frameConstants(frame)
 	switch op {
@@ -4232,6 +6563,22 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		left := vm.pop()
 		if result, ok := integerShift(left, right, true); ok {
 			vm.push(result)
+		} else if left != nil && right != nil && left.Type == object.ValueString && right.Type == object.ValueString &&
+			left.Class == core.R.Classes["String"] && right.Class == core.R.Classes["String"] &&
+			core.AttachedSingletonClass(left) == nil && core.AttachedSingletonClass(right) == nil &&
+			core.StringAppendUsesBuiltinImplementation() {
+			result, handled := core.AppendStringOneFast(left, right)
+			if !handled {
+				result = core.AppendStringOne(left, right)
+			}
+			if result != nil && result.Type == object.ValueException {
+				if vm.raiseException(frame, result) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, result)
+				return nil
+			}
+			vm.push(result)
 		} else {
 			vm.push(vm.send(left, "<<", []*object.EmeraldValue{right}))
 		}
@@ -4252,14 +6599,32 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpJump:
 		pos := vm.readUint16()
 		if pos < frame.Ip-2 {
+			if vm.tryExecuteStaticIntegerArithmeticLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteConstantKeywordIntegerLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteConstantNativeIntegerLoop(frame, pos, frame.Ip-2) {
+				break
+			}
 			if vm.tryExecuteCountedIntegerLoop(frame, pos, frame.Ip-2) {
 				break
 			}
 			if vm.tryExecuteCollectionFillLoop(frame, pos, frame.Ip-2) ||
+				vm.tryExecuteArrayIntegerFillLoop(frame, pos, frame.Ip-2) ||
+				vm.tryExecuteHashLinearFillLoop(frame, pos, frame.Ip-2) ||
+				vm.tryExecuteHashIntegerFillLoop(frame, pos, frame.Ip-2) ||
 				vm.tryExecuteArraySumLoop(frame, pos, frame.Ip-2) {
 				break
 			}
 			if vm.tryExecuteASCIIStringLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteASCIIStringAppendLoop(frame, pos, frame.Ip-2) {
+				break
+			}
+			if vm.tryExecuteTypedStringCallLoop(frame, pos, frame.Ip-2) {
 				break
 			}
 			if vm.tryExecuteIntegerBytecodeLoop(frame, pos, frame.Ip-2) {
@@ -4307,16 +6672,16 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 
 	case compiler.OpArray:
-		n := vm.readUint16()
+		n := vm.readUint32()
 		elems := make([]*object.EmeraldValue, n)
 		for i := n - 1; i >= 0; i-- {
 			elems[i] = vm.pop()
 		}
-		vm.push(&object.EmeraldValue{
+		vm.push(vm.trackObjectSpaceAllocation(&object.EmeraldValue{
 			Type:  object.ValueArray,
 			Data:  elems,
 			Class: core.R.Classes["Array"],
-		})
+		}, frame))
 
 	case compiler.OpArrayAppend:
 		splatMode := vm.readUint8()
@@ -4326,11 +6691,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if splatMode != 0 {
 			var expanded []*object.EmeraldValue
 			var err *object.EmeraldValue
-			if splatMode == 2 {
-				expanded, err = vm.toAForAssignmentSplat(value)
-			} else {
-				expanded, err = vm.toAryForSplat(value)
-			}
+			expanded, err = vm.toAForAssignmentSplat(value)
 			if err != nil {
 				if vm.raiseException(frame, err) {
 					return nil
@@ -4348,8 +6709,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpHash:
 		n := vm.readUint16()
 		h := &object.RHash{
-			Pairs:  make(map[*object.EmeraldValue]*object.EmeraldValue),
-			Hashes: make(map[*object.EmeraldValue]int64),
+			Pairs: make(map[*object.EmeraldValue]*object.EmeraldValue, int(n)),
+			Keys:  make([]*object.EmeraldValue, 0, int(n)),
 		}
 		for i := 0; i < int(n); i++ {
 			key := hashLiteralKey(vm.pop())
@@ -4362,11 +6723,64 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			h.Keys = append(h.Keys, key)
 			h.Pairs[key] = value
 		}
-		vm.push(&object.EmeraldValue{
+		vm.push(vm.trackObjectSpaceAllocation(&object.EmeraldValue{
 			Type:  object.ValueHash,
 			Data:  h,
 			Class: core.R.Classes["Hash"],
-		})
+		}, frame))
+
+	case compiler.OpHashMerge:
+		source := vm.pop()
+		target := vm.pop()
+		if source == nil || source.Type != object.ValueHash {
+			if source != nil && core.ReceiverHasCallableMethod(source, "to_hash") {
+				source = core.CallMethod(source, "to_hash")
+			}
+			if source != nil && source.Type == object.ValueException {
+				if vm.raiseException(frame, source) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, source)
+				return nil
+			}
+			if source == nil || source.Type != object.ValueHash {
+				name := "nil"
+				if source != nil {
+					name = source.TypeName()
+				}
+				errVal := core.NewTypeError("no implicit conversion of " + name + " into Hash")
+				if vm.raiseException(frame, errVal) {
+					return nil
+				}
+				vm.returnUnhandledException(frame, errVal)
+				return nil
+			}
+		}
+		targetHash, _ := target.Data.(*object.RHash)
+		sourceHash, _ := source.Data.(*object.RHash)
+		if targetHash == nil || sourceHash == nil {
+			errVal := core.NewTypeError("no implicit conversion into Hash")
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, errVal)
+			return nil
+		}
+		for _, key := range sourceHash.Keys {
+			targetKey := hashLiteralExistingKey(targetHash, key)
+			if targetKey == nil {
+				targetKey = hashLiteralKey(key)
+				targetHash.Keys = append(targetHash.Keys, targetKey)
+			}
+			value, ok := sourceHash.Pairs[key]
+			if !ok {
+				value = executorHashValue(source, key)
+			}
+			targetHash.Pairs[targetKey] = value
+		}
+		targetHash.Buckets = nil
+		targetHash.BucketSize = 0
+		vm.push(target)
 
 	case compiler.OpMarkKeywordHash:
 		value := vm.pop()
@@ -4394,7 +6808,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		index := vm.pop()
 		left := vm.pop()
 		result := vm.indexAssign(left, index, value)
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if result != nil && result.Type == object.ValueException {
+			if vm.raiseException(frame, result) {
+				return nil
+			}
+			vm.returnUnhandledException(frame, result)
 			return nil
 		}
 		vm.push(value)
@@ -4491,7 +6909,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		resolvedName := core.ResolveGlobalAlias(rawName)
 		threadSpecial := vm.threadSpecialGlobals != nil && isThreadSpecialGlobal(resolvedName)
 		var val *object.EmeraldValue
-		if resolvedName == "$!" {
+		if derivedValue, derived := core.MatchDataDerivedGlobal(vm.currentMatchDataGlobal(), resolvedName); derived {
+			val = derivedValue
+			threadSpecial = true
+		} else if resolvedName == "$!" {
 			val = core.LastException
 		} else if resolvedName == "$@" {
 			val = vm.currentExceptionBacktraceGlobal()
@@ -4584,90 +7005,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if !ok {
 			return fmt.Errorf("OpGetConstant: expected string constant, got %T", constants[nameIdx].Data)
 		}
-		if strings.HasPrefix(name, "::") {
-			absoluteName := strings.TrimPrefix(name, "::")
-			if objectClass := core.R.Classes["Object"]; objectClass != nil && objectClass.PrivateConstants[absoluteName] {
-				owner := &object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: core.R.Classes["Class"]}
-				val := vm.privateConstantAccessResult(owner, absoluteName)
-				if val != nil && val.Type == object.ValueException && vm.raiseException(frame, val) {
-					return nil
-				}
-				vm.push(val)
-			} else if val, ok := vm.topLevelConstantValue(absoluteName); ok {
-				vm.push(val)
-			} else if qualifiedConst, ok := vm.qualifiedConstantValue(absoluteName); ok {
-				if qualifiedConst != nil && qualifiedConst.Type == object.ValueException && vm.raiseException(frame, qualifiedConst) {
-					return nil
-				}
-				vm.push(qualifiedConst)
-			} else {
-				missing := vm.missingConstantValue(absoluteName, true)
-				if missing != nil && missing.Type == object.ValueException && vm.raiseException(frame, missing) {
-					return nil
-				}
-				vm.push(missing)
-			}
-			break
+		value := vm.resolveConstantRead(frame, name)
+		if vm.raiseConstantException(frame, value) {
+			return nil
 		}
-		allowTopLevelFallback := vm.allowTopLevelConstantFallback(name)
-		if val, ok := vm.lexicalConstantValue(name); ok {
-			if val != nil && val.Type == object.ValueException && vm.raiseException(frame, val) {
-				return nil
-			}
-			vm.push(val)
-		} else if allowTopLevelFallback {
-			if val, ok := vm.topLevelConstantValue(name); ok {
-				vm.push(val)
-			} else if name == "ENV" {
-				vm.push(core.EnvObject())
-			} else if name == "ThreadGroup::Default" {
-				vm.push(core.DefaultThreadGroup())
-			} else if processConst, ok := processConstantValue(name); ok {
-				vm.push(processConst)
-			} else if cls, ok := core.R.Classes[name]; ok {
-				vm.push(&object.EmeraldValue{
-					Type:  object.ValueClass,
-					Data:  cls,
-					Class: core.R.Classes["Class"],
-				})
-			} else if namespace, ok := vm.namespaceModuleValue(name); ok {
-				vm.push(namespace)
-			} else if localConst, ok := vm.scopedLocalConstantValue(frame, name); ok {
-				if localConst != nil && localConst.Type == object.ValueException && vm.raiseException(frame, localConst) {
-					return nil
-				}
-				vm.push(localConst)
-			} else if qualifiedConst, ok := vm.qualifiedConstantValue(name); ok {
-				if qualifiedConst != nil && qualifiedConst.Type == object.ValueException && vm.raiseException(frame, qualifiedConst) {
-					return nil
-				}
-				vm.push(qualifiedConst)
-			} else {
-				missing := vm.missingConstantValue(name, false)
-				if missing != nil && missing.Type == object.ValueException && vm.raiseException(frame, missing) {
-					return nil
-				}
-				vm.push(missing)
-			}
-		} else if localConst, ok := vm.scopedLocalConstantValue(frame, name); ok {
-			if localConst != nil && localConst.Type == object.ValueException && vm.raiseException(frame, localConst) {
-				return nil
-			}
-			vm.push(localConst)
-		} else if qualifiedConst, ok := vm.qualifiedConstantValue(name); ok {
-			if qualifiedConst != nil && qualifiedConst.Type == object.ValueException && vm.raiseException(frame, qualifiedConst) {
-				return nil
-			}
-			vm.push(qualifiedConst)
-		} else {
-			missing := vm.missingConstantValue(name, false)
-			if missing != nil && missing.Type == object.ValueException && vm.raiseException(frame, missing) {
-				return nil
-			}
-			vm.push(missing)
-		}
+		vm.push(value)
 
 	case compiler.OpSetConstant:
+		object.BumpConstantGeneration()
 		nameIdx := vm.readUint16()
 		definitionFinalization := vm.readUint8() == 1
 		rawName := constants[nameIdx].Data.(string)
@@ -4676,7 +7021,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		value := vm.peek(0)
 		if idx, top := vm.findClassStackEntry(name); top != nil {
 			value = top
-			vm.classStack = append(vm.classStack[:idx], vm.classStack[idx+1:]...)
+			nextClassStack := make([]*object.EmeraldValue, 0, len(vm.classStack)-1)
+			nextClassStack = append(nextClassStack, vm.classStack[:idx]...)
+			nextClassStack = append(nextClassStack, vm.classStack[idx+1:]...)
+			vm.classStack = nextClassStack
 			if top.Type == object.ValueClass {
 				vm.runMinitestMethods(top)
 			}
@@ -4717,11 +7065,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if !ok {
 			value = vm.sendBypassVisibility(receiver, "const_missing", []*object.EmeraldValue{{Type: object.ValueSymbol, Data: name, Class: core.R.Classes["Symbol"]}})
 		}
-		if value != nil && value.Type == object.ValueException && vm.raiseException(frame, value) {
-			return nil
-		}
-		if value != nil && value.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
-			vm.returnUnhandledException(frame, value)
+		if vm.raiseConstantException(frame, value) {
 			return nil
 		}
 		vm.push(value)
@@ -4784,6 +7128,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.push(derefClosureValue(vm.stack[stackIdx]))
 
+	case compiler.OpGetLocalFast:
+		idx := vm.readUint8()
+		stackIdx := frame.Bp + int(idx) + 1
+		if stackIdx < 0 || stackIdx >= len(vm.stack) {
+			return fmt.Errorf("OpGetLocalFast: invalid stack access basePtr=%d idx=%d stackIdx=%d sp=%d", frame.Bp, idx, stackIdx, vm.sp)
+		}
+		vm.push(derefClosureValue(vm.stack[stackIdx]))
+
 	case compiler.OpSetLocal:
 		idx := vm.readUint8()
 		basePtr := frame.Bp
@@ -4840,7 +7192,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 		receiver := vm.stack[frame.Bp]
 		if obj, ok := receiver.Data.(*object.Object); ok {
-			if val, ok := obj.InstanceVars[name]; ok {
+			if val := obj.GetInstanceVar(name); val != nil {
 				vm.push(val)
 			} else {
 				vm.push(core.R.NilVal)
@@ -4913,6 +7265,29 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			if vm.raiseException(frame, core.NewNameError("uninitialized class variable "+name)) {
 				return nil
 			}
+			vm.push(core.R.NilVal)
+		}
+
+	case compiler.OpGetClassVarOrNil:
+		nameIdx := vm.readUint16()
+		name := constants[nameIdx].Data.(string)
+		receiver := vm.stack[frame.Bp]
+		target := vm.classVarScopeReceiver(receiver)
+		if vm.classVarAccessesToplevel(target) {
+			if vm.raiseException(frame, core.NewRuntimeError("class variable access from toplevel")) {
+				return nil
+			}
+			vm.push(core.R.NilVal)
+			break
+		}
+		if val, errVal, ok := core.LookupClassVariableWithError(target, name); errVal != nil {
+			if vm.raiseException(frame, errVal) {
+				return nil
+			}
+			vm.push(core.R.NilVal)
+		} else if ok {
+			vm.push(val)
+		} else {
 			vm.push(core.R.NilVal)
 		}
 
@@ -5094,6 +7469,33 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.push(result)
 
+	case compiler.OpUndef:
+		count := vm.readUint16()
+		args := make([]*object.EmeraldValue, count)
+		for i := 0; i < count; i++ {
+			args[count-1-i] = vm.pop()
+		}
+		receiver := vm.pop()
+		target := receiver
+		if len(vm.classStack) > 0 {
+			target = vm.classStack[len(vm.classStack)-1]
+		} else if receiver == core.R.Main {
+			target = &object.EmeraldValue{
+				Type:  object.ValueClass,
+				Data:  core.R.Classes["Object"],
+				Class: core.R.Classes["Class"],
+			}
+		}
+		result := core.UndefMethod(target, args...)
+		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+			return nil
+		}
+		if result != nil && result.Type == object.ValueException && core.EvaluatingRaiseErrorMatcher() {
+			vm.returnUnhandledException(frame, result)
+			return nil
+		}
+		vm.push(result)
+
 	case compiler.OpSingletonClass:
 		receiver := vm.popFrameValue(frame)
 		singleton := core.SingletonClass(receiver)
@@ -5111,7 +7513,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.fireTracePointReturn(frame, core.R.NilVal)
 		}
 		// Don't decrement fp here - the caller will handle that
-		vm.sp = frame.Bp
+		vm.setStackPointer(frame.Bp)
 
 	case compiler.OpReturnValue, compiler.OpNonLocalReturnValue:
 		retVal := vm.pop()
@@ -5134,7 +7536,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.returnUnhandledException(frame, exception)
 			return nil
 		}
-		if frame.Fn != nil && (frame.Fn.Name == "__block__" || op == compiler.OpNonLocalReturnValue) && !frame.Fn.DefinedByDefineMethod && frame.Closure != nil && frame.Closure.ReturnOwnerID > 0 && frame.Closure.ReturnOwnerID != frame.ID {
+		if frame.Fn != nil && (frame.Fn.Name == "__block__" || op == compiler.OpNonLocalReturnValue) && !frame.DefinedByDefineMethod && !frame.Fn.DefinedByDefineMethod && frame.Closure != nil && frame.Closure.ReturnOwnerID > 0 && frame.Closure.ReturnOwnerID != frame.ID {
 			if vm.threadDepth > 0 || !vm.frameIDActive(frame.Closure.ReturnOwnerID) {
 				exception := core.NewLocalJumpErrorWithReturn(retVal)
 				if vm.raiseException(frame, exception) {
@@ -5164,10 +7566,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 
 	case compiler.OpBlockReturn:
 		retVal := vm.pop()
-		vm.sp = frame.Bp
+		vm.setStackPointer(frame.Bp)
 		vm.push(retVal)
 
 	case compiler.OpSend, compiler.OpSendWithKeywords, compiler.OpSendSetter:
+		sendIP := frame.Ip
 		isKeywordSend := op == compiler.OpSendWithKeywords
 		isSetterSend := op == compiler.OpSendSetter
 		methodNameIdx := vm.readUint16()
@@ -5193,7 +7596,17 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 
-		args := make([]*object.EmeraldValue, int(numArgs))
+		// Most sends in ordinary Ruby code have at most a handful of positional
+		// arguments. Store those vectors in the caller frame so the interpreter
+		// does not allocate a slice backing store for every OpSend. The frame is
+		// suspended while the callee runs, so its scratch storage remains stable
+		// for a Ruby callee's Args and for synchronous native callbacks.
+		var args []*object.EmeraldValue
+		if numArgs <= len(frame.SendArgStorage) {
+			args = frame.SendArgStorage[:numArgs]
+		} else {
+			args = make([]*object.EmeraldValue, int(numArgs))
+		}
 		for i := 0; i < int(numArgs); i++ {
 			args[numArgs-1-i] = vm.pop()
 		}
@@ -5214,9 +7627,13 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			if last == nil || last.Type == object.ValueNil {
 				args = args[:len(args)-1]
 			} else if last.Type == object.ValueHash {
-				last = copyKeywordHash(last)
-				args[len(args)-1] = last
-				core.MarkRuby2KeywordHash(last)
+				if len(executorHashToMap(last)) == 0 {
+					args = args[:len(args)-1]
+				} else {
+					last = copyKeywordHash(last)
+					args[len(args)-1] = last
+					core.MarkRuby2KeywordHash(last)
+				}
 			}
 		}
 		assignedValue := core.R.NilVal
@@ -5228,7 +7645,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if methodName == "include" && receiver == core.R.Main && len(vm.classStack) == 0 {
 			if vm.nextInstructionIsExpectationSend(frame) {
 				methodName = "__mspec_include_matcher__"
-			} else {
+			} else if method, _, _ := vm.lookupMethodForSend(receiver, methodName, args, false, false); method == nil {
 				receiver = &object.EmeraldValue{Type: object.ValueClass, Data: core.R.Classes["Object"], Class: core.R.Classes["Class"]}
 			}
 		}
@@ -5262,7 +7679,25 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if blockArg == 3 && len(vm.activeRescues) > 0 {
 			implicitIdentifierCause = core.LastException
 		}
-		result := vm.send(receiver, methodName, args)
+		keywordCall := isKeywordSend
+		if splatIndex != 255 && len(args) > 0 {
+			last := args[len(args)-1]
+			keywordCall = last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last)
+		}
+		var result *object.EmeraldValue
+		if keywordCall {
+			var cached bool
+			result, cached = vm.executeBytecodeKeywordSendCache(frame, sendIP, receiver, methodName, args, blockArg)
+			if !cached {
+				result = vm.sendWithKeywords(receiver, methodName, args)
+			}
+		} else {
+			var cached bool
+			result, cached = vm.executeBytecodeSendCache(frame, sendIP, receiver, methodName, args, blockArg)
+			if !cached {
+				result = vm.send(receiver, methodName, args)
+			}
+		}
 		if vm.pendingEscapedThrowHandler != nil {
 			handler := vm.pendingEscapedThrowHandler
 			value := vm.pendingEscapedThrowValue
@@ -5290,12 +7725,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		if blockArg == 3 {
-			result = implicitIdentifierNameError(result, receiver, methodName, implicitIdentifierCause)
+			result = implicitIdentifierNameError(vm, result, receiver, methodName, implicitIdentifierCause)
 		}
-		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
-			return nil
-		}
-		if shouldPropagateExceptionValue(result) && (isSetterSend || blockArg == 3 || core.EvaluatingRaiseErrorMatcher() || numberedParameterMethodNamePattern.MatchString(methodName)) {
+		if shouldPropagateExceptionValue(result) {
+			if vm.raiseException(frame, result) {
+				return nil
+			}
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -5319,7 +7754,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		frame.BlockBreak = true
 		frame.BlockBreakVal = val
-		vm.sp = frame.Bp
+		vm.setStackPointer(frame.Bp)
 		vm.push(val)
 		return nil
 
@@ -5350,7 +7785,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		frame.BlockBreak = true
 		frame.BlockBreakVal = val
-		vm.sp = frame.Bp
+		vm.setStackPointer(frame.Bp)
 		vm.push(val)
 		return nil
 
@@ -5370,7 +7805,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		frame.BlockNextVal = val
 		frame.Ip = len(frame.Fn.Instructions) - 1
-		vm.sp = frame.Bp
+		vm.setStackPointer(frame.Bp)
 		core.ForEachMarkNext()
 		return nil
 
@@ -5390,7 +7825,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		frame.Ip = -1
-		vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+		vm.setStackPointer(frame.Bp + 1 + frame.Fn.NumLocals)
 
 	case compiler.OpYield:
 		block := vm.yieldBlock()
@@ -5403,10 +7838,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		result := vm.callBlock(block)
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
-		if result != nil && result.Type == object.ValueException {
+		if shouldPropagateExceptionValue(result) {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -5428,10 +7863,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		result := vm.callBlock(block, args...)
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
-		if result != nil && result.Type == object.ValueException {
+		if shouldPropagateExceptionValue(result) {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -5462,10 +7897,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return nil
 		}
 		result := vm.callBlock(block, expanded...)
-		if result != nil && result.Type == object.ValueException && vm.raiseException(frame, result) {
+		if shouldPropagateExceptionValue(result) && vm.raiseException(frame, result) {
 			return nil
 		}
-		if result != nil && result.Type == object.ValueException {
+		if shouldPropagateExceptionValue(result) {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
@@ -5482,10 +7917,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		closure.Refinements = vm.activeRefinementSnapshot()
 		closure.RefinementsFixed = true
+		closure.RefinementCheckGeneration = 0
+		closure.RefinementCheckValid = false
 
 		visibility := vm.currentDefinitionVisibility()
 		if frame.Fn != nil && frame.Fn.MethodBody {
 			visibility = "public"
+		}
+		if closure.Fn.DefinitionVisibility != "" {
+			visibility = closure.Fn.DefinitionVisibility
 		}
 		method := &object.Method{
 			Name:         name,
@@ -5508,7 +7948,22 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			method.Owner = classVal
 			if classVal.Type == object.ValueClass {
 				cls := classVal.Data.(*object.Class)
+				var forwardedObjectMethod *object.Method
+				if cls == core.R.Classes["Kernel"] {
+					if previousKernelMethod := cls.Methods[name]; previousKernelMethod != nil {
+						if objectMethod := core.R.Classes["Object"].Methods[name]; objectMethod != nil &&
+							sameMethodFunction(objectMethod.Fn, previousKernelMethod.Fn) {
+							forwardedObjectMethod = objectMethod
+						}
+					}
+				}
 				cls.DefineMethod(name, method)
+				if forwardedObjectMethod != nil {
+					copy := *method
+					copy.Visibility = forwardedObjectMethod.Visibility
+					copy.DispatchOwner = classVal
+					core.R.Classes["Object"].DefineMethod(name, &copy)
+				}
 				if cls.IsSingleton && cls.SingletonOwner != nil {
 					key := nativeSingletonKey(cls.SingletonOwner)
 					methods := vm.nativeSingletonMethods[key]
@@ -5530,6 +7985,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					}
 					vm.returnUnhandledException(frame, errVal)
 					return nil
+				}
+				if cls == core.R.Classes["Kernel"] && vm.currentDefinitionMode() == "module_function" {
+					copy := *method
+					copy.Visibility = "public"
+					if cls.SingletonClass == nil {
+						if singleton := core.SingletonClass(classVal); singleton != nil && singleton.Type == object.ValueClass {
+							cls.SingletonClass = singleton.Data.(*object.Class)
+						}
+					}
+					if cls.SingletonClass != nil {
+						copy.Owner = &object.EmeraldValue{Type: object.ValueClass, Data: cls.SingletonClass, Class: core.R.Classes["Class"]}
+						cls.SingletonClass.DefineMethod(name, &copy)
+					}
 				}
 			} else if classVal.Type == object.ValueModule {
 				mod := classVal.Data.(*object.Module)
@@ -5590,6 +8058,8 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		closure.Refinements = vm.activeRefinementSnapshot()
 		closure.RefinementsFixed = true
+		closure.RefinementCheckGeneration = 0
+		closure.RefinementCheckValid = false
 		receiver := vm.pop()
 		if singletonMethodDefinitionFrozen(receiver) {
 			errVal := frozenMethodDefinitionError(receiver, false)
@@ -5605,11 +8075,12 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			OriginalName: name,
 			Fn:           closure.Fn,
 			Closure:      closure,
+			Visibility:   closure.Fn.DefinitionVisibility,
 		}
 
 		if receiver != nil && receiver.Type == object.ValueObject {
 			if obj, ok := receiver.Data.(*object.Object); ok {
-				obj.SingletonMethods[name] = method
+				obj.SetSingletonMethod(name, method)
 			} else {
 				key := nativeSingletonKey(receiver)
 				methods := vm.nativeSingletonMethods[key]
@@ -5658,14 +8129,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		name := constants[nameIdx].Data.(string)
 
 		fn := &object.Function{
-			Name:           name,
-			SourcePath:     frame.Fn.SourcePath,
-			EvalSource:     frame.Fn.EvalSource,
-			SourceEncoding: frame.Fn.SourceEncoding,
-			Instructions:   vm.pop().Data.([]byte),
-			Constants:      constants,
-			NumLocals:      0,
-			GlobalNames:    frame.Fn.GlobalNames,
+			Name:               name,
+			SourcePath:         frame.Fn.SourcePath,
+			SourceAbsolutePath: frame.Fn.SourceAbsolutePath,
+			EvalSource:         frame.Fn.EvalSource,
+			SourceEncoding:     frame.Fn.SourceEncoding,
+			Instructions:       vm.pop().Data.([]byte),
+			Constants:          constants,
+			NumLocals:          0,
+			GlobalNames:        frame.Fn.GlobalNames,
 		}
 
 		method := &object.Method{
@@ -5928,6 +8400,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				Class: core.R.Classes["Module"],
 			}
 		}
+		if moduleVal.Type == object.ValueModule {
+			moduleVal.Data.(*object.Module).SyntheticNamespace = false
+		}
 		if container, constName, ok := vm.scopedLocalConstantContainer(frame, name); !absolute && ok {
 			defineConstantOn(container, constName, moduleVal)
 			vm.rubyConsts[qualifiedConstantName(container, constName)] = moduleVal
@@ -6058,30 +8533,30 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if !ok {
 			return fmt.Errorf("not a function: %v", constant)
 		}
-		fnCopy := *fn
-		fnCopy.Constants = constants
+		closureFn := functionWithConstants(fn, constants)
 
 		free := make([]*object.EmeraldValue, numFree)
 		for i := numFree - 1; i >= 0; i-- {
 			free[i] = snapshotClosureCapture(vm.pop())
 		}
 
+		binding := vm.captureFrameBinding()
 		closure := &object.Closure{
-			Fn:         &fnCopy,
+			Fn:         closureFn,
 			Free:       free,
 			Block:      vm.yieldBlock(),
-			Binding:    vm.captureFrameBinding(),
-			ClassStack: vm.currentClassStackSnapshot(),
+			Binding:    binding,
+			ClassStack: binding.ClassStack,
 			AutoSplat:  true,
 		}
 		if refinements, fixed := vm.currentFixedRefinements(); fixed {
 			closure.Refinements = append([]*object.EmeraldValue(nil), refinements...)
 			closure.RefinementsFixed = true
 		}
-		if fnCopy.Name == "__block__" || fnCopy.SingletonClassBody {
+		if closureFn.Name == "__block__" || closureFn.SingletonClassBody {
 			closure.ReturnOwnerID = vm.lexicalReturnOwnerID(frame)
 		}
-		if fnCopy.Name == "__scoped_const_rhs__" && frame.WhileEnd >= 0 {
+		if closureFn.Name == "__scoped_const_rhs__" && frame.WhileEnd >= 0 {
 			closure.BreakOwnerID = frame.ID
 		}
 
@@ -6099,22 +8574,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if !ok {
 			return fmt.Errorf("not a function: %v", constants[fnIdx])
 		}
-		fnCopy := *fn
-		fnCopy.Constants = constants
+		closureFn := functionWithConstants(fn, constants)
 
 		free := make([]*object.EmeraldValue, numFree)
 		for i := numFree - 1; i >= 0; i-- {
 			free[i] = snapshotClosureCapture(vm.pop())
 		}
 
+		binding := vm.captureFrameBinding()
 		proc := &object.Proc{
-			Fn:           &fnCopy,
-			Env:          free,
-			Block:        vm.yieldBlock(),
-			Binding:      vm.captureFrameBinding(),
-			ClassStack:   vm.currentClassStackSnapshot(),
-			InstanceVars: make(map[string]*object.EmeraldValue),
-			IsLambda:     true,
+			Fn:         closureFn,
+			Env:        free,
+			Block:      vm.yieldBlock(),
+			Binding:    binding,
+			ClassStack: binding.ClassStack,
+			IsLambda:   true,
 		}
 		if refinements, fixed := vm.currentFixedRefinements(); fixed {
 			proc.Refinements = append([]*object.EmeraldValue(nil), refinements...)
@@ -6261,9 +8735,9 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			forwardedBlock = superFrame.Block
 		}
 
-		args := make([]*object.EmeraldValue, int(numArgs))
+		var args []*object.EmeraldValue
 		if numArgs == 255 {
-			if superFrame.Fn != nil && superFrame.Fn.DefinedByDefineMethod {
+			if superFrame.DefinedByDefineMethod || (superFrame.Fn != nil && superFrame.Fn.DefinedByDefineMethod) {
 				result := core.NewRuntimeError("implicit argument passing of super from method defined by define_method() is not supported")
 				if vm.raiseException(frame, result) {
 					return nil
@@ -6273,6 +8747,11 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			args = vm.implicitSuperArgs(superFrame)
 		} else {
+			if numArgs <= len(frame.SendArgStorage) {
+				args = frame.SendArgStorage[:numArgs]
+			} else {
+				args = make([]*object.EmeraldValue, int(numArgs))
+			}
 			for i := 0; i < int(numArgs); i++ {
 				args[int(numArgs)-1-i] = vm.pop()
 			}
@@ -6355,11 +8834,19 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		if !ok || methodObj == nil || methodObj.Visibility == "undefined" {
 			if superMethodName != "method_missing" {
-				missingArgs := make([]*object.EmeraldValue, 0, len(args)+1)
-				missingArgs = append(missingArgs, &object.EmeraldValue{Type: object.ValueSymbol, Data: superMethodName, Class: core.R.Classes["Symbol"]})
-				missingArgs = append(missingArgs, args...)
-				if missing := vm.send(self, "method_missing", missingArgs); missing != nil && missing.Type != object.ValueException {
+				previousBlock := vm.currentBlock
+				vm.currentBlock = forwardedBlock
+				missing := vm.callMethodMissingForSend(self, superMethodName, args)
+				vm.currentBlock = previousBlock
+				if missing != nil && missing.Type != object.ValueException {
 					vm.push(missing)
+					return nil
+				}
+				if missing != nil && missing.Type == object.ValueException {
+					if vm.raiseException(frame, missing) {
+						return nil
+					}
+					vm.returnUnhandledException(frame, missing)
 					return nil
 				}
 			}
@@ -6370,7 +8857,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			vm.returnUnhandledException(frame, result)
 			return nil
 		}
-
 		if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
 			prevBlock := vm.currentBlock
 			vm.currentBlock = forwardedBlock
@@ -6383,9 +8869,15 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		if fn, ok := methodObj.Fn.(*object.Function); ok {
 			oldFrame := vm.frames[vm.fp]
 			prevBlock := vm.currentBlock
+			prevClassStack := vm.classStack
 			vm.currentBlock = forwardedBlock
+			methodClosure := methodObj.Closure
+			if methodClosure != nil {
+				vm.classStack = methodClosure.ClassStack
+			}
 			defer func() {
 				vm.currentBlock = prevBlock
+				vm.classStack = prevClassStack
 			}()
 			if errVal := rejectBlockArgument(fn, vm.currentBlock); errVal != nil {
 				if vm.raiseException(frame, errVal) {
@@ -6411,21 +8903,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 					blockParamProc, _ = blockVal.Data.(*object.Proc)
 				}
 			}
-			newFrame := vm.pushReusableFrame(Frame{
+			newFrame := vm.pushReusableFrame()
+			*newFrame = Frame{
 				ID:                    vm.allocateFrameID(),
 				Fn:                    fn,
 				Ip:                    -1,
 				Bp:                    bp,
+				Closure:               methodClosure,
 				MethodName:            superMethodName,
 				OriginalMethodName:    methodObj.OriginalName,
-				SuperStart:            owner.SuperClass,
+				SuperStart:            owner,
 				SuperModule:           ownerModule,
+				SuperAfterClass:       ownerModule == nil,
 				Args:                  args,
 				Block:                 vm.currentBlock,
 				DefinedByDefineMethod: methodObj.DefinedByDefineMethod,
-			})
-			if ownerModule != nil {
-				newFrame.SuperStart = owner
 			}
 			if blockParamProc != nil && blockParamProc.BreakOwnerID == 0 {
 				blockParamProc.BreakOwnerID = newFrame.ID
@@ -6437,16 +8929,31 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			for curFrame.Ip < len(instructions)-1 {
 				curFrame.Ip++
 				op := compiler.Opcode(instructions[curFrame.Ip])
-				vm.fireTracePointLine(curFrame, op)
-				curFrame.InstructionException = core.LastException
-				curFrame.InstructionSnapshotSet = true
-				if err := vm.execute(op, curFrame); err != nil {
+				traceLineActive := false
+				if core.AnyTracePointActive() {
+					traceLineActive = vm.fireTracePointLine(curFrame, op)
+				}
+				if traceLineActive || !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+					curFrame.InstructionException = core.LastException
+					curFrame.InstructionSnapshotSet = true
+				}
+				var err error
+				if vm.instructionLimit == 0 && !DevMode && !traceLineActive && simpleOpcodeFastPath[op] {
+					err = vm.executeSimpleOpcode(op, curFrame)
+				} else {
+					err = vm.execute(op, curFrame)
+				}
+				if err != nil {
 					return err
 				}
-				if vm.handlePendingNonLocalReturn(curFrame) || vm.handlePendingNonLocalBreak(curFrame) || curFrame.Returned {
+				if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(curFrame)) ||
+					(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(curFrame)) || curFrame.Returned {
 					break
 				}
 				curFrame = vm.frames[vm.fp]
+				if curFrame.BlockBreak || curFrame.BlockNextVal != nil {
+					break
+				}
 				if core.LastBlockResult != nil {
 					break
 				}
@@ -6454,14 +8961,21 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 
 			result := core.R.NilVal
-			if pending, ok := vm.pendingBreakResultForFrame(curFrame); ok {
+			if curFrame.BlockBreak {
+				result = curFrame.BlockBreakVal
+				if result == nil {
+					result = core.R.NilVal
+				}
+			} else if curFrame.BlockNextVal != nil {
+				result = curFrame.BlockNextVal
+			} else if pending, ok := vm.pendingBreakResultForFrame(curFrame); ok {
 				result = pending
 			} else if core.LastBlockResult != nil {
 				result = core.LastBlockResult
 			} else if vm.sp > bp {
 				result = vm.stack[vm.sp-1]
 			}
-			vm.sp = bp
+			vm.setStackPointer(bp)
 			vm.endActiveRescuesForFrame(curFrame)
 			curFrame.InstructionException = nil
 			curFrame.InstructionSnapshotSet = false
@@ -6570,7 +9084,10 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		value, found := vm.lexicalConstantValue(name)
 		if !found && vm.allowTopLevelConstantFallback(name) {
-			value, found = vm.topLevelConstantValue(name)
+			value, found = vm.topLevelDefinitionConstantValue(name)
+		}
+		if found && value != nil && value.Type == object.ValueModule && value.Data.(*object.Module).SyntheticNamespace {
+			found = false
 		}
 		if found && value != nil && value.Type != object.ValueException {
 			vm.push(&object.EmeraldValue{Type: object.ValueString, Data: "constant", Class: core.R.Classes["String"], Frozen: true})
@@ -6586,7 +9103,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			return fmt.Errorf("OpDefinedMethod: expected string constant, got %T", constants[nameIdx].Data)
 		}
 		receiver := vm.pop()
-		methodObj, _, _ := vm.lookupMethodForSend(receiver, name, nil, false)
+		methodObj, _, _ := vm.lookupMethodForSend(receiver, name, nil, false, false)
 		found := methodObj != nil && methodObj.Visibility != "undefined"
 		defined := found
 		if found && !implicit && methodObj.Visibility != "" && methodObj.Visibility != "public" {
@@ -6594,7 +9111,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		if !found && receiver != nil {
 			symbol := &object.EmeraldValue{Type: object.ValueSymbol, Data: name, Class: core.R.Classes["Symbol"]}
-			responds := vm.send(receiver, "respond_to_missing?", []*object.EmeraldValue{symbol, core.R.FalseVal})
+			responds := vm.sendBypassVisibility(receiver, "respond_to_missing?", []*object.EmeraldValue{symbol, core.R.FalseVal})
 			defined = responds != nil && responds.Type == object.ValueBool && responds.Data.(bool)
 		}
 		if defined {
@@ -6670,7 +9187,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		frame.RetryRescue = nil
 		core.LastException = active.PreviousException
-		vm.sp = active.StackTop
+		vm.setStackPointer(active.StackTop)
 		vm.rescueStack = append(vm.rescueStack, &RescueHandler{
 			BodyOffset:      active.BodyOffset,
 			StackTop:        active.StackTop,
@@ -6705,7 +9222,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				return nil
 			}
 			frame.Ip = -1
-			vm.sp = frame.Bp + 1 + frame.Fn.NumLocals
+			vm.setStackPointer(frame.Bp + 1 + frame.Fn.NumLocals)
 			return nil
 		}
 		if pending.IsThrow {
@@ -6726,7 +9243,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			frame.BlockNextVal = pending.ReturnValue
 			frame.Ip = len(frame.Fn.Instructions) - 1
-			vm.sp = frame.Bp
+			vm.setStackPointer(frame.Bp)
 			core.ForEachMarkNext()
 			return nil
 		}
@@ -6739,7 +9256,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				if frame.Fn != nil {
 					base += frame.Fn.NumLocals
 				}
-				vm.sp = base
+				vm.setStackPointer(base)
 				vm.push(pending.ReturnValue)
 				frame.Returned = true
 				return nil
@@ -6751,7 +9268,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 			}
 			frame.BlockBreak = true
 			frame.BlockBreakVal = pending.ReturnValue
-			vm.sp = frame.Bp
+			vm.setStackPointer(frame.Bp)
 			vm.push(pending.ReturnValue)
 			return nil
 		}
@@ -6771,7 +9288,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 	case compiler.OpRaise:
 		var exception *object.EmeraldValue
 		previousException := core.LastException
-		constructedException := false
 		if vm.sp > 0 {
 			exception = vm.pop()
 		}
@@ -6780,7 +9296,6 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				exception = core.R.NilVal
 			}
 			exception = core.RaiseValue(exception)
-			constructedException = true
 		}
 		cause := previousException
 		canSetCause := len(vm.activeRescues) > 0
@@ -6791,7 +9306,7 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 				canSetCause = true
 			}
 		}
-		if constructedException && canSetCause && cause != nil && cause != exception {
+		if canSetCause && cause != nil && cause != exception {
 			if exc, ok := exception.Data.(*object.RException); ok && exc != nil && exc.Cause == nil {
 				exc.Cause = cause
 			}
@@ -6889,6 +9404,14 @@ func (vm *VM) execute(op compiler.Opcode, frame *Frame) error {
 		}
 		vm.catchStack = append(vm.catchStack, handler)
 
+	case compiler.OpEndCatch:
+		for index := len(vm.catchStack) - 1; index >= 0; index-- {
+			if vm.catchStack[index].Frame == frame {
+				vm.catchStack = append(vm.catchStack[:index], vm.catchStack[index+1:]...)
+				break
+			}
+		}
+
 	case compiler.OpThrow:
 		var value *object.EmeraldValue
 		if vm.sp > 0 {
@@ -6931,6 +9454,24 @@ func (vm *VM) push(val *object.EmeraldValue) {
 	vm.sp++
 }
 
+func (vm *VM) setStackPointer(next int) {
+	if next < 0 {
+		next = 0
+	}
+	if next < vm.sp {
+		end := vm.sp
+		if end > len(vm.stack) {
+			end = len(vm.stack)
+		}
+		start := next
+		if start > end {
+			start = end
+		}
+		clear(vm.stack[start:end])
+	}
+	vm.sp = next
+}
+
 func (vm *VM) recordPoppedValue(val *object.EmeraldValue) {
 	if len(vm.poppedValues) == 0 {
 		vm.poppedValues = append(vm.poppedValues, val)
@@ -6945,6 +9486,7 @@ func (vm *VM) pop() *object.EmeraldValue {
 	}
 	vm.sp--
 	val := vm.stack[vm.sp]
+	vm.stack[vm.sp] = nil
 	if val == nil {
 		val = core.R.NilVal
 	}
@@ -6979,6 +9521,15 @@ func (vm *VM) frameConstants(frame *Frame) []*object.EmeraldValue {
 	return vm.constants
 }
 
+func functionWithConstants(fn *object.Function, constants []*object.EmeraldValue) *object.Function {
+	if fn == nil || fn.Constants != nil {
+		return fn
+	}
+	copy := *fn
+	copy.Constants = constants
+	return &copy
+}
+
 func (vm *VM) nextInstructionIsExpectationSend(frame *Frame) bool {
 	if frame == nil || frame.Fn == nil {
 		return false
@@ -7010,6 +9561,16 @@ func (vm *VM) readUint16() int {
 	return high<<8 | low
 }
 
+func (vm *VM) readUint32() int {
+	frame := vm.frames[vm.fp]
+	value := 0
+	for range 4 {
+		frame.Ip++
+		value = value<<8 | int(frame.Fn.Instructions[frame.Ip])
+	}
+	return value
+}
+
 func (vm *VM) readUint8() int {
 	frame := vm.frames[vm.fp]
 	frame.Ip++
@@ -7018,6 +9579,12 @@ func (vm *VM) readUint8() int {
 
 func (vm *VM) add(left, right *object.EmeraldValue) *object.EmeraldValue {
 	if left != nil && left.Type == object.ValueInteger && !core.IntegerPlusUsesBuiltinImplementation() {
+		return vm.send(left, "+", []*object.EmeraldValue{right})
+	}
+	if left != nil && left.Type == object.ValueString && left.Class == core.R.Classes["String"] && !core.StringPlusUsesBuiltinImplementation() {
+		return vm.send(left, "+", []*object.EmeraldValue{right})
+	}
+	if left != nil && left.Type == object.ValueFloat && left.Class == core.R.Classes["Float"] && !core.FloatPlusUsesBuiltinImplementation() {
 		return vm.send(left, "+", []*object.EmeraldValue{right})
 	}
 	if left != nil && left.Type == object.ValueString && left.Class != core.R.Classes["String"] {
@@ -7137,6 +9704,9 @@ func vmValueToInt64(value *object.EmeraldValue) int64 {
 }
 
 func (vm *VM) mul(left, right *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueInteger && !core.IntegerMulUsesBuiltinImplementation() {
+		return vm.send(left, "*", []*object.EmeraldValue{right})
+	}
 	if left != nil && right != nil && left.Type == object.ValueInteger && right.Type == object.ValueFloat {
 		return &object.EmeraldValue{Type: object.ValueFloat, Data: toFloat64(left) * right.Data.(float64), Class: core.R.Classes["Float"]}
 	}
@@ -7458,6 +10028,12 @@ func (vm *VM) equals(left, right *object.EmeraldValue) *object.EmeraldValue {
 	if left.Type == object.ValueNil && right.Type == object.ValueNil {
 		return core.R.TrueVal
 	}
+	if left != nil && left.Type == object.ValueString {
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(left, "==", []*object.EmeraldValue{right}, false, false)
+		if fallback == nil && methodObj != nil && methodOwner != core.R.Classes["String"] {
+			return vm.invokeMethod(left, "==", "==", []*object.EmeraldValue{right}, methodObj, methodOwner, false)
+		}
+	}
 	if left.Type == object.ValueArray && right.Type != object.ValueArray {
 		return vm.send(left, "==", []*object.EmeraldValue{right})
 	}
@@ -7632,6 +10208,9 @@ func (vm *VM) arraysEqual(left, right *object.EmeraldValue) bool {
 }
 
 func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueInteger && !core.IntegerLessThanUsesBuiltinImplementation() {
+		return vm.send(left, "<", []*object.EmeraldValue{right})
+	}
 	if result := moduleCompare(left, right, "<"); result != nil {
 		return result
 	}
@@ -7697,6 +10276,9 @@ func (vm *VM) lessThan(left, right *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func (vm *VM) greaterThan(left, right *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueInteger && !core.IntegerGreaterThanUsesBuiltinImplementation() {
+		return vm.send(left, ">", []*object.EmeraldValue{right})
+	}
 	if result := moduleCompare(left, right, ">"); result != nil {
 		return result
 	}
@@ -7828,25 +10410,42 @@ func integerAsBigInt(value *object.EmeraldValue) (*big.Int, bool) {
 }
 
 func integerBitOperation(left, right *object.EmeraldValue, operation string) (*object.EmeraldValue, bool) {
-	if left != nil && right != nil && left.Type == object.ValueInteger && right.Type == object.ValueInteger {
-		_, leftIsBig := core.NumericBigIntOverride(left)
-		_, rightIsBig := core.NumericBigIntOverride(right)
-		if !leftIsBig && !rightIsBig {
-			l := left.Data.(int64)
-			r := right.Data.(int64)
-			var result int64
-			switch operation {
-			case "&":
-				result = l & r
-			case "|":
-				result = l | r
-			case "^":
-				result = l ^ r
-			default:
-				return nil, false
-			}
-			return core.NewIntegerValue(result), true
+	if left == nil || right == nil || left.Type != object.ValueInteger || right.Type != object.ValueInteger {
+		return nil, false
+	}
+	// The compiler emits these operators as dedicated bytecodes, but Ruby still
+	// allows Integer's methods to be redefined at runtime. Keep the raw integer
+	// path generation-safe just like the typed integer tiers below.
+	var builtinAvailable bool
+	switch operation {
+	case "&":
+		builtinAvailable = core.IntegerBitAndUsesBuiltinImplementation()
+	case "|":
+		builtinAvailable = core.IntegerBitOrUsesBuiltinImplementation()
+	case "^":
+		builtinAvailable = core.IntegerBitXorUsesBuiltinImplementation()
+	default:
+		return nil, false
+	}
+	if !builtinAvailable {
+		return nil, false
+	}
+
+	_, leftIsBig := core.NumericBigIntOverride(left)
+	_, rightIsBig := core.NumericBigIntOverride(right)
+	if !leftIsBig && !rightIsBig {
+		l := left.Data.(int64)
+		r := right.Data.(int64)
+		var result int64
+		switch operation {
+		case "&":
+			result = l & r
+		case "|":
+			result = l | r
+		case "^":
+			result = l ^ r
 		}
+		return core.NewIntegerValue(result), true
 	}
 	l, lok := integerAsBigInt(left)
 	r, rok := integerAsBigInt(right)
@@ -8092,6 +10691,25 @@ func sameModuleObject(left, right *object.Module) bool {
 }
 
 func (vm *VM) index(left, index *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueArray && index != nil && index.Type == object.ValueInteger {
+		if region := left.LazyArrayRegionValue(); region != nil && region.ElementAt != nil {
+			position, ok := index.Data.(int64)
+			if ok {
+				if position < 0 {
+					position = int64(region.Length) + position
+				}
+				if position < 0 || position >= int64(region.Length) {
+					return core.R.NilVal
+				}
+				if value, handled := region.ElementAt(int(position)); handled {
+					return value
+				}
+			}
+		}
+	}
+	if left != nil && left.Type == object.ValueArray && left.LazyArrayRegionValue() != nil {
+		left.MaterializeLazyArray()
+	}
 	if left != nil && left.Class != nil {
 		if (left.Type == object.ValueArray && left.Class != core.R.Classes["Array"]) ||
 			(left.Type == object.ValueHash && left.Class != core.R.Classes["Hash"]) ||
@@ -8128,6 +10746,9 @@ func (vm *VM) index(left, index *object.EmeraldValue) *object.EmeraldValue {
 }
 
 func (vm *VM) sliceIndex(left, start, length *object.EmeraldValue) *object.EmeraldValue {
+	if left != nil && left.Type == object.ValueArray && left.LazyArrayRegionValue() != nil {
+		left.MaterializeLazyArray()
+	}
 	if left != nil && left.Class != nil {
 		if (left.Type == object.ValueArray && left.Class != core.R.Classes["Array"]) ||
 			(left.Type == object.ValueHash && left.Class != core.R.Classes["Hash"]) ||
@@ -8223,6 +10844,54 @@ func (vm *VM) indexAssign(left, index, value *object.EmeraldValue) *object.Emera
 }
 
 func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
+	return vm.sendWithCallInfo(receiver, method, args, false)
+}
+
+func (vm *VM) sendWithKeywords(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue) *object.EmeraldValue {
+	return vm.sendWithCallInfo(receiver, method, args, true)
+}
+
+// hotSendLookup is a one-entry inline cache for the overwhelmingly common
+// repeated send site in native-backed loops. The regular methodCache is
+// generation-safe but still requires receiver/singleton/refinement checks and
+// a map lookup on every call. This cache is narrower: only a public method on
+// a receiver that has no singleton/refinement state is retained, and keyword
+// syntax stays on the full path because its argument protocol is distinct.
+func (vm *VM) hotSendLookup(receiver *object.EmeraldValue, method string, keywordSyntax bool) (*object.Method, *object.Class, bool) {
+	if vm == nil || !hotSendCacheEnabled || keywordSyntax || receiver == nil || method == "" ||
+		vm.hotSendMethod == nil || vm.hotSendClass != receiver.Class || vm.hotSendName != method ||
+		vm.hotSendGeneration != object.CurrentMethodGeneration() {
+		return nil, nil, false
+	}
+	// The one-entry hot cache is keyed only by receiver class.  Class/Module
+	// values have per-object singleton method tables, so they require the
+	// identity-aware bytecode cache and must not enter this narrower cache.
+	if registerIRCacheableClassReceiver(receiver) {
+		return nil, nil, false
+	}
+	if !vm.registerIRCacheableReceiverForMethod(receiver, method) {
+		return nil, nil, false
+	}
+	return vm.hotSendMethod, vm.hotSendOwner, true
+}
+
+func (vm *VM) rememberHotSend(receiver *object.EmeraldValue, method string, keywordSyntax bool, methodObj *object.Method, methodOwner *object.Class) {
+	if vm == nil || !hotSendCacheEnabled || keywordSyntax || receiver == nil || method == "" || methodObj == nil ||
+		methodObj.DispatchOwner != nil || methodObj.Visibility == "private" || methodObj.Visibility == "protected" ||
+		methodObj.Visibility == "undefined" || methodUsesRefinements(methodObj) ||
+		registerIRCacheableClassReceiver(receiver) ||
+		!vm.registerIRCacheableReceiverForMethod(receiver, method) {
+		return
+	}
+	vm.hotSendClass = receiver.Class
+	vm.hotSendName = method
+	vm.hotSendGeneration = object.CurrentMethodGeneration()
+	vm.hotSendMethod = methodObj
+	vm.hotSendOwner = methodOwner
+	vm.hotSendNativeFn, _ = methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue)
+}
+
+func (vm *VM) sendWithCallInfo(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, keywordSyntax bool) *object.EmeraldValue {
 	if debugSendTraceEnabled {
 		depth := atomic.AddInt64(&sendTraceDepth, 1)
 		if depth <= 40 {
@@ -8240,6 +10909,14 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		receiver = core.R.NilVal
 	}
 	receiver = derefClosureValue(receiver)
+	if receiver != nil && receiver.Type == object.ValueArray && receiver.LazyArrayRegionValue() != nil && !lazyArraySendKeepsRegion(method) {
+		receiver.MaterializeLazyArray()
+	}
+	for _, arg := range args {
+		if arg != nil && arg.Type == object.ValueArray && arg.LazyArrayRegionValue() != nil {
+			arg.MaterializeLazyArray()
+		}
+	}
 	if method == "resolve_feature_path" && receiver == vm.getGlobalByName("$LOAD_PATH") {
 		return vm.resolveLoadPathFeature(args)
 	}
@@ -8249,9 +10926,9 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		return err
 	}
 	if method == "send" {
-		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, false)
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, false, false)
 		if fallback == nil && methodObj != nil && methodOwner != core.R.Classes["Object"] && methodOwner != core.R.Classes["BasicObject"] {
-			return vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner)
+			return vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner, keywordSyntax)
 		}
 	}
 	if (method == "send" || method == "__send__" || method == "public_send") && len(args) > 0 {
@@ -8280,18 +10957,22 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 				return result
 			}
 		}
-		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, forwardArgs, true)
+		methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, forwardArgs, true, false)
 		if fallback != nil {
-			if method != "public_send" {
-				if missingResult := vm.callMethodMissingForSend(receiver, methodName, forwardArgs); missingResult != nil {
-					vm.visibilityBypass = prev
-					return missingResult
-				}
+			if missingResult := vm.callMethodMissingForSend(receiver, methodName, forwardArgs); missingResult != nil {
+				vm.visibilityBypass = prev
+				return missingResult
 			}
 			vm.visibilityBypass = prev
 			return fallback
 		}
-		result := vm.invokeMethod(receiver, method, methodName, forwardArgs, methodObj, methodOwner)
+		if methodObj == nil || methodObj.Visibility == "undefined" {
+			if missingResult := vm.callMethodMissingForSend(receiver, methodName, forwardArgs); missingResult != nil {
+				vm.visibilityBypass = prev
+				return missingResult
+			}
+		}
+		result := vm.invokeMethod(receiver, method, methodName, forwardArgs, methodObj, methodOwner, keywordSyntax)
 		vm.visibilityBypass = prev
 		return result
 	}
@@ -8313,7 +10994,7 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		}
 		binding := vm.currentFrameBinding()
 		if binding == nil {
-			binding = &object.RBinding{Locals: map[string]*object.EmeraldValue{}}
+			binding = &object.RBinding{RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}}}
 		}
 		callerClassVarScope := vm.classVarScopeReceiver(binding.Self)
 		binding.Self = receiver
@@ -8332,22 +11013,20 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		vm.copyBindingLocalsToCurrentFrame(binding)
 		return result
 	}
-	if (method == "class_eval" || method == "module_eval") && vm.currentBlock != nil {
+	if (method == "class_eval" || method == "module_eval") && vm.currentBlock != nil &&
+		(receiver.Type == object.ValueClass || receiver.Type == object.ValueModule) {
 		if len(args) > 0 {
 			return core.NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 0)", len(args)))
 		}
 		block := vm.currentBlock
 		vm.currentBlock = nil
-		if receiver.Type == object.ValueClass || receiver.Type == object.ValueModule {
-			previousVisibility := core.CurrentMethodVisibilityMode(receiver)
-			core.SetCurrentMethodVisibility(receiver, "public")
-			vm.classStack = append(vm.classStack, receiver)
-			result := vm.callBlockWithSelf(block, receiver, append([]*object.EmeraldValue{receiver}, args...)...)
-			vm.classStack = vm.classStack[:len(vm.classStack)-1]
-			core.SetCurrentMethodVisibility(receiver, previousVisibility)
-			return result
-		}
-		return vm.callBlockWithSelf(block, receiver, append([]*object.EmeraldValue{receiver}, args...)...)
+		previousVisibility := core.CurrentMethodVisibilityMode(receiver)
+		core.SetCurrentMethodVisibility(receiver, "public")
+		vm.classStack = append(vm.classStack, receiver)
+		result := vm.callBlockWithSelf(block, receiver, append([]*object.EmeraldValue{receiver}, args...)...)
+		vm.classStack = vm.classStack[:len(vm.classStack)-1]
+		core.SetCurrentMethodVisibility(receiver, previousVisibility)
+		return result
 	}
 	if method == "instance_exec" && vm.currentBlock != nil {
 		block := vm.currentBlock
@@ -8395,7 +11074,14 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		return result
 	}
 
-	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, method, args, false)
+	methodObj, methodOwner, cached := vm.hotSendLookup(receiver, method, keywordSyntax)
+	var fallback *object.EmeraldValue
+	if !cached {
+		methodObj, methodOwner, fallback = vm.lookupMethodForSend(receiver, method, args, false, true)
+		if fallback == nil && methodObj != nil {
+			vm.rememberHotSend(receiver, method, keywordSyntax, methodObj, methodOwner)
+		}
+	}
 	if fallback != nil {
 		if numberedParameterMethodNamePattern.MatchString(method) {
 			markExceptionRaised(fallback)
@@ -8406,9 +11092,100 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		}
 		return fallback
 	}
+	if methodObj != nil && methodObj.Visibility == "undefined" {
+		if missingResult := vm.callMethodMissingForSend(receiver, method, args); missingResult != nil {
+			return missingResult
+		}
+		return core.NewNoMethodErrorWithDetails(receiver, method, args)
+	}
+	if method == "new" && !keywordSyntax && core.IsBuiltinClassNewMethod(methodObj) &&
+		!core.AnyTracePointActive() {
+		if result, executed := vm.fastClassNewDirect(receiver, args...); executed {
+			return result
+		}
+	}
+	if cached && methodObj != nil && vm.hotSendNativeFn != nil && !core.AnyTracePointActive() && method != "sleep" && method != "tap" &&
+		methodObj.OriginalName != "tap" && (receiver.Type != object.ValueProc || method != "call" && method != "[]" && method != "yield") {
+		return vm.hotSendNativeFn(receiver, args...)
+	}
 	if methodObj == nil {
 		if missingResult := vm.callMethodMissingForSend(receiver, method, args); missingResult != nil {
 			return missingResult
+		}
+	}
+	// Public generated accessors and the narrow integer-comparison shape are
+	// already fully guarded by their helpers.  Run them before invokeMethod so
+	// ordinary send sites do not pay the generic visibility, native/Function,
+	// keyword binder, and leaf-plan probes on every call.  Private/protected
+	// methods and dispatch aliases deliberately stay on invokeMethod, where the
+	// complete Ruby visibility protocol is enforced.
+	if methodObj != nil && methodObj.DispatchOwner == nil &&
+		(methodObj.Visibility == "" || methodObj.Visibility == "public") {
+		if fn, ok := methodObj.Fn.(*object.Function); ok {
+			if directAttributeAccessorEnabled {
+				if result, executed := vm.executeDirectAttributeAccessor(fn, receiver, args, methodObj); executed {
+					return result
+				}
+			}
+			if directAttributeCompareEnabled {
+				if result, executed := vm.executeEarlyAttributeComparePlan(fn, receiver, args, methodObj); executed {
+					return result
+				}
+			}
+			if vm.instructionLimit == 0 && !core.AnyTracePointActive() && vm.currentBlock == nil &&
+				len(args) == len(fn.Params) && !fn.HasRestParam && !fn.HasBlockParam && len(fn.KeywordParams) == 0 &&
+				fn.KeywordRestParam == "" && !fn.KeywordRestOnly && simpleBlockParameterPatterns(fn) {
+				defaultsClear := len(fn.ParamDefaults) == len(fn.Params)
+				if defaultsClear {
+					for _, defaultValue := range fn.ParamDefaults {
+						if defaultValue != nil {
+							defaultsClear = false
+							break
+						}
+					}
+				}
+				if defaultsClear {
+					if cachedLeaf, found := vm.leafMethodCache[fn]; found {
+						if cachedLeaf.kind == leafMethodRegisterIR && cachedLeaf.registerIR != nil &&
+							(cachedLeaf.registerIR.integerOnly || registerIRPlanSafeForDirectNoFrame(cachedLeaf.registerIR)) {
+							if result, executed := vm.tryExecuteRegisterIRDirectNoFrame(cachedLeaf.registerIR, fn, receiver, args); executed {
+								return result
+							}
+						}
+					}
+				}
+			}
+			// A fixed-arity public Ruby method with no block/keyword protocol can
+			// enter its already-cached leaf plan directly.  invokeMethod performs
+			// the same plan probe after repeating all of the generic binder and
+			// visibility checks; this narrow guard has already established the
+			// observable preconditions and leaves a miss on the complete path.
+			// The framed companion removes the remaining invokeMethod probes for
+			// bodies that need locals, allocations or dynamic sends. It is still
+			// limited to an exact fixed-arity public method with no active block,
+			// keyword protocol, define_method binding or rescue stack; a miss is
+			// harmless because executeRegisterIR falls back before user code.
+			if vm.instructionLimit == 0 && !core.AnyTracePointActive() && vm.currentBlock == nil &&
+				len(vm.catchStack) == 0 && !keywordSyntax && !methodObj.DefinedByDefineMethod &&
+				len(args) == len(fn.Params) && !fn.HasRestParam && !fn.HasBlockParam && len(fn.KeywordParams) == 0 &&
+				fn.KeywordRestParam == "" && !fn.KeywordRestOnly && simpleBlockParameterPatterns(fn) &&
+				methodObj.DispatchOwner == nil && (methodObj.Visibility == "" || methodObj.Visibility == "public") &&
+				!methodObj.Ruby2Keywords && !methodUsesRefinements(methodObj) {
+				if cachedLeaf, found := vm.leafMethodCache[fn]; found && cachedLeaf.kind == leafMethodRegisterIR &&
+					cachedLeaf.registerIR != nil && registerIRPlanSafeForActiveRescues(cachedLeaf.registerIR, vm) {
+					if result, executed := vm.executeRegisterIR(cachedLeaf.registerIR, fn, receiver, args, method, methodObj, methodOwner); executed {
+						return result
+					}
+				}
+			}
+		}
+	}
+	if forwardableFastEnabled && methodObj != nil && methodObj.DispatchOwner == nil &&
+		(methodObj.Visibility == "" || methodObj.Visibility == "public") {
+		if fn, ok := methodObj.Fn.(*object.Function); ok {
+			if result, executed := vm.executeForwardableDelegatorFast(fn, receiver, args, keywordSyntax); executed {
+				return result
+			}
 		}
 	}
 	var implicitEvalBinding *object.RBinding
@@ -8418,7 +11195,7 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 		args = append(args, &object.EmeraldValue{Type: object.ValueBinding, Data: implicitEvalBinding, Class: core.R.Classes["Binding"]})
 	}
 
-	result := vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner)
+	result := vm.invokeMethod(receiver, method, method, args, methodObj, methodOwner, keywordSyntax)
 	if implicitEvalBinding != nil {
 		vm.copyBindingLocalsToCurrentFrame(implicitEvalBinding)
 	}
@@ -8430,12 +11207,102 @@ func (vm *VM) send(receiver *object.EmeraldValue, method string, args []*object.
 	return result
 }
 
-func implicitIdentifierNameError(result, receiver *object.EmeraldValue, method string, cause *object.EmeraldValue) *object.EmeraldValue {
+func lazyArraySendKeepsRegion(method string) bool {
+	switch method {
+	case "map", "collect", "each", "length", "size", "to_a", "to_ary":
+		return true
+	default:
+		return false
+	}
+}
+
+// executeForwardableDelegatorFast removes the generated Forwardable wrapper
+// frame for the common public-delegate case.  The generated method shape is
+// stable across Forwardable releases: a `proc` rest/block wrapper first calls
+// an accessor (for example `renderer`) and then forwards to one named method.
+// We retain the normal path for private targets, missing methods, refinements,
+// tracing, and all non-generated functions so warning/visibility semantics are
+// unchanged.
+func (vm *VM) executeForwardableDelegatorFast(fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, keywordSyntax bool) (*object.EmeraldValue, bool) {
+	if vm == nil || fn == nil || receiver == nil || core.AnyTracePointActive() || vm.instructionLimit != 0 || len(vm.catchStack) != 0 ||
+		!strings.HasSuffix(fn.SourcePath, "/forwardable.rb") || !fn.HasRestParam || !fn.HasBlockParam || len(fn.Params) != 0 || fn.Name == "" {
+		return nil, false
+	}
+	plan, found := vm.forwardableDelegators[fn]
+	if !found {
+		stringsInConstants := make([]string, 0, 4)
+		for _, constant := range fn.Constants {
+			if constant != nil && constant.Type == object.ValueString {
+				if value, ok := constant.Data.(string); ok {
+					stringsInConstants = append(stringsInConstants, value)
+				}
+			}
+		}
+		if len(stringsInConstants) >= 4 && stringsInConstants[0] == "proc" && stringsInConstants[1] != "" &&
+			stringsInConstants[2] != "" && stringsInConstants[2] == stringsInConstants[3] && stringsInConstants[2] == fn.Name {
+			plan = forwardableDelegatorPlan{accessor: stringsInConstants[1], target: stringsInConstants[2], valid: true}
+		}
+		vm.forwardableDelegators[fn] = plan
+	}
+	if !plan.valid {
+		return nil, false
+	}
+	accessorName, targetName := plan.accessor, plan.target
+	accessor, accessorOwner, accessorCached := vm.hotSendLookup(receiver, accessorName, false)
+	var accessorFallback *object.EmeraldValue
+	if !accessorCached {
+		accessor, accessorOwner, accessorFallback = vm.lookupMethodForSend(receiver, accessorName, nil, false, true)
+		if accessorFallback == nil && accessor != nil {
+			vm.rememberHotSend(receiver, accessorName, false, accessor, accessorOwner)
+		}
+	}
+	if accessorFallback != nil || accessor == nil || accessor.Visibility == "undefined" {
+		return nil, false
+	}
+	previousBlock := vm.currentBlock
+	vm.currentBlock = nil
+	accessorResult := vm.invokeMethod(receiver, accessorName, accessorName, nil, accessor, accessorOwner, false)
+	vm.currentBlock = previousBlock
+	if accessorResult == nil || accessorResult.Type == object.ValueException {
+		return accessorResult, true
+	}
+	target, targetOwner, targetCached := vm.hotSendLookup(accessorResult, targetName, keywordSyntax)
+	var targetFallback *object.EmeraldValue
+	if !targetCached {
+		target, targetOwner, targetFallback = vm.lookupMethodForSend(accessorResult, targetName, args, false, true)
+		if targetFallback == nil && target != nil {
+			vm.rememberHotSend(accessorResult, targetName, keywordSyntax, target, targetOwner)
+		}
+	}
+	if targetFallback != nil || target == nil || target.Visibility == "undefined" || target.DispatchOwner != nil ||
+		(target.Visibility != "" && target.Visibility != "public") {
+		return nil, false
+	}
+	return vm.invokeMethod(accessorResult, targetName, targetName, args, target, targetOwner, keywordSyntax), true
+}
+
+func implicitIdentifierNameError(vm *VM, result, receiver *object.EmeraldValue, method string, cause *object.EmeraldValue) *object.EmeraldValue {
 	if result == nil || result.Type != object.ValueException || result.Class != core.R.Classes["NoMethodError"] {
 		return result
 	}
 	exc, ok := result.Data.(*object.RException)
-	if !ok || exc == nil || exc.NameErrorName != method || exc.NameErrorReceiver != receiver {
+	if !ok || exc == nil {
+		return result
+	}
+	// The normal send path may defer a missing method to invokeMethod, which
+	// historically created a message-only NoMethodError without the structured
+	// receiver/name fields.  Bare identifiers still have Ruby NameError
+	// semantics, so accept that exact default message as well as the structured
+	// form. A custom method_missing error with another name remains untouched.
+	structuredMatch := exc.NameErrorName == method && (exc.NameErrorReceiver == nil || exc.NameErrorReceiver == receiver)
+	messageMatch := exc.NameErrorName == "" && strings.Contains(exc.Message, "undefined method `"+method+"'")
+	if messageMatch && vm != nil {
+		methodMissing, _, fallback := vm.lookupMethodForSend(receiver, "method_missing", nil, false, false)
+		if fallback == nil && methodMissing != nil {
+			return result
+		}
+	}
+	if !structuredMatch && !messageMatch {
 		return result
 	}
 	nameError := core.NewNameErrorWithDetails("undefined local variable or method `"+method+"'", receiver, method)
@@ -8489,7 +11356,7 @@ func (vm *VM) callMethodMissingForSend(receiver *object.EmeraldValue, methodName
 	missingArgs := make([]*object.EmeraldValue, 0, len(args)+1)
 	missingArgs = append(missingArgs, nameValue)
 	missingArgs = append(missingArgs, args...)
-	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, "method_missing", missingArgs, false)
+	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, "method_missing", missingArgs, false, false)
 	if fallback != nil {
 		vm.visibilityBypass = prev
 		return nil
@@ -8498,7 +11365,7 @@ func (vm *VM) callMethodMissingForSend(receiver *object.EmeraldValue, methodName
 		vm.visibilityBypass = prev
 		return nil
 	}
-	result := vm.invokeMethod(receiver, "send", "method_missing", missingArgs, methodObj, methodOwner)
+	result := vm.invokeMethod(receiver, "send", "method_missing", missingArgs, methodObj, methodOwner, false)
 	vm.visibilityBypass = prev
 	return result
 }
@@ -8560,8 +11427,8 @@ func (vm *VM) normalizeBlockPass(block *object.EmeraldValue) (*object.EmeraldVal
 			className = block.Class.Name
 		}
 		if block.Class != nil {
-			if method, owner, _ := vm.lookupMethodForSend(block, "to_proc", nil, false); method != nil {
-				converted := vm.invokeMethod(block, "to_proc", "to_proc", nil, method, owner)
+			if method, owner, _ := vm.lookupMethodForSend(block, "to_proc", nil, false, false); method != nil {
+				converted := vm.invokeMethod(block, "to_proc", "to_proc", nil, method, owner, false)
 				if converted != nil && converted.Type == object.ValueException {
 					return nil, converted
 				}
@@ -8582,7 +11449,7 @@ func (vm *VM) normalizeBlockPass(block *object.EmeraldValue) (*object.EmeraldVal
 	}
 }
 
-func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, missingAsNameError bool) (*object.Method, *object.Class, *object.EmeraldValue) {
+func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, missingAsNameError, deferGenericMissing bool) (*object.Method, *object.Class, *object.EmeraldValue) {
 	if cached, owner, ok := vm.cachedPlainMethod(receiver, method); ok {
 		cached, owner, ok = resolveVisibilityAliasMethod(method, cached, owner)
 		if ok {
@@ -8751,9 +11618,10 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 		}
 		if !ok {
 			if m, found := mod.Methods[method]; found {
-				methodObj = m
-				methodOwner = nil
-				ok = true
+				if _, native := m.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); native {
+					methodObj = m
+					ok = true
+				}
 			}
 		}
 	}
@@ -8773,6 +11641,15 @@ func (vm *VM) lookupMethodForSend(receiver *object.EmeraldValue, method string, 
 					method:     methodObj,
 					owner:      methodOwner,
 				}
+			}
+		}
+	}
+	if !ok && receiver.Class != nil && valueHasClassInAncestry(receiver, core.R.Classes["Object"]) {
+		if kernel := core.R.Classes["Kernel"]; kernel != nil {
+			if m, owner, found := kernel.GetMethodWithOwner(method); found {
+				methodObj = m
+				methodOwner = owner
+				ok = true
 			}
 		}
 	}
@@ -8826,15 +11703,25 @@ afterInheritedClassMethodLookup:
 			return nil, nil, fallback
 		}
 		if missingAsNameError {
-			return nil, nil, core.NewNameError("undefined method `" + method + "'")
+			previousException := core.LastException
+			result := core.NewNameError("undefined method `" + method + "'")
+			core.LastException = previousException
+			return nil, nil, result
 		}
+		if deferGenericMissing {
+			return nil, nil, nil
+		}
+		previousException := core.LastException
+		var result *object.EmeraldValue
 		if numberedParameterMethodNamePattern.MatchString(method) {
-			return nil, nil, core.NewNoMethodError("undefined local variable or method `" + method + "'")
+			result = core.NewNoMethodError("undefined local variable or method `" + method + "'")
+		} else if core.EvaluatingRaiseErrorMatcher() {
+			result = core.NewNoMethodErrorWithDetails(receiver, method, args)
+		} else {
+			result = core.NewNoMethodErrorWithDetails(receiver, method, args)
 		}
-		if core.EvaluatingRaiseErrorMatcher() {
-			return nil, nil, core.NewNoMethodErrorWithDetails(receiver, method, args)
-		}
-		return nil, nil, core.NewNoMethodErrorWithDetails(receiver, method, args)
+		core.LastException = previousException
+		return nil, nil, result
 	}
 	return methodObj, methodOwner, nil
 }
@@ -8844,36 +11731,47 @@ func (vm *VM) cachedPlainMethod(receiver *object.EmeraldValue, method string) (*
 		receiver.Type == object.ValueClass || receiver.Type == object.ValueModule || receiver.Type == object.ValueException {
 		return nil, nil, false
 	}
-	if refinements, fixed := vm.currentFixedRefinements(); fixed && len(refinements) > 0 {
-		return nil, nil, false
-	}
-	for _, scope := range vm.classStack {
-		if scope == nil {
-			continue
+	if refinements, fixed := vm.currentFixedRefinements(); fixed {
+		if len(refinements) > 0 {
+			return nil, nil, false
 		}
-		switch scope.Type {
-		case object.ValueClass:
-			if len(scope.Data.(*object.Class).UsedRefinements) > 0 {
-				return nil, nil, false
+	} else {
+		for _, scope := range vm.classStack {
+			if scope == nil {
+				continue
 			}
-		case object.ValueModule:
-			if len(scope.Data.(*object.Module).UsedRefinements) > 0 {
-				return nil, nil, false
+			switch scope.Type {
+			case object.ValueClass:
+				if len(scope.Data.(*object.Class).UsedRefinements) > 0 {
+					return nil, nil, false
+				}
+			case object.ValueModule:
+				if len(scope.Data.(*object.Module).UsedRefinements) > 0 {
+					return nil, nil, false
+				}
 			}
 		}
 	}
+	needsExternalSingletonLookup := true
 	if receiver.Type == object.ValueObject {
 		if instance, ok := receiver.Data.(*object.Object); ok {
 			if len(instance.SingletonMethods) > 0 || instance.SingletonClass != nil {
 				return nil, nil, false
 			}
+			needsExternalSingletonLookup = false
 		}
 	}
-	if core.AttachedSingletonClass(receiver) != nil {
-		return nil, nil, false
+	switch receiver.Type {
+	case object.ValueBool, object.ValueNil, object.ValueInteger, object.ValueFloat, object.ValueSymbol:
+		needsExternalSingletonLookup = false
 	}
-	if methods := vm.nativeSingletonMethods[nativeSingletonKey(receiver)]; len(methods) > 0 {
-		return nil, nil, false
+	if needsExternalSingletonLookup {
+		if core.AttachedSingletonClass(receiver) != nil {
+			return nil, nil, false
+		}
+		if methods := vm.nativeSingletonMethods[nativeSingletonKey(receiver)]; len(methods) > 0 {
+			return nil, nil, false
+		}
 	}
 	key := methodCacheKey{class: receiver.Class, name: method}
 	cached, found := vm.methodCache[key]
@@ -8968,6 +11866,8 @@ func (vm *VM) activateCurrentRefinement(refinery *object.EmeraldValue) {
 	if !frame.Closure.RefinementsFixed {
 		frame.Closure.Refinements = vm.activeRefinementSnapshot()
 		frame.Closure.RefinementsFixed = true
+		frame.Closure.RefinementCheckGeneration = 0
+		frame.Closure.RefinementCheckValid = false
 	}
 	for _, existing := range frame.Closure.Refinements {
 		if existing == refinery {
@@ -8975,6 +11875,8 @@ func (vm *VM) activateCurrentRefinement(refinery *object.EmeraldValue) {
 		}
 	}
 	frame.Closure.Refinements = append(frame.Closure.Refinements, refinery)
+	frame.Closure.RefinementCheckGeneration = 0
+	frame.Closure.RefinementCheckValid = false
 }
 
 func (vm *VM) usingReceiverAllowed(receiver *object.EmeraldValue) bool {
@@ -9052,24 +11954,394 @@ func nativeSingletonKey(receiver *object.EmeraldValue) interface{} {
 	return receiver
 }
 
-func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
-	var oldFrame *Frame
-	if vm.fp >= 0 && vm.fp < len(vm.frames) && vm.frames[vm.fp] != nil {
-		oldFrame = vm.frames[vm.fp]
+// callNativeMethod keeps the common fixed-arity native sends on the direct
+// variadic call forms. Passing a pre-built slice with `args...` can force a
+// small backing array to escape at hot Register IR call sites; the explicit
+// forms let the compiler keep the argument vector on the caller's stack.
+func callNativeMethod(fn func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue, receiver *object.EmeraldValue, args []*object.EmeraldValue) *object.EmeraldValue {
+	if fn == nil {
+		return nil
 	}
+	switch len(args) {
+	case 0:
+		return fn(receiver)
+	case 1:
+		return fn(receiver, args[0])
+	case 2:
+		return fn(receiver, args[0], args[1])
+	case 3:
+		return fn(receiver, args[0], args[1], args[2])
+	case 4:
+		return fn(receiver, args[0], args[1], args[2], args[3])
+	default:
+		return fn(receiver, args...)
+	}
+}
+
+// cachedBytecodeMethodIgnoresCallerBlock proves that a fixed-arity method does
+// not observe the transient block of its caller.  A plain method call inside a
+// Ruby callback does not implicitly forward that callback block, but the VM's
+// execution context can still carry it while resolving the send.  Only this
+// conservative bytecode subset may clear that transient value; yield,
+// block_given?, explicit block forwarding, super forwarding, and nested
+// closures retain the complete path.
+func cachedBytecodeMethodIgnoresCallerBlock(fn *object.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if fn.CallerBlockObservationChecked {
+		return fn.CallerBlockObservationSafe
+	}
+	safe := !fn.HasBlockParam && !fn.RejectBlock
+	for position := 0; safe && position < len(fn.Instructions); {
+		op := compiler.Opcode(fn.Instructions[position])
+		switch op {
+		case compiler.OpCurrentClosure, compiler.OpClosure, compiler.OpLambda,
+			compiler.OpBlock, compiler.OpBlockWithArg, compiler.OpBlockReturn,
+			compiler.OpNext, compiler.OpBreak, compiler.OpBreakValue, compiler.OpRedo,
+			compiler.OpSendWithBlock, compiler.OpSendSuper,
+			compiler.OpYield, compiler.OpYieldWithValue, compiler.OpYieldWithSplat,
+			compiler.OpDefinedYield, compiler.OpBlockGiven, compiler.OpNonLocalReturnValue:
+			safe = false
+			continue
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			safe = false
+			continue
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if position+width > len(fn.Instructions) {
+			safe = false
+			continue
+		}
+		position += width
+	}
+	fn.CallerBlockObservationSafe = safe
+	fn.CallerBlockObservationChecked = true
+	return safe
+}
+
+// executeCachedFixedArityRubyBytecode enters a cached positional Ruby method
+// without repeating invokeMethod's lookup, visibility and general binder
+// probes. The callee bytecode still executes its own default-argument
+// prologue, so omitted positional defaults retain their normal evaluation
+// order. Any unsupported shape returns executed=false before mutating VM state.
+func (vm *VM) executeCachedFixedArityRubyBytecode(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, allowImplicitNonPublic bool) (*object.EmeraldValue, bool) {
+	return vm.executeCachedFixedArityRubyBytecodeMode(receiver, method, args, methodObj, methodOwner, allowImplicitNonPublic, false, true)
+}
+
+// executeCachedFixedArityRubyBytecodeTrusted is used only after the
+// generation-scoped Register IR send cache has observed a successful fixed
+// arity entry. It retains dynamic safety checks but avoids repeating immutable
+// function-shape, refinement and caller-block scans.
+func (vm *VM) executeCachedFixedArityRubyBytecodeTrusted(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class) (*object.EmeraldValue, bool) {
+	return vm.executeCachedFixedArityRubyBytecodeMode(receiver, method, args, methodObj, methodOwner, false, true, true)
+}
+
+// executeCachedFixedArityRubyBytecodeForSend remembers the immutable function
+// shape proof made by a call-site cache.  The proof is generation-scoped by
+// the surrounding registerIRSendCache; a runtime guard miss clears it before
+// replaying the complete fixed-arity admission path.
+func (vm *VM) executeCachedFixedArityRubyBytecodeForSend(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, allowImplicitNonPublic bool, proven *bool) (*object.EmeraldValue, bool) {
+	trustedEligible := methodObj != nil &&
+		(methodObj.Visibility == "" || methodObj.Visibility == "public") &&
+		!methodUsesRefinements(methodObj) && vm.currentBlock == nil
+	if registerIRTrustedBytecodeEntryEnabled && trustedEligible && proven != nil && *proven {
+		if result, executed := vm.executeCachedFixedArityRubyBytecodeTrusted(receiver, method, args, methodObj, methodOwner); executed {
+			return result, true
+		}
+		*proven = false
+	}
+	result, executed := vm.executeCachedFixedArityRubyBytecode(receiver, method, args, methodObj, methodOwner, allowImplicitNonPublic)
+	if executed && trustedEligible && proven != nil {
+		*proven = true
+	}
+	return result, executed
+}
+
+func (vm *VM) executeCachedFixedArityRubyBytecodeMode(receiver *object.EmeraldValue, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, allowImplicitNonPublic bool, trusted bool, nativeProbesDone bool) (*object.EmeraldValue, bool) {
+	if vm == nil || !cachedRubyBytecodeFrameEnabled {
+		return nil, false
+	}
+	if receiver == nil || methodObj == nil {
+		return nil, false
+	}
+	if methodObj.DispatchOwner != nil {
+		if methodObj.DispatchOwner.Type != object.ValueClass {
+			return nil, false
+		}
+		dispatchOwner, ok := methodObj.DispatchOwner.Data.(*object.Class)
+		if !ok || dispatchOwner == nil {
+			return nil, false
+		}
+		methodOwner = dispatchOwner
+	}
+	if methodObj.Ruby2Keywords {
+		return nil, false
+	}
+	if trusted {
+		// The normal fixed entry rejects non-public methods unless the caller
+		// explicitly proves the implicit receiver rule. The send-cache entry
+		// does not retain that caller context, so deopt rather than widening
+		// visibility on a warmed private/protected call.
+		if methodObj.Visibility != "" && methodObj.Visibility != "public" {
+			return nil, false
+		}
+	} else if methodObj.Visibility != "" && methodObj.Visibility != "public" {
+		callerSelf := core.R.Main
+		if vm.fp >= 0 && vm.fp < len(vm.frames) {
+			callerFrame := vm.frames[vm.fp]
+			if callerFrame != nil && callerFrame.Bp >= 0 && callerFrame.Bp < len(vm.stack) && vm.stack[callerFrame.Bp] != nil {
+				callerSelf = vm.stack[callerFrame.Bp]
+			}
+		}
+		if !allowImplicitNonPublic || receiver != callerSelf || methodObj.Visibility != "private" && methodObj.Visibility != "protected" {
+			return nil, false
+		}
+	}
+	if !trusted && methodUsesRefinements(methodObj) {
+		return nil, false
+	}
+	if vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || len(vm.catchStack) != 0 {
+		return nil, false
+	}
+	fn, ok := methodObj.Fn.(*object.Function)
+	if !ok || fn == nil {
+		return nil, false
+	}
+	if !trusted {
+		if len(fn.ParamLocalIndices) != len(fn.Params) {
+			return nil, false
+		}
+		if !cachedPositionalMethodArgumentShape(fn) {
+			return nil, false
+		}
+	}
+	if errVal := methodArityError(fn, len(args)); errVal != nil {
+		return errVal, true
+	}
+	prevBlock := vm.currentBlock
+	if prevBlock != nil {
+		if trusted || fn.RejectBlock || !cachedBytecodeMethodIgnoresCallerBlock(fn) {
+			return nil, false
+		}
+	}
+	// bindSimpleFunctionArguments writes the receiver at bp and locals through
+	// bp+NumLocals.  The stack grows on demand for ordinary calls, but this
+	// probe must not mutate it before the fast-path admission is complete.
+	if vm.sp < 0 || vm.sp+fn.NumLocals >= len(vm.stack) {
+		return nil, false
+	}
+	// The cached fixed-arity entry is also used by Gem methods whose source
+	// body has not been admitted to Register IR. Preserve the native Gem ABI
+	// boundary in both normal and trusted mode: trusted skips immutable
+	// function-shape probes, but it must not bypass the exact class/source/
+	// layout guards that make these native entries safe.
+	if !nativeProbesDone {
+		if nativePDFDispatchCandidateForMethod(receiver, methodObj) {
+			if result, executed := vm.executeNativePDFDispatch(methodObj, receiver, args, false); executed {
+				return result, true
+			}
+		}
+		if method == "width_of" {
+			if result, executed := vm.executeNativePrawnFontMetricWidth(methodObj, receiver, args); executed {
+				return result, true
+			}
+		}
+		if method == "soft_hyphen" || method == "zero_width_space" || method == "whitespace" || method == "break_chars" || method == "hyphen" || method == "tokenize" || method == "add_fragment_to_line" || method == "fragment_finished" {
+			if result, executed := vm.executeNativePrawnLineWrapMethod(methodObj, receiver, args); executed {
+				return result, true
+			}
+		}
+	}
+	oldFrame := vm.frames[vm.fp]
+	prevClassStack := vm.classStack
+	bp := vm.sp
+	vm.stack[bp] = receiver
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	vm.bindPositionalParameterSlots(fn, args, bp)
+	minSp := bp + 1 + fn.NumLocals
+	if vm.sp < minSp {
+		vm.sp = minSp
+	}
+	invocation := vm.buildInvocationMetadata(receiver, method, methodObj, methodOwner)
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: methodObj.Closure,
+		MethodName: method, OriginalMethodName: methodObj.OriginalName,
+		SuperStart: invocation.superStart, SuperModule: invocation.superModule,
+		SuperAfterClass: invocation.superAfterClass, Args: args, Block: nil,
+		DefinedByDefineMethod: methodObj.DefinedByDefineMethod,
+		BlockBreakAddr:        -1, WhileStart: -1, WhileEnd: -1,
+		TraceSelf: receiver, BacktraceReceiver: receiver,
+		BacktraceMethod: methodObj, BacktraceOwner: methodOwner,
+	}
+	vm.currentBlock = nil
+	if methodObj.Closure != nil {
+		vm.classStack = methodObj.Closure.ClassStack
+	}
+
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		if vm.fp >= 0 && oldFrame != nil {
+			vm.frames[vm.fp] = oldFrame
+		}
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+	}
+
+	var result *object.EmeraldValue
+	instructions := frame.Fn.Instructions
+	for frame.Ip < len(instructions)-1 {
+		frame.Ip++
+		op := compiler.Opcode(instructions[frame.Ip])
+		traceLineActive := false
+		if traceLineActive || !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+			frame.InstructionException = core.LastException
+			frame.InstructionSnapshotSet = true
+		}
+		var err error
+		if vm.instructionLimit == 0 && !DevMode && !traceLineActive {
+			if cachedFixedAritySendEnabled && op == compiler.OpSend {
+				handled, fastErr := vm.executeCachedFixedAritySend(frame, op, instructions)
+				if handled {
+					err = fastErr
+				} else if simpleOpcodeFastPath[op] {
+					err = vm.executeSimpleOpcode(op, frame)
+				} else {
+					err = vm.execute(op, frame)
+				}
+			} else if simpleOpcodeFastPath[op] {
+				err = vm.executeSimpleOpcode(op, frame)
+			} else {
+				err = vm.execute(op, frame)
+			}
+		} else {
+			err = vm.execute(op, frame)
+		}
+		if err != nil {
+			if core.LastException != nil && core.LastException.Type == object.ValueException {
+				result = core.LastException
+			} else {
+				result = core.NewRuntimeError(err.Error())
+			}
+			cleanup()
+			return result, true
+		}
+		if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+			(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
+			break
+		}
+		frame = vm.frames[vm.fp]
+		if frame.BlockBreak || frame.BlockNextVal != nil || core.LastBlockResult != nil {
+			break
+		}
+		instructions = frame.Fn.Instructions
+	}
+	if frame.BlockBreak {
+		result = frame.BlockBreakVal
+	} else if frame.BlockNextVal != nil {
+		result = frame.BlockNextVal
+	} else if core.LastBlockResult != nil {
+		result = core.LastBlockResult
+	} else if vm.sp > bp {
+		result = vm.stack[vm.sp-1]
+	}
+	if result == nil {
+		result = core.R.NilVal
+	}
+	cleanup()
+	return result, true
+}
+
+func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method string, args []*object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, keywordSyntax bool) *object.EmeraldValue {
 	if methodObj == nil {
 		return core.NewNoMethodError("undefined method `" + method + "'")
 	}
 	if methodObj.DispatchOwner != nil {
-		copy := *methodObj
-		copy.Owner = methodObj.DispatchOwner
-		methodObj = &copy
-		if copy.Owner.Type == object.ValueClass {
-			methodOwner, _ = copy.Owner.Data.(*object.Class)
+		// DispatchOwner is immutable metadata on the method entry.  The
+		// invocation only needs its class as the effective owner; copying the
+		// whole Method here used to add a heap-visible struct copy to every
+		// forwarded send without changing any field consumed below.
+		if methodObj.DispatchOwner.Type == object.ValueClass {
+			methodOwner, _ = methodObj.DispatchOwner.Data.(*object.Class)
 		}
 	}
 	if methodObj.Visibility == "undefined" {
 		return core.NewNoMethodError("undefined method `" + method + "'")
+	}
+	// The native Gem ABI is deliberately checked before all generic Ruby
+	// binding/frame work.  It is opt-in and source-identity guarded; any shape
+	// it cannot prove is replayed through the ordinary method below.
+	if nativePDFDispatchCandidateForMethod(receiver, methodObj) {
+		if result, executed := vm.executeNativePDFDispatch(methodObj, receiver, args, keywordSyntax); executed {
+			return result
+		}
+	}
+	if !keywordSyntax && receiver != nil && receiver.Type == object.ValueObject && receiver.Class != nil {
+		if receiver.Class.Name == "Prawn::Document" {
+			if result, executed := vm.executeNativePrawnTextStateBlock(methodObj, receiver, args); executed {
+				return result
+			}
+		} else if receiver.Class.Name == "Prawn::Text::Formatted::Arranger" {
+			if result, executed := vm.executeNativePrawnFormattedApplyFontSettings(methodObj, receiver, args); executed {
+				return result
+			}
+			if result, executed := vm.executeNativePrawnFormattedApplyFontSize(methodObj, receiver, args); executed {
+				return result
+			}
+		} else if receiver.Class.Name == "Prawn::Text::Formatted::LineWrap" {
+			if result, executed := vm.executeNativePrawnLineWrapMethod(methodObj, receiver, args); executed {
+				return result
+			}
+		} else if receiver.Class.Name == "Prawn::Text::Formatted::Fragment" && method == "process_text" {
+			if result, executed := vm.executeNativePrawnFormattedProcessText(methodObj, receiver, args); executed {
+				return result
+			}
+		} else if receiver.Class.Name == "Prawn::Fonts::AFM" {
+			if result, executed := vm.executeNativePrawnAFMSize(methodObj, receiver, args); executed {
+				return result
+			}
+		}
+	}
+	if method == "width_of" {
+		if result, executed := vm.executeNativePrawnFontMetricWidth(methodObj, receiver, args); executed {
+			return result
+		}
+	}
+	// Public native methods do not need argument binding, a Ruby Frame, or
+	// visibility/protected-self checks.  Keep this guard deliberately narrow:
+	// aliases with dispatch owners, TracePoint, Proc keyword plumbing, and the
+	// backtrace-sensitive sleep/tap wrappers must retain the full path below.
+	if nativeInvokeFastEnabled {
+		if nativeFn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok &&
+			methodObj.DispatchOwner == nil &&
+			(methodObj.Visibility == "" || methodObj.Visibility == "public") &&
+			!core.AnyTracePointActive() &&
+			method != "sleep" && method != "tap" && methodObj.OriginalName != "tap" &&
+			(receiver == nil || receiver.Type != object.ValueProc || method != "call" && method != "[]" && method != "yield") {
+			return callNativeMethod(nativeFn, receiver, args)
+		}
+	}
+	var oldFrame *Frame
+	if vm.fp >= 0 && vm.fp < len(vm.frames) && vm.frames[vm.fp] != nil {
+		oldFrame = vm.frames[vm.fp]
 	}
 	currentSelf := core.R.Main
 	if oldFrame != nil && oldFrame.Bp >= 0 && oldFrame.Bp < len(vm.stack) && vm.stack[oldFrame.Bp] != nil {
@@ -9078,7 +12350,8 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 	privateReceiverAllowed := receiver == core.R.Main || (parentMethod != "public_send" && receiver == currentSelf)
 	if methodObj.Visibility == "protected" && parentMethod != "public_send" {
 		sameRuntimeClass := currentSelf != nil && receiver != nil && currentSelf.Class != nil && currentSelf.Class == receiver.Class
-		if sameRuntimeClass || methodOwner != nil && valueHasClassInAncestry(currentSelf, methodOwner) && valueHasClassInAncestry(receiver, methodOwner) {
+		lexicalAccess := vm.lexicalScopeDefinesMethod(method, methodObj)
+		if sameRuntimeClass || lexicalAccess || methodOwner != nil && valueHasClassInAncestry(currentSelf, methodOwner) && valueHasClassInAncestry(receiver, methodOwner) {
 			privateReceiverAllowed = true
 		}
 	}
@@ -9088,65 +12361,196 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		(methodObj.Visibility == "private" || methodObj.Visibility == "protected") && !privateReceiverAllowed {
 		return core.NewNoMethodErrorForVisibility(receiver, method, methodObj.Visibility, args)
 	}
+	if method == "compute_width_of" || method == "kern" || method == "unscaled_width_of" {
+		if result, executed := vm.executeNativePrawnTextMethod(methodObj, receiver, args); executed {
+			return result
+		}
+	}
 	if fn, ok := methodObj.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue); ok {
+		traceCall := core.TracePointEventActive("c_call")
+		traceReturn := core.TracePointEventActive("c_return")
 		var binding *object.RBinding
 		var methodID string
 		var definedClass *object.EmeraldValue
-		prepareTraceContext := func() {
-			if binding != nil {
-				return
-			}
+		if traceCall || traceReturn {
 			binding = vm.currentFrameBinding()
 			methodID = traceMethodID(methodObj, method)
-			definedClass = traceDefinedClass(methodObj, methodOwner)
+			definedClass = traceDefinedClassForInvocation(methodObj, methodOwner)
 		}
-		if core.TracePointEventActive("c_call") {
-			prepareTraceContext()
+		if traceCall {
 			core.FireTracePointCall("c_call", binding, receiver, definedClass, methodID, method, nil)
 		}
-		invoke := func() *object.EmeraldValue { return fn(receiver, args...) }
-		if method == "sleep" && methodOwner == core.R.Classes["Object"] {
-			invoke = func() *object.EmeraldValue {
-				return vm.withNativeBacktraceFrame("Kernel#sleep", func() *object.EmeraldValue { return fn(receiver, args...) })
-			}
-		} else if vm.currentBlock != nil && (methodObj.OriginalName == "tap" || method == "tap") {
-			invoke = func() *object.EmeraldValue {
-				return vm.withNativeBacktraceFrame("Kernel#tap", func() *object.EmeraldValue { return fn(receiver, args...) })
-			}
+		previousProcCallKeywordSyntax := vm.procCallKeywordSyntax
+		if receiver != nil && receiver.Type == object.ValueProc &&
+			(method == "call" || method == "[]" || method == "yield") {
+			vm.procCallKeywordSyntax = keywordSyntax
 		}
-		result := invoke()
-		if core.TracePointEventActive("c_return") {
-			prepareTraceContext()
+		var result *object.EmeraldValue
+		if method == "sleep" && methodOwner == core.R.Classes["Object"] {
+			result = vm.withNativeBacktraceFrame("Kernel#sleep", func() *object.EmeraldValue {
+				return callNativeMethod(fn, receiver, args)
+			})
+		} else if vm.currentBlock != nil && (methodObj.OriginalName == "tap" || method == "tap") {
+			result = vm.withNativeBacktraceFrame("Kernel#tap", func() *object.EmeraldValue {
+				return callNativeMethod(fn, receiver, args)
+			})
+		} else {
+			result = callNativeMethod(fn, receiver, args)
+		}
+		vm.procCallKeywordSyntax = previousProcCallKeywordSyntax
+		if traceReturn {
 			core.FireTracePointReturn("c_return", binding, receiver, definedClass, methodID, method, nil, result)
 		}
 		return result
 	}
 
 	if fn, ok := methodObj.Fn.(*object.Function); ok {
-		if errVal := rejectBlockArgument(fn, vm.currentBlock); errVal != nil {
-			return errVal
+		if result, executed := vm.tryExecuteTypedIntegerMethod(methodObj, fn, args); executed {
+			return result
 		}
-		args = dropAnonymousKeywordRestNonSymbolHash(fn, args)
-		args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
-		args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, methodObj.Ruby2Keywords)
-		args = mergeKeywordRestOverflowHashes(fn, args)
-		if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
-			return errVal
+		if result, executed := vm.tryExecuteTypedSSAFunction(methodObj, fn, receiver, args, parentMethod); executed {
+			return result
 		}
-		if err := methodArityError(fn, positionalArityArgCount(fn, args)); err != nil {
-			return err
+		if nativeForwardableDelegatorCandidate(methodObj) {
+			if result, executed := vm.executeNativeForwardableDelegatorFast(methodObj, receiver, args, keywordSyntax); executed {
+				return result
+			}
 		}
-		if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
-			return errVal
+		if result, executed := vm.tryExecuteTypedHotFunction(methodObj, fn, receiver, args); executed {
+			return result
 		}
-		if errVal := rejectedNonSymbolPositionalHashWithKeywords(fn, args); errVal != nil {
-			return errVal
+		if profile := vm.rubyMethodProfile; profile != nil {
+			profile.mu.Lock()
+			profile.counts[fn]++
+			profile.mu.Unlock()
 		}
-		if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
-			return errVal
+		if forwardableFastEnabled && methodObj.DispatchOwner == nil &&
+			(methodObj.Visibility == "" || methodObj.Visibility == "public") {
+			if result, executed := vm.executeForwardableDelegatorFast(fn, receiver, args, keywordSyntax); executed {
+				return result
+			}
 		}
-		if errVal := unknownKeywordArgument(fn, args); errVal != nil {
-			return errVal
+		if directAttributeAccessorEnabled {
+			if result, executed := vm.executeDirectAttributeAccessor(fn, receiver, args, methodObj); executed {
+				return result
+			}
+		}
+		if directAttributeCompareEnabled {
+			if result, executed := vm.executeEarlyAttributeComparePlan(fn, receiver, args, methodObj); executed {
+				return result
+			}
+		}
+		if result, executed := vm.executeEarlyColdRaiseRegisterIR(fn, receiver, args, method, methodObj, methodOwner); executed {
+			return result
+		}
+		var cachedLeafPlan leafMethodPlan
+		cachedLeafPlanReady := false
+		if vm.instructionLimit == 0 && !core.AnyTracePointActive() {
+			cachedLeafPlan, cachedLeafPlanReady = vm.leafMethodCache[fn]
+			if !cachedLeafPlanReady {
+				cachedLeafPlan = buildLeafMethodPlan(fn)
+				vm.leafMethodCache[fn] = cachedLeafPlan
+				cachedLeafPlanReady = true
+			}
+			// Optional readers are common in library object models. Their plan
+			// already proves the default-argument prologue and the guarded ivar
+			// access, so a no-argument call can skip the binder and callee Frame.
+			// Keep this admission narrower than the general leaf probe: methods with
+			// dispatch aliases, refinements, a block, or keyword-marked syntax stay
+			// on the complete invocation path.
+			if len(args) == 0 && vm.currentBlock == nil && methodObj.DispatchOwner == nil && !methodObj.Ruby2Keywords &&
+				(cachedLeafPlan.kind == leafMethodOptionalInstanceReader || cachedLeafPlan.kind == leafMethodOptionalInstanceFallbackReader) &&
+				!methodUsesRefinements(methodObj) {
+				if result, executed := vm.executeCachedLeafMethodPlan(cachedLeafPlan, fn, receiver, args, method, methodObj, methodOwner); executed {
+					return result
+				}
+			}
+		}
+		simpleMethodProtocol := registerIRSimpleMethodProtocolEnabled && !keywordSyntax && !methodObj.Ruby2Keywords && vm.simpleBlockCallShape(fn)
+		if simpleMethodProtocol && len(args) > 0 {
+			last := args[len(args)-1]
+			if last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last) {
+				simpleMethodProtocol = false
+			}
+		}
+		if simpleMethodProtocol {
+			// The cached shape has no defaults, rest/keyword/block parameters,
+			// destructuring, or reject flags.  Exact arity is therefore the only
+			// observable pre-body check for an ordinary (non-keyword) call.
+			if len(args) != len(fn.Params) {
+				return methodArityError(fn, len(args))
+			}
+		} else {
+			if errVal := rejectBlockArgument(fn, vm.currentBlock); errVal != nil {
+				return errVal
+			}
+			args = dropAnonymousKeywordRestNonSymbolHash(fn, args)
+			preserveRuby2KeywordMark := methodObj.Ruby2Keywords || !keywordSyntax
+			args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args, preserveRuby2KeywordMark)
+			args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, preserveRuby2KeywordMark)
+			args = mergeKeywordRestOverflowHashes(fn, args)
+			if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
+				return errVal
+			}
+			if err := methodArityError(fn, positionalArityArgCount(fn, args)); err != nil {
+				return err
+			}
+			if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
+				return errVal
+			}
+			if errVal := rejectedNonSymbolPositionalHashWithKeywords(fn, args); errVal != nil {
+				return errVal
+			}
+			if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
+				return errVal
+			}
+			if errVal := unknownKeywordArgument(fn, args); errVal != nil {
+				return errVal
+			}
+		}
+		if vm.instructionLimit == 0 && !core.AnyTracePointActive() {
+			if !cachedLeafPlanReady {
+				cachedLeafPlan, cachedLeafPlanReady = vm.leafMethodCache[fn]
+				if !cachedLeafPlanReady {
+					cachedLeafPlan = buildLeafMethodPlan(fn)
+					vm.leafMethodCache[fn] = cachedLeafPlan
+					cachedLeafPlanReady = true
+				}
+			}
+			if result, executed := vm.executeCachedLeafMethodPlan(cachedLeafPlan, fn, receiver, args, method, methodObj, methodOwner); executed {
+				return result
+			}
+			if result, executed := vm.executeIntegerMethodPlan(fn, args); executed {
+				return result
+			}
+		}
+		var caseDispatch *caseDispatchPlan
+		if vm.instructionLimit == 0 && !core.AnyTracePointActive() {
+			if cachedPlan, found := vm.leafMethodCache[fn]; found && cachedPlan.kind == leafMethodCaseDispatch &&
+				methodObj.DispatchOwner == nil && !methodUsesRefinements(methodObj) {
+				caseDispatch = cachedPlan.caseDispatch
+			}
+		}
+		caseDispatchEntry := 0
+		caseDispatchActive := false
+		var selectedCaseBranch *caseDispatchBranch
+		if caseDispatch != nil {
+			if start, direct, ok := vm.caseDispatchStart(caseDispatch, args); ok {
+				// A branch consisting only of an immutable literal and ReturnValue
+				// has no observable frame/binding work. Return it before allocating
+				// the callee frame; all argument/default/block/visibility checks have
+				// already completed above. Branches with any other shape retain the
+				// normal framed entry below.
+				if direct != nil {
+					return direct
+				}
+				if result, executed := vm.executeCaseDispatchBranchNoFrame(caseDispatch, start, fn, receiver, args); executed {
+					return result
+				}
+				caseDispatchEntry = start
+				selectedCaseBranch = caseDispatchBranchForEntry(caseDispatch, start)
+				caseDispatchActive = true
+			}
 		}
 		bp := vm.sp
 
@@ -9156,11 +12560,13 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		if len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
 			positionalArgs := args
 			var kwargsHash map[*object.EmeraldValue]*object.EmeraldValue
+			var keywordSource *object.EmeraldValue
 			if len(args) > 0 {
 				lastArg := args[len(args)-1]
 				if lastArg.Type == object.ValueHash && core.Ruby2KeywordHash(lastArg) {
 					positionalArgs = args[:len(args)-1]
 					kwargsHash = executorHashToMap(lastArg)
+					keywordSource = lastArg
 				}
 			}
 
@@ -9191,7 +12597,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 				}
 			}
 			if fn.KeywordRestParam != "" {
-				restHash := vm.keywordRestHash(kwargsHash, fn.KeywordParams)
+				restHash := vm.keywordRestHash(kwargsHash, keywordSource, fn.KeywordParams)
 				if index, ok := fn.LocalNames[fn.KeywordRestParam]; ok {
 					slot := bp + 1 + index
 					vm.stack[slot] = restHash
@@ -9224,7 +12630,7 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 					ClassStack:       closure.ClassStack,
 					Refinements:      append([]*object.EmeraldValue(nil), closure.Refinements...),
 					RefinementsFixed: closure.RefinementsFixed,
-					InstanceVars:     make(map[string]*object.EmeraldValue),
+					AutoSplat:        closure.AutoSplat,
 					IsLambda:         false,
 					BreakOwnerID:     closure.BreakOwnerID,
 					ReturnOwnerID:    closure.ReturnOwnerID,
@@ -9251,17 +12657,23 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			vm.sp = minSp
 		}
 		if errVal := vm.bindParameterPatterns(fn, bp); errVal != nil {
-			vm.sp = bp
+			vm.setStackPointer(bp)
 			return errVal
 		}
 
 		methodClosure := methodObj.Closure
+		traceActive := core.TracePointEventActive("call") || core.TracePointEventActive("return")
 		var traceParameters *object.EmeraldValue
-		if core.TracePointEventActive("call") || core.TracePointEventActive("return") {
+		var traceDefinedClass *object.EmeraldValue
+		var traceMethodName string
+		if traceActive {
 			traceParameters = core.TracePointParameters(fn, true)
+			traceDefinedClass = traceDefinedClassForInvocation(methodObj, methodOwner)
+			traceMethodName = traceMethodID(methodObj, method)
 		}
 		invocation := vm.buildInvocationMetadata(receiver, method, methodObj, methodOwner)
-		newFrame := vm.pushReusableFrame(Frame{
+		newFrame := vm.pushReusableFrame()
+		*newFrame = Frame{
 			ID:                    vm.allocateFrameID(),
 			Fn:                    fn,
 			Ip:                    -1,
@@ -9269,7 +12681,6 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			Closure:               methodClosure,
 			MethodName:            method,
 			OriginalMethodName:    methodObj.OriginalName,
-			LabelName:             invocation.label,
 			SuperStart:            invocation.superStart,
 			SuperModule:           invocation.superModule,
 			SuperAfterClass:       invocation.superAfterClass,
@@ -9280,11 +12691,14 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 			WhileStart:            -1,
 			WhileEnd:              -1,
 			TraceSelf:             receiver,
-			TraceDefinedClass:     invocation.traceDefinedClass,
-			TraceMethodID:         invocation.traceMethodID,
+			TraceDefinedClass:     traceDefinedClass,
+			TraceMethodID:         traceMethodName,
 			TraceCalleeID:         method,
 			TraceParameters:       traceParameters,
-		})
+			BacktraceReceiver:     receiver,
+			BacktraceMethod:       methodObj,
+			BacktraceOwner:        methodOwner,
+		}
 		if blockParamProc != nil && blockParamProc.BreakOwnerID == 0 {
 			blockParamProc.BreakOwnerID = newFrame.ID
 		}
@@ -9299,18 +12713,38 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		vm.currentBlock = nil
 		prevClassStack := vm.classStack
 		if methodClosure != nil {
-			vm.classStack = append([]*object.EmeraldValue(nil), methodClosure.ClassStack...)
+			vm.classStack = methodClosure.ClassStack
 		}
 		frame := vm.frames[vm.fp]
+		var irResult *object.EmeraldValue
+		irExecuted := false
+		if caseDispatchActive && selectedCaseBranch != nil && selectedCaseBranch.registerIR != nil &&
+			registerIRPlanSafeForCaseDispatchFramed(selectedCaseBranch.registerIR) {
+			irResult, irExecuted = vm.executeRegisterIRInstructions(selectedCaseBranch.registerIR, receiver, args, frame, registerIRSendCacheEnabled)
+			caseDispatchActive = false
+		}
 		instructions := frame.Fn.Instructions
-
-		for frame.Ip < len(instructions)-1 {
+		for !irExecuted && frame.Ip < len(instructions)-1 {
+			if caseDispatchActive && frame.Ip+1 == caseDispatch.skipIP {
+				frame.Ip = caseDispatchEntry - 1
+				caseDispatchActive = false
+			}
 			frame.Ip++
 			op := compiler.Opcode(instructions[frame.Ip])
-			vm.fireTracePointLine(frame, op)
-			frame.InstructionException = core.LastException
-			frame.InstructionSnapshotSet = true
-			err := vm.execute(op, frame)
+			traceLineActive := false
+			if core.AnyTracePointActive() {
+				traceLineActive = vm.fireTracePointLine(frame, op)
+			}
+			if traceLineActive || !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+				frame.InstructionException = core.LastException
+				frame.InstructionSnapshotSet = true
+			}
+			var err error
+			if vm.instructionLimit == 0 && !DevMode && !traceLineActive && simpleOpcodeFastPath[op] {
+				err = vm.executeSimpleOpcode(op, frame)
+			} else {
+				err = vm.execute(op, frame)
+			}
 			if err != nil {
 				vm.currentBlock = prevBlock
 				vm.classStack = prevClassStack
@@ -9319,7 +12753,8 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 				}
 				return core.NewRuntimeError(err.Error())
 			}
-			if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
+			if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+				(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
 				break
 			}
 			frame = vm.frames[vm.fp]
@@ -9335,7 +12770,9 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		vm.classStack = prevClassStack
 
 		result := core.R.NilVal
-		if frame.BlockBreak {
+		if irExecuted {
+			result = irResult
+		} else if frame.BlockBreak {
 			result = frame.BlockBreakVal
 			if result == nil {
 				result = core.R.NilVal
@@ -9349,9 +12786,14 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 		} else if vm.sp > bp {
 			result = vm.stack[vm.sp-1]
 		}
-		vm.sp = bp
+		vm.setStackPointer(bp)
 
 		vm.endActiveRescuesForFrame(frame)
+		for i := len(vm.rescueStack) - 1; i >= 0; i-- {
+			if vm.rescueStack[i].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:i], vm.rescueStack[i+1:]...)
+			}
+		}
 		frame.InstructionException = nil
 		frame.InstructionSnapshotSet = false
 		vm.frames = vm.frames[:vm.fp]
@@ -9366,15 +12808,20 @@ func (vm *VM) invokeMethod(receiver *object.EmeraldValue, parentMethod, method s
 	return core.R.NilVal
 }
 
-func (vm *VM) pushReusableFrame(initial Frame) *Frame {
+func (vm *VM) pushReusableFrame() *Frame {
 	next := vm.fp + 1
 	if next < cap(vm.frames) {
 		vm.frames = vm.frames[:next+1]
-	} else {
-		vm.frames = append(vm.frames, nil)
+		frame := vm.frames[next]
+		if frame == nil {
+			frame = &Frame{}
+			vm.frames[next] = frame
+		}
+		vm.fp = next
+		return frame
 	}
-	frame := &initial
-	vm.frames[next] = frame
+	frame := &Frame{}
+	vm.frames = append(vm.frames, frame)
 	vm.fp = next
 	return frame
 }
@@ -9498,7 +12945,7 @@ structureScanned:
 }
 
 func loopLocalAt(instructions compiler.Instructions, position, end int) (int, int, bool) {
-	if position+1 >= end || compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+	if position+1 >= end || !isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
 		return 0, position, false
 	}
 	return int(instructions[position+1]), position + 2, true
@@ -9551,6 +12998,49 @@ func simpleIntegerLoopHeader(frame *Frame, target, jumpPosition int) (counterLoc
 	return
 }
 
+// integerLoopHeader accepts the same strict `<`/positive-counter loop shape
+// as simpleIntegerLoopHeader, but also admits an immutable integer literal as
+// the upper bound.  The caller still validates the counter update and all
+// body operations before committing any result.
+func integerLoopHeader(frame *Frame, target, jumpPosition int) (counterLocal, limitLocal, exitPosition, bodyPosition int, limit int64, ok bool) {
+	if frame == nil || frame.Fn == nil || target < 0 || target >= jumpPosition {
+		return 0, -1, 0, 0, 0, false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return 0, -1, 0, 0, 0, false
+	}
+	limitLocal = -1
+	if isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
+		limitLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+		if !ok {
+			return 0, -1, 0, 0, 0, false
+		}
+	} else {
+		limit, position, ok = loopIntegerConstantAt(frame, position, jumpPosition)
+		if !ok {
+			return 0, -1, 0, 0, 0, false
+		}
+	}
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return 0, -1, 0, 0, 0, false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return 0, -1, 0, 0, 0, false
+	}
+	exitPosition = int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return 0, -1, 0, 0, 0, false
+	}
+	bodyPosition = position + 3
+	return counterLocal, limitLocal, exitPosition, bodyPosition, limit, true
+}
+
 func (vm *VM) commitIntegerLoopLocal(frame *Frame, local int, value int64) *object.EmeraldValue {
 	result := core.NewIntegerValue(value)
 	vm.stack[frame.Bp+local+1] = result
@@ -9561,6 +13051,506 @@ func (vm *VM) commitIntegerLoopLocal(frame *Frame, local int, value int64) *obje
 	}
 	vm.updateCapturedBindingLocal(frame, local, result)
 	return result
+}
+
+// tryExecuteArrayIntegerFillLoop batches the strict loop shape
+// `array << ((counter * factor) % modulus)` into one append.  It is separate
+// from the array+hash batcher because a plain Array loop is common and should
+// not pay for Hash guards or per-iteration builtin dispatch.  Exact Array and
+// Integer builtin-generation checks preserve redefinition and subclass
+// semantics; any miss re-enters the ordinary bytecode loop unchanged.
+func (vm *VM) tryExecuteArrayIntegerFillLoop(frame *Frame, target, jumpPosition int) bool {
+	if vm == nil || frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		!integerLoopOptimizationEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		!core.CollectionLoopBuiltinsAvailable() {
+		return false
+	}
+	counterLocal, limitLocal, exitPosition, position, limit, ok := integerLoopHeader(frame, target, jumpPosition)
+	if !ok {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	arrayLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	expressionLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || expressionLocal != counterLocal {
+		return false
+	}
+	factor, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMul {
+		return false
+	}
+	position++
+	modulus, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || modulus == 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	valueLocal := -1
+	if compiler.Opcode(instructions[position]) == compiler.OpBitLeftShift {
+		if position+1 >= jumpPosition || compiler.Opcode(instructions[position+1]) != compiler.OpPop {
+			return false
+		}
+		position += 2
+	} else {
+		if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+			compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+			return false
+		}
+		valueLocal = int(instructions[position+1])
+		position += 3
+		appendedLocal, nextPosition, localOK := loopLocalAt(instructions, position, jumpPosition)
+		if !localOK || appendedLocal != valueLocal || nextPosition+1 >= jumpPosition ||
+			compiler.Opcode(instructions[nextPosition]) != compiler.OpBitLeftShift ||
+			compiler.Opcode(instructions[nextPosition+1]) != compiler.OpPop {
+			return false
+		}
+		position = nextPosition + 2
+	}
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	readLocal := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		return value, value != nil
+	}
+	counterValue, ok := readLocal(counterLocal)
+	if !ok || !smallIntegerValue(counterValue) {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocal(limitLocal)
+		if !limitOK || !smallIntegerValue(limitValue) {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	arrayValue, ok := readLocal(arrayLocal)
+	if !ok || arrayValue.Type != object.ValueArray || arrayValue.Class != core.R.Classes["Array"] || arrayValue.Frozen {
+		return false
+	}
+	elements, ok := arrayValue.Data.([]*object.EmeraldValue)
+	if !ok {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations > 1_000_000 {
+		iterations = 1_000_000
+	}
+	values := make([]*object.EmeraldValue, 0, int(iterations))
+	lastValue := int64(0)
+	for index := uint64(0); index < iterations; index++ {
+		product, valid := applyIntegerBinary(compiler.OpMul, counter, factor)
+		if !valid {
+			return false
+		}
+		value, valid := applyIntegerBinary(compiler.OpMod, product, modulus)
+		if !valid {
+			return false
+		}
+		values = append(values, core.NewIntegerValue(value))
+		lastValue = value
+		counter, valid = applyIntegerBinary(compiler.OpAdd, counter, step)
+		if !valid {
+			return false
+		}
+	}
+	arrayValue.Data = append(elements, values...)
+	if valueLocal >= 0 && len(values) > 0 {
+		vm.commitIntegerLoopLocal(frame, valueLocal, lastValue)
+	}
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if counter >= limit {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+// tryExecuteHashLinearFillLoop batches the common closed-world shape
+// `hash[counter] = counter + offset` followed by a positive counter step.
+// Ruby MRI keeps these Integer values immediate; RGo can approximate that
+// behavior here by preflighting raw int64 values and committing the ordered
+// canonical key/value view once instead of dispatching Hash#[]= per iteration.
+// Any unsupported receiver/layout, overflow, or method-generation change
+// returns false before the Hash is mutated and leaves the ordinary bytecode
+// loop as the semantic fallback.
+func (vm *VM) tryExecuteHashLinearFillLoop(frame *Frame, target, jumpPosition int) bool {
+	if vm == nil || frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		!integerLoopOptimizationEnabled || vm.instructionLimit != 0 || DevMode ||
+		core.AnyTracePointActive() || !core.IntegerPlusUsesBuiltinImplementation() ||
+		!core.IntegerLessThanUsesBuiltinImplementation() {
+		return false
+	}
+	counterLocal, limitLocal, exitPosition, position, limit, ok := integerLoopHeader(frame, target, jumpPosition)
+	if !ok {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	hashLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	keyLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || keyLocal != counterLocal {
+		return false
+	}
+	valueLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || valueLocal != counterLocal {
+		return false
+	}
+	valueOffset, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+1 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpIndexAssign ||
+		compiler.Opcode(instructions[position+1]) != compiler.OpPop {
+		return false
+	}
+	position += 2
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	readLocal := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		return value, value != nil
+	}
+	counterValue, ok := readLocal(counterLocal)
+	if !ok || !smallIntegerValue(counterValue) {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocal(limitLocal)
+		if !limitOK || !smallIntegerValue(limitValue) {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	hashValue, ok := readLocal(hashLocal)
+	if !ok || hashValue.Type != object.ValueHash || hashValue.Class != core.R.Classes["Hash"] ||
+		hashValue.Frozen || core.AttachedSingletonClass(hashValue) != nil ||
+		!core.IntegerHashBatchAvailable(hashValue) {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations > 1_000_000 {
+		iterations = 1_000_000
+	}
+	if nextCounter, handled := core.StoreIntegerHashLinearBatch(hashValue, counter, step, valueOffset, int(iterations)); handled {
+		last := vm.commitIntegerLoopLocal(frame, counterLocal, nextCounter)
+		vm.recordPoppedValue(last)
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		if nextCounter >= limit {
+			frame.Ip = exitPosition - 1
+		} else {
+			frame.Ip = target - 1
+		}
+		return true
+	}
+	keys := make([]*object.EmeraldValue, int(iterations))
+	values := make([]*object.EmeraldValue, int(iterations))
+	preflightCounter := counter
+	generation := object.CurrentMethodGeneration()
+	for index := range keys {
+		value, valid := checkedIntegerAdd(preflightCounter, valueOffset)
+		if !valid {
+			return false
+		}
+		keys[index] = core.NewSmallIntegerValue(preflightCounter)
+		values[index] = core.NewSmallIntegerValue(value)
+		preflightCounter, valid = checkedIntegerAdd(preflightCounter, step)
+		if !valid {
+			return false
+		}
+	}
+	if object.CurrentMethodGeneration() != generation {
+		return false
+	}
+	// The loop itself created every key/value through the exact small-integer
+	// constructors after the builtin/generation preflight above. Reuse the
+	// trusted canonical materializer so the large linear Hash constructor does
+	// not scan the same keys a second time before grouping them.
+	if !core.StoreIntegerHashBatchTrustedCanonical(hashValue, keys, values) {
+		return false
+	}
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, preflightCounter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if preflightCounter >= limit {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
+}
+
+// tryExecuteHashIntegerFillLoop batches `hash[counter % modulus] = value`
+// loops.  The direct path is admitted only for an exact Hash with no default,
+// identity comparison, or non-integer pre-existing keys.  It maintains the
+// ordered key list and integer hash buckets explicitly, so Hash#[] and
+// Hash#keys retain their normal observable behavior while avoiding one dynamic
+// hash dispatch and equality probe per iteration.
+func (vm *VM) tryExecuteHashIntegerFillLoop(frame *Frame, target, jumpPosition int) bool {
+	if vm == nil || frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		!integerLoopOptimizationEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		!core.CollectionLoopBuiltinsAvailable() {
+		return false
+	}
+	counterLocal, limitLocal, exitPosition, position, limit, ok := integerLoopHeader(frame, target, jumpPosition)
+	if !ok {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	expressionLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || expressionLocal != counterLocal {
+		return false
+	}
+	factor, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMul {
+		return false
+	}
+	position++
+	valueModulus, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || valueModulus == 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+		return false
+	}
+	valueLocal := int(instructions[position+1])
+	position += 3
+	hashLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	keyLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || keyLocal != counterLocal {
+		return false
+	}
+	keyModulus, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || keyModulus == 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMod {
+		return false
+	}
+	position++
+	storedLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || storedLocal != valueLocal || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpIndexAssign ||
+		position+1 >= jumpPosition || compiler.Opcode(instructions[position+1]) != compiler.OpPop {
+		return false
+	}
+	position += 2
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	readLocal := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		return value, value != nil
+	}
+	counterValue, ok := readLocal(counterLocal)
+	if !ok || !smallIntegerValue(counterValue) {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocal(limitLocal)
+		if !limitOK || !smallIntegerValue(limitValue) {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	hashValue, ok := readLocal(hashLocal)
+	if !ok || hashValue.Type != object.ValueHash || hashValue.Class != core.R.Classes["Hash"] || hashValue.Frozen {
+		return false
+	}
+	hash, ok := hashValue.Data.(*object.RHash)
+	if !ok || hash == nil || hash.Default != nil || hash.DefaultProc != nil || hash.CompareByIdentity ||
+		len(hash.Pairs) != len(hash.Keys) {
+		return false
+	}
+	integerKeys := make(map[int64]*object.EmeraldValue, len(hash.Keys))
+	for _, key := range hash.Keys {
+		if !smallIntegerValue(key) {
+			return false
+		}
+		integer := key.Data.(int64)
+		if _, exists := integerKeys[integer]; exists {
+			return false
+		}
+		if _, exists := hash.Pairs[key]; !exists {
+			return false
+		}
+		integerKeys[integer] = key
+	}
+	for key := range hash.Pairs {
+		if !smallIntegerValue(key) {
+			return false
+		}
+		integer := key.Data.(int64)
+		if integerKeys[integer] != key {
+			return false
+		}
+	}
+	counter := counterValue.Data.(int64)
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations > 1_000_000 {
+		iterations = 1_000_000
+	}
+	keys := make([]int64, int(iterations))
+	values := make([]int64, int(iterations))
+	preflightCounter := counter
+	for index := uint64(0); index < iterations; index++ {
+		product, valid := applyIntegerBinary(compiler.OpMul, preflightCounter, factor)
+		if !valid {
+			return false
+		}
+		value, valid := applyIntegerBinary(compiler.OpMod, product, valueModulus)
+		if !valid {
+			return false
+		}
+		key, valid := applyIntegerBinary(compiler.OpMod, preflightCounter, keyModulus)
+		if !valid {
+			return false
+		}
+		keys[index] = key
+		values[index] = value
+		preflightCounter, valid = applyIntegerBinary(compiler.OpAdd, preflightCounter, step)
+		if !valid {
+			return false
+		}
+	}
+	hash.Hashes = make(map[*object.EmeraldValue]int64, len(hash.Pairs)+int(iterations))
+	hash.Buckets = make(map[int64][]*object.EmeraldValue, len(hash.Pairs)+int(iterations))
+	for key := range hash.Pairs {
+		integer := key.Data.(int64)
+		code := integer*33 + 0x30
+		hash.Hashes[key] = code
+		hash.Buckets[code] = append(hash.Buckets[code], key)
+	}
+	hash.BucketSize = len(hash.Pairs)
+	lastValue := values[len(values)-1]
+	for index := range keys {
+		key := keys[index]
+		valueObject := core.NewSmallIntegerValue(values[index])
+		if existing, exists := integerKeys[key]; exists {
+			hash.Pairs[existing] = valueObject
+		} else {
+			keyObject := core.NewSmallIntegerValue(key)
+			hash.Pairs[keyObject] = valueObject
+			hash.Keys = append(hash.Keys, keyObject)
+			code := key*33 + 0x30
+			hash.Hashes[keyObject] = code
+			hash.Buckets[code] = append(hash.Buckets[code], keyObject)
+			hash.BucketSize++
+			integerKeys[key] = keyObject
+		}
+	}
+	counter = preflightCounter
+	if len(integerKeys) != len(hash.Pairs) {
+		return false
+	}
+	last := vm.commitIntegerLoopLocal(frame, valueLocal, lastValue)
+	last = vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	if counter >= limit {
+		frame.Ip = exitPosition - 1
+	} else {
+		frame.Ip = target - 1
+	}
+	return true
 }
 
 func (vm *VM) tryExecuteCollectionFillLoop(frame *Frame, target, jumpPosition int) bool {
@@ -9653,41 +13643,79 @@ func (vm *VM) tryExecuteCollectionFillLoop(frame *Frame, target, jumpPosition in
 		hashValue == nil || hashValue.Type != object.ValueHash || hashValue.Class != core.R.Classes["Hash"] || hashValue.Frozen {
 		return false
 	}
+	batchHash := core.IntegerHashBatchAvailable(hashValue)
 	counter := counterValue.Data.(int64)
 	limit := limitValue.Data.(int64)
-	values := make([]*object.EmeraldValue, 0, 1024)
-	keys := make([]*object.EmeraldValue, 0, 1024)
+	capacity := int64(0)
+	if counter < limit {
+		distance := uint64(limit) - uint64(counter)
+		stepUnsigned := uint64(step)
+		quotient := distance / stepUnsigned
+		if quotient >= 1_000_000 {
+			capacity = 1_000_000
+		} else {
+			capacity = int64(quotient)
+			if distance%stepUnsigned != 0 {
+				capacity++
+			}
+		}
+	}
+	arrayElements, ok := arrayValue.Data.([]*object.EmeraldValue)
+	if !ok || capacity <= 0 || int64(len(arrayElements)) > int64(^uint(0)>>1)-capacity {
+		return false
+	}
+	originalArrayLength := len(arrayElements)
+	batchCapacity := int(capacity)
+	var nextArray []*object.EmeraldValue
+	if cap(arrayElements)-originalArrayLength >= batchCapacity {
+		nextArray = arrayElements[:originalArrayLength+batchCapacity]
+	} else {
+		nextArray = make([]*object.EmeraldValue, originalArrayLength+batchCapacity)
+		copy(nextArray, arrayElements)
+	}
+	values := nextArray[originalArrayLength : originalArrayLength : originalArrayLength+batchCapacity]
+	keys := make([]int64, 0, int(capacity))
 	var lastValue int64
 	for iterations := 0; counter < limit && iterations < 1_000_000; iterations++ {
-		product, valid := applyIntegerBinary(compiler.OpMul, counter, factor)
+		product, valid := checkedIntegerMul(counter, factor)
 		if !valid {
 			return false
 		}
-		computed, valid := applyIntegerBinary(compiler.OpMod, product, valueModulus)
+		computed, valid := checkedIntegerMod(product, valueModulus)
 		if !valid {
 			return false
 		}
-		key, valid := applyIntegerBinary(compiler.OpMod, counter, keyModulus)
+		key, valid := checkedIntegerMod(counter, keyModulus)
 		if !valid {
 			return false
 		}
-		values = append(values, core.NewIntegerValue(computed))
-		keys = append(keys, core.NewIntegerValue(key))
+		values = append(values, core.NewSmallIntegerValue(computed))
+		keys = append(keys, key)
 		lastValue = computed
-		next, valid := applyIntegerBinary(compiler.OpAdd, counter, step)
+		next, valid := checkedIntegerAdd(counter, step)
 		if !valid {
 			return false
 		}
 		counter = next
 	}
-	if !core.AppendArrayValues(arrayValue, values) {
-		return false
-	}
-	for index, key := range keys {
-		if !core.StoreHashValue(hashValue, key, values[index]) {
-			return false
+	if batchHash {
+		if !core.StoreIntegerHashRawBatchTrustedCanonical(hashValue, keys, values) {
+			boxedKeys := make([]*object.EmeraldValue, len(keys))
+			for index, key := range keys {
+				boxedKeys[index] = core.NewSmallIntegerValue(key)
+			}
+			if !core.StoreIntegerHashBatchTrustedCanonical(hashValue, boxedKeys, values) {
+				return false
+			}
+		}
+	} else {
+		for index, key := range keys {
+			if !core.StoreHashValue(hashValue, core.NewSmallIntegerValue(key), values[index]) {
+				return false
+			}
 		}
 	}
+	arrayValue.Data = nextArray[:originalArrayLength+len(values)]
 	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
 	if len(values) > 0 {
 		last = vm.commitIntegerLoopLocal(frame, valueLocal, lastValue)
@@ -9788,11 +13816,11 @@ func (vm *VM) tryExecuteArraySumLoop(frame *Frame, target, jumpPosition int) boo
 		if element == nil || element.Type != object.ValueInteger {
 			return false
 		}
-		nextSum, valid := applyIntegerBinary(compiler.OpAdd, sum, element.Data.(int64))
+		nextSum, valid := checkedIntegerAdd(sum, element.Data.(int64))
 		if !valid {
 			return false
 		}
-		nextCounter, valid := applyIntegerBinary(compiler.OpAdd, counter, step)
+		nextCounter, valid := checkedIntegerAdd(counter, step)
 		if !valid {
 			return false
 		}
@@ -9952,30 +13980,28 @@ func (vm *VM) tryExecuteASCIIStringLoop(frame *Frame, target, jumpPosition int) 
 	if remaining > 1_000_000 {
 		remaining = 1_000_000
 	}
-	raw := make([]byte, 0, remaining)
-	for iterations := int64(0); iterations < remaining; iterations++ {
-		mod := counter % modulus
-		if mod < 0 {
-			mod += modulus
-		}
-		raw = append(raw, byte(base+mod))
-		if counter > math.MaxInt64-step {
+	if remaining > 0 {
+		if remaining > math.MaxInt64/step {
 			return false
 		}
-		counter += step
+		updatedCounter, ok := checkedIntegerAdd(counter, remaining*step)
+		if !ok {
+			return false
+		}
+		if _, handled := core.AppendASCIIBytePattern(stringValue, base, modulus, counter, step, remaining); !handled {
+			return false
+		}
+		counter = updatedCounter
 	}
-	if errValue := core.AppendASCIIBytes(stringValue, string(raw)); errValue != nil {
-		return false
-	}
-	updatedCounter := core.NewIntegerValue(counter)
-	vm.stack[frame.Bp+counterLocal+1] = updatedCounter
+	updatedCounterValue := core.NewIntegerValue(counter)
+	vm.stack[frame.Bp+counterLocal+1] = updatedCounterValue
 	if name, ok := vm.topLevelLocalName(frame, counterLocal); ok {
 		if binding := vm.topLevelBindingData(); binding != nil {
-			binding.Locals[name] = updatedCounter
+			binding.Locals[name] = updatedCounterValue
 		}
 	}
-	vm.updateCapturedBindingLocal(frame, counterLocal, updatedCounter)
-	vm.recordPoppedValue(updatedCounter)
+	vm.updateCapturedBindingLocal(frame, counterLocal, updatedCounterValue)
+	vm.recordPoppedValue(updatedCounterValue)
 	frame.WhileEnd = exitPosition
 	frame.BlockBreakAddr = exitPosition
 	if counter >= limit {
@@ -9986,24 +14012,1468 @@ func (vm *VM) tryExecuteASCIIStringLoop(frame *Frame, target, jumpPosition int) 
 	return true
 }
 
+// tryExecuteASCIIStringAppendLoop batches the strict loop shape
+// `while i < limit; string << "literal"; i += step; end`.  The body has no
+// observable operation other than appending an immutable literal and updating
+// the integer counter, so the builder can perform one checked write while the
+// VM commits the final local value.  Any dynamic receiver, encoding mismatch,
+// overflow, or method redefinition deopts before mutation.
+func (vm *VM) tryExecuteASCIIStringAppendLoop(frame *Frame, target, jumpPosition int) bool {
+	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" || !integerLoopOptimizationEnabled || vm.instructionLimit != 0 || DevMode ||
+		core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() || !core.IntegerPlusUsesBuiltinImplementation() || !core.IntegerLessThanUsesBuiltinImplementation() ||
+		target < 0 || jumpPosition <= target {
+		return false
+	}
+	counterLocal, limitLocal, exitPosition, position, literalLimit, ok := integerLoopHeader(frame, target, jumpPosition)
+	if !ok || position+2 >= jumpPosition || !isLocalLoadOpcode(compiler.Opcode(frame.Fn.Instructions[position])) {
+		return false
+	}
+	stringLocal, position, ok := loopLocalAt(frame.Fn.Instructions, position, jumpPosition)
+	if !ok || position+2 >= jumpPosition || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpConstant {
+		return false
+	}
+	constantIndex := int(frame.Fn.Instructions[position+1])<<8 | int(frame.Fn.Instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(frame.Fn.Constants) {
+		return false
+	}
+	literal := frame.Fn.Constants[constantIndex]
+	if literal == nil || literal.Type != object.ValueString || literal.Class != core.R.Classes["String"] {
+		return false
+	}
+	position += 3
+	operator := compiler.Opcode(frame.Fn.Instructions[position])
+	if operator != compiler.OpBitLeftShift && operator != compiler.OpAdd {
+		return false
+	}
+	if operator == compiler.OpBitLeftShift && !core.StringAppendUsesBuiltinImplementation() ||
+		operator == compiler.OpAdd && !core.StringPlusUsesBuiltinImplementation() {
+		return false
+	}
+	position++
+	if operator == compiler.OpBitLeftShift {
+		if position >= jumpPosition || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpPop {
+			return false
+		}
+		position++
+	} else {
+		if position+2 >= jumpPosition || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpSetLocal ||
+			int(frame.Fn.Instructions[position+1]) != stringLocal || compiler.Opcode(frame.Fn.Instructions[position+2]) != compiler.OpPop {
+			return false
+		}
+		position += 3
+	}
+	updateLocal, position, ok := loopLocalAt(frame.Fn.Instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(frame.Fn.Instructions[position]) != compiler.OpSetLocal ||
+		int(frame.Fn.Instructions[position+1]) != counterLocal || compiler.Opcode(frame.Fn.Instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	counterValue := vm.stack[frame.Bp+counterLocal+1]
+	stringValue := vm.stack[frame.Bp+stringLocal+1]
+	if counterValue == nil || stringValue == nil || stringLocal == counterLocal || !smallIntegerValue(counterValue) || stringValue.Type != object.ValueString || stringValue.Class != core.R.Classes["String"] ||
+		core.AttachedSingletonClass(stringValue) != nil || operator == compiler.OpBitLeftShift && stringValue.Frozen {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	limit := literalLimit
+	if limitLocal >= 0 {
+		limitValue := vm.stack[frame.Bp+limitLocal+1]
+		if limitValue == nil || !smallIntegerValue(limitValue) {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	remaining := int64(0)
+	if counter < limit {
+		distance := uint64(limit) - uint64(counter)
+		stepUnsigned := uint64(step)
+		quotient := distance / stepUnsigned
+		if quotient > uint64(math.MaxInt64) {
+			return false
+		}
+		remaining = int64(quotient)
+		if distance%stepUnsigned != 0 {
+			if remaining == math.MaxInt64 {
+				return false
+			}
+			remaining++
+		}
+	}
+	if remaining > 0 {
+		if step > 0 && remaining > math.MaxInt64/step {
+			return false
+		}
+		updatedCounter, ok := checkedIntegerAdd(counter, remaining*step)
+		if !ok {
+			return false
+		}
+		var result *object.EmeraldValue
+		var handled bool
+		if operator == compiler.OpBitLeftShift {
+			result, handled = core.AppendStringLiteralASCIIRepeated(stringValue, literal, remaining)
+		} else {
+			result, handled = core.ConcatStringLiteralASCIIRepeated(stringValue, literal, remaining)
+		}
+		if !handled || result == nil || result.Type == object.ValueException {
+			return false
+		}
+		if operator == compiler.OpAdd {
+			vm.stack[frame.Bp+stringLocal+1] = result
+			if name, ok := vm.topLevelLocalName(frame, stringLocal); ok {
+				if binding := vm.topLevelBindingData(); binding != nil {
+					binding.Locals[name] = result
+				}
+			}
+			vm.updateCapturedBindingLocal(frame, stringLocal, result)
+		}
+		counter = updatedCounter
+	}
+	updated := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(updated)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+// tryExecuteConstantNativeIntegerLoop recognizes the small but very common
+// loop shape `sum = sum + "literal".size; i = i + 1`.  The receiver and
+// zero-argument method are resolved once at the loop header; the body then
+// becomes a checked integer update instead of two stack sends on every
+// iteration.  The matcher is intentionally narrow: only a constant receiver,
+// a public direct-native size/length method, integer locals, and a positive
+// counter step are accepted.  Any guard miss leaves the original bytecode
+// path untouched, including Ruby method redefinition and BigInt overflow.
+func (vm *VM) tryExecuteConstantNativeIntegerLoop(frame *Frame, target, jumpPosition int) bool {
+	if vm == nil || frame == nil || frame.Fn == nil || !integerLoopOptimizationEnabled ||
+		vm.instructionLimit != 0 || core.AnyTracePointActive() || target < 0 ||
+		jumpPosition <= target || jumpPosition+2 >= len(frame.Fn.Instructions) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpAdd) {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	limitLocal := -1
+	limitConstant := int64(0)
+	if isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
+		limitLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	} else {
+		limitConstant, position, ok = loopIntegerConstantAt(frame, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	}
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return false
+	}
+	position += 3
+
+	sumLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || sumLocal == counterLocal {
+		return false
+	}
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+		return false
+	}
+	constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(frame.Fn.Constants) {
+		return false
+	}
+	receiver := frame.Fn.Constants[constantIndex]
+	if receiver == nil || (receiver.Type != object.ValueString && receiver.Type != object.ValueArray && receiver.Type != object.ValueHash) {
+		return false
+	}
+	position += 3
+	if position+5 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSend ||
+		instructions[position+3] != 0 || instructions[position+4] != 0 || instructions[position+5] != 255 {
+		return false
+	}
+	methodIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if methodIndex < 0 || methodIndex >= len(frame.Fn.Constants) {
+		return false
+	}
+	methodName, ok := frame.Fn.Constants[methodIndex].Data.(string)
+	if !ok || (methodName != "size" && methodName != "length") {
+		return false
+	}
+	position += 6
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != sumLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+		return false
+	}
+	position += 3
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+
+	if !vm.registerIRCacheableReceiverForMethod(receiver, methodName) {
+		return false
+	}
+	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, nil, false, false)
+	if fallback != nil || methodObj == nil || methodObj.Visibility == "undefined" {
+		return false
+	}
+	methodObj, methodOwner, ok = resolveVisibilityAliasMethod(methodName, methodObj, methodOwner)
+	if !ok || methodObj == nil {
+		return false
+	}
+	nativeFn := registerIRDirectNativeFn(methodObj, methodName)
+	if nativeFn == nil || methodOwner == nil || methodUsesRefinements(methodObj) {
+		return false
+	}
+	nativeResult := nativeFn(receiver)
+	if nativeResult == nil || nativeResult.Type != object.ValueInteger || !smallIntegerValue(nativeResult) {
+		return false
+	}
+	readLocal := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		if value == nil || value.Type != object.ValueInteger || !smallIntegerValue(value) {
+			return nil, false
+		}
+		if _, cell := value.Data.(*closureCell); cell {
+			return nil, false
+		}
+		return value, true
+	}
+	counterValue, ok := readLocal(counterLocal)
+	if !ok {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocal(limitLocal)
+		if !limitOK {
+			return false
+		}
+		limitConstant = limitValue.Data.(int64)
+	}
+	sumValue, ok := readLocal(sumLocal)
+	if !ok {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	limit := limitConstant
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations > math.MaxInt64 {
+		return false
+	}
+	iterationCount := int64(iterations)
+	delta, ok := checkedIntegerMul(nativeResult.Data.(int64), iterationCount)
+	if !ok {
+		return false
+	}
+	updatedSum, ok := checkedIntegerAdd(sumValue.Data.(int64), delta)
+	if !ok {
+		return false
+	}
+	counterDelta, ok := checkedIntegerMul(step, iterationCount)
+	if !ok {
+		return false
+	}
+	updatedCounter, ok := checkedIntegerAdd(counter, counterDelta)
+	if !ok {
+		return false
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, updatedSum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, updatedCounter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+func parseStaticIntegerLoopBody(frame *Frame, start, end int) ([]staticIntegerAssignment, bool) {
+	if frame == nil || frame.Fn == nil || start < 0 || start >= end || end > len(frame.Fn.Instructions) {
+		return nil, false
+	}
+	instructions := frame.Fn.Instructions
+	stack := make([]*staticIntegerExpression, 0, 8)
+	assignments := make([]staticIntegerAssignment, 0, 4)
+	for position := start; position < end; {
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
+			if position+1 >= end {
+				return nil, false
+			}
+			stack = append(stack, &staticIntegerExpression{local: int(instructions[position+1])})
+			position += 2
+		case compiler.OpConstant:
+			value, next, ok := loopIntegerConstantAt(frame, position, end)
+			if !ok {
+				return nil, false
+			}
+			stack = append(stack, &staticIntegerExpression{value: value, isConstant: true})
+			position = next
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
+			compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor:
+			if len(stack) < 2 {
+				return nil, false
+			}
+			right := stack[len(stack)-1]
+			left := stack[len(stack)-2]
+			stack = stack[:len(stack)-2]
+			stack = append(stack, &staticIntegerExpression{op: op, left: left, right: right})
+			position++
+		case compiler.OpNeg, compiler.OpNegate:
+			if len(stack) == 0 {
+				return nil, false
+			}
+			value := stack[len(stack)-1]
+			stack[len(stack)-1] = &staticIntegerExpression{op: op, left: value}
+			position++
+		case compiler.OpSetLocal:
+			if len(stack) == 0 || position+2 >= end {
+				return nil, false
+			}
+			local := int(instructions[position+1])
+			if compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+				return nil, false
+			}
+			assignments = append(assignments, staticIntegerAssignment{local: local, expr: stack[len(stack)-1]})
+			stack = stack[:len(stack)-1]
+			position += 3
+		default:
+			return nil, false
+		}
+	}
+	return assignments, len(stack) == 0 && len(assignments) > 0
+}
+
+func staticIntegerLocalExpression(expr *staticIntegerExpression, local int) bool {
+	return expr != nil && !expr.isConstant && expr.left == nil && expr.right == nil && expr.local == local
+}
+
+func staticIntegerConstantExpression(expr *staticIntegerExpression) (int64, bool) {
+	if expr == nil || !expr.isConstant || expr.left != nil || expr.right != nil {
+		return 0, false
+	}
+	return expr.value, true
+}
+
+func staticIntegerIncrementExpression(expr *staticIntegerExpression, local int) (int64, bool) {
+	if expr == nil || expr.op != compiler.OpAdd || !staticIntegerLocalExpression(expr.left, local) {
+		return 0, false
+	}
+	step, ok := staticIntegerConstantExpression(expr.right)
+	return step, ok && step > 0
+}
+
+func staticIntegerModularRecurrenceExpression(expr *staticIntegerExpression, stateLocal int) (factor, offset, modulus int64, ok bool) {
+	if expr == nil || expr.op != compiler.OpMod || expr.left == nil || expr.right == nil {
+		return 0, 0, 0, false
+	}
+	modulus, ok = staticIntegerConstantExpression(expr.right)
+	if !ok || modulus <= 0 || expr.left.op != compiler.OpAdd || expr.left.left == nil || expr.left.right == nil {
+		return 0, 0, 0, false
+	}
+	term := expr.left.left
+	if term.op != compiler.OpMul || term.left == nil || term.right == nil ||
+		!staticIntegerLocalExpression(term.left, stateLocal) {
+		return 0, 0, 0, false
+	}
+	factor, ok = staticIntegerConstantExpression(term.right)
+	if !ok || factor < 0 {
+		return 0, 0, 0, false
+	}
+	offset, ok = staticIntegerConstantExpression(expr.left.right)
+	if !ok || offset < 0 {
+		return 0, 0, 0, false
+	}
+	return factor, offset, modulus, true
+}
+
+func staticIntegerSumExpression(expr *staticIntegerExpression, sumLocal, counterLocal int) (factor, offset int64, hasFactor, offsetAfterSum, ok bool) {
+	if expr == nil || expr.op != compiler.OpAdd || !staticIntegerLocalExpression(expr.left, sumLocal) {
+		if expr == nil || expr.op != compiler.OpAdd {
+			return 0, 0, false, false, false
+		}
+		outerOffset, outerOK := staticIntegerConstantExpression(expr.right)
+		if !outerOK || expr.left == nil || expr.left.op != compiler.OpAdd || !staticIntegerLocalExpression(expr.left.left, sumLocal) {
+			return 0, 0, false, false, false
+		}
+		term := expr.left.right
+		if staticIntegerLocalExpression(term, counterLocal) {
+			return 1, outerOffset, false, true, true
+		}
+		if term != nil && term.op == compiler.OpMul && staticIntegerLocalExpression(term.left, counterLocal) {
+			factor, factorOK := staticIntegerConstantExpression(term.right)
+			return factor, outerOffset, factorOK, true, factorOK
+		}
+		return 0, 0, false, false, false
+	}
+	term := expr.right
+	if value, constantOK := staticIntegerConstantExpression(term); constantOK {
+		// Represent `sum = sum + constant` as an affine term with a zero
+		// counter factor.  Keeping hasFactor=true distinguishes this from
+		// the implicit factor-one `sum += counter` form below and lets the
+		// closed-form path multiply the constant by the iteration count.
+		return 0, value, true, false, true
+	}
+	if staticIntegerLocalExpression(term, counterLocal) {
+		return 1, 0, false, false, true
+	}
+	if term == nil || term.op != compiler.OpMul || !staticIntegerLocalExpression(term.left, counterLocal) {
+		if term != nil && term.op == compiler.OpAdd && staticIntegerLocalExpression(term.left, counterLocal) {
+			value, constantOK := staticIntegerConstantExpression(term.right)
+			return 1, value, false, false, constantOK
+		}
+		return 0, 0, false, false, false
+	}
+	factor, factorOK := staticIntegerConstantExpression(term.right)
+	if !factorOK {
+		return 0, 0, false, false, false
+	}
+	return factor, 0, true, false, true
+}
+
+func (vm *VM) tryExecuteStaticIntegerArithmeticLoop(frame *Frame, target, jumpPosition int) bool {
+	if !integerLoopOptimizationEnabled || vm == nil || frame == nil || frame.Fn == nil || vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		target < 0 || jumpPosition <= target || jumpPosition+2 >= len(frame.Fn.Instructions) {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	limitLocal := -1
+	limit := int64(0)
+	if isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
+		limitLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	} else {
+		limit, position, ok = loopIntegerConstantAt(frame, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	}
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return false
+	}
+	bodyStart := position + 3
+	assignments, ok := parseStaticIntegerLoopBody(frame, bodyStart, jumpPosition)
+	if !ok || len(assignments) != 2 || assignments[1].local != counterLocal {
+		return false
+	}
+	if limitLocal >= 0 {
+		for _, assignment := range assignments {
+			if assignment.local == limitLocal {
+				return false
+			}
+		}
+	}
+	step, ok := staticIntegerIncrementExpression(assignments[1].expr, counterLocal)
+	if !ok || assignments[0].local == counterLocal {
+		return false
+	}
+	factor, offset, hasFactor, offsetAfterSum, ok := staticIntegerSumExpression(assignments[0].expr, assignments[0].local, counterLocal)
+	if !ok {
+		return false
+	}
+	readLocalValue := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		if value == nil || value.Type != object.ValueInteger || value.BigIntValue() != nil {
+			return nil, false
+		}
+		if _, cell := value.Data.(*closureCell); cell {
+			return nil, false
+		}
+		return value, true
+	}
+	counterValue, ok := readLocalValue(counterLocal)
+	if !ok {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocalValue(limitLocal)
+		if !limitOK {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	counter := counterValue.Data.(int64)
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+	if factor, offset, modulus, recurrenceOK := staticIntegerModularRecurrenceExpression(assignments[0].expr, assignments[0].local); recurrenceOK {
+		stateValue, stateOK := readLocalValue(assignments[0].local)
+		if stateOK {
+			var recurrenceLocals [256]int64
+			recurrenceLocals[assignments[0].local] = stateValue.Data.(int64)
+			recurrenceLocals[counterLocal] = counter
+			recurrenceSteps := []integerLoopStep{
+				{op: compiler.OpGetLocal, local: assignments[0].local},
+				{op: compiler.OpConstant, value: factor},
+				{op: compiler.OpMul},
+				{op: compiler.OpConstant, value: offset},
+				{op: compiler.OpAdd},
+				{op: compiler.OpConstant, value: modulus},
+				{op: compiler.OpMod},
+				{op: compiler.OpSetLocal, local: assignments[0].local},
+				{op: compiler.OpPop},
+				{op: compiler.OpGetLocal, local: counterLocal},
+				{op: compiler.OpConstant, value: step},
+				{op: compiler.OpAdd},
+				{op: compiler.OpSetLocal, local: counterLocal},
+				{op: compiler.OpPop},
+			}
+			if vm.tryExecuteModularRecurrenceLoop(frame, exitPosition, counterLocal, limit, recurrenceSteps, recurrenceLocals) {
+				return true
+			}
+		}
+	}
+	sumValue, ok := readLocalValue(assignments[0].local)
+	if !ok || !vm.fusedIntegerOperationAvailable(compiler.OpAdd) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpLessThan) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpMul) && hasFactor {
+		return false
+	}
+	sum := sumValue.Data.(int64)
+	// For a non-negative, monotonic series every intermediate term and partial
+	// sum is bounded by the final value.  In that narrow proven shape we can
+	// replace the per-iteration interpreter with a checked arithmetic-series
+	// calculation.  Any negative input/term or checked-overflow possibility
+	// leaves the existing loop below responsible for Ruby's exact fallback.
+	effectiveFactor := int64(1)
+	if hasFactor {
+		effectiveFactor = factor
+	}
+	if counter >= 0 && sum >= 0 && step > 0 && effectiveFactor >= 0 && offset >= 0 {
+		distance := uint64(limit) - uint64(counter)
+		stepUnsigned := uint64(step)
+		iterations := distance / stepUnsigned
+		if distance%stepUnsigned != 0 {
+			iterations++
+		}
+		if iterations <= math.MaxInt64 {
+			count := int64(iterations)
+			triangular, seriesOK := integerTriangular(count - 1)
+			counterDelta, counterOK := checkedIntegerMul(step, count)
+			finalCounter, finalCounterOK := checkedIntegerAdd(counter, counterDelta)
+			counterSeries, counterSeriesOK := checkedIntegerMul(count, counter)
+			if seriesOK && counterOK && finalCounterOK && counterSeriesOK {
+				stepSeries, stepSeriesOK := checkedIntegerMul(step, triangular)
+				counterSeriesWithStep, counterSeriesWithStepOK := checkedIntegerAdd(counterSeries, stepSeries)
+				weightedSeries, weightedSeriesOK := checkedIntegerMul(counterSeriesWithStep, effectiveFactor)
+				offsetSeries, offsetSeriesOK := checkedIntegerMul(count, offset)
+				termSeries, termSeriesOK := checkedIntegerAdd(weightedSeries, offsetSeries)
+				finalSum, finalSumOK := checkedIntegerAdd(sum, termSeries)
+				if stepSeriesOK && counterSeriesWithStepOK && weightedSeriesOK && termSeriesOK && offsetSeriesOK && finalSumOK {
+					vm.commitIntegerLoopLocal(frame, assignments[0].local, finalSum)
+					last := vm.commitIntegerLoopLocal(frame, counterLocal, finalCounter)
+					vm.recordPoppedValue(last)
+					frame.WhileEnd = exitPosition
+					frame.BlockBreakAddr = exitPosition
+					frame.Ip = exitPosition - 1
+					return true
+				}
+			}
+		}
+	}
+	for counter < limit {
+		term := counter
+		if hasFactor {
+			term, ok = applyIntegerBinary(compiler.OpMul, counter, factor)
+			if !ok {
+				return false
+			}
+		}
+		if !offsetAfterSum && offset != 0 {
+			term, ok = applyIntegerBinary(compiler.OpAdd, term, offset)
+			if !ok {
+				return false
+			}
+		}
+		sum, ok = applyIntegerBinary(compiler.OpAdd, sum, term)
+		if !ok {
+			return false
+		}
+		if offsetAfterSum && offset != 0 {
+			sum, ok = applyIntegerBinary(compiler.OpAdd, sum, offset)
+			if !ok {
+				return false
+			}
+		}
+		counter, ok = applyIntegerBinary(compiler.OpAdd, counter, step)
+		if !ok {
+			return false
+		}
+	}
+	vm.commitIntegerLoopLocal(frame, assignments[0].local, sum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+// tryExecuteConstantKeywordIntegerLoop recognizes a deliberately narrow
+// top-level loop whose body adds the result of one fixed keyword call:
+//
+//	sum += receiver.value(flag: 1)
+//	i += 1
+//
+// The keyword hash and method dispatch are validated once at the loop header.
+// The callee must be a pure, no-send keyword method whose result is therefore
+// constant for the fixed keyword value.  After the guard, the loop is reduced
+// to checked int64 arithmetic (including a closed-form repeated addition).
+// Any shape, generation, visibility, singleton, refinement, keyword, or
+// overflow miss returns false before mutating the Ruby frame, preserving the
+// ordinary interpreter's complete dynamic semantics.
+func (vm *VM) tryExecuteConstantKeywordIntegerLoop(frame *Frame, target, jumpPosition int) bool {
+	if vm == nil || frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+		!integerLoopOptimizationEnabled || !registerIRKeywordSendCacheEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpAdd) || target < 0 ||
+		jumpPosition <= target || jumpPosition+2 >= len(frame.Fn.Instructions) {
+		return false
+	}
+	instructions := frame.Fn.Instructions
+	position := target
+	counterLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok {
+		return false
+	}
+	limitLocal := -1
+	limit := int64(0)
+	if isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
+		limitLocal, position, ok = loopLocalAt(instructions, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	} else {
+		limit, position, ok = loopIntegerConstantAt(frame, position, jumpPosition)
+		if !ok {
+			return false
+		}
+	}
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpLessThan {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpJumpNotTruthy {
+		return false
+	}
+	exitPosition := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 3
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetWhileEnd ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != exitPosition {
+		return false
+	}
+	position += 3
+
+	sumLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || sumLocal == counterLocal {
+		return false
+	}
+	receiverLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || receiverLocal == counterLocal || receiverLocal == sumLocal {
+		return false
+	}
+	readConstant := func(position int) (*object.EmeraldValue, int, bool) {
+		if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return nil, position, false
+		}
+		index := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if index < 0 || index >= len(frame.Fn.Constants) || frame.Fn.Constants[index] == nil {
+			return nil, position, false
+		}
+		return frame.Fn.Constants[index], position + 3, true
+	}
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpHash ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != 0 {
+		return false
+	}
+	position += 3
+	keywordValue, position, ok := readConstant(position)
+	if !ok || !smallIntegerValue(keywordValue) {
+		return false
+	}
+	keywordKey, position, ok := readConstant(position)
+	if !ok || keywordKey.Type != object.ValueSymbol {
+		return false
+	}
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpHash ||
+		int(instructions[position+1])<<8|int(instructions[position+2]) != 1 {
+		return false
+	}
+	position += 3
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpHashMerge {
+		return false
+	}
+	position++
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpMarkKeywordHash {
+		return false
+	}
+	position++
+	if position+5 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSendWithKeywords ||
+		instructions[position+3] != 0 || instructions[position+4] != 1 || instructions[position+5] != 255 {
+		return false
+	}
+	methodIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+	if methodIndex < 0 || methodIndex >= len(frame.Fn.Constants) {
+		return false
+	}
+	methodName, ok := frame.Fn.Constants[methodIndex].Data.(string)
+	if !ok || methodName == "" {
+		return false
+	}
+	position += 6
+	if position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != sumLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop {
+		return false
+	}
+	position += 3
+	updateLocal, position, ok := loopLocalAt(instructions, position, jumpPosition)
+	if !ok || updateLocal != counterLocal {
+		return false
+	}
+	step, position, ok := loopIntegerConstantAt(frame, position, jumpPosition)
+	if !ok || step <= 0 || position >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return false
+	}
+	position++
+	if position+2 >= jumpPosition || compiler.Opcode(instructions[position]) != compiler.OpSetLocal ||
+		int(instructions[position+1]) != counterLocal || compiler.Opcode(instructions[position+2]) != compiler.OpPop ||
+		position+3 != jumpPosition {
+		return false
+	}
+	if keywordKey.Data == nil {
+		return false
+	}
+	keywordName, ok := keywordKey.Data.(string)
+	if !ok {
+		return false
+	}
+
+	readLocal := func(local int) (*object.EmeraldValue, bool) {
+		index := frame.Bp + local + 1
+		if index < 0 || index >= len(vm.stack) {
+			return nil, false
+		}
+		value := vm.stack[index]
+		return value, value != nil
+	}
+	counterValue, ok := readLocal(counterLocal)
+	if !ok || !smallIntegerValue(counterValue) {
+		return false
+	}
+	if limitLocal >= 0 {
+		limitValue, limitOK := readLocal(limitLocal)
+		if !limitOK || !smallIntegerValue(limitValue) {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
+	sumValue, ok := readLocal(sumLocal)
+	if !ok || !smallIntegerValue(sumValue) {
+		return false
+	}
+	receiver, ok := readLocal(receiverLocal)
+	if !ok || receiver == nil || !vm.registerIRCacheableReceiverForMethod(receiver, methodName) {
+		return false
+	}
+	counter := counterValue.Data.(int64)
+	if counter >= limit {
+		frame.WhileEnd = exitPosition
+		frame.BlockBreakAddr = exitPosition
+		frame.Ip = exitPosition - 1
+		return true
+	}
+
+	methodObj, methodOwner, fallback := vm.lookupMethodForSend(receiver, methodName, nil, false, false)
+	if fallback != nil || methodObj == nil || methodObj.DispatchOwner != nil ||
+		(methodObj.Visibility != "" && methodObj.Visibility != "public") || methodUsesRefinements(methodObj) {
+		return false
+	}
+	methodObj, methodOwner, ok = resolveVisibilityAliasMethod(methodName, methodObj, methodOwner)
+	if !ok || methodObj == nil {
+		return false
+	}
+	fn, ok := methodObj.Fn.(*object.Function)
+	if !ok || len(fn.Params) != 0 || len(fn.KeywordParams) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.RejectKeywords || !simpleBlockParameterPatterns(fn) ||
+		len(fn.ParamDefaults) > 0 && fn.ParamDefaults[0] != nil || fn.KeywordParams[0].Name != keywordName ||
+		fn.KeywordParams[0].HasDefault {
+		return false
+	}
+	plan, found := vm.cachedKeywordMethodNoSendPlan(fn)
+	if !found || plan == nil {
+		return false
+	}
+	for _, instruction := range plan.instructions {
+		switch instruction.op {
+		case registerIRLoadLocal, registerIRLoadLiteral, registerIRMove, registerIRSwap, registerIRReturn:
+		case registerIRBinary:
+			if !vm.fusedIntegerOperationAvailable(instruction.opcode) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	keywordHash := &object.EmeraldValue{
+		Type:  object.ValueHash,
+		Data:  map[*object.EmeraldValue]*object.EmeraldValue{keywordKey: keywordValue},
+		Class: core.R.Classes["Hash"],
+	}
+	core.MarkRuby2KeywordHash(keywordHash)
+	callResult, executed := vm.executeKeywordMethodNoSendFast(methodObj, receiver, []*object.EmeraldValue{keywordHash})
+	if !executed || !smallIntegerValue(callResult) {
+		return false
+	}
+	constantResult := callResult.Data.(int64)
+	countDistance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := countDistance / stepUnsigned
+	if countDistance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations > math.MaxInt64 {
+		return false
+	}
+	count := int64(iterations)
+	delta, ok := checkedIntegerMul(constantResult, count)
+	if !ok {
+		return false
+	}
+	updatedSum, ok := checkedIntegerAdd(sumValue.Data.(int64), delta)
+	if !ok {
+		return false
+	}
+	counterDelta, ok := checkedIntegerMul(step, count)
+	if !ok {
+		return false
+	}
+	updatedCounter, ok := checkedIntegerAdd(counter, counterDelta)
+	if !ok {
+		return false
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, updatedSum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, updatedCounter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+func (vm *VM) tryExecuteAffineIntegerFunctionLoop(frame *Frame, target, jumpPosition, exitPosition, counterLocal int, limit int64, steps []integerLoopStep, locals [256]int64) bool {
+	if vm == nil || frame == nil || !integerLoopCachedFunctionPlanEnabled || len(steps) < 8 {
+		return false
+	}
+	// The stack shape is the compiler's canonical `sum += value(counter)`
+	// assignment.  A bare call has Self before its single integer argument;
+	// receiver calls and additional sends intentionally stay on the general
+	// typed loop path.
+	position := 0
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	sumLocal := steps[position].local
+	position++
+	if steps[position].op != compiler.OpSelf {
+		return false
+	}
+	position++
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	argumentLocal := steps[position].local
+	position++
+	if argumentLocal != counterLocal || steps[position].op != compiler.OpSend || steps[position].argc != 1 || steps[position].fn == nil || steps[position].plan == nil {
+		return false
+	}
+	callee := steps[position]
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != sumLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop {
+		return false
+	}
+	position++
+	if position+5 != len(steps) || !isLocalLoadOpcode(steps[position].op) || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant || steps[position].value <= 0 {
+		return false
+	}
+	step := steps[position].value
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop {
+		return false
+	}
+	if sumLocal == counterLocal || callee.plan == nil {
+		return false
+	}
+	factor, offset, ok := affineIntegerFunctionPlan(callee.plan)
+	if !ok {
+		return false
+	}
+	for _, step := range callee.plan.steps {
+		switch step.op {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul:
+			if !vm.fusedIntegerOperationAvailable(step.op) {
+				return false
+			}
+		}
+	}
+	counter := locals[counterLocal]
+	sum := locals[sumLocal]
+	if counter >= limit {
+		return false
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations <= 0 || iterations > math.MaxInt64 {
+		return false
+	}
+	count := int64(iterations)
+	counterDelta, ok := checkedIntegerMul(step, count)
+	if !ok {
+		return false
+	}
+	updatedCounter, ok := checkedIntegerAdd(counter, counterDelta)
+	if !ok {
+		return false
+	}
+	lastOffset, ok := checkedIntegerSub(count, 1)
+	if !ok {
+		return false
+	}
+	lastStep, ok := checkedIntegerMul(step, lastOffset)
+	if !ok {
+		return false
+	}
+	lastCounter, ok := checkedIntegerAdd(counter, lastStep)
+	if !ok {
+		return false
+	}
+	firstResult, ok := vm.executeCachedIntegerFunctionPlan(callee.fn, callee.plan, []int64{counter})
+	if !ok {
+		return false
+	}
+	lastResult, ok := vm.executeCachedIntegerFunctionPlan(callee.fn, callee.plan, []int64{lastCounter})
+	if !ok {
+		return false
+	}
+	firstProduct, ok := checkedIntegerMul(factor, counter)
+	if !ok {
+		return false
+	}
+	firstAffine, ok := checkedIntegerAdd(firstProduct, offset)
+	if !ok || firstAffine != firstResult {
+		return false
+	}
+	lastProduct, ok := checkedIntegerMul(factor, lastCounter)
+	if !ok {
+		return false
+	}
+	lastAffine, ok := checkedIntegerAdd(lastProduct, offset)
+	if !ok || lastAffine != lastResult {
+		return false
+	}
+	triangular, ok := integerTriangular(count - 1)
+	if !ok {
+		return false
+	}
+	base, ok := checkedIntegerMul(count, firstResult)
+	if !ok {
+		return false
+	}
+	slope, ok := checkedIntegerMul(factor, step)
+	if !ok {
+		return false
+	}
+	slopeSeries, ok := checkedIntegerMul(slope, triangular)
+	if !ok {
+		return false
+	}
+	delta, ok := checkedIntegerAdd(base, slopeSeries)
+	if !ok {
+		return false
+	}
+	updatedSum, ok := checkedIntegerAdd(sum, delta)
+	if !ok {
+		return false
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, updatedSum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, updatedCounter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+// tryExecuteIntegerBitMixLoop lowers the common dispatch-style loop
+// `sum = (sum + bit_mix(counter)) & mask`. The callee has already been
+// admitted as the exact raw-int bit-mix kernel by the bytecode loop parser;
+// this tier removes the remaining per-iteration stack and opcode switches.
+// Any overflow or method-generation change leaves the original locals
+// untouched and lets the ordinary loop executor replay the body.
+func (vm *VM) tryExecuteIntegerBitMixLoop(frame *Frame, exitPosition, counterLocal int, limit int64, steps []integerLoopStep, locals [256]int64) bool {
+	if vm == nil || frame == nil || !integerFunctionKernelEnabled || len(steps) < 14 ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpAdd) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpBitAnd) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpLessThan) {
+		return false
+	}
+	position := 0
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	sumLocal := steps[position].local
+	if sumLocal == counterLocal {
+		return false
+	}
+	position++
+	if position >= len(steps) || steps[position].op != compiler.OpSelf {
+		return false
+	}
+	position++
+	if position >= len(steps) || !isLocalLoadOpcode(steps[position].op) || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if position >= len(steps) || steps[position].op != compiler.OpSend ||
+		steps[position].argc != 1 || steps[position].integerKernel.kind != integerFunctionKernelBitMix {
+		return false
+	}
+	callee := steps[position]
+	position++
+	if position+10 != len(steps) || steps[position].op != compiler.OpAdd ||
+		steps[position+1].op != compiler.OpConstant ||
+		steps[position+2].op != compiler.OpBitAnd ||
+		steps[position+3].op != compiler.OpSetLocal || steps[position+3].local != sumLocal ||
+		steps[position+4].op != compiler.OpPop ||
+		!isLocalLoadOpcode(steps[position+5].op) || steps[position+5].local != counterLocal ||
+		steps[position+6].op != compiler.OpConstant || steps[position+6].value <= 0 ||
+		steps[position+7].op != compiler.OpAdd ||
+		steps[position+8].op != compiler.OpSetLocal || steps[position+8].local != counterLocal ||
+		steps[position+9].op != compiler.OpPop {
+		return false
+	}
+	if callee.integerGeneration != object.CurrentMethodGeneration() {
+		return false
+	}
+	mask := steps[position+1].value
+	step := steps[position+6].value
+	counter := locals[counterLocal]
+	sum := locals[sumLocal]
+	if counter >= limit {
+		return false
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(step)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations == 0 || iterations > 1_000_000 || iterations > uint64(math.MaxInt64) {
+		return false
+	}
+	count := int64(iterations)
+	counterDelta, ok := checkedIntegerMul(step, count)
+	if !ok {
+		return false
+	}
+	updatedCounter, ok := checkedIntegerAdd(counter, counterDelta)
+	if !ok {
+		return false
+	}
+	lastOffset := count - 1
+	lastDelta, ok := checkedIntegerMul(step, lastOffset)
+	if !ok {
+		return false
+	}
+	lastCounter, ok := checkedIntegerAdd(counter, lastDelta)
+	if !ok {
+		return false
+	}
+	if _, ok = checkedIntegerMul(counter, callee.integerKernel.multiply); !ok {
+		return false
+	}
+	if _, ok = checkedIntegerMul(lastCounter, callee.integerKernel.multiply); !ok {
+		return false
+	}
+	if integerBitMixRawLoopEnabled && integerBitMixRawLoopSafe(callee.integerKernel, mask, sum, counter) {
+		// The endpoint product checks above prove every monotonic non-negative
+		// counter product is Fixnum-safe. The mask proof bounds both operands of
+		// the accumulator add, so this loop needs no per-iteration overflow or
+		// generation branch while it executes only raw arithmetic.
+		for counter < limit {
+			value := executeIntegerFunctionKernelUnchecked(callee.integerKernel, counter)
+			sum = (sum + value) & mask
+			counter += step
+		}
+		if callee.integerGeneration != object.CurrentMethodGeneration() {
+			return false
+		}
+	} else {
+		for iterations := 0; counter < limit; iterations++ {
+			if callee.integerGeneration != object.CurrentMethodGeneration() {
+				return false
+			}
+			value := executeIntegerFunctionKernelUnchecked(callee.integerKernel, counter)
+			sum, ok = checkedIntegerAdd(sum, value)
+			if !ok {
+				return false
+			}
+			sum &= mask
+			counter, ok = checkedIntegerAdd(counter, step)
+			if !ok {
+				return false
+			}
+		}
+	}
+	if counter != updatedCounter {
+		return false
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, sum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+func integerBitMixRawLoopSafe(kernel integerFunctionKernel, mask, sum, counter int64) bool {
+	if !integerBitMixRawLoopEnabled || kernel.kind != integerFunctionKernelBitMix ||
+		mask < 0 || kernel.mask < 0 || sum < 0 || sum > mask || counter < 0 || kernel.multiply < 0 {
+		return false
+	}
+	return kernel.mask <= math.MaxInt64-mask
+}
+
+// mulModInt64 multiplies two residues without overflowing an int64. The
+// recurrence tier only admits a positive modulus <= MaxInt64, so the high
+// half of the uint64 product is smaller than the divisor required by
+// bits.Div64.
+func mulModInt64(left, right, modulus int64) (int64, bool) {
+	if modulus <= 0 || left < 0 || left >= modulus || right < 0 || right >= modulus {
+		return 0, false
+	}
+	high, low := bits.Mul64(uint64(left), uint64(right))
+	_, remainder := bits.Div64(high, low, uint64(modulus))
+	return int64(remainder), true
+}
+
+func addModInt64(left, right, modulus int64) int64 {
+	return int64((uint64(left) + uint64(right)) % uint64(modulus))
+}
+
+// composeModAffine returns outer(inner(x)) for transforms of the form
+// (factor*x + offset) % modulus. All fields are normalized residues.
+func composeModAffine(outerFactor, outerOffset, innerFactor, innerOffset, modulus int64) (int64, int64, bool) {
+	factor, ok := mulModInt64(outerFactor, innerFactor, modulus)
+	if !ok {
+		return 0, 0, false
+	}
+	product, ok := mulModInt64(outerFactor, innerOffset, modulus)
+	if !ok {
+		return 0, 0, false
+	}
+	return factor, addModInt64(product, outerOffset, modulus), true
+}
+
+// tryExecuteModularRecurrenceLoop collapses a strict loop containing only
+// `state = (state * factor + offset) % modulus` and a positive counter
+// increment. The one-step expression is admitted only when every int64
+// intermediate is proven safe; modular exponentiation then computes the
+// same exact Ruby integer result in O(log iterations) time.
+func (vm *VM) tryExecuteModularRecurrenceLoop(frame *Frame, exitPosition, counterLocal int, limit int64, steps []integerLoopStep, locals [256]int64) bool {
+	if vm == nil || frame == nil || len(steps) < 14 ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpAdd) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpMul) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpMod) ||
+		!vm.fusedIntegerOperationAvailable(compiler.OpLessThan) {
+		return false
+	}
+	position := 0
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	stateLocal := steps[position].local
+	if stateLocal == counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant {
+		return false
+	}
+	factor := steps[position].value
+	position++
+	if steps[position].op != compiler.OpMul {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant {
+		return false
+	}
+	offset := steps[position].value
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant {
+		return false
+	}
+	modulus := steps[position].value
+	position++
+	if steps[position].op != compiler.OpMod {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != stateLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop {
+		return false
+	}
+	position++
+	if position+5 != len(steps) || !isLocalLoadOpcode(steps[position].op) || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant || steps[position].value <= 0 {
+		return false
+	}
+	counterStep := steps[position].value
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop {
+		return false
+	}
+	if modulus <= 0 || factor < 0 || offset < 0 {
+		return false
+	}
+	state := locals[stateLocal]
+	counter := locals[counterLocal]
+	if state < 0 || state >= modulus || counter >= limit {
+		return false
+	}
+	// Prove the original Ruby operations stay Fixnum-sized on every pass.
+	product, ok := checkedIntegerMul(modulus-1, factor)
+	if !ok {
+		return false
+	}
+	if _, ok = checkedIntegerAdd(product, offset); !ok {
+		return false
+	}
+	distance := uint64(limit) - uint64(counter)
+	stepUnsigned := uint64(counterStep)
+	iterations := distance / stepUnsigned
+	if distance%stepUnsigned != 0 {
+		iterations++
+	}
+	if iterations == 0 || iterations > math.MaxInt64 {
+		return false
+	}
+	count := int64(iterations)
+	counterDelta, ok := checkedIntegerMul(counterStep, count)
+	if !ok {
+		return false
+	}
+	updatedCounter, ok := checkedIntegerAdd(counter, counterDelta)
+	if !ok {
+		return false
+	}
+	// Normalize the one-step transform and exponentiate it by squaring.
+	baseFactor := factor % modulus
+	baseOffset := offset % modulus
+	resultFactor := int64(1 % modulus)
+	resultOffset := int64(0)
+	remaining := uint64(iterations)
+	for remaining > 0 {
+		if remaining&1 != 0 {
+			resultFactor, resultOffset, ok = composeModAffine(baseFactor, baseOffset, resultFactor, resultOffset, modulus)
+			if !ok {
+				return false
+			}
+		}
+		remaining >>= 1
+		if remaining > 0 {
+			baseFactor, baseOffset, ok = composeModAffine(baseFactor, baseOffset, baseFactor, baseOffset, modulus)
+			if !ok {
+				return false
+			}
+		}
+	}
+	stateProduct, ok := mulModInt64(resultFactor, state, modulus)
+	if !ok {
+		return false
+	}
+	updatedState := addModInt64(stateProduct, resultOffset, modulus)
+	vm.commitIntegerLoopLocal(frame, stateLocal, updatedState)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, updatedCounter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
 func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition int) bool {
-	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__main__" ||
+	if frame != nil && frame.integerLoopDisabled != nil && frame.integerLoopDisabled[target] {
+		return false
+	}
+	if vm.tryExecuteIntegerBytecodeLoopPlan(frame, target, jumpPosition) {
+		return true
+	}
+	if frame != nil {
+		if frame.integerLoopDisabled == nil {
+			frame.integerLoopDisabled = make(map[int]bool)
+		}
+		frame.integerLoopDisabled[target] = true
+	}
+	return false
+}
+
+func (vm *VM) tryExecuteIntegerBytecodeLoopPlan(frame *Frame, target, jumpPosition int) bool {
+	if !integerLoopOptimizationEnabled || frame == nil || frame.Fn == nil ||
 		vm.instructionLimit != 0 || core.AnyTracePointActive() ||
 		target < 0 || target+11 >= jumpPosition || jumpPosition+2 >= len(frame.Fn.Instructions) {
 		return false
 	}
 	instructions := frame.Fn.Instructions
 	position := target
-	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
+	if !isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
 		return false
 	}
 	counterLocal := int(instructions[position+1])
 	position += 2
-	if compiler.Opcode(instructions[position]) != compiler.OpGetLocal {
-		return false
+	limitLocal := -1
+	limitConstant := int64(0)
+	if isLocalLoadOpcode(compiler.Opcode(instructions[position])) {
+		limitLocal = int(instructions[position+1])
+		position += 2
+	} else {
+		// A constant upper bound is the common form emitted for scripts such as
+		// `while i < 5_000_000`.  Treat it as immutable compiled input instead of
+		// requiring callers to first copy it into a Ruby local slot.  The value is
+		// still checked for a small Integer representation below; non-integer and
+		// bignum bounds deopt to the ordinary VM before any loop body executes.
+		if compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return false
+		}
+		var limitOK bool
+		limitConstant, position, limitOK = loopIntegerConstantAt(frame, position, jumpPosition)
+		if !limitOK {
+			return false
+		}
 	}
-	limitLocal := int(instructions[position+1])
-	position += 2
 	if compiler.Opcode(instructions[position]) != compiler.OpLessThan {
 		return false
 	}
@@ -10024,21 +15494,43 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 
 	steps := make([]integerLoopStep, 0, 24)
 	var used [256]bool
-	used[counterLocal], used[limitLocal] = true, true
+	used[counterLocal] = true
+	if limitLocal >= 0 {
+		used[limitLocal] = true
+	}
 	var stackKinds [32]bool
+	var stackReceiverLocals [32]int
+	for index := range stackReceiverLocals {
+		stackReceiverLocals[index] = -2
+	}
 	stackDepth := 0
 	receiver := vm.stack[frame.Bp]
 	for position < jumpPosition {
 		op := compiler.Opcode(instructions[position])
-		step := integerLoopStep{op: op}
+		step := integerLoopStep{op: op, receiverLocal: -2}
 		switch op {
-		case compiler.OpGetLocal:
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
 			if position+1 >= jumpPosition || stackDepth >= len(stackKinds) {
 				return false
 			}
 			step.local = int(instructions[position+1])
-			used[step.local] = true
-			stackKinds[stackDepth] = false
+			localValue := (*object.EmeraldValue)(nil)
+			localIndex := frame.Bp + step.local + 1
+			if localIndex >= 0 && localIndex < len(vm.stack) {
+				localValue = derefClosureValue(vm.stack[localIndex])
+			}
+			if localValue != nil && localValue.Type != object.ValueInteger {
+				// A non-integer local can only participate as the receiver of
+				// a proven pure integer method.  Do not add it to `used`: the
+				// final commit path is intentionally integer-only.
+				step.receiverLocal = step.local
+				stackKinds[stackDepth] = true
+				stackReceiverLocals[stackDepth] = step.local
+			} else {
+				used[step.local] = true
+				stackKinds[stackDepth] = false
+				stackReceiverLocals[stackDepth] = -2
+			}
 			stackDepth++
 			position += 2
 		case compiler.OpConstant:
@@ -10058,6 +15550,7 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 			}
 			step.value = value.Data.(int64)
 			stackKinds[stackDepth] = false
+			stackReceiverLocals[stackDepth] = -2
 			stackDepth++
 			position += 3
 		case compiler.OpSelf:
@@ -10065,13 +15558,24 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 				return false
 			}
 			stackKinds[stackDepth] = true
+			stackReceiverLocals[stackDepth] = -1
 			stackDepth++
 			position++
 		case compiler.OpSend:
-			if position+5 >= jumpPosition || stackDepth < 2 ||
-				!stackKinds[stackDepth-2] || stackKinds[stackDepth-1] ||
-				instructions[position+3] != 0 || instructions[position+4] != 1 || instructions[position+5] != 255 {
+			if position+5 >= jumpPosition {
 				return false
+			}
+			argc := int(instructions[position+4])
+			receiverIndex := stackDepth - argc - 1
+			if argc < 0 || argc > 4 || receiverIndex < 0 ||
+				!stackKinds[receiverIndex] ||
+				instructions[position+3] != 0 || instructions[position+5] != 255 {
+				return false
+			}
+			for index := stackDepth - argc; index < stackDepth; index++ {
+				if stackKinds[index] {
+					return false
+				}
 			}
 			index := int(instructions[position+1])<<8 | int(instructions[position+2])
 			if index < 0 || index >= len(frame.Fn.Constants) {
@@ -10081,23 +15585,76 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 			if !ok {
 				return false
 			}
-			methodObj, _, fallback := vm.lookupMethodForSend(receiver, name, nil, false)
+			receiverLocal := stackReceiverLocals[receiverIndex]
+			sendReceiver := receiver
+			if receiverLocal >= 0 {
+				localIndex := frame.Bp + receiverLocal + 1
+				if localIndex < 0 || localIndex >= len(vm.stack) {
+					return false
+				}
+				sendReceiver = derefClosureValue(vm.stack[localIndex])
+				if sendReceiver == nil {
+					return false
+				}
+			}
+			methodObj, _, fallback := vm.lookupMethodForSend(sendReceiver, name, nil, false, false)
 			if fallback != nil || methodObj == nil || methodObj.Visibility == "undefined" ||
-				(methodObj.Visibility == "private" && receiver != core.R.Main) ||
 				methodObj.Visibility == "protected" {
 				return false
 			}
-			fn, ok := methodObj.Fn.(*object.Function)
-			if !ok || len(fn.ParamLocalIndices) != 1 {
+			if methodObj.DispatchOwner != nil || methodObj.Ruby2Keywords || methodUsesRefinements(methodObj) ||
+				(receiverLocal >= 0 && methodObj.Visibility != "" && methodObj.Visibility != "public") {
 				return false
 			}
-			plan, ok := vm.cachedIntegerFunctionPlan(fn)
-			if !ok || plan == nil {
+			fn, ok := methodObj.Fn.(*object.Function)
+			if !ok || len(fn.ParamLocalIndices) != argc {
 				return false
+			}
+			integerPlan, integerOK := vm.cachedIntegerFunctionPlan(fn)
+			var typedPlan *typedSSAPlan
+			typedReferenceCall := false
+			if !integerOK || integerPlan == nil {
+				var typedOK bool
+				typedPlan, typedOK = vm.cachedTypedSSAPlan(fn)
+				if !typedOK {
+					typedPlan, typedOK = vm.cachedTypedSSAReferencePlan(fn)
+				}
+				if !typedOK || typedPlan == nil {
+					return false
+				}
+				if typedPlan.hasReference {
+					if argc != 0 || !typedSSAReferenceCallPlanEligible(typedPlan) {
+						return false
+					}
+					call, callOK := typedSSAReferenceCallInstruction(typedPlan)
+					if !callOK {
+						return false
+					}
+					if _, callOK = vm.cachedTypedSSAReferenceCallee(sendReceiver, call, nil); !callOK {
+						return false
+					}
+					typedReferenceCall = true
+				}
 			}
 			step.fn = fn
-			stackDepth--
+			step.plan = integerPlan
+			if integerFunctionKernelEnabled && integerOK && integerPlan != nil &&
+				integerPlan.kernel.kind != integerFunctionKernelNone &&
+				core.IntegerMulUsesBuiltinImplementation() &&
+				core.IntegerBitXorUsesBuiltinImplementation() &&
+				core.IntegerRightShiftUsesBuiltinImplementation() &&
+				core.IntegerBitAndUsesBuiltinImplementation() {
+				step.integerKernel = integerPlan.kernel
+				step.integerGeneration = object.CurrentMethodGeneration()
+			}
+			step.typedPlan = typedPlan
+			step.typedGeneration = object.CurrentMethodGeneration()
+			step.typedReferenceCall = typedReferenceCall
+			step.argc = uint8(argc)
+			step.receiverLocal = receiverLocal
+			stackDepth -= argc
 			stackKinds[stackDepth-1] = false
+			stackReceiverLocals[stackDepth-1] = -2
 			position += 6
 		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod,
 			compiler.OpBitAnd, compiler.OpBitOr, compiler.OpBitXor,
@@ -10133,7 +15690,6 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 	if stackDepth != 0 || len(steps) == 0 {
 		return false
 	}
-
 	var locals [256]int64
 	usedLocals := make([]int, 0, 8)
 	for local, inUse := range used {
@@ -10157,15 +15713,48 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 		locals[local] = value.Data.(int64)
 		usedLocals = append(usedLocals, local)
 	}
+	limit := limitConstant
+	if limitLocal >= 0 {
+		limitIndex := frame.Bp + limitLocal + 1
+		if limitIndex < 0 || limitIndex >= len(vm.stack) {
+			return false
+		}
+		limitValue := vm.stack[limitIndex]
+		if limitValue == nil || limitValue.Type != object.ValueInteger {
+			return false
+		}
+		if _, big := core.NumericBigIntOverride(limitValue); big {
+			return false
+		}
+		limit = limitValue.Data.(int64)
+	}
 	if !vm.fusedIntegerBuiltinsAvailable() {
 		return false
+	}
+	if vm.tryExecuteModularRecurrenceLoop(frame, exitPosition, counterLocal, limit, steps, locals) {
+		return true
+	}
+	if vm.tryExecuteTypedSSAIntegerCallLoop(frame, exitPosition, counterLocal, limit, steps, locals) {
+		return true
+	}
+	if vm.tryExecuteTypedSSAIntegerFunctionLoop(frame, exitPosition, counterLocal, limit, steps, locals) {
+		return true
+	}
+	if vm.tryExecuteTypedSSAReferenceGetterLoop(frame, exitPosition, counterLocal, limit, steps, locals) {
+		return true
+	}
+	if vm.tryExecuteAffineIntegerFunctionLoop(frame, target, jumpPosition, exitPosition, counterLocal, limit, steps, locals) {
+		return true
+	}
+	if vm.tryExecuteIntegerBitMixLoop(frame, exitPosition, counterLocal, limit, steps, locals) {
+		return true
 	}
 
 	var values [32]int64
 	var selfValues [32]bool
 	var before [256]int64
 	completed := true
-	for iterations := 0; locals[counterLocal] < locals[limitLocal]; iterations++ {
+	for iterations := 0; locals[counterLocal] < limit; iterations++ {
 		if iterations == 1_000_000 {
 			completed = false
 			break
@@ -10177,8 +15766,15 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 		failed := false
 		for _, step := range steps {
 			switch step.op {
-			case compiler.OpGetLocal:
-				values[stackPointer] = locals[step.local]
+			case compiler.OpGetLocal, compiler.OpGetLocalFast:
+				if step.receiverLocal >= 0 {
+					// The receiver is only a stack-shape placeholder here.  The
+					// callee was resolved once at admission and its integer plan
+					// does not read self or instance state.
+					values[stackPointer] = 0
+				} else {
+					values[stackPointer] = locals[step.local]
+				}
 				selfValues[stackPointer] = false
 				stackPointer++
 			case compiler.OpConstant:
@@ -10189,12 +15785,58 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 				selfValues[stackPointer] = true
 				stackPointer++
 			case compiler.OpSend:
-				result, ok := vm.executeSingleIntegerFunctionPlan(step.fn, values[stackPointer-1])
+				argc := int(step.argc)
+				if argc < 0 || stackPointer < argc+1 {
+					failed = true
+					break
+				}
+				var result int64
+				var ok bool
+				if step.integerKernel.kind != integerFunctionKernelNone {
+					if step.integerGeneration != object.CurrentMethodGeneration() || argc != 1 {
+						failed = true
+						break
+					}
+					result, ok = executeIntegerFunctionKernel(step.integerKernel, values[stackPointer-1])
+				} else if step.typedPlan != nil {
+					if step.typedGeneration != object.CurrentMethodGeneration() || argc != len(step.fn.ParamLocalIndices) {
+						failed = true
+						break
+					}
+					if step.typedReferenceCall {
+						callReceiver := receiver
+						if step.receiverLocal >= 0 {
+							localIndex := frame.Bp + step.receiverLocal + 1
+							if localIndex < 0 || localIndex >= len(vm.stack) {
+								failed = true
+								break
+							}
+							callReceiver = derefClosureValue(vm.stack[localIndex])
+						}
+						value, executed := vm.executeTypedSSAReferencePrimitivePlan(step.typedPlan, step.fn, callReceiver, nil)
+						if executed && value.kind == typedSSAInteger {
+							result, ok = value.int, true
+						}
+					} else {
+						var callValues [16]int64
+						for argument := 0; argument < argc; argument++ {
+							callValues[argument] = values[stackPointer-argc+argument]
+						}
+						value, executed := vm.executeTypedSSAUnboxedArgsPlan(step.typedPlan, step.fn, callValues[:argc])
+						if executed && value.kind == typedSSAInteger {
+							result, ok = value.int, true
+						}
+					}
+				} else if integerLoopCachedFunctionPlanEnabled {
+					result, ok = vm.executeCachedIntegerFunctionPlan(step.fn, step.plan, values[stackPointer-argc:stackPointer])
+				} else {
+					result, ok = vm.executeIntegerFunctionPlan(step.fn, values[stackPointer-argc:stackPointer])
+				}
 				if !ok {
 					failed = true
 					break
 				}
-				stackPointer--
+				stackPointer -= argc
 				values[stackPointer-1] = result
 				selfValues[stackPointer-1] = false
 			case compiler.OpNeg, compiler.OpNegate:
@@ -10243,6 +15885,236 @@ func (vm *VM) tryExecuteIntegerBytecodeLoop(frame *Frame, target, jumpPosition i
 	} else {
 		frame.Ip = target - 1
 	}
+	return true
+}
+
+// tryExecuteTypedSSAIntegerCallLoop lowers a counted while loop whose body is
+// `sum += pure_helper(counter_or_constants); counter += constant`.  The
+// callee may have any fixed integer arity and arbitrary branch structure that
+// the unboxed SSA compiler proves.  The whole outer loop then stays in raw
+// int64 state; only the final locals are boxed when the loop exits.
+func (vm *VM) tryExecuteTypedSSAIntegerCallLoop(frame *Frame, exitPosition, counterLocal int, limit int64, steps []integerLoopStep, locals [256]int64) bool {
+	if vm == nil || frame == nil || len(steps) < 8 {
+		return false
+	}
+	position := 0
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	sumLocal := steps[position].local
+	position++
+	if sumLocal == counterLocal || position >= len(steps) || steps[position].op != compiler.OpSelf {
+		return false
+	}
+	position++
+	// Decode the receiver/argument expression leading to the send.  The
+	// receiver must be self; each argument is a primitive local or literal.
+	type integerCallSource struct {
+		local    int
+		constant int64
+		isLocal  bool
+	}
+	sources := make([]integerCallSource, 0, 4)
+	for position < len(steps) && steps[position].op != compiler.OpSend {
+		step := steps[position]
+		switch step.op {
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
+			sources = append(sources, integerCallSource{local: step.local, isLocal: true})
+		case compiler.OpConstant:
+			sources = append(sources, integerCallSource{constant: step.value})
+		default:
+			return false
+		}
+		position++
+	}
+	if position >= len(steps) {
+		return false
+	}
+	callee := steps[position]
+	if callee.op != compiler.OpSend || callee.typedPlan == nil || callee.fn == nil ||
+		int(callee.argc) != len(sources) || callee.argc == 0 || callee.argc > 4 ||
+		callee.typedPlan.hasReference || callee.typedPlan.hasYield ||
+		callee.typedGeneration != object.CurrentMethodGeneration() ||
+		!vm.typedSSAIntegerOpsAvailable(callee.typedPlan) {
+		return false
+	}
+	position++
+	if position+8 != len(steps) || steps[position].op != compiler.OpAdd ||
+		steps[position+1].op != compiler.OpSetLocal || steps[position+1].local != sumLocal ||
+		steps[position+2].op != compiler.OpPop || !isLocalLoadOpcode(steps[position+3].op) ||
+		steps[position+3].local != counterLocal || steps[position+4].op != compiler.OpConstant ||
+		steps[position+4].value <= 0 || steps[position+5].op != compiler.OpAdd ||
+		steps[position+6].op != compiler.OpSetLocal || steps[position+6].local != counterLocal ||
+		steps[position+7].op != compiler.OpPop {
+		return false
+	}
+	counter := locals[counterLocal]
+	sum := locals[sumLocal]
+	if counter >= limit {
+		return false
+	}
+	counterStep := steps[position+4].value
+	if !vm.fusedIntegerBuiltinsAvailable() || !vm.typedSSAIntegerOpsAvailable(callee.typedPlan) {
+		return false
+	}
+	var staticArguments [4]int64
+	var dynamicArguments [4]bool
+	for index, source := range sources {
+		if source.isLocal && source.local == counterLocal {
+			dynamicArguments[index] = true
+		} else if source.isLocal {
+			staticArguments[index] = locals[source.local]
+		} else {
+			staticArguments[index] = source.constant
+		}
+	}
+	clampKernel := callee.typedPlan.integerKernel.kind == typedSSAIntegerKernelClamp && len(sources) == 3
+	for counter < limit {
+		if callee.typedGeneration != object.CurrentMethodGeneration() {
+			return false
+		}
+		var result int64
+		if clampKernel {
+			value := staticArguments[0]
+			if dynamicArguments[0] {
+				value = counter
+			}
+			low := staticArguments[1]
+			if dynamicArguments[1] {
+				low = counter
+			}
+			high := staticArguments[2]
+			if dynamicArguments[2] {
+				high = counter
+			}
+			if value < low {
+				result = low
+			} else if value > high {
+				result = high
+			} else {
+				result = value
+			}
+		} else {
+			var arguments [4]int64
+			for index := range sources {
+				arguments[index] = staticArguments[index]
+				if dynamicArguments[index] {
+					arguments[index] = counter
+				}
+			}
+			value, executed := vm.executeTypedSSAUnboxedArgsPlanTrusted(callee.typedPlan, callee.fn, arguments[:len(sources)])
+			if !executed || value.kind != typedSSAInteger {
+				return false
+			}
+			result = value.int
+		}
+		var ok bool
+		sum, ok = checkedIntegerAdd(sum, result)
+		if !ok {
+			return false
+		}
+		counter, ok = checkedIntegerAdd(counter, counterStep)
+		if !ok {
+			return false
+		}
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, sum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
+	return true
+}
+
+// tryExecuteTypedSSAIntegerFunctionLoop is the direct loop kernel for a pure
+// one-argument typed callee.  The generic integer-loop executor still walks a
+// decoded step slice and a tiny stack on every iteration; this shape is common
+// enough to lower the whole `sum += helper(counter); counter += constant` body
+// to raw int64 operations while retaining the normal VM fallback on any guard
+// miss.
+func (vm *VM) tryExecuteTypedSSAIntegerFunctionLoop(frame *Frame, exitPosition, counterLocal int, limit int64, steps []integerLoopStep, locals [256]int64) bool {
+	if vm == nil || frame == nil || len(steps) < 8 {
+		return false
+	}
+	position := 0
+	if !isLocalLoadOpcode(steps[position].op) {
+		return false
+	}
+	sumLocal := steps[position].local
+	position++
+	if steps[position].op != compiler.OpSelf {
+		return false
+	}
+	position++
+	if !isLocalLoadOpcode(steps[position].op) || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	callee := steps[position]
+	if callee.op != compiler.OpSend || callee.argc != 1 || callee.fn == nil || callee.typedPlan == nil ||
+		callee.typedGeneration != object.CurrentMethodGeneration() || callee.typedPlan.integerKernel.kind != typedSSAIntegerKernelCompareBinary ||
+		!vm.typedSSAIntegerOpsAvailable(callee.typedPlan) {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != sumLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop {
+		return false
+	}
+	position++
+	if position+5 != len(steps) || !isLocalLoadOpcode(steps[position].op) || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpConstant || steps[position].value <= 0 {
+		return false
+	}
+	step := steps[position].value
+	position++
+	if steps[position].op != compiler.OpAdd {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpSetLocal || steps[position].local != counterLocal {
+		return false
+	}
+	position++
+	if steps[position].op != compiler.OpPop || sumLocal == counterLocal {
+		return false
+	}
+	counter := locals[counterLocal]
+	sum := locals[sumLocal]
+	if counter >= limit {
+		return false
+	}
+	for counter < limit {
+		result, ok := executeTypedSSAIntegerKernel(callee.typedPlan.integerKernel, counter)
+		if !ok {
+			return false
+		}
+		sum, ok = checkedIntegerAdd(sum, result)
+		if !ok {
+			return false
+		}
+		counter, ok = checkedIntegerAdd(counter, step)
+		if !ok {
+			return false
+		}
+	}
+	vm.commitIntegerLoopLocal(frame, sumLocal, sum)
+	last := vm.commitIntegerLoopLocal(frame, counterLocal, counter)
+	vm.recordPoppedValue(last)
+	frame.WhileEnd = exitPosition
+	frame.BlockBreakAddr = exitPosition
+	frame.Ip = exitPosition - 1
 	return true
 }
 
@@ -10376,6 +16248,32 @@ func (vm *VM) tryExecuteCountedIntegerLoop(frame *Frame, target, jumpPosition in
 	}
 	limit := limitValue.Data.(int64)
 	counterIndex := len(updates) - 1
+	if len(updates) == 2 && updates[0].local != counterLocal && len(updates[0].steps) == 3 &&
+		updates[0].steps[0].op == compiler.OpMul && updates[0].steps[1].op == compiler.OpAdd &&
+		updates[0].steps[2].op == compiler.OpMod && updates[0].steps[2].value > 0 {
+		recurrenceSteps := []integerLoopStep{
+			{op: compiler.OpGetLocal, local: updates[0].local},
+			{op: compiler.OpConstant, value: updates[0].steps[0].value},
+			{op: compiler.OpMul},
+			{op: compiler.OpConstant, value: updates[0].steps[1].value},
+			{op: compiler.OpAdd},
+			{op: compiler.OpConstant, value: updates[0].steps[2].value},
+			{op: compiler.OpMod},
+			{op: compiler.OpSetLocal, local: updates[0].local},
+			{op: compiler.OpPop},
+			{op: compiler.OpGetLocal, local: counterLocal},
+			{op: compiler.OpConstant, value: counterUpdate.steps[0].value},
+			{op: compiler.OpAdd},
+			{op: compiler.OpSetLocal, local: counterLocal},
+			{op: compiler.OpPop},
+		}
+		var recurrenceLocals [256]int64
+		recurrenceLocals[updates[0].local] = values[0]
+		recurrenceLocals[counterLocal] = values[counterIndex]
+		if vm.tryExecuteModularRecurrenceLoop(frame, exitPosition, counterLocal, limit, recurrenceSteps, recurrenceLocals) {
+			return true
+		}
+	}
 
 	completed := true
 	for iterations := 0; values[counterIndex] < limit; iterations++ {
@@ -10474,9 +16372,1793 @@ func (vm *VM) fusedIntegerBuiltinsAvailable() bool {
 	generation := object.CurrentMethodGeneration()
 	if vm.fusedIntegerGeneration != generation {
 		vm.fusedIntegerGeneration = generation
-		vm.fusedIntegerOps = core.IntegerPlusUsesBuiltinImplementation()
+		var operations uint16
+		if core.IntegerPlusUsesBuiltinImplementation() {
+			operations |= 1 << 0
+		}
+		if core.IntegerSubUsesBuiltinImplementation() {
+			operations |= 1 << 1
+		}
+		if core.IntegerMulUsesBuiltinImplementation() {
+			operations |= 1 << 2
+		}
+		if core.IntegerModUsesBuiltinImplementation() {
+			operations |= 1 << 3
+		}
+		if core.IntegerBitAndUsesBuiltinImplementation() {
+			operations |= 1 << 9
+		}
+		if core.IntegerBitOrUsesBuiltinImplementation() {
+			operations |= 1 << 11
+		}
+		if core.IntegerBitXorUsesBuiltinImplementation() {
+			operations |= 1 << 12
+		}
+		if core.IntegerLeftShiftUsesBuiltinImplementation() {
+			operations |= 1 << 13
+		}
+		if core.IntegerRightShiftUsesBuiltinImplementation() {
+			operations |= 1 << 14
+		}
+		if core.IntegerEqualUsesBuiltinImplementation() {
+			operations |= 1 << 4
+		}
+		if core.IntegerLessThanUsesBuiltinImplementation() {
+			operations |= 1 << 5
+		}
+		if core.IntegerGreaterThanUsesBuiltinImplementation() {
+			operations |= 1 << 6
+		}
+		if core.IntegerLessThanOrEqualUsesBuiltinImplementation() {
+			operations |= 1 << 7
+		}
+		if core.IntegerGreaterThanOrEqualUsesBuiltinImplementation() {
+			operations |= 1 << 8
+		}
+		if core.IntegerToSUsesBuiltinImplementation() {
+			operations |= 1 << 10
+		}
+		vm.fusedIntegerOps = operations
 	}
-	return vm.fusedIntegerOps
+	return vm.fusedIntegerOps&(1<<0) != 0
+}
+
+func (vm *VM) fusedIntegerOperationAvailable(op compiler.Opcode) bool {
+	// Refresh the same generation-scoped mask used by the long-standing +
+	// fast path. Method redefinitions invalidate the generation and therefore
+	// make every typed arithmetic/comparison guard conservative again.
+	vm.fusedIntegerBuiltinsAvailable()
+	var bit uint16
+	switch op {
+	case compiler.OpAdd:
+		bit = 1 << 0
+	case compiler.OpSub:
+		bit = 1 << 1
+	case compiler.OpMul:
+		bit = 1 << 2
+	case compiler.OpMod:
+		bit = 1 << 3
+	case compiler.OpEqual:
+		bit = 1 << 4
+	case compiler.OpLessThan:
+		bit = 1 << 5
+	case compiler.OpGreaterThan:
+		bit = 1 << 6
+	case compiler.OpLessThanOrEqual:
+		bit = 1 << 7
+	case compiler.OpGreaterThanOrEqual:
+		bit = 1 << 8
+	case compiler.OpBitAnd:
+		bit = 1 << 9
+	case compiler.OpBitOr:
+		bit = 1 << 11
+	case compiler.OpBitXor:
+		bit = 1 << 12
+	case compiler.OpBitLeftShift:
+		bit = 1 << 13
+	case compiler.OpBitRightShift:
+		bit = 1 << 14
+	default:
+		return false
+	}
+	return vm.fusedIntegerOps&bit != 0
+}
+
+func (vm *VM) fusedIntegerToSAvailable() bool {
+	if vm == nil {
+		return false
+	}
+	vm.fusedIntegerBuiltinsAvailable()
+	return vm.fusedIntegerOps&(1<<10) != 0
+}
+
+// fusedFloatBuiltinsAvailable mirrors the Integer generation-scoped mask for
+// the typed Float value tier.  Ruby can replace Float operators at any time;
+// one method-generation refresh is enough to invalidate all speculative raw
+// float operations until the next call boundary.
+func (vm *VM) fusedFloatBuiltinsAvailable() bool {
+	generation := object.CurrentMethodGeneration()
+	if vm.fusedFloatGeneration != generation {
+		vm.fusedFloatGeneration = generation
+		var operations uint16
+		if core.FloatPlusUsesBuiltinImplementation() {
+			operations |= 1 << 0
+		}
+		if core.FloatSubUsesBuiltinImplementation() {
+			operations |= 1 << 1
+		}
+		if core.FloatMulUsesBuiltinImplementation() {
+			operations |= 1 << 2
+		}
+		if core.FloatDivUsesBuiltinImplementation() {
+			operations |= 1 << 3
+		}
+		if core.FloatModUsesBuiltinImplementation() {
+			operations |= 1 << 4
+		}
+		if core.FloatEqualUsesBuiltinImplementation() {
+			operations |= 1 << 5
+		}
+		if core.FloatLessThanUsesBuiltinImplementation() {
+			operations |= 1 << 6
+		}
+		if core.FloatGreaterThanUsesBuiltinImplementation() {
+			operations |= 1 << 7
+		}
+		if core.FloatLessThanOrEqualUsesBuiltinImplementation() {
+			operations |= 1 << 8
+		}
+		if core.FloatGreaterThanOrEqualUsesBuiltinImplementation() {
+			operations |= 1 << 9
+		}
+		vm.fusedFloatOps = operations
+	}
+	return vm.fusedFloatOps&(1<<0) != 0
+}
+
+func (vm *VM) fusedFloatOperationAvailable(op compiler.Opcode) bool {
+	vm.fusedFloatBuiltinsAvailable()
+	var bit uint16
+	switch op {
+	case compiler.OpAdd:
+		bit = 1 << 0
+	case compiler.OpSub:
+		bit = 1 << 1
+	case compiler.OpMul:
+		bit = 1 << 2
+	case compiler.OpDiv:
+		bit = 1 << 3
+	case compiler.OpMod:
+		bit = 1 << 4
+	case compiler.OpEqual:
+		bit = 1 << 5
+	case compiler.OpLessThan:
+		bit = 1 << 6
+	case compiler.OpGreaterThan:
+		bit = 1 << 7
+	case compiler.OpLessThanOrEqual:
+		bit = 1 << 8
+	case compiler.OpGreaterThanOrEqual:
+		bit = 1 << 9
+	default:
+		return false
+	}
+	return vm.fusedFloatOps&bit != 0
+}
+
+// fusedStringOperationAvailable is the small generation-scoped guard used by
+// raw-string typed SSA values.  String values are only unboxed for exact
+// compatible built-ins; a Ruby redefinition invalidates the mask on the next
+// method-generation epoch and the caller deopts before observing a result.
+func (vm *VM) fusedStringOperationAvailable(op compiler.Opcode) bool {
+	generation := object.CurrentMethodGeneration()
+	if vm.fusedStringGeneration != generation {
+		vm.fusedStringGeneration = generation
+		var operations uint8
+		if core.StringPlusUsesBuiltinImplementation() {
+			operations |= 1 << 0
+		}
+		if core.StringEqualUsesBuiltinImplementation() {
+			operations |= 1 << 1
+		}
+		vm.fusedStringOps = operations
+	}
+	switch op {
+	case compiler.OpAdd:
+		return vm.fusedStringOps&(1<<0) != 0
+	case compiler.OpEqual:
+		return vm.fusedStringOps&(1<<1) != 0
+	default:
+		return false
+	}
+}
+
+func (vm *VM) executeLeafMethodPlan(fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, method string, methodObj *object.Method, methodOwner *object.Class) (*object.EmeraldValue, bool) {
+	plan, found := vm.leafMethodCache[fn]
+	if !found {
+		plan = buildLeafMethodPlan(fn)
+		vm.leafMethodCache[fn] = plan
+	}
+	return vm.executeCachedLeafMethodPlan(plan, fn, receiver, args, method, methodObj, methodOwner)
+}
+
+func (vm *VM) cachedLeafOptionalGuard(plan leafMethodPlan) bool {
+	if plan.optionalGuard == nil {
+		return true
+	}
+	generation := object.CurrentMethodGeneration()
+	cache := plan.runtime
+	if cache != nil && cache.optionalGuardChecked && cache.optionalGuardGeneration == generation {
+		return cache.optionalGuardSafe
+	}
+	nilClass := core.R.Classes["NilClass"]
+	safe := false
+	if nilClass != nil {
+		current, _, found := nilClass.GetMethodWithOwner("nil?")
+		safe = found && current == plan.optionalGuard
+	}
+	if cache != nil {
+		cache.optionalGuardGeneration = generation
+		cache.optionalGuardChecked = true
+		cache.optionalGuardSafe = safe
+	}
+	return safe
+}
+
+func (vm *VM) cachedLeafRescueConstants(plan leafMethodPlan) (*object.EmeraldValue, *object.EmeraldValue, bool) {
+	if vm == nil || plan.rescueConstantName == "" {
+		return nil, nil, false
+	}
+	generation := object.CurrentConstantGeneration()
+	cache := plan.runtime
+	if cache != nil && cache.constantChecked && cache.constantVM == vm && cache.constantGeneration == generation {
+		if !cache.constantSafe {
+			return nil, nil, false
+		}
+		return cache.rescueConstant, cache.rescueDefaultEncoding, true
+	}
+	constant, found := vm.qualifiedConstantValue(plan.rescueConstantName)
+	constantSafe := found && constant != nil && constant.Type == object.ValueString && core.AttachedSingletonClass(constant) == nil
+	defaultEncoding, defaultFound := vm.qualifiedConstantValue(plan.rescueDefaultName)
+	constantSafe = constantSafe && defaultFound && defaultEncoding != nil && defaultEncoding.Type != object.ValueException
+	if cache != nil {
+		cache.constantVM = vm
+		cache.constantGeneration = generation
+		cache.constantChecked = true
+		cache.constantSafe = constantSafe
+		cache.rescueConstant = constant
+		cache.rescueDefaultEncoding = defaultEncoding
+	}
+	if !constantSafe {
+		return nil, nil, false
+	}
+	return constant, defaultEncoding, true
+}
+
+func (vm *VM) cachedLeafEncodeFunction(plan leafMethodPlan) (func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue, bool) {
+	if vm == nil || plan.rescueEncodeGuard == nil {
+		return nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	cache := plan.runtime
+	if cache != nil && cache.encodeChecked && cache.encodeVM == vm && cache.encodeGeneration == generation {
+		return cache.encodeFn, cache.encodeSafe
+	}
+	var encodeFn func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue
+	stringClass := core.R.Classes["String"]
+	if stringClass != nil {
+		current, _, found := stringClass.GetMethodWithOwner("encode")
+		if found && current == plan.rescueEncodeGuard {
+			encodeFn, _ = plan.rescueEncodeGuard.Fn.(func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue)
+		}
+	}
+	safe := encodeFn != nil
+	if cache != nil {
+		cache.encodeVM = vm
+		cache.encodeGeneration = generation
+		cache.encodeChecked = true
+		cache.encodeSafe = safe
+		cache.encodeFn = encodeFn
+	}
+	return encodeFn, safe
+}
+
+func (vm *VM) executeCachedLeafMethodPlan(plan leafMethodPlan, fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, method string, methodObj *object.Method, methodOwner *object.Class) (*object.EmeraldValue, bool) {
+	switch plan.kind {
+	case leafMethodInstanceReader:
+		if len(args) != 0 {
+			return nil, false
+		}
+		if value := core.DynamicInstanceVar(receiver, plan.name); value != nil {
+			return value, true
+		}
+		return core.R.NilVal, true
+	case leafMethodInstanceWriter:
+		if len(args) != 1 {
+			return nil, false
+		}
+		if result := core.SetDynamicInstanceVar(receiver, plan.name, args[0]); result != nil {
+			return result, true
+		}
+		return args[0], true
+	case leafMethodInstanceFallbackIndex:
+		if len(args) != 0 || receiver == nil || plan.indexKey == nil {
+			return nil, false
+		}
+		primary := core.DynamicInstanceVar(receiver, plan.name)
+		if primary != nil && primary.IsTruthy() {
+			return primary, true
+		}
+		secondary := core.DynamicInstanceVar(receiver, plan.secondaryName)
+		if secondary == nil {
+			secondary = core.R.NilVal
+		}
+		if !secondary.IsTruthy() {
+			return secondary, true
+		}
+		if value, executed := core.DirectHashIndex(secondary, plan.indexKey); executed {
+			return value, true
+		}
+		return nil, false
+	case leafMethodOptionalInstanceReader:
+		if methodObj == nil || methodObj.DispatchOwner != nil || methodUsesRefinements(methodObj) || len(args) != 0 || vm.currentBlock != nil {
+			return nil, false
+		}
+		if !vm.cachedLeafOptionalGuard(plan) {
+			return nil, false
+		}
+		value := core.DynamicInstanceVar(receiver, plan.name)
+		if value == nil || plan.optionalTruthy && !value.IsTruthy() {
+			if plan.optionalDefault != nil {
+				return plan.optionalDefault, true
+			}
+			return core.R.NilVal, true
+		}
+		return value, true
+	case leafMethodOptionalInstanceFallbackReader:
+		if methodObj == nil || methodObj.DispatchOwner != nil || methodUsesRefinements(methodObj) || len(args) != 0 || vm.currentBlock != nil || plan.optionalFallbackName == "" || plan.optionalFallbackValue == nil {
+			return nil, false
+		}
+		if !vm.cachedLeafOptionalGuard(plan) {
+			return nil, false
+		}
+		value := core.DynamicInstanceVar(receiver, plan.name)
+		if value != nil && value.IsTruthy() {
+			return value, true
+		}
+		// The fallback literal is a mutable Ruby string.  Keep the plan's
+		// constant immutable and materialize a fresh value for each recursive
+		// call, just as OpConstant does for an unfrozen source literal.
+		fallbackValue := plan.optionalFallbackValue
+		fallbackArg := &object.EmeraldValue{
+			Type:     object.ValueString,
+			Data:     fallbackValue.Data,
+			Class:    fallbackValue.Class,
+			Encoding: fallbackValue.Encoding,
+		}
+		return vm.send(receiver, plan.optionalFallbackName, []*object.EmeraldValue{fallbackArg}), true
+	case leafMethodRescueLiteral:
+		if plan.rescueLiteral == nil || len(args) != 1 || methodObj == nil || methodObj.DispatchOwner != nil || methodUsesRefinements(methodObj) || vm.currentBlock != nil {
+			return nil, false
+		}
+		literal := plan.rescueLiteral
+		if literal.Type != object.ValueString {
+			return literal, true
+		}
+		return &object.EmeraldValue{Type: object.ValueString, Data: literal.Data, Class: literal.Class, Encoding: literal.Encoding}, true
+	case leafMethodRescueEncoding:
+		if methodObj == nil || methodObj.DispatchOwner != nil || methodUsesRefinements(methodObj) || vm.currentBlock != nil || plan.rescueConstantName == "" || plan.rescueEncodeGuard == nil || len(args) > 1 {
+			return nil, false
+		}
+		constant, defaultEncoding, constantsOK := vm.cachedLeafRescueConstants(plan)
+		if !constantsOK {
+			return nil, false
+		}
+		encodeFn, callable := vm.cachedLeafEncodeFunction(plan)
+		if !callable {
+			return nil, false
+		}
+		encoding := defaultEncoding
+		if len(args) == 1 {
+			encoding = args[0]
+		}
+		result := encodeFn(constant, encoding)
+		if result == nil {
+			return nil, false
+		}
+		if result.Type == object.ValueException {
+			for _, rescueClass := range plan.rescueErrorClasses {
+				if rescueClass != nil && classInheritsFrom(result.Class, rescueClass) {
+					return core.R.NilVal, true
+				}
+			}
+		}
+		return result, true
+	case leafMethodRescueEncodeLiteral:
+		if methodObj == nil || methodObj.DispatchOwner != nil || methodUsesRefinements(methodObj) || vm.currentBlock != nil || len(args) != 1 || plan.rescueEncodeLiteral == nil || plan.rescueEncodeGuard == nil {
+			return nil, false
+		}
+		value := args[0]
+		stringClass := core.R.Classes["String"]
+		if stringClass == nil || value == nil || value.Type != object.ValueString || value.Class != stringClass || core.AttachedSingletonClass(value) != nil {
+			return nil, false
+		}
+		encodeFn, callable := vm.cachedLeafEncodeFunction(plan)
+		if !callable {
+			return nil, false
+		}
+		result := encodeFn(value, plan.rescueEncodeLiteral)
+		if result == nil || result.Type == object.ValueException {
+			// The rescue body may raise a library-specific exception.  Re-enter the
+			// original method so its exact handler/backtrace semantics remain intact.
+			return nil, false
+		}
+		return result, true
+	case leafMethodAttributeIntegerCompare:
+		if vm.attributeCompareOff {
+			return nil, false
+		}
+		return vm.executeAttributeIntegerComparePlan(fn, plan, receiver, args, methodObj)
+	case leafMethodRegisterIR:
+		if !registerIREnabled || plan.registerIR == nil || plan.registerIR.blockReturn {
+			return nil, false
+		}
+		// A leaf Register IR plan marked requiresFrame cannot enter either of
+		// executeRegisterIR's no-frame tiers.  The caller has already completed
+		// the normal fixed-arity/keyword protocol, so tell the executor that the
+		// framed route is cached and avoid rescanning the no-frame predicates on
+		// every hot leaf call.  executeRegisterIR still repeats the typed probes
+		// and all active-rescue/trace guards before creating the frame.
+		if plan.registerIR.requiresFrame {
+			return vm.executeRegisterIR(plan.registerIR, fn, receiver, args, method, methodObj, methodOwner, true)
+		}
+		return vm.executeRegisterIR(plan.registerIR, fn, receiver, args, method, methodObj, methodOwner)
+	default:
+		return nil, false
+	}
+}
+
+func caseDispatchLoadOpcode(op compiler.Opcode) bool {
+	return op == compiler.OpGetLocal || op == compiler.OpGetLocalFast
+}
+
+// parseCaseDispatchTest recognizes the bytecode prologue emitted for a simple
+// `case local; when Constant; ...` clause.  The test leaves the duplicated
+// subject on the stack and starts its clause with OpPop; the fast entry skips
+// both the predicate and that balancing pop.
+func parseCaseDispatchTest(fn *object.Function, position int, first bool, expectedLocal int) (name string, bodyStart, falseTarget int, ok bool) {
+	if fn == nil || position < 0 || position >= len(fn.Instructions) {
+		return "", 0, 0, false
+	}
+	if first {
+		if position+1 >= len(fn.Instructions) || !caseDispatchLoadOpcode(compiler.Opcode(fn.Instructions[position])) || int(fn.Instructions[position+1]) != expectedLocal {
+			return "", 0, 0, false
+		}
+		position += 2
+	}
+	if position >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpDup {
+		return "", 0, 0, false
+	}
+	position++
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpGetConstant {
+		return "", 0, 0, false
+	}
+	constantIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil {
+		return "", 0, 0, false
+	}
+	name, ok = fn.Constants[constantIndex].Data.(string)
+	if !ok || name == "" {
+		return "", 0, 0, false
+	}
+	position += 3
+	for position+2 < len(fn.Instructions) && compiler.Opcode(fn.Instructions[position]) == compiler.OpGetScopedConstant {
+		scopedIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+		if scopedIndex < 0 || scopedIndex >= len(fn.Constants) || fn.Constants[scopedIndex] == nil {
+			return "", 0, 0, false
+		}
+		scopedName, scopedOK := fn.Constants[scopedIndex].Data.(string)
+		if !scopedOK || scopedName == "" {
+			return "", 0, 0, false
+		}
+		name += "::" + scopedName
+		position += 3
+	}
+	if position >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSwap {
+		return "", 0, 0, false
+	}
+	position++
+	if position+5 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSend ||
+		fn.Instructions[position+3] != 0 || fn.Instructions[position+4] != 1 || fn.Instructions[position+5] != 255 {
+		return "", 0, 0, false
+	}
+	methodIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if methodIndex < 0 || methodIndex >= len(fn.Constants) || fn.Constants[methodIndex] == nil {
+		return "", 0, 0, false
+	}
+	methodName, ok := fn.Constants[methodIndex].Data.(string)
+	if !ok || methodName != "===" {
+		return "", 0, 0, false
+	}
+	position += 6
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJumpNotTruthy {
+		return "", 0, 0, false
+	}
+	falseTarget = int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	bodyStart = position + 3
+	if bodyStart >= len(fn.Instructions) || falseTarget <= bodyStart || falseTarget >= len(fn.Instructions) ||
+		compiler.Opcode(fn.Instructions[bodyStart]) != compiler.OpPop {
+		return "", 0, 0, false
+	}
+	return name, bodyStart, falseTarget, true
+}
+
+func caseDispatchPrefixSafe(fn *object.Function, end int) bool {
+	if fn == nil || end < 0 || end > len(fn.Instructions) {
+		return false
+	}
+	for position := 0; position < end; {
+		op := compiler.Opcode(fn.Instructions[position])
+		switch op {
+		case compiler.OpJumpLocalPresent, compiler.OpNil, compiler.OpTrue, compiler.OpFalse,
+			compiler.OpConstant, compiler.OpSetLocal, compiler.OpPop:
+		default:
+			return false
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return false
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if position+width > end {
+			return false
+		}
+		position += width
+	}
+	return true
+}
+
+// buildCaseDispatchBranchIR extracts one `when` body into a tiny synthetic
+// function and compiles it independently of the case predicate. The normal
+// compiler places an unconditional OpJump immediately before the next
+// predicate; that jump is replaced with a local ReturnValue. Jumps belonging
+// to conditionals inside the body are rebased, while jumps that escape the
+// body are rejected so the compatibility path remains authoritative.
+func buildCaseDispatchBranchIR(fn *object.Function, bodyStart, falseTarget int) (*registerIRPlan, bool) {
+	if !registerIRCaseDispatchBranchEnabled || fn == nil || bodyStart < 0 || falseTarget <= bodyStart+3 || falseTarget > len(fn.Instructions) {
+		return nil, false
+	}
+	end := falseTarget - 3
+	if end <= bodyStart || compiler.Opcode(fn.Instructions[end]) != compiler.OpJump || end+2 >= len(fn.Instructions) {
+		return nil, false
+	}
+	outerTarget := int(fn.Instructions[end+1])<<8 | int(fn.Instructions[end+2])
+	if outerTarget < falseTarget || outerTarget >= len(fn.Instructions) {
+		return nil, false
+	}
+	start := bodyStart + 1 // skip the case subject's balancing OpPop
+	if start >= end {
+		return nil, false
+	}
+	body := append([]byte(nil), fn.Instructions[start:end]...)
+	returnPosition := len(body)
+	body = append(body, compiler.Make(compiler.OpReturnValue)...)
+
+	isRelocatableJump := func(op compiler.Opcode) bool {
+		switch op {
+		case compiler.OpJump, compiler.OpJumpTruthy, compiler.OpJumpNotTruthy,
+			compiler.OpJumpNotNil, compiler.OpJumpLocalPresent:
+			return true
+		default:
+			return false
+		}
+	}
+	for position := start; position < end; {
+		op := compiler.Opcode(fn.Instructions[position])
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return nil, false
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if width <= 0 || position+width > end {
+			return nil, false
+		}
+		if isRelocatableJump(op) {
+			operandPosition := position + 1
+			if op == compiler.OpJumpLocalPresent {
+				operandPosition += 1 // local slot precedes the target
+			}
+			if operandPosition+1 >= position+width {
+				return nil, false
+			}
+			target := int(fn.Instructions[operandPosition])<<8 | int(fn.Instructions[operandPosition+1])
+			if target < start || target > end {
+				return nil, false
+			}
+			newTarget := target - start
+			if target == end {
+				newTarget = returnPosition
+			}
+			newPosition := position - start
+			body[newPosition+operandPosition-position] = byte(newTarget >> 8)
+			body[newPosition+operandPosition-position+1] = byte(newTarget)
+		}
+		position += width
+	}
+	branchFn := *fn
+	branchFn.Instructions = body
+	branchFn.LineMap = nil
+	plan, ok := compileRegisterIRWithOptions(&branchFn, registerIRCompileOptions{
+		allowStringLiterals:    true,
+		allowClosures:          true,
+		allowOptionalDefaults:  true,
+		allowStringEncoding:    registerIRStringEncodingEnabled,
+		allowLogicalAssignment: registerIRLogicalAssignmentEnabled,
+	})
+	if !ok || plan == nil || plan.blockReturn {
+		return nil, false
+	}
+	// A frozen source file makes string constants immutable and therefore safe
+	// to share from a frameless branch plan.  The ordinary compiler keeps these
+	// constants behind constantValue until the framed tier has proved the
+	// source mode; for this synthetic plan materialize an equivalent immutable
+	// value once and turn it into a direct literal load.
+	if fn.FreezeStringLiterals {
+		for index := range plan.instructions {
+			instruction := &plan.instructions[index]
+			if (instruction.op != registerIRLoadConstantValue && instruction.op != registerIRLoadFrozenString) || instruction.value == nil || instruction.value.Type != object.ValueString {
+				continue
+			}
+			frozen := *instruction.value
+			frozen.Cold = instruction.value.CloneColdData()
+			frozen.Frozen = true
+			frozen.Chilled = false
+			frozen.Literal = true
+			if frozen.Encoding == "" {
+				frozen.Encoding = fn.SourceEncoding
+			}
+			instruction.op = registerIRLoadLiteral
+			instruction.value = &frozen
+		}
+	}
+	return plan, true
+}
+
+func buildCaseDispatchPlan(fn *object.Function) (*caseDispatchPlan, bool) {
+	if fn == nil || len(fn.Params) == 0 || len(fn.ParamLocalIndices) == 0 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, false
+	}
+	local := fn.ParamLocalIndices[0]
+	for position := 0; position < len(fn.Instructions); {
+		if caseDispatchLoadOpcode(compiler.Opcode(fn.Instructions[position])) && position+1 < len(fn.Instructions) && int(fn.Instructions[position+1]) == local {
+			if !caseDispatchPrefixSafe(fn, position) {
+				break
+			}
+			name, bodyStart, falseTarget, ok := parseCaseDispatchTest(fn, position, true, local)
+			if ok {
+				pattern := caseDispatchStaticConstant(name)
+				target, _ := caseDispatchPatternBuiltin(pattern)
+				direct := (*object.EmeraldValue)(nil)
+				if !fn.EvaluateParamDefaults {
+					direct = caseDispatchDirectLiteral(fn, bodyStart+1)
+				}
+				branchIR, _ := buildCaseDispatchBranchIR(fn, bodyStart, falseTarget)
+				branches := []caseDispatchBranch{{constantName: name, entryIP: bodyStart + 1, pattern: pattern, target: target, direct: direct, registerIR: branchIR, checked: pattern != nil}}
+				next := falseTarget
+				for len(branches) < 32 {
+					name, bodyStart, falseTarget, ok = parseCaseDispatchTest(fn, next, false, local)
+					if !ok {
+						break
+					}
+					pattern := caseDispatchStaticConstant(name)
+					target, _ := caseDispatchPatternBuiltin(pattern)
+					direct := (*object.EmeraldValue)(nil)
+					if !fn.EvaluateParamDefaults {
+						direct = caseDispatchDirectLiteral(fn, bodyStart+1)
+					}
+					branchIR, _ := buildCaseDispatchBranchIR(fn, bodyStart, falseTarget)
+					branches = append(branches, caseDispatchBranch{constantName: name, entryIP: bodyStart + 1, pattern: pattern, target: target, direct: direct, registerIR: branchIR, checked: pattern != nil})
+					next = falseTarget
+				}
+				if len(branches) >= 2 {
+					param := -1
+					for index, candidate := range fn.ParamLocalIndices {
+						if candidate == local {
+							param = index
+							break
+						}
+					}
+					if param >= 0 {
+						return &caseDispatchPlan{generation: object.CurrentMethodGeneration(), local: local, param: param, skipIP: position, branches: branches}, true
+					}
+				}
+			}
+		}
+		definition, valid := compiler.Lookup(byte(compiler.Opcode(fn.Instructions[position])))
+		if !valid {
+			break
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if position+width > len(fn.Instructions) {
+			break
+		}
+		position += width
+	}
+	return nil, false
+}
+
+func (vm *VM) caseDispatchConstant(name string) *object.EmeraldValue {
+	if vm != nil && vm.rubyConsts != nil {
+		if value := vm.rubyConsts[name]; value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func caseDispatchStaticConstant(name string) *object.EmeraldValue {
+	name = strings.TrimPrefix(name, "::")
+	if class := core.R.Classes[name]; class != nil {
+		return &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: core.R.Classes["Class"]}
+	}
+	return nil
+}
+
+// caseDispatchDirectLiteral recognizes the smallest case clause body:
+// balancing OpPop (handled by the entryIP) followed by one immutable literal
+// and OpReturnValue. Such a branch cannot observe the callee frame, locals,
+// class stack, or block state, so a successful case match may return the
+// literal before the frame is allocated. Mutable String constants are
+// deliberately excluded; their normal constantValue materialization must
+// remain per invocation.
+func caseDispatchDirectLiteral(fn *object.Function, entryIP int) *object.EmeraldValue {
+	if fn == nil || entryIP < 0 || entryIP >= len(fn.Instructions) {
+		return nil
+	}
+	op := compiler.Opcode(fn.Instructions[entryIP])
+	switch op {
+	case compiler.OpNil:
+		if entryIP+1 < len(fn.Instructions) && compiler.Opcode(fn.Instructions[entryIP+1]) == compiler.OpReturnValue {
+			return core.R.NilVal
+		}
+	case compiler.OpTrue:
+		if entryIP+1 < len(fn.Instructions) && compiler.Opcode(fn.Instructions[entryIP+1]) == compiler.OpReturnValue {
+			return core.R.TrueVal
+		}
+	case compiler.OpFalse:
+		if entryIP+1 < len(fn.Instructions) && compiler.Opcode(fn.Instructions[entryIP+1]) == compiler.OpReturnValue {
+			return core.R.FalseVal
+		}
+	case compiler.OpConstant:
+		if entryIP+3 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[entryIP+3]) != compiler.OpReturnValue {
+			return nil
+		}
+		index := int(fn.Instructions[entryIP+1])<<8 | int(fn.Instructions[entryIP+2])
+		if index < 0 || index >= len(fn.Constants) || !registerIRImmutableLiteral(fn.Constants[index]) {
+			return nil
+		}
+		return fn.Constants[index]
+	}
+	return nil
+}
+
+func caseDispatchSamePattern(left, right *object.EmeraldValue) bool {
+	if left == nil || right == nil || left.Type != right.Type {
+		return false
+	}
+	if left.Type == object.ValueModule {
+		return left.Data == right.Data
+	}
+	if left.Type != object.ValueClass {
+		return left == right
+	}
+	leftClass, leftOK := left.Data.(*object.Class)
+	rightClass, rightOK := right.Data.(*object.Class)
+	return leftOK && rightOK && leftClass == rightClass
+}
+
+func caseDispatchPatternBuiltin(pattern *object.EmeraldValue) (*object.Class, bool) {
+	if pattern == nil || pattern.Type != object.ValueClass || pattern.Class == nil ||
+		core.AttachedSingletonClass(pattern) != nil {
+		return nil, false
+	}
+	target, ok := pattern.Data.(*object.Class)
+	if !ok || target == nil || target.IsSingleton {
+		return nil, false
+	}
+	expected, expectedOK := core.R.Classes["Module"].GetMethod("===")
+	actual, _, actualOK := pattern.Class.GetMethodWithOwner("===")
+	if !expectedOK || expected == nil || !actualOK || actual == nil || !sameMethodFunction(actual.Fn, expected.Fn) {
+		return nil, false
+	}
+	return target, true
+}
+
+func (vm *VM) caseDispatchStart(plan *caseDispatchPlan, args []*object.EmeraldValue) (int, *object.EmeraldValue, bool) {
+	if vm == nil || plan == nil || plan.generation != object.CurrentMethodGeneration() || plan.param < 0 || plan.param >= len(args) {
+		return 0, nil, false
+	}
+	value := derefClosureValue(args[plan.param])
+	if value == nil || core.AttachedSingletonClass(value) != nil {
+		return 0, nil, false
+	}
+	if !caseDispatchConstantCacheEnabled {
+		plan.constantsChecked = false
+		plan.constantsBuiltin = false
+	}
+	constantGeneration := object.CurrentConstantGeneration()
+	if caseDispatchConstantCacheEnabled && plan.constantGeneration != constantGeneration {
+		plan.constantGeneration = constantGeneration
+		plan.constantsChecked = false
+		plan.constantsBuiltin = false
+	}
+	if !caseDispatchConstantCacheEnabled || !plan.constantsChecked {
+		anyBuiltin := false
+		for index := range plan.branches {
+			branch := &plan.branches[index]
+			pattern := vm.caseDispatchConstant(branch.constantName)
+			if pattern == nil {
+				pattern = branch.pattern
+			}
+			target, ok := caseDispatchPatternBuiltin(pattern)
+			branch.pattern = pattern
+			branch.target = target
+			branch.checked = true
+			if ok && target != nil {
+				anyBuiltin = true
+			}
+		}
+		plan.constantsChecked = true
+		// Unsupported/custom predicates are intentionally left with a nil target.
+		// A hit on any proven builtin branch is still safe; if no builtin branch
+		// matches, return false so the complete method evaluates the unsupported
+		// predicates with their exact Ruby semantics.
+		plan.constantsBuiltin = anyBuiltin
+		// Constant reassignment can replace a branch target, so discard concrete
+		// class results whenever the constant generation changes.
+		plan.classEntries = nil
+	}
+	if !plan.constantsBuiltin {
+		return 0, nil, false
+	}
+	// Class/module values may carry singleton behavior that changes `===`; the
+	// normal predicate path remains authoritative for those receivers.  Exact
+	// ordinary values, however, have stable class ancestry for the current
+	// method generation and can use a one-entry lookup after the first call.
+	if caseDispatchClassCacheEnabled && value.Class != nil && core.AttachedSingletonClass(value) == nil {
+		if plan.classEntries == nil {
+			plan.classEntries = make(map[*object.Class]int)
+		}
+		if entry, found := plan.classEntries[value.Class]; found {
+			if entry < 0 {
+				return 0, nil, false
+			}
+			branch := &plan.branches[entry]
+			return branch.entryIP, branch.direct, true
+		}
+		entry := -1
+		for index := range plan.branches {
+			branch := &plan.branches[index]
+			if branch.target != nil && valueHasClassInAncestry(value, branch.target) {
+				entry = index
+				break
+			}
+		}
+		plan.classEntries[value.Class] = entry
+		if entry < 0 {
+			return 0, nil, false
+		}
+		branch := &plan.branches[entry]
+		return branch.entryIP, branch.direct, true
+	}
+	for index := range plan.branches {
+		branch := &plan.branches[index]
+		if branch.target == nil || !valueHasClassInAncestry(value, branch.target) {
+			continue
+		}
+		return branch.entryIP, branch.direct, true
+	}
+	return 0, nil, false
+}
+
+func caseDispatchBranchForEntry(plan *caseDispatchPlan, entryIP int) *caseDispatchBranch {
+	if plan == nil {
+		return nil
+	}
+	if plan.branchEntries == nil {
+		plan.branchEntries = make(map[int]*caseDispatchBranch, len(plan.branches))
+		for index := range plan.branches {
+			branch := &plan.branches[index]
+			plan.branchEntries[branch.entryIP] = branch
+		}
+	}
+	if branch, found := plan.branchEntries[entryIP]; found {
+		return branch
+	}
+	return nil
+}
+
+func (vm *VM) executeCaseDispatchBranchNoFrame(plan *caseDispatchPlan, entryIP int, fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	branch := caseDispatchBranchForEntry(plan, entryIP)
+	branchSafe := branch != nil && branch.registerIR != nil && fn != nil && registerIRPlanSafeForDirectNoFrameWithOptions(branch.registerIR, false, true, true)
+	if !branchSafe {
+		return nil, false
+	}
+	// The enclosing case-dispatch leaf has already crossed the block's direct
+	// warmup threshold. Do not impose a second 32-call warmup on each selected
+	// branch: it would make the outer block deopt on its first hot invocation.
+	if branch.registerIR.noFrameCalls < registerIRDirectNoFrameWarmupCalls {
+		branch.registerIR.noFrameCalls = registerIRDirectNoFrameWarmupCalls
+	}
+	result, executed := vm.executeRegisterIRDirectNoFrameWithFree(branch.registerIR, fn, receiver, args, object.CurrentMethodGeneration(), nil, false, true, true)
+	return result, executed
+}
+
+func leafInstruction(fn *object.Function, position *int, expected compiler.Opcode) bool {
+	if fn == nil || position == nil || *position < 0 || *position >= len(fn.Instructions) {
+		return false
+	}
+	definition, ok := compiler.Lookup(byte(fn.Instructions[*position]))
+	if !ok || compiler.Opcode(fn.Instructions[*position]) != expected {
+		return false
+	}
+	size := 1
+	for _, width := range definition.OperandWidths {
+		size += width
+	}
+	if *position+size > len(fn.Instructions) {
+		return false
+	}
+	*position += size
+	return true
+}
+
+func leafInstanceVariableName(fn *object.Function, position int, expected compiler.Opcode) (string, int, bool) {
+	if fn == nil || position < 0 || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != expected {
+		return "", position, false
+	}
+	index := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+		return "", position, false
+	}
+	name, ok := fn.Constants[index].Data.(string)
+	return name, position + 3, ok && name != ""
+}
+
+func leafSendName(fn *object.Function, position int, expected string) (string, int, bool) {
+	if fn == nil || position < 0 || position+5 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSend ||
+		fn.Instructions[position+3] != 0 || fn.Instructions[position+4] != 0 || fn.Instructions[position+5] != 255 {
+		return "", position, false
+	}
+	index := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+		return "", position, false
+	}
+	name, ok := fn.Constants[index].Data.(string)
+	if !ok || name != expected {
+		return "", position, false
+	}
+	return name, position + 6, true
+}
+
+func leafSendNameArity(fn *object.Function, position int, expected string, arity byte) (string, int, bool) {
+	if fn == nil || position < 0 || position+5 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSend ||
+		fn.Instructions[position+3] != 0 || fn.Instructions[position+4] != arity || fn.Instructions[position+5] != 255 {
+		return "", position, false
+	}
+	index := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+		return "", position, false
+	}
+	name, ok := fn.Constants[index].Data.(string)
+	if !ok || name != expected {
+		return "", position, false
+	}
+	return name, position + 6, true
+}
+
+func leafConstantName(fn *object.Function, position int, expected string) (int, bool) {
+	if fn == nil || position < 0 || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpGetConstant {
+		return position, false
+	}
+	index := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+		return position, false
+	}
+	name, ok := fn.Constants[index].Data.(string)
+	if !ok || name != expected {
+		return position, false
+	}
+	return position + 3, true
+}
+
+func leafQualifiedConstantName(fn *object.Function, position int) (name string, next int, ok bool) {
+	if fn == nil || position < 0 || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpGetConstant {
+		return "", position, false
+	}
+	index := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+		return "", position, false
+	}
+	name, ok = fn.Constants[index].Data.(string)
+	if !ok || name == "" {
+		return "", position, false
+	}
+	position += 3
+	for position+2 < len(fn.Instructions) && compiler.Opcode(fn.Instructions[position]) == compiler.OpGetScopedConstant {
+		index = int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+		if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+			return "", position, false
+		}
+		part, partOK := fn.Constants[index].Data.(string)
+		if !partOK || part == "" {
+			return "", position, false
+		}
+		name += "::" + part
+		position += 3
+	}
+	return name, position, true
+}
+
+func leafNormalizeQualifiedConstantName(name string) string {
+	return strings.TrimPrefix(name, "::")
+}
+
+func leafSetLocal(fn *object.Function, position, local int) (int, bool) {
+	if fn == nil || position < 0 || position+1 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSetLocal || int(fn.Instructions[position+1]) != local {
+		return position, false
+	}
+	return position + 2, true
+}
+
+func leafJumpLocalPresent(fn *object.Function, position, local int) (defaultStart, target int, ok bool) {
+	if fn == nil || position < 0 || position+3 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJumpLocalPresent || int(fn.Instructions[position+1]) != local {
+		return position, 0, false
+	}
+	target = int(fn.Instructions[position+2])<<8 | int(fn.Instructions[position+3])
+	defaultStart = position + 4
+	if target <= defaultStart || target > len(fn.Instructions) {
+		return position, 0, false
+	}
+	return defaultStart, target, true
+}
+
+func optionalInstanceFallbackReaderShape(fn *object.Function) (name, fallbackName string, fallbackValue *object.EmeraldValue, guard *object.Method, ok bool) {
+	if fn == nil || len(fn.Params) != 2 || len(fn.ParamLocalIndices) != 2 || len(fn.ParamDefaults) != 2 ||
+		fn.HasRestParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return "", "", nil, nil, false
+	}
+	firstLocal, secondLocal := fn.ParamLocalIndices[0], fn.ParamLocalIndices[1]
+	position, target, valid := leafJumpLocalPresent(fn, 0, firstLocal)
+	if !valid {
+		return "", "", nil, nil, false
+	}
+	if !leafInstruction(fn, &position, compiler.OpNil) {
+		return "", "", nil, nil, false
+	}
+	var advanced bool
+	if position, advanced = leafSetLocal(fn, position, firstLocal); !advanced || !leafInstruction(fn, &position, compiler.OpPop) || position != target {
+		return "", "", nil, nil, false
+	}
+
+	position, target, valid = leafJumpLocalPresent(fn, position, secondLocal)
+	if !valid {
+		return "", "", nil, nil, false
+	}
+	if _, valid = leafConstantName(fn, position, "DEFAULT_OPTS"); !valid {
+		return "", "", nil, nil, false
+	}
+	position += 3
+	if position, advanced = leafSetLocal(fn, position, secondLocal); !advanced || !leafInstruction(fn, &position, compiler.OpPop) || position != target {
+		return "", "", nil, nil, false
+	}
+
+	if position >= len(fn.Instructions) || !isLocalLoadOpcode(compiler.Opcode(fn.Instructions[position])) || position+1 >= len(fn.Instructions) || int(fn.Instructions[position+1]) != firstLocal {
+		return "", "", nil, nil, false
+	}
+	localPosition := position
+	if !leafInstruction(fn, &position, compiler.Opcode(fn.Instructions[localPosition])) {
+		return "", "", nil, nil, false
+	}
+	if _, position, valid = leafSendName(fn, position, "nil?"); !valid || !leafInstruction(fn, &position, compiler.OpJumpNotTruthy) {
+		return "", "", nil, nil, false
+	}
+	definedName, next, definedOK := leafInstanceVariableName(fn, position, compiler.OpDefinedInstanceVar)
+	if !definedOK {
+		return "", "", nil, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpDup) || !leafInstruction(fn, &position, compiler.OpJumpNotTruthy) || !leafInstruction(fn, &position, compiler.OpPop) {
+		return "", "", nil, nil, false
+	}
+	readName, next, readOK := leafInstanceVariableName(fn, position, compiler.OpGetInstanceVar)
+	if !readOK || readName != definedName {
+		return "", "", nil, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpDup) || !leafInstruction(fn, &position, compiler.OpJumpTruthy) || !leafInstruction(fn, &position, compiler.OpPop) ||
+		!leafInstruction(fn, &position, compiler.OpSelf) {
+		return "", "", nil, nil, false
+	}
+	if position < 0 || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpConstant {
+		return "", "", nil, nil, false
+	}
+	constantIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil || fn.Constants[constantIndex].Type != object.ValueString || fn.Constants[constantIndex].Data != "Helvetica" {
+		return "", "", nil, nil, false
+	}
+	fallbackValue = fn.Constants[constantIndex]
+	position += 3
+	fallbackName, position, valid = leafSendNameArity(fn, position, "font", 1)
+	if !valid || !leafInstruction(fn, &position, compiler.OpReturnValue) {
+		return "", "", nil, nil, false
+	}
+	nilClass := core.R.Classes["NilClass"]
+	if nilClass == nil {
+		return "", "", nil, nil, false
+	}
+	guardMethod, _, guardOK := nilClass.GetMethodWithOwner("nil?")
+	if !guardOK || guardMethod == nil {
+		return "", "", nil, nil, false
+	}
+	return definedName, fallbackName, fallbackValue, guardMethod, true
+}
+
+func optionalInstanceReaderShape(fn *object.Function) (name string, defaultValue *object.EmeraldValue, truthyOnly bool, guard *object.Method, ok bool) {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 ||
+		fn.HasRestParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		len(fn.ParamDefaults) > 1 {
+		return "", nil, false, nil, false
+	}
+	parameterLocal := fn.ParamLocalIndices[0]
+	position := 0
+	if !leafInstruction(fn, &position, compiler.OpJumpLocalPresent) ||
+		!leafInstruction(fn, &position, compiler.OpNil) {
+		return "", nil, false, nil, false
+	}
+	if position+1 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSetLocal || int(fn.Instructions[position+1]) != parameterLocal ||
+		!leafInstruction(fn, &position, compiler.OpSetLocal) || !leafInstruction(fn, &position, compiler.OpPop) {
+		return "", nil, false, nil, false
+	}
+	localPosition := position
+	if position >= len(fn.Instructions) || !isLocalLoadOpcode(compiler.Opcode(fn.Instructions[position])) || position+1 >= len(fn.Instructions) || int(fn.Instructions[position+1]) != parameterLocal {
+		return "", nil, false, nil, false
+	}
+	if !leafInstruction(fn, &position, compiler.Opcode(fn.Instructions[localPosition])) {
+		return "", nil, false, nil, false
+	}
+	fontPosition := position
+	if leafInstruction(fn, &position, compiler.OpBang) && leafInstruction(fn, &position, compiler.OpJumpNotTruthy) {
+		name, next, nameOK := leafInstanceVariableName(fn, position, compiler.OpGetInstanceVar)
+		if nameOK && leafInstruction(fn, &next, compiler.OpReturnValue) && next < len(fn.Instructions) {
+			// font_size(points = nil, &block) has exactly this no-argument
+			// getter prefix. The rest handles setters and blocks.
+			return name, nil, false, nil, true
+		}
+	}
+	position = fontPosition
+
+	// character_spacing(amount = nil, &block) has a slightly longer getter
+	// branch that returns zero for an unset or false instance variable.
+	position = 0
+	if !leafInstruction(fn, &position, compiler.OpJumpLocalPresent) ||
+		!leafInstruction(fn, &position, compiler.OpNil) {
+		return "", nil, false, nil, false
+	}
+	if position+1 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpSetLocal || int(fn.Instructions[position+1]) != parameterLocal ||
+		!leafInstruction(fn, &position, compiler.OpSetLocal) ||
+		!leafInstruction(fn, &position, compiler.OpPop) {
+		return "", nil, false, nil, false
+	}
+	localPosition = position
+	if position >= len(fn.Instructions) || !isLocalLoadOpcode(compiler.Opcode(fn.Instructions[position])) || position+1 >= len(fn.Instructions) || int(fn.Instructions[position+1]) != parameterLocal {
+		return "", nil, false, nil, false
+	}
+	if !leafInstruction(fn, &position, compiler.Opcode(fn.Instructions[localPosition])) {
+		return "", nil, false, nil, false
+	}
+	if _, next, sendOK := leafSendName(fn, position, "nil?"); sendOK {
+		position = next
+	} else {
+		return "", nil, false, nil, false
+	}
+	if !leafInstruction(fn, &position, compiler.OpJumpNotTruthy) {
+		return "", nil, false, nil, false
+	}
+	definedName, next, definedOK := leafInstanceVariableName(fn, position, compiler.OpDefinedInstanceVar)
+	if !definedOK {
+		return "", nil, false, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpDup) || !leafInstruction(fn, &position, compiler.OpJumpNotTruthy) ||
+		!leafInstruction(fn, &position, compiler.OpPop) {
+		return "", nil, false, nil, false
+	}
+	readName, next, readOK := leafInstanceVariableName(fn, position, compiler.OpGetInstanceVar)
+	if !readOK || readName != definedName {
+		return "", nil, false, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpDup) || !leafInstruction(fn, &position, compiler.OpJumpTruthy) ||
+		!leafInstruction(fn, &position, compiler.OpPop) {
+		return "", nil, false, nil, false
+	}
+	constantPosition := position
+	if !leafInstruction(fn, &position, compiler.OpConstant) || constantPosition+2 >= len(fn.Instructions) {
+		return "", nil, false, nil, false
+	}
+	constantIndex := int(fn.Instructions[constantPosition+1])<<8 | int(fn.Instructions[constantPosition+2])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || !smallIntegerValue(fn.Constants[constantIndex]) || fn.Constants[constantIndex].Data.(int64) != 0 ||
+		!leafInstruction(fn, &position, compiler.OpReturnValue) {
+		return "", nil, false, nil, false
+	}
+	nilClass := core.R.Classes["NilClass"]
+	if nilClass == nil {
+		return "", nil, false, nil, false
+	}
+	guardMethod, _, guardOK := nilClass.GetMethodWithOwner("nil?")
+	if !guardOK || guardMethod == nil {
+		return "", nil, false, nil, false
+	}
+	return definedName, core.NewIntegerValue(0), true, guardMethod, true
+}
+
+// rescueLiteralShape recognizes a method whose only executable body is an
+// immutable literal wrapped in a rescue clause. The rescue is unreachable for
+// a literal, so a one-argument call can return the value without a Ruby frame;
+// zero-argument calls retain the default-expression semantics.
+func rescueLiteralShape(fn *object.Function) (*object.EmeraldValue, bool) {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || len(fn.ParamDefaults) != 1 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, false
+	}
+	position, target, ok := leafJumpLocalPresent(fn, 0, fn.ParamLocalIndices[0])
+	if !ok || target < position+3 || target > len(fn.Instructions) || compiler.Opcode(fn.Instructions[target-3]) != compiler.OpSetLocal ||
+		int(fn.Instructions[target-2]) != fn.ParamLocalIndices[0] || compiler.Opcode(fn.Instructions[target-1]) != compiler.OpPop {
+		return nil, false
+	}
+	position = target
+	if position+8 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpBeginRescue {
+		return nil, false
+	}
+	position += 9
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpConstant {
+		return nil, false
+	}
+	constantIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil ||
+		!registerIRImmutableLiteral(fn.Constants[constantIndex]) && fn.Constants[constantIndex].Type != object.ValueString {
+		return nil, false
+	}
+	literal := fn.Constants[constantIndex]
+	position += 3
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJump {
+		return nil, false
+	}
+	jumpTarget := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if jumpTarget <= position+3 || jumpTarget >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[jumpTarget-1]) != compiler.OpEndRescue ||
+		compiler.Opcode(fn.Instructions[jumpTarget]) != compiler.OpReturnValue {
+		return nil, false
+	}
+	return literal, true
+}
+
+func rescueEncodingShape(fn *object.Function) (constantName, defaultName string, encodeGuard *object.Method, rescueClasses []*object.Class, ok bool) {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || len(fn.ParamDefaults) != 1 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return "", "", nil, nil, false
+	}
+	position, target, valid := leafJumpLocalPresent(fn, 0, fn.ParamLocalIndices[0])
+	if !valid || target < position+3 || target > len(fn.Instructions) || compiler.Opcode(fn.Instructions[target-3]) != compiler.OpSetLocal ||
+		int(fn.Instructions[target-2]) != fn.ParamLocalIndices[0] || compiler.Opcode(fn.Instructions[target-1]) != compiler.OpPop {
+		return "", "", nil, nil, false
+	}
+	defaultName, position, valid = leafQualifiedConstantName(fn, position)
+	if !valid || position != target-3 {
+		return "", "", nil, nil, false
+	}
+	defaultName = leafNormalizeQualifiedConstantName(defaultName)
+	position = target
+	if position+8 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpBeginRescue {
+		return "", "", nil, nil, false
+	}
+	position += 9
+	constantName, position, valid = leafQualifiedConstantName(fn, position)
+	if !valid || position >= len(fn.Instructions) || !isLocalLoadOpcode(compiler.Opcode(fn.Instructions[position])) ||
+		position+1 >= len(fn.Instructions) || int(fn.Instructions[position+1]) != fn.ParamLocalIndices[0] {
+		return "", "", nil, nil, false
+	}
+	constantName = leafNormalizeQualifiedConstantName(constantName)
+	position += 2
+	if _, position, valid = leafSendNameArity(fn, position, "encode", 1); !valid || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJump {
+		return "", "", nil, nil, false
+	}
+	bodyJumpTarget := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	position += 3
+	if bodyJumpTarget <= position || bodyJumpTarget >= len(fn.Instructions) {
+		return "", "", nil, nil, false
+	}
+	firstRescue, next, firstOK := leafQualifiedConstantName(fn, position)
+	if !firstOK {
+		return "", "", nil, nil, false
+	}
+	secondRescue, next, secondOK := leafQualifiedConstantName(fn, next)
+	if !secondOK || next >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[next]) != compiler.OpRescueMatch {
+		return "", "", nil, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpRescueMatch) {
+		return "", "", nil, nil, false
+	}
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJumpNotTruthy {
+		return "", "", nil, nil, false
+	}
+	reraiseTarget := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	position += 3
+	if reraiseTarget+1 >= len(fn.Instructions) || !leafInstruction(fn, &position, compiler.OpRescue) || !leafInstruction(fn, &position, compiler.OpPop) ||
+		!leafInstruction(fn, &position, compiler.OpNil) || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJump ||
+		int(fn.Instructions[position+1])<<8|int(fn.Instructions[position+2]) != bodyJumpTarget-1 {
+		return "", "", nil, nil, false
+	}
+	position += 3
+	if !leafInstruction(fn, &position, compiler.OpReraise) || !leafInstruction(fn, &position, compiler.OpEndRescue) || position != bodyJumpTarget ||
+		bodyJumpTarget >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[bodyJumpTarget]) != compiler.OpReturnValue {
+		return "", "", nil, nil, false
+	}
+	firstRescue = leafNormalizeQualifiedConstantName(firstRescue)
+	secondRescue = leafNormalizeQualifiedConstantName(secondRescue)
+	if firstRescue != "Encoding::InvalidByteSequenceError" || secondRescue != "Encoding::UndefinedConversionError" {
+		return "", "", nil, nil, false
+	}
+	stringClass := core.R.Classes["String"]
+	if stringClass == nil {
+		return "", "", nil, nil, false
+	}
+	encodeGuard, _, guardOK := stringClass.GetMethodWithOwner("encode")
+	if !guardOK || encodeGuard == nil {
+		return "", "", nil, nil, false
+	}
+	rescueClasses = []*object.Class{core.R.Classes["Encoding::InvalidByteSequenceError"], core.R.Classes["Encoding::UndefinedConversionError"]}
+	if rescueClasses[0] == nil || rescueClasses[1] == nil {
+		return "", "", nil, nil, false
+	}
+	return constantName, defaultName, encodeGuard, rescueClasses, true
+}
+
+// rescueEncodeLiteralShape recognizes the hot success path of a method that
+// encodes its sole argument with a fixed string encoding and handles encoding
+// failures in a rescue clause.  The rescue body itself is deliberately not
+// replayed here: a native encode success is returned directly, while an encode
+// exception deopts to the original method so its custom error/backtrace logic
+// remains authoritative.
+func rescueEncodeLiteralShape(fn *object.Function) (*object.EmeraldValue, *object.Method, bool) {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || len(fn.ParamDefaults) != 1 || fn.ParamDefaults[0] != nil ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, nil, false
+	}
+	position := 0
+	if !leafInstruction(fn, &position, compiler.OpBeginRescue) {
+		return nil, nil, false
+	}
+	if position >= len(fn.Instructions) || !isLocalLoadOpcode(compiler.Opcode(fn.Instructions[position])) || position+1 >= len(fn.Instructions) || int(fn.Instructions[position+1]) != fn.ParamLocalIndices[0] {
+		return nil, nil, false
+	}
+	position += 2
+	if position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpConstant {
+		return nil, nil, false
+	}
+	constantIndex := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil || fn.Constants[constantIndex].Type != object.ValueString {
+		return nil, nil, false
+	}
+	encoding := fn.Constants[constantIndex]
+	if _, ok := encoding.Data.(string); !ok {
+		return nil, nil, false
+	}
+	position += 3
+	var sendOK bool
+	_, position, sendOK = leafSendNameArity(fn, position, "encode", 1)
+	if !sendOK || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJump {
+		return nil, nil, false
+	}
+	bodyTarget := int(fn.Instructions[position+1])<<8 | int(fn.Instructions[position+2])
+	position += 3
+	if bodyTarget <= position || bodyTarget >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[bodyTarget]) != compiler.OpReturnValue {
+		return nil, nil, false
+	}
+	firstRescue, next, firstOK := leafQualifiedConstantName(fn, position)
+	secondRescue, next, secondOK := leafQualifiedConstantName(fn, next)
+	if !firstOK || !secondOK || next >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[next]) != compiler.OpRescueMatch {
+		return nil, nil, false
+	}
+	firstRescue = leafNormalizeQualifiedConstantName(firstRescue)
+	secondRescue = leafNormalizeQualifiedConstantName(secondRescue)
+	if firstRescue != "Encoding::InvalidByteSequenceError" || secondRescue != "Encoding::UndefinedConversionError" {
+		return nil, nil, false
+	}
+	position = next
+	if !leafInstruction(fn, &position, compiler.OpRescueMatch) || position+2 >= len(fn.Instructions) || compiler.Opcode(fn.Instructions[position]) != compiler.OpJumpNotTruthy {
+		return nil, nil, false
+	}
+	position += 3
+	if !leafInstruction(fn, &position, compiler.OpRescue) || !leafInstruction(fn, &position, compiler.OpPop) || position >= bodyTarget {
+		return nil, nil, false
+	}
+	stringClass := core.R.Classes["String"]
+	if stringClass == nil {
+		return nil, nil, false
+	}
+	encodeGuard, _, guardOK := stringClass.GetMethodWithOwner("encode")
+	if !guardOK || encodeGuard == nil {
+		return nil, nil, false
+	}
+	return encoding, encodeGuard, true
+}
+
+func buildLeafMethodPlan(fn *object.Function) leafMethodPlan {
+	unsupported := leafMethodPlan{kind: leafMethodUnsupported}
+	if fn == nil {
+		return unsupported
+	}
+	if optionalInstanceFallbackReaderEnabled {
+		if name, fallbackName, fallbackValue, guard, ok := optionalInstanceFallbackReaderShape(fn); ok {
+			return leafMethodPlan{kind: leafMethodOptionalInstanceFallbackReader, name: name, optionalGuard: guard, optionalFallbackName: fallbackName, optionalFallbackValue: fallbackValue, runtime: &leafMethodRuntimeCache{}}
+		}
+	}
+	if name, defaultValue, truthyOnly, guard, ok := optionalInstanceReaderShape(fn); ok {
+		return leafMethodPlan{kind: leafMethodOptionalInstanceReader, name: name, optionalDefault: defaultValue, optionalTruthy: truthyOnly, optionalGuard: guard, runtime: &leafMethodRuntimeCache{}}
+	}
+	if literal, ok := rescueLiteralShape(fn); ok {
+		return leafMethodPlan{kind: leafMethodRescueLiteral, rescueLiteral: literal}
+	}
+	if constantName, defaultName, encodeGuard, rescueClasses, ok := rescueEncodingShape(fn); ok {
+		return leafMethodPlan{
+			kind:               leafMethodRescueEncoding,
+			rescueConstantName: constantName,
+			rescueDefaultName:  defaultName,
+			rescueEncodeGuard:  encodeGuard,
+			rescueErrorClasses: rescueClasses,
+			runtime:            &leafMethodRuntimeCache{},
+		}
+	}
+	if encoding, encodeGuard, ok := rescueEncodeLiteralShape(fn); ok {
+		return leafMethodPlan{kind: leafMethodRescueEncodeLiteral, rescueEncodeLiteral: encoding, rescueEncodeGuard: encodeGuard, runtime: &leafMethodRuntimeCache{}}
+	}
+	if fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return unsupported
+	}
+	// Case dispatch is a purpose-built fast path for the large `case value;
+	// when Constant` methods emitted by libraries such as pdf-core. Prefer it
+	// over a broad Register IR plan when both recognize the same function: the
+	// dispatch plan skips the method's 200+ bytecode instructions and only
+	// resolves the selected branch, while the general IR would still interpret
+	// every send in the method body.
+	if caseDispatchEnabled {
+		if plan, ok := buildCaseDispatchPlan(fn); ok {
+			return leafMethodPlan{kind: leafMethodCaseDispatch, caseDispatch: plan}
+		}
+	}
+	instructions := fn.Instructions
+	if len(fn.Params) == 0 && len(instructions) == 4 && compiler.Opcode(instructions[0]) == compiler.OpGetInstanceVar && compiler.Opcode(instructions[3]) == compiler.OpReturnValue {
+		index := int(instructions[1])<<8 | int(instructions[2])
+		if index >= 0 && index < len(fn.Constants) {
+			if name, ok := fn.Constants[index].Data.(string); ok {
+				return leafMethodPlan{kind: leafMethodInstanceReader, name: name}
+			}
+		}
+	}
+	if len(fn.Params) == 1 && len(fn.ParamLocalIndices) == 1 && len(instructions) == 6 &&
+		isLocalLoadOpcode(compiler.Opcode(instructions[0])) && int(instructions[1]) == fn.ParamLocalIndices[0] &&
+		compiler.Opcode(instructions[2]) == compiler.OpSetInstanceVar && compiler.Opcode(instructions[5]) == compiler.OpReturnValue {
+		index := int(instructions[3])<<8 | int(instructions[4])
+		if index >= 0 && index < len(fn.Constants) {
+			if name, ok := fn.Constants[index].Data.(string); ok {
+				return leafMethodPlan{kind: leafMethodInstanceWriter, name: name}
+			}
+		}
+	}
+	if primary, secondary, ok := attributeIntegerCompareNames(fn); ok {
+		return leafMethodPlan{kind: leafMethodAttributeIntegerCompare, name: primary, secondaryName: secondary}
+	}
+	if plan, ok := compileRegisterIR(fn); ok {
+		if primary, secondary, key, matched := registerIRInstanceFallbackIndexShape(plan); matched {
+			return leafMethodPlan{kind: leafMethodInstanceFallbackIndex, name: primary, secondaryName: secondary, indexKey: key, registerIR: plan}
+		}
+		return leafMethodPlan{kind: leafMethodRegisterIR, registerIR: plan}
+	}
+	return unsupported
+}
+
+// registerIRInstanceFallbackIndexShape recognizes the short-circuit accessor
+// emitted for methods such as `@location || (@shape && @shape[:location])`.
+// The exact register shape matters: both ivars are read directly, the
+// fallback key is an immutable literal, and the only operation after the
+// truthiness guards is a single index.  Runtime execution still requires an
+// exact builtin Hash with no default/default_proc; custom []/subclasses then
+// deopt to the ordinary Register IR/method path.
+func registerIRInstanceFallbackIndexShape(plan *registerIRPlan) (string, string, *object.EmeraldValue, bool) {
+	if plan == nil || len(plan.instructions) != 10 || plan.hasSends || plan.hasImplicitSends || plan.requiresFrame {
+		return "", "", nil, false
+	}
+	instructions := plan.instructions
+	first := instructions[0]
+	firstCopy := instructions[1]
+	truthy := instructions[2]
+	second := instructions[3]
+	secondCopy := instructions[4]
+	notTruthy := instructions[5]
+	secondAgain := instructions[6]
+	key := instructions[7]
+	index := instructions[8]
+	result := instructions[9]
+	if first.op != registerIRLoadInstanceVar || first.name == "" ||
+		firstCopy.op != registerIRMove || firstCopy.left != first.dst ||
+		truthy.op != registerIRJumpTruthy || truthy.left != first.dst || truthy.target != 9 ||
+		second.op != registerIRLoadInstanceVar || second.name == "" ||
+		secondCopy.op != registerIRMove || secondCopy.left != second.dst ||
+		notTruthy.op != registerIRJumpNotTruthy || notTruthy.left != second.dst || notTruthy.target != 9 ||
+		secondAgain.op != registerIRLoadInstanceVar || secondAgain.name != second.name ||
+		key.op != registerIRLoadLiteral || key.value == nil ||
+		(key.value.Type != object.ValueString && key.value.Type != object.ValueSymbol) ||
+		index.op != registerIRIndex || index.dst != secondAgain.dst || index.left != secondAgain.dst || index.right != key.dst ||
+		result.op != registerIRReturn || result.left != first.dst {
+		return "", "", nil, false
+	}
+	return first.name, second.name, key.value, true
+}
+
+// executeDirectAttributeAccessor handles the exact methods emitted by
+// attr_reader/attr_writer before the general Ruby binder allocates a frame.
+// The metadata is attached to the method itself, so this does not infer an
+// accessor from arbitrary bytecode. Any optional/keyword/rest/pattern/block
+// shape, arity mismatch, trace, or instruction-limit context keeps the normal
+// compatibility path.
+func (vm *VM) executeDirectAttributeAccessor(fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, methodObj *object.Method) (*object.EmeraldValue, bool) {
+	if vm == nil || fn == nil || methodObj == nil || vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		methodObj.DispatchOwner != nil || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		fn.HasRestParam || fn.HasBlockParam || fn.RejectBlock && vm.currentBlock != nil {
+		return nil, false
+	}
+	for _, pattern := range fn.ParamPatterns {
+		if pattern != nil {
+			return nil, false
+		}
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	if methodObj.AttrReaderName != "" && len(fn.Params) == 0 && len(args) == 0 {
+		if value := core.DynamicInstanceVar(receiver, methodObj.AttrReaderName); value != nil {
+			return value, true
+		}
+		return core.R.NilVal, true
+	}
+	if methodObj.AttrWriterName != "" && len(fn.Params) == 1 && len(args) == 1 {
+		if result := core.SetDynamicInstanceVar(receiver, methodObj.AttrWriterName, args[0]); result != nil {
+			return result, true
+		}
+		return args[0], true
+	}
+	return nil, false
+}
+
+func (vm *VM) executeEarlyAttributeComparePlan(fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, methodObj *object.Method) (*object.EmeraldValue, bool) {
+	if vm == nil || fn == nil || methodObj == nil || vm.instructionLimit != 0 || core.AnyTracePointActive() ||
+		len(vm.catchStack) > 0 || vm.currentBlock != nil && fn.RejectBlock || methodObj.Ruby2Keywords ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || len(args) != 1 {
+		return nil, false
+	}
+	plan, found := vm.leafMethodCache[fn]
+	if !found || plan.kind != leafMethodAttributeIntegerCompare {
+		return nil, false
+	}
+	return vm.executeAttributeIntegerComparePlan(fn, plan, receiver, args, methodObj)
+}
+
+// executeEarlyColdRaiseRegisterIR skips the full positional/keyword binder
+// only for a fixed-arity IR plan that contains a string literal proven to be
+// on an exception-only path. The plan still creates its normal Frame, so
+// raises, backtraces, class scope and constantValue semantics are unchanged.
+// Keeping this entry restricted to the cold-string marker avoids the broad
+// early-plan probe that regressed AWS workloads in earlier experiments.
+func (vm *VM) executeEarlyColdRaiseRegisterIR(fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, method string, methodObj *object.Method, methodOwner *object.Class) (*object.EmeraldValue, bool) {
+	if !registerIREnabled || !registerIRColdRaiseStringLiteralsEnabled || vm == nil || fn == nil || methodObj == nil || vm.currentBlock != nil || vm.instructionLimit != 0 ||
+		core.AnyTracePointActive() || len(vm.catchStack) > 0 || methodObj.Ruby2Keywords || methodObj.DispatchOwner != nil ||
+		methodUsesRefinements(methodObj) || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) || len(args) != len(fn.Params) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	for _, arg := range args {
+		if arg != nil && arg.Type == object.ValueHash && core.Ruby2KeywordHash(arg) {
+			return nil, false
+		}
+	}
+	plan, found := vm.leafMethodCache[fn]
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.coldRaiseStringLiterals {
+		return nil, false
+	}
+	if !registerIRPlanSafeForActiveRescues(plan.registerIR, vm) {
+		return nil, false
+	}
+	return vm.executeRegisterIR(plan.registerIR, fn, receiver, args, method, methodObj, methodOwner)
+}
+
+func isLocalLoadOpcode(op compiler.Opcode) bool {
+	return op == compiler.OpGetLocal || op == compiler.OpGetLocalFast
+}
+
+// fastFixedPositionalMethod is deliberately narrower than Ruby's complete
+// argument binder. It is only used as a speculative leaf/typed probe; any
+// keyword-marked hash, optional/default metadata, block rejection, closure
+// binding, or define_method state keeps the full compatibility path.
+func attributeIntegerCompareNames(fn *object.Function) (string, string, bool) {
+	if fn == nil || len(fn.Params) != 1 || len(fn.Instructions) != 65 {
+		return "", "", false
+	}
+	instructions := fn.Instructions
+	opcodes := map[int]compiler.Opcode{
+		0: compiler.OpSelf, 1: compiler.OpSend, 7: compiler.OpGetLocal, 9: compiler.OpSend,
+		15: compiler.OpEqual, 16: compiler.OpJumpNotTruthy, 19: compiler.OpGetLocal,
+		21: compiler.OpSend, 27: compiler.OpSelf, 28: compiler.OpSend, 34: compiler.OpSend,
+		40: compiler.OpJump, 43: compiler.OpSelf, 44: compiler.OpSend, 50: compiler.OpGetLocal,
+		52: compiler.OpSend, 58: compiler.OpSend, 64: compiler.OpReturnValue,
+	}
+	for offset, opcode := range opcodes {
+		actual := compiler.Opcode(instructions[offset])
+		if actual != opcode && !(opcode == compiler.OpGetLocal && isLocalLoadOpcode(actual)) {
+			return "", "", false
+		}
+	}
+	if instructions[8] != 0 || instructions[20] != 0 || instructions[51] != 0 ||
+		int(instructions[17])<<8|int(instructions[18]) != 43 ||
+		int(instructions[41])<<8|int(instructions[42]) != 64 {
+		return "", "", false
+	}
+	nameAt := func(offset int) (string, bool) {
+		index := int(instructions[offset+1])<<8 | int(instructions[offset+2])
+		if index < 0 || index >= len(fn.Constants) || fn.Constants[index] == nil {
+			return "", false
+		}
+		name, ok := fn.Constants[index].Data.(string)
+		return name, ok
+	}
+	primary, primaryOK := nameAt(1)
+	otherPrimary, otherPrimaryOK := nameAt(9)
+	secondary, secondaryOK := nameAt(21)
+	otherSecondary, otherSecondaryOK := nameAt(28)
+	firstCompare, firstCompareOK := nameAt(34)
+	elsePrimary, elsePrimaryOK := nameAt(44)
+	elseOtherPrimary, elseOtherPrimaryOK := nameAt(52)
+	secondCompare, secondCompareOK := nameAt(58)
+	if !primaryOK || !otherPrimaryOK || !secondaryOK || !otherSecondaryOK ||
+		!firstCompareOK || !elsePrimaryOK || !elseOtherPrimaryOK || !secondCompareOK ||
+		primary == "" || secondary == "" || primary != otherPrimary || primary != elsePrimary ||
+		primary != elseOtherPrimary || secondary != otherSecondary || firstCompare != "<=>" || secondCompare != "<=>" {
+		return "", "", false
+	}
+	return primary, secondary, true
+}
+
+func (vm *VM) executeAttributeIntegerComparePlan(fn *object.Function, plan leafMethodPlan, receiver *object.EmeraldValue, args []*object.EmeraldValue, methodObj *object.Method) (*object.EmeraldValue, bool) {
+	if len(args) != 1 || receiver == nil || args[0] == nil || receiver.Type != object.ValueObject || args[0].Type != object.ValueObject ||
+		receiver.Class == nil || receiver.Class != args[0].Class || methodUsesRefinements(methodObj) {
+		return nil, false
+	}
+	left, leftOK := receiver.Data.(*object.Object)
+	right, rightOK := args[0].Data.(*object.Object)
+	if !leftOK || !rightOK || left == nil || right == nil || len(left.SingletonMethods) > 0 || left.SingletonClass != nil ||
+		len(right.SingletonMethods) > 0 || right.SingletonClass != nil {
+		return nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	runtimePlan, found := vm.attributeCompareCache[fn]
+	if !found || runtimePlan.generation != generation || runtimePlan.class != receiver.Class {
+		if !core.IntegerCompareUsesBuiltinImplementation() {
+			return nil, false
+		}
+		primary, _, primaryFound := receiver.Class.GetMethodWithOwner(plan.name)
+		secondary, _, secondaryFound := receiver.Class.GetMethodWithOwner(plan.secondaryName)
+		if !primaryFound || !secondaryFound || primary == nil || secondary == nil ||
+			(primary.Visibility != "" && primary.Visibility != "public") ||
+			(secondary.Visibility != "" && secondary.Visibility != "public") ||
+			primary.AttrReaderName == "" || secondary.AttrReaderName == "" {
+			return nil, false
+		}
+		runtimePlan = attributeIntegerCompareRuntimePlan{
+			generation:           generation,
+			class:                receiver.Class,
+			primaryInstanceVar:   primary.AttrReaderName,
+			secondaryInstanceVar: secondary.AttrReaderName,
+		}
+		vm.attributeCompareCache[fn] = runtimePlan
+	}
+	leftPrimary := left.GetInstanceVar(runtimePlan.primaryInstanceVar)
+	rightPrimary := right.GetInstanceVar(runtimePlan.primaryInstanceVar)
+	leftSecondary := left.GetInstanceVar(runtimePlan.secondaryInstanceVar)
+	rightSecondary := right.GetInstanceVar(runtimePlan.secondaryInstanceVar)
+	if !smallIntegerValue(leftPrimary) || !smallIntegerValue(rightPrimary) ||
+		!smallIntegerValue(leftSecondary) || !smallIntegerValue(rightSecondary) {
+		return nil, false
+	}
+	leftValue := leftPrimary.Data.(int64)
+	rightValue := rightPrimary.Data.(int64)
+	if leftValue == rightValue {
+		leftValue = rightSecondary.Data.(int64)
+		rightValue = leftSecondary.Data.(int64)
+	}
+	result := int64(0)
+	if leftValue < rightValue {
+		result = -1
+	} else if leftValue > rightValue {
+		result = 1
+	}
+	return core.NewIntegerValue(result), true
+}
+
+func smallIntegerValue(value *object.EmeraldValue) bool {
+	return value != nil && value.Type == object.ValueInteger && value.BigIntValue() == nil
+}
+
+func methodUsesRefinements(method *object.Method) bool {
+	if method == nil || method.Closure == nil {
+		return false
+	}
+	return closureUsesRefinements(method.Closure)
+}
+
+func closureUsesRefinements(closure *object.Closure) bool {
+	if closure == nil {
+		return false
+	}
+	generation := object.CurrentMethodGeneration()
+	if closure.RefinementCheckValid && closure.RefinementCheckGeneration == generation {
+		return closure.RefinementCheckResult
+	}
+	result := false
+	if len(closure.Refinements) > 0 {
+		result = true
+	} else {
+		for _, scope := range closure.ClassStack {
+			if scope == nil {
+				continue
+			}
+			switch scope.Type {
+			case object.ValueClass:
+				if class, ok := scope.Data.(*object.Class); ok && class != nil && len(class.UsedRefinements) > 0 {
+					result = true
+				}
+			case object.ValueModule:
+				if module, ok := scope.Data.(*object.Module); ok && module != nil && len(module.UsedRefinements) > 0 {
+					result = true
+				}
+			}
+			if result {
+				break
+			}
+		}
+	}
+	closure.RefinementCheckGeneration = generation
+	closure.RefinementCheckResult = result
+	closure.RefinementCheckValid = true
+	return result
 }
 
 func (vm *VM) cachedIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) {
@@ -10545,19 +18227,58 @@ func applyIntegerBinary(op compiler.Opcode, left, right int64) (int64, bool) {
 }
 
 func (vm *VM) executeSingleIntegerFunctionPlan(fn *object.Function, argument int64) (int64, bool) {
+	values := [1]int64{argument}
+	return vm.executeIntegerFunctionPlan(fn, values[:])
+}
+
+func (vm *VM) executeIntegerMethodPlan(fn *object.Function, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if fn == nil || len(args) > 16 || len(args) != len(fn.ParamLocalIndices) {
+		return nil, false
+	}
+	var values [16]int64
+	for index, argument := range args {
+		if argument == nil || argument.Type != object.ValueInteger {
+			return nil, false
+		}
+		if _, big := core.NumericBigIntOverride(argument); big {
+			return nil, false
+		}
+		values[index] = argument.Data.(int64)
+	}
+	result, ok := vm.executeIntegerFunctionPlan(fn, values[:len(args)])
+	if !ok {
+		return nil, false
+	}
+	return core.NewIntegerValue(result), true
+}
+
+func (vm *VM) executeIntegerFunctionPlan(fn *object.Function, arguments []int64) (int64, bool) {
 	plan, ok := vm.cachedIntegerFunctionPlan(fn)
-	if !ok || len(fn.ParamLocalIndices) != 1 || plan.usesAdd && !vm.fusedIntegerBuiltinsAvailable() {
+	if !ok {
+		return 0, false
+	}
+	return vm.executeCachedIntegerFunctionPlan(fn, plan, arguments)
+}
+
+// executeCachedIntegerFunctionPlan is the inner typed-callee runner used by
+// integer bytecode loops.  The caller has already resolved the exact Function
+// and immutable expression plan at loop admission, so keeping the map lookup
+// out of every iteration materially reduces the cost of small pure Ruby
+// callees while preserving the same arity, builtin-generation and overflow
+// guards as the ordinary entry point.
+func (vm *VM) executeCachedIntegerFunctionPlan(fn *object.Function, plan *integerFunctionPlan, arguments []int64) (int64, bool) {
+	if fn == nil || plan == nil || len(arguments) != len(fn.ParamLocalIndices) || plan.usesAdd && !vm.fusedIntegerBuiltinsAvailable() {
 		return 0, false
 	}
 	var stack [16]int64
 	stackPointer := 0
 	for _, step := range plan.steps {
 		switch step.op {
-		case compiler.OpGetLocal:
-			if step.param != 0 {
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
+			if step.param < 0 || step.param >= len(arguments) {
 				return 0, false
 			}
-			stack[stackPointer] = argument
+			stack[stackPointer] = arguments[step.param]
 			stackPointer++
 		case compiler.OpConstant:
 			stack[stackPointer] = step.value
@@ -10587,10 +18308,89 @@ func (vm *VM) executeSingleIntegerFunctionPlan(fn *object.Function, argument int
 	return 0, false
 }
 
+// affineIntegerFunctionPlan proves that a positional integer callee computes
+// `factor*x + offset`.  It accepts only checked affine operations; any
+// nonlinear expression, bit operation, or malformed stack shape deopts to the
+// existing per-iteration typed callee runner.
+func affineIntegerFunctionPlan(plan *integerFunctionPlan) (factor, offset int64, ok bool) {
+	if plan == nil {
+		return 0, 0, false
+	}
+	stack := make([]affineIntegerExpression, 0, 8)
+	for _, step := range plan.steps {
+		switch step.op {
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
+			if step.param != 0 {
+				return 0, 0, false
+			}
+			stack = append(stack, affineIntegerExpression{factor: 1})
+		case compiler.OpConstant:
+			stack = append(stack, affineIntegerExpression{offset: step.value})
+		case compiler.OpNeg, compiler.OpNegate:
+			if len(stack) < 1 {
+				return 0, 0, false
+			}
+			value := stack[len(stack)-1]
+			if value.factor == math.MinInt64 || value.offset == math.MinInt64 {
+				return 0, 0, false
+			}
+			value.factor = -value.factor
+			value.offset = -value.offset
+			stack[len(stack)-1] = value
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul:
+			if len(stack) < 2 {
+				return 0, 0, false
+			}
+			right := stack[len(stack)-1]
+			left := stack[len(stack)-2]
+			stack = stack[:len(stack)-2]
+			var value affineIntegerExpression
+			var factorOK, offsetOK bool
+			switch step.op {
+			case compiler.OpAdd:
+				value.factor, factorOK = checkedIntegerAdd(left.factor, right.factor)
+				value.offset, offsetOK = checkedIntegerAdd(left.offset, right.offset)
+				if !factorOK || !offsetOK {
+					return 0, 0, false
+				}
+			case compiler.OpSub:
+				value.factor, factorOK = checkedIntegerSub(left.factor, right.factor)
+				value.offset, offsetOK = checkedIntegerSub(left.offset, right.offset)
+				if !factorOK || !offsetOK {
+					return 0, 0, false
+				}
+			case compiler.OpMul:
+				if left.factor != 0 && right.factor != 0 {
+					return 0, 0, false
+				}
+				if right.factor == 0 {
+					value.factor, factorOK = checkedIntegerMul(left.factor, right.offset)
+					value.offset, offsetOK = checkedIntegerMul(left.offset, right.offset)
+				} else {
+					value.factor, factorOK = checkedIntegerMul(right.factor, left.offset)
+					value.offset, offsetOK = checkedIntegerMul(right.offset, left.offset)
+				}
+				if !factorOK || !offsetOK {
+					return 0, 0, false
+				}
+			}
+			stack = append(stack, value)
+		case compiler.OpReturnValue:
+			if len(stack) != 1 {
+				return 0, 0, false
+			}
+			value := stack[0]
+			return value.factor, value.offset, true
+		default:
+			return 0, 0, false
+		}
+	}
+	return 0, 0, false
+}
+
 func buildIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) {
 	if fn == nil || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
-		fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
-		len(fn.ParamLocalIndices) == 0 {
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly {
 		return nil, false
 	}
 	for _, pattern := range fn.ParamPatterns {
@@ -10609,7 +18409,7 @@ func buildIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) 
 	for position := 0; position < len(instructions); {
 		op := compiler.Opcode(instructions[position])
 		switch op {
-		case compiler.OpGetLocal:
+		case compiler.OpGetLocal, compiler.OpGetLocalFast:
 			if position+1 >= len(instructions) {
 				return nil, false
 			}
@@ -10677,7 +18477,50 @@ func buildIntegerFunctionPlan(fn *object.Function) (*integerFunctionPlan, bool) 
 	if len(plan.steps) == 0 || plan.steps[len(plan.steps)-1].op != compiler.OpReturnValue {
 		return nil, false
 	}
+	plan.kernel = detectIntegerFunctionKernel(plan)
 	return plan, true
+}
+
+func detectIntegerFunctionKernel(plan *integerFunctionPlan) integerFunctionKernel {
+	if plan == nil || len(plan.steps) != 10 {
+		return integerFunctionKernel{}
+	}
+	steps := plan.steps
+	if (steps[0].op != compiler.OpGetLocal && steps[0].op != compiler.OpGetLocalFast) ||
+		steps[0].param != 0 || steps[1].op != compiler.OpConstant ||
+		steps[2].op != compiler.OpMul ||
+		(steps[3].op != compiler.OpGetLocal && steps[3].op != compiler.OpGetLocalFast) ||
+		steps[3].param != 0 || steps[4].op != compiler.OpConstant ||
+		steps[5].op != compiler.OpBitRightShift || steps[6].op != compiler.OpBitXor ||
+		steps[7].op != compiler.OpConstant || steps[8].op != compiler.OpBitAnd ||
+		steps[9].op != compiler.OpReturnValue {
+		return integerFunctionKernel{}
+	}
+	if steps[4].value < 0 || steps[4].value >= 64 {
+		return integerFunctionKernel{}
+	}
+	return integerFunctionKernel{
+		kind:     integerFunctionKernelBitMix,
+		multiply: steps[1].value,
+		shift:    steps[4].value,
+		mask:     steps[7].value,
+	}
+}
+
+func executeIntegerFunctionKernel(kernel integerFunctionKernel, argument int64) (int64, bool) {
+	if kernel.kind != integerFunctionKernelBitMix || kernel.shift < 0 || kernel.shift >= 64 {
+		return 0, false
+	}
+	product, ok := checkedIntegerMul(argument, kernel.multiply)
+	if !ok {
+		return 0, false
+	}
+	return (product ^ (argument >> uint(kernel.shift))) & kernel.mask, true
+}
+
+func executeIntegerFunctionKernelUnchecked(kernel integerFunctionKernel, argument int64) int64 {
+	product := argument * kernel.multiply
+	return (product ^ (argument >> uint(kernel.shift))) & kernel.mask
 }
 
 func valueHasClassInAncestry(value *object.EmeraldValue, target *object.Class) bool {
@@ -10690,6 +18533,50 @@ func valueHasClassInAncestry(value *object.EmeraldValue, target *object.Class) b
 		}
 	}
 	return false
+}
+
+func (vm *VM) lexicalScopeDefinesMethod(name string, target *object.Method) bool {
+	if vm == nil || target == nil {
+		return false
+	}
+	for i := len(vm.classStack) - 1; i >= 0; i-- {
+		scope := vm.classStack[i]
+		if scope == nil {
+			continue
+		}
+		switch scope.Type {
+		case object.ValueClass:
+			if klass, ok := scope.Data.(*object.Class); ok && klass != nil {
+				if method, _, found := klass.GetMethodWithOwner(name); found && sameMethodImplementation(method, target) {
+					return true
+				}
+			}
+		case object.ValueModule:
+			if module, ok := scope.Data.(*object.Module); ok && module != nil {
+				if method, found := module.GetMethod(name); found && sameMethodImplementation(method, target) {
+					return true
+				}
+				if module.SingletonClass != nil {
+					if method, _, found := module.SingletonClass.GetMethodWithOwner(name); found && sameMethodImplementation(method, target) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func sameMethodImplementation(left, right *object.Method) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	leftFn, leftOK := left.Fn.(*object.Function)
+	rightFn, rightOK := right.Fn.(*object.Function)
+	return leftOK && rightOK && leftFn == rightFn
 }
 
 func backtraceMethodLabel(receiver *object.EmeraldValue, methodObj *object.Method, methodOwner *object.Class, fallback string) string {
@@ -10729,29 +18616,34 @@ func backtraceMethodLabel(receiver *object.EmeraldValue, methodObj *object.Metho
 
 func (vm *VM) buildInvocationMetadata(receiver *object.EmeraldValue, name string, method *object.Method, owner *object.Class) invocationMetadata {
 	dispatchClass := receiver.Class
-	if method.DispatchOwner != nil && method.DispatchOwner.Type == object.ValueModule && receiver.Type == object.ValueClass {
-		if class, ok := receiver.Data.(*object.Class); ok && class.SingletonClass != nil {
-			dispatchClass = class.SingletonClass
+	implementationOwner := method.Owner
+	if implementationOwner == nil || implementationOwner.Type != object.ValueModule {
+		implementationOwner = method.DispatchOwner
+	}
+	if implementationOwner != nil && implementationOwner.Type == object.ValueModule {
+		switch receiver.Type {
+		case object.ValueClass:
+			if singleton := core.SingletonClass(receiver); singleton != nil && singleton.Type == object.ValueClass {
+				dispatchClass, _ = singleton.Data.(*object.Class)
+			}
+		case object.ValueModule:
+			if singleton := core.SingletonClass(receiver); singleton != nil && singleton.Type == object.ValueClass {
+				dispatchClass, _ = singleton.Data.(*object.Class)
+			}
 		}
 	}
-	result := invocationMetadata{
-		label:             backtraceMethodLabel(receiver, method, owner, name),
-		traceDefinedClass: traceDefinedClass(method, owner),
-		traceMethodID:     traceMethodID(method, name),
-	}
+	result := invocationMetadata{}
 	if prependedOwner, prependedModule := methodFromPrependedModule(dispatchClass, name, method); prependedModule != nil {
 		result.superStart = prependedOwner
 		result.superModule = prependedModule
 	} else if includedOwner, ownerModule := methodFromIncludedModule(dispatchClass, name, method); ownerModule != nil {
 		result.superStart = includedOwner
 		result.superModule = ownerModule
-	} else if owner == receiver.Class {
-		result.superStart = receiver.Class
+	} else if owner != nil {
+		result.superStart = owner
 		result.superAfterClass = true
 	} else if owner == nil {
 		result.superStart = receiver.Class
-	} else {
-		result.superStart = owner.SuperClass
 	}
 	return result
 }
@@ -10803,7 +18695,7 @@ func traceMethodID(methodObj *object.Method, fallback string) string {
 	return fallback
 }
 
-func traceDefinedClass(methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
+func traceDefinedClassForInvocation(methodObj *object.Method, methodOwner *object.Class) *object.EmeraldValue {
 	if methodObj != nil && methodObj.Owner != nil {
 		return methodObj.Owner
 	}
@@ -10853,6 +18745,9 @@ func (vm *VM) implicitSuperArgs(frame *Frame) []*object.EmeraldValue {
 		return nil
 	}
 	fn := frame.Fn
+	if fn.HasRestParam && fn.AnonymousRestParam {
+		return append([]*object.EmeraldValue(nil), frame.Args...)
+	}
 	args := make([]*object.EmeraldValue, 0, len(frame.Args)+1)
 	appendRest := func() {
 		if !fn.HasRestParam || fn.AnonymousRestParam {
@@ -10907,8 +18802,10 @@ func (vm *VM) implicitSuperArgs(frame *Frame) []*object.EmeraldValue {
 			}
 		}
 		keywordHash := &object.EmeraldValue{Type: object.ValueHash, Data: hash, Class: core.R.Classes["Hash"]}
-		core.MarkRuby2KeywordHash(keywordHash)
-		args = append(args, keywordHash)
+		if len(hash.Keys) > 0 {
+			core.MarkRuby2KeywordHash(keywordHash)
+			args = append(args, keywordHash)
+		}
 	}
 	return args
 }
@@ -10919,7 +18816,9 @@ func (vm *VM) superContextFrame(frame *Frame) *Frame {
 	}
 	for i := vm.fp - 1; i >= 0; i-- {
 		candidate := vm.frames[i]
-		if candidate != nil && candidate.Fn != nil && candidate.Fn.MethodBody && candidate.MethodName == frame.MethodName {
+		if candidate != nil && candidate.Fn != nil &&
+			(candidate.Fn.MethodBody || candidate.DefinedByDefineMethod || candidate.Fn.DefinedByDefineMethod) &&
+			candidate.MethodName == frame.MethodName {
 			return candidate
 		}
 	}
@@ -10972,8 +18871,8 @@ func functionAcceptsKeywords(fn *object.Function) bool {
 	return fn != nil && (len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.RejectKeywords)
 }
 
-func dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn *object.Function, args []*object.EmeraldValue) []*object.EmeraldValue {
-	if fn == nil || functionAcceptsKeywords(fn) || len(args) == 0 {
+func dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn *object.Function, args []*object.EmeraldValue, preserveMark bool) []*object.EmeraldValue {
+	if fn == nil || preserveMark || functionAcceptsKeywords(fn) || len(args) == 0 {
 		return args
 	}
 	last := args[len(args)-1]
@@ -11043,7 +18942,7 @@ func executorHashValue(hash *object.EmeraldValue, key *object.EmeraldValue) *obj
 }
 
 func dropAnonymousKeywordRestNonSymbolHash(fn *object.Function, args []*object.EmeraldValue) []*object.EmeraldValue {
-	if fn == nil || !fn.KeywordRestOnly || len(args) < 2 {
+	if fn == nil || !fn.KeywordRestOnly || fn.HasRestParam || len(args) < 2 {
 		return args
 	}
 	last := args[len(args)-1]
@@ -11211,30 +19110,30 @@ type methodAncestorEntry struct {
 
 func flattenedMethodAncestors(class *object.Class) []methodAncestorEntry {
 	entries := make([]methodAncestorEntry, 0)
+	seenModules := make(map[*object.Module]bool)
 	for current := class; current != nil; current = current.SuperClass {
 		for _, prepended := range current.PrependedModules {
-			appendModuleMethodAncestors(&entries, current, prepended, map[*object.Module]bool{})
+			appendModuleMethodAncestors(&entries, current, prepended, seenModules)
 		}
 		entries = append(entries, methodAncestorEntry{class: current})
 		for index := len(current.IncludedModules) - 1; index >= 0; index-- {
-			appendModuleMethodAncestors(&entries, current, current.IncludedModules[index], map[*object.Module]bool{})
+			appendModuleMethodAncestors(&entries, current, current.IncludedModules[index], seenModules)
 		}
 	}
 	return entries
 }
 
-func appendModuleMethodAncestors(entries *[]methodAncestorEntry, owner *object.Class, module *object.Module, path map[*object.Module]bool) {
-	if module == nil || path[module] {
+func appendModuleMethodAncestors(entries *[]methodAncestorEntry, owner *object.Class, module *object.Module, seen map[*object.Module]bool) {
+	if module == nil || seen[module] {
 		return
 	}
-	path[module] = true
-	defer delete(path, module)
+	seen[module] = true
 	for _, prepended := range module.PrependedModules {
-		appendModuleMethodAncestors(entries, owner, prepended, path)
+		appendModuleMethodAncestors(entries, owner, prepended, seen)
 	}
 	*entries = append(*entries, methodAncestorEntry{class: owner, module: module})
 	for index := len(module.IncludedModules) - 1; index >= 0; index-- {
-		appendModuleMethodAncestors(entries, owner, module.IncludedModules[index], path)
+		appendModuleMethodAncestors(entries, owner, module.IncludedModules[index], seen)
 	}
 }
 
@@ -11395,6 +19294,7 @@ func (vm *VM) lexicalQualifiedConstantContainer(qualifiedName string) (*object.E
 
 func bindingLocalValue(binding *object.RBinding, name string) *object.EmeraldValue {
 	for current := binding; current != nil; current = current.Parent {
+		current.MaterializeLocals()
 		if current.Locals == nil {
 			continue
 		}
@@ -11441,15 +19341,35 @@ func (vm *VM) lexicalConstantValue(name string) (*object.EmeraldValue, bool) {
 				break
 			}
 		}
-		if value, ok := includedModuleConstantLookup(container, name); ok {
-			return value, true
-		}
 		if innermostClass == nil && container.Type == object.ValueClass {
 			innermostClass = container.Data.(*object.Class)
 		}
 	}
 	if restartAfterAutoload {
 		return vm.lexicalConstantValue(name)
+	}
+	if vm.fp >= 0 && vm.fp < len(vm.frames) {
+		frame := vm.frames[vm.fp]
+		if frame != nil && frame.Fn != nil && frame.Fn.EvalSource {
+			for i := len(vm.classStack) - 1; i >= 0; i-- {
+				container := vm.classStack[i]
+				if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
+					continue
+				}
+				if value, ok := vm.qualifiedLexicalParentConstantValue(container, name); ok {
+					return value, true
+				}
+			}
+		}
+	}
+	for i := len(vm.classStack) - 1; i >= 0; i-- {
+		container := vm.classStack[i]
+		if container == nil || (container.Type != object.ValueClass && container.Type != object.ValueModule) {
+			continue
+		}
+		if value, ok := includedModuleConstantLookup(container, name); ok {
+			return value, true
+		}
 	}
 	if innermostClass != nil {
 		if value, ok := classConstantLookup(innermostClass.SuperClass, name); ok {
@@ -11464,7 +19384,7 @@ func (vm *VM) dynamicBlockContextClass() *object.EmeraldValue {
 		return nil
 	}
 	frame := vm.frames[vm.fp]
-	if frame == nil || frame.Fn == nil || frame.Fn.Name != "__block__" || frame.Closure == nil || frame.Closure.Binding == nil {
+	if frame == nil || frame.Fn == nil || frame.Fn.MethodBody || frame.Fn.Name != "__block__" || frame.Closure == nil || frame.Closure.Binding == nil {
 		return nil
 	}
 	if frame.Bp < 0 || frame.Bp >= len(vm.stack) {
@@ -11474,7 +19394,10 @@ func (vm *VM) dynamicBlockContextClass() *object.EmeraldValue {
 	if currentSelf == nil || currentSelf == frame.Closure.Binding.Self || len(frame.Closure.ClassStack) == 0 {
 		return nil
 	}
-	context := frame.Closure.ClassStack[len(frame.Closure.ClassStack)-1]
+	if len(vm.classStack) == 0 {
+		return nil
+	}
+	context := vm.classStack[len(vm.classStack)-1]
 	if context == nil || (context.Type != object.ValueClass && context.Type != object.ValueModule) {
 		return nil
 	}
@@ -11563,9 +19486,14 @@ func (vm *VM) allowTopLevelConstantFallback(name string) bool {
 	if strings.Contains(name, "::") {
 		return true
 	}
+	dynamicContext := vm.dynamicBlockContextClass()
 	for i := len(vm.classStack) - 1; i >= 0; i-- {
 		entry := vm.classStack[i]
 		if entry == nil {
+			continue
+		}
+		if dynamicContext != nil && sameModuleOrClassValue(entry, dynamicContext) {
+			dynamicContext = nil
 			continue
 		}
 		if entry.Type == object.ValueModule {
@@ -11650,6 +19578,67 @@ func (vm *VM) missingConstantValue(name string, absolute bool) *object.EmeraldVa
 	return vm.sendBypassVisibility(receiver, "const_missing", []*object.EmeraldValue{{Type: object.ValueSymbol, Data: constName, Class: core.R.Classes["Symbol"]}})
 }
 
+// resolveConstantRead performs the side-effectful part of OpGetConstant while
+// preserving the same lexical, autoload, top-level and const_missing rules as
+// the bytecode interpreter. Register IR uses this only with a real Frame, so
+// dynamic class-stack and binding context remain visible to the resolver.
+func (vm *VM) resolveConstantRead(frame *Frame, name string) *object.EmeraldValue {
+	if strings.HasPrefix(name, "::") {
+		absoluteName := strings.TrimPrefix(name, "::")
+		if objectClass := core.R.Classes["Object"]; objectClass != nil && objectClass.PrivateConstants[absoluteName] {
+			owner := &object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: core.R.Classes["Class"]}
+			return vm.privateConstantAccessResult(owner, absoluteName)
+		}
+		if val, ok := vm.topLevelConstantValue(absoluteName); ok {
+			return val
+		}
+		if qualifiedConst, ok := vm.qualifiedConstantValue(absoluteName); ok {
+			return qualifiedConst
+		}
+		return vm.missingConstantValue(absoluteName, true)
+	}
+
+	allowTopLevelFallback := vm.allowTopLevelConstantFallback(name)
+	if val, ok := vm.lexicalConstantValue(name); ok {
+		return val
+	}
+	if allowTopLevelFallback {
+		if val, ok := vm.topLevelConstantValue(name); ok {
+			return val
+		}
+		if name == "ENV" {
+			return core.EnvObject()
+		}
+		if name == "ThreadGroup::Default" {
+			return core.DefaultThreadGroup()
+		}
+		if processConst, ok := processConstantValue(name); ok {
+			return processConst
+		}
+		if cls, ok := core.R.Classes[name]; ok {
+			return &object.EmeraldValue{
+				Type:  object.ValueClass,
+				Data:  cls,
+				Class: core.R.Classes["Class"],
+			}
+		}
+		if namespace, ok := vm.namespaceModuleValue(name); ok {
+			return namespace
+		}
+		if localConst, ok := vm.scopedLocalConstantValue(frame, name); ok {
+			return localConst
+		}
+		if qualifiedConst, ok := vm.qualifiedConstantValue(name); ok {
+			return qualifiedConst
+		}
+	} else if localConst, ok := vm.scopedLocalConstantValue(frame, name); ok {
+		return localConst
+	} else if qualifiedConst, ok := vm.qualifiedConstantValue(name); ok {
+		return qualifiedConst
+	}
+	return vm.missingConstantValue(name, false)
+}
+
 func (vm *VM) topLevelConstantValue(name string) (*object.EmeraldValue, bool) {
 	if value, ok := vm.rubyConsts[name]; ok {
 		return value, true
@@ -11692,7 +19681,9 @@ func (vm *VM) namespaceModuleValue(name string) (*object.EmeraldValue, bool) {
 	prefix := name + "::"
 	for constName := range vm.rubyConsts {
 		if strings.HasPrefix(constName, prefix) {
-			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+			module := object.NewModule(name)
+			module.SyntheticNamespace = true
+			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: core.R.Classes["Module"]}
 			vm.rubyConsts[name] = moduleVal
 			vm.populateNamespaceModule(moduleVal, name)
 			return moduleVal, true
@@ -11700,7 +19691,9 @@ func (vm *VM) namespaceModuleValue(name string) (*object.EmeraldValue, bool) {
 	}
 	for className := range core.R.Classes {
 		if strings.HasPrefix(className, prefix) {
-			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: object.NewModule(name), Class: core.R.Classes["Module"]}
+			module := object.NewModule(name)
+			module.SyntheticNamespace = true
+			moduleVal := &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: core.R.Classes["Module"]}
 			vm.rubyConsts[name] = moduleVal
 			vm.populateNamespaceModule(moduleVal, name)
 			return moduleVal, true
@@ -11938,16 +19931,21 @@ func (vm *VM) currentClassStackSnapshot() []*object.EmeraldValue {
 	if len(vm.classStack) == 0 {
 		return nil
 	}
-	return append([]*object.EmeraldValue(nil), vm.classStack...)
+	stack := vm.classStack
+	if dynamicContext := vm.dynamicBlockContextClass(); dynamicContext != nil &&
+		sameModuleOrClassValue(stack[len(stack)-1], dynamicContext) {
+		stack = stack[:len(stack)-1]
+	}
+	return append([]*object.EmeraldValue(nil), stack...)
 }
 
 func (vm *VM) classVarScopeReceiver(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if vm.instanceExecClassVarScope != nil {
-		return vm.instanceExecClassVarScope
+		return classVarLexicalOwner(vm.instanceExecClassVarScope)
 	}
 	if len(vm.classStack) > 0 {
 		if scope := vm.classStack[len(vm.classStack)-1]; scope != nil {
-			return scope
+			return classVarLexicalOwner(scope)
 		}
 	}
 	if vm.fp >= 0 && vm.fp < len(vm.frames) {
@@ -11956,7 +19954,23 @@ func (vm *VM) classVarScopeReceiver(receiver *object.EmeraldValue) *object.Emera
 			return &object.EmeraldValue{Type: object.ValueClass, Data: core.R.Classes["Object"], Class: core.R.Classes["Class"]}
 		}
 	}
-	return receiver
+	return classVarLexicalOwner(receiver)
+}
+
+func classVarLexicalOwner(scope *object.EmeraldValue) *object.EmeraldValue {
+	if scope == nil || scope.Type != object.ValueClass {
+		return scope
+	}
+	class, _ := scope.Data.(*object.Class)
+	if class == nil || !class.IsSingleton || class.SingletonOwner == nil {
+		return scope
+	}
+	switch class.SingletonOwner.Type {
+	case object.ValueClass, object.ValueModule:
+		return class.SingletonOwner
+	default:
+		return scope
+	}
 }
 
 func (vm *VM) classVarAccessesToplevel(receiver *object.EmeraldValue) bool {
@@ -11995,6 +20009,9 @@ func defineConstantOn(container *object.EmeraldValue, name string, value *object
 			alreadyDefined = true
 		}
 		module.DefineConstant(name, value)
+	}
+	if !alreadyDefined {
+		object.BumpConstantGeneration()
 	}
 	core.AssignConstantName(container, name, value)
 	core.RecordConstantLocation(container, name, false)
@@ -12099,12 +20116,8 @@ func snapshotClosureCapture(value *object.EmeraldValue) *object.EmeraldValue {
 	if value == nil {
 		return core.R.NilVal
 	}
-	if cell, ok := value.Data.(*closureCell); ok {
-		return &object.EmeraldValue{
-			Type:  object.ValueObject,
-			Data:  cell,
-			Class: value.Class,
-		}
+	if _, ok := value.Data.(*closureCell); ok {
+		return value
 	}
 	return value
 }
@@ -12249,14 +20262,22 @@ func (vm *VM) completeThrow(frame *Frame, handler *CatchHandler, value *object.E
 	}
 	core.LastException = nil
 	core.LastRaisedResult = nil
-	vm.sp = handler.StackTop
+	vm.setStackPointer(handler.StackTop)
 	if value != nil {
 		vm.push(value)
 	}
 	handler.Frame.Ip = handler.EndOffset - 1
 	if handler.Frame != frame {
-		frame.BlockBreak = true
-		frame.BlockBreakVal = value
+		for index := vm.fp; index >= 0; index-- {
+			unwindFrame := vm.frames[index]
+			if unwindFrame == handler.Frame {
+				break
+			}
+			if unwindFrame != nil {
+				unwindFrame.BlockBreak = true
+				unwindFrame.BlockBreakVal = value
+			}
+		}
 	}
 }
 
@@ -12399,6 +20420,7 @@ func (vm *VM) raiseException(frame *Frame, exception *object.EmeraldValue) bool 
 			EnsureOffset:      handler.EnsureOffset,
 			EnsureEndOffset:   handler.EnsureEndOffset,
 			Frame:             handler.Frame,
+			Exception:         exception,
 			PreviousException: previousException,
 			RescueStackDepth:  len(vm.rescueStack),
 		}
@@ -12438,9 +20460,19 @@ func (vm *VM) returnUnhandledException(frame *Frame, exception *object.EmeraldVa
 	if vm.isRoot && frame == vm.frames[0] {
 		vm.unhandledException = exception
 	}
-	vm.sp = frame.Bp
+	vm.setStackPointer(frame.Bp)
 	vm.push(exception)
 	frame.Ip = len(frame.Fn.Instructions) - 1
+}
+
+func (vm *VM) raiseConstantException(frame *Frame, value *object.EmeraldValue) bool {
+	if value == nil || value.Type != object.ValueException {
+		return false
+	}
+	if !vm.raiseException(frame, value) {
+		vm.returnUnhandledException(frame, value)
+	}
+	return true
 }
 
 func (vm *VM) attachExceptionLocations(exception *object.EmeraldValue) {
@@ -12449,6 +20481,10 @@ func (vm *VM) attachExceptionLocations(exception *object.EmeraldValue) {
 	}
 	exc, ok := exception.Data.(*object.RException)
 	if !ok || exc == nil || len(exc.Backtrace) > 0 || len(exc.Locations) > 0 {
+		return
+	}
+	if deferCaughtExceptionBacktrace && (len(vm.rescueStack) > 0 || len(vm.activeRescues) > 0) {
+		exc.Locations = vm.currentBacktraceFramesWithPathResolution(false)
 		return
 	}
 	exc.Locations = vm.currentBacktraceFrames()
@@ -12848,9 +20884,179 @@ func isConstantNameRune(r rune) bool {
 	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_'
 }
 
+func simpleFunctionArgumentShape(fn *object.Function) bool {
+	if fn == nil || fn.HasRestParam || fn.HasBlockParam || fn.RejectKeywords || fn.RejectBlock || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	for _, local := range fn.ParamLocalIndices {
+		if local < 0 || local >= fn.NumLocals {
+			return false
+		}
+	}
+	return true
+}
+
+// cachedPositionalMethodArgumentShape admits the small positional binder used
+// by the cached bytecode entry. It is intentionally stricter than Ruby's full
+// binder: defaults are allowed because the callee bytecode owns their
+// OpJumpLocalPresent prologue, while rest/keyword/destructuring protocols stay
+// on invokeMethod.
+func cachedPositionalMethodArgumentShape(fn *object.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if fn.CachedPositionalArgumentShapeChecked {
+		return fn.CachedPositionalArgumentShapeEligible
+	}
+	eligible := !fn.HasRestParam && !fn.HasBlockParam && !fn.RejectKeywords &&
+		len(fn.KeywordParams) == 0 && fn.KeywordRestParam == "" && !fn.KeywordRestOnly &&
+		!fn.SingleDestructure && !fn.ImplicitItParameter
+	if eligible {
+		for _, pattern := range fn.ParamPatterns {
+			if pattern != nil {
+				eligible = false
+				break
+			}
+		}
+	}
+	if eligible {
+		for _, local := range fn.ParamLocalIndices {
+			if local < 0 || local >= fn.NumLocals {
+				eligible = false
+				break
+			}
+		}
+	}
+	fn.CachedPositionalArgumentShapeEligible = eligible
+	fn.CachedPositionalArgumentShapeChecked = true
+	return eligible
+}
+
+func (vm *VM) simpleBlockCallShape(fn *object.Function) bool {
+	if vm == nil || fn == nil {
+		return false
+	}
+	if fn.SimpleArgumentShapeChecked {
+		return fn.SimpleArgumentShapeEligible
+	}
+	eligible, found := vm.simpleBlockBinding[fn]
+	if !found {
+		eligible = simpleFunctionArgumentShape(fn) && !fn.RejectKeywords
+		vm.simpleBlockBinding[fn] = eligible
+	}
+	fn.SimpleArgumentShapeEligible = eligible
+	fn.SimpleArgumentShapeChecked = true
+	return eligible
+}
+
+func (vm *VM) simpleFunctionArgumentBinding(fn *object.Function, args []*object.EmeraldValue, procData *object.Proc) bool {
+	if vm == nil || fn == nil {
+		return false
+	}
+	if !vm.simpleBlockCallShape(fn) {
+		return false
+	}
+	if procData != nil && core.ProcRuby2Keywords(procData) {
+		return false
+	}
+	if len(args) > 0 {
+		last := args[len(args)-1]
+		if last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last) {
+			return false
+		}
+	}
+	return true
+}
+
+func (vm *VM) bindSimpleFunctionArguments(fn *object.Function, args []*object.EmeraldValue, bp int) {
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	for index, local := range fn.ParamLocalIndices {
+		value := core.R.NilVal
+		if index < len(args) && args[index] != nil {
+			value = args[index]
+		}
+		vm.stack[bp+1+local] = value
+	}
+	vm.sp = bp + 1 + fn.NumLocals
+}
+
+func simpleDestructurePairShape(fn *object.Function) bool {
+	if fn == nil || !fn.SingleDestructure || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		len(fn.ParamPatterns) != 1 || len(fn.ParamLocalIndices) != 1 {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	pattern := fn.ParamPatterns[0]
+	if pattern == nil || pattern.Name != "" || pattern.Rest != nil || len(pattern.Children) != 2 {
+		return false
+	}
+	for _, child := range pattern.Children {
+		if child == nil || child.Name == "" || len(child.Children) != 0 || child.Rest != nil {
+			return false
+		}
+		if _, ok := fn.LocalNames[child.Name]; !ok {
+			return false
+		}
+	}
+	for _, local := range fn.ParamLocalIndices {
+		if local < 0 || local >= fn.NumLocals {
+			return false
+		}
+	}
+	return true
+}
+
+// bindSimpleDestructurePair handles the hot, already-array form of
+// `|(first, second)|`. Any coercion-sensitive input stays on the general
+// bindParameterPattern path, preserving to_ary, error and Binding semantics.
+func (vm *VM) bindSimpleDestructurePair(fn *object.Function, args []*object.EmeraldValue, bp int) bool {
+	if vm == nil || fn == nil || len(args) != 1 || args[0] == nil || args[0].Type != object.ValueArray {
+		return false
+	}
+	eligible, found := vm.simpleDestructurePair[fn]
+	if !found {
+		eligible = simpleDestructurePairShape(fn)
+		vm.simpleDestructurePair[fn] = eligible
+	}
+	if !eligible {
+		return false
+	}
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	value := args[0]
+	setClosureValue(&vm.stack[bp+1+fn.ParamLocalIndices[0]], value)
+	elements := value.Data.([]*object.EmeraldValue)
+	pattern := fn.ParamPatterns[0]
+	for index, child := range pattern.Children {
+		childValue := core.R.NilVal
+		if index < len(elements) && elements[index] != nil {
+			childValue = elements[index]
+		}
+		local := fn.LocalNames[child.Name]
+		setClosureValue(&vm.stack[bp+1+local], childValue)
+	}
+	vm.sp = bp + 1 + fn.NumLocals
+	return true
+}
+
 func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldValue, prevBlock *object.EmeraldValue, markRuby2Keywords bool) int {
-	args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args)
-	args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, markRuby2Keywords)
+	preserveRuby2KeywordMark := markRuby2Keywords || !vm.procCallKeywordSyntax
+	args = dropEmptyRuby2KeywordHashForPositionalOnlyFunction(fn, args, preserveRuby2KeywordMark)
+	args = copyUnmarkedRuby2KeywordHashForPositionalFunction(fn, args, preserveRuby2KeywordMark)
 	args = mergeKeywordRestOverflowHashes(fn, args)
 	bp := vm.sp
 	for i := 0; i < fn.NumLocals; i++ {
@@ -12860,10 +21066,12 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 	if len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
 		positionalArgs := args
 		var kwargs map[*object.EmeraldValue]*object.EmeraldValue
+		var keywordSource *object.EmeraldValue
 
 		if len(args) > 0 && args[len(args)-1] != nil && args[len(args)-1].Type == object.ValueHash && core.Ruby2KeywordHash(args[len(args)-1]) {
 			lastArg := args[len(args)-1]
 			kwargs = executorHashToMap(lastArg)
+			keywordSource = lastArg
 			positionalArgs = args[:len(args)-1]
 		}
 
@@ -12905,7 +21113,7 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 		if fn.KeywordRestParam != "" {
 			if index, ok := fn.LocalNames[fn.KeywordRestParam]; ok {
 				slot := bp + 1 + index
-				vm.stack[slot] = vm.keywordRestHash(kwargs, fn.KeywordParams)
+				vm.stack[slot] = vm.keywordRestHash(kwargs, keywordSource, fn.KeywordParams)
 				if vm.sp <= slot {
 					vm.sp = slot + 1
 				}
@@ -12933,7 +21141,7 @@ func (vm *VM) bindFunctionArguments(fn *object.Function, args []*object.EmeraldV
 					ClassStack:       closure.ClassStack,
 					Refinements:      append([]*object.EmeraldValue(nil), closure.Refinements...),
 					RefinementsFixed: closure.RefinementsFixed,
-					InstanceVars:     make(map[string]*object.EmeraldValue),
+					AutoSplat:        closure.AutoSplat,
 					IsLambda:         false,
 					BreakOwnerID:     closure.BreakOwnerID,
 					ReturnOwnerID:    closure.ReturnOwnerID,
@@ -13217,7 +21425,7 @@ func (vm *VM) bindRestParameterSlots(fn *object.Function, args []*object.Emerald
 			restElems[len(restElems)-1] = last
 		}
 	}
-	if !fn.AnonymousRestParam {
+	if fn.RestParamName != "" {
 		restSlot := bp + 1 + fn.LocalNames[fn.RestParamName]
 		vm.stack[restSlot] = &object.EmeraldValue{
 			Type:  object.ValueArray,
@@ -13434,6 +21642,5582 @@ func (vm *VM) expandYieldSplatArgs(args []*object.EmeraldValue, splatIndex int) 
 }
 
 func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return vm.callBlockArgs(block, args)
+}
+
+type integerCapturedTimesPlan struct {
+	freeIndex   byte
+	termOpcode  compiler.Opcode
+	termConst   int64
+	termDirect  bool
+	postOpcode  compiler.Opcode
+	postConst   int64
+	hasPostTerm bool
+	// capturedUpdate is the zero-argument form used by idioms such as
+	// `n += 1` inside Integer#times. There is no loop parameter to combine;
+	// each iteration simply applies capturedOpcode/capturedConst to the free
+	// integer and stores it back.
+	capturedUpdate bool
+	capturedOpcode compiler.Opcode
+	capturedConst  int64
+}
+
+// stringCapturedTimesPlan describes the small, common builder loop
+// `text << "literal"` captured by Integer#times.  It is deliberately narrow:
+// dynamic coercion, subclasses, frozen receivers, and redefined methods all
+// fall back to the normal block interpreter.
+type stringCapturedTimesPlan struct {
+	freeIndex byte
+	value     *object.EmeraldValue
+}
+
+// integerTimesCapturedCallPlan describes the common callback shapes
+// `n.times { |ignored| captured = pure_integer_method(captured) }` and
+// `n.times { captured = receiver.pure_integer_method(captured) }`.
+// Integer#times itself supplies the block argument, but the callback's body
+// only reads and writes one captured Integer.  The method call is admitted
+// only when its Register/typed plan is pure integer arithmetic; all other
+// shapes fall back to the ordinary block/frame path.
+type integerTimesCapturedCallPlan struct {
+	freeIndex         byte
+	receiverFreeIndex byte // 255 means the implicit `self` receiver
+	methodName        string
+	// accumulate admits the common `captured += pure_method(index)` form.
+	// The older shape passes the captured value as the callee argument; this
+	// variant passes the Integer#times index and adds the result to the capture.
+	accumulate    bool
+	argumentLocal byte
+}
+
+func integerTimesCapturedCallShape(fn *object.Function) (integerTimesCapturedCallPlan, bool) {
+	invalid := integerTimesCapturedCallPlan{}
+	if fn == nil || len(fn.Params) > 1 || len(fn.ParamLocalIndices) != len(fn.Params) || len(fn.FreeVarNames) < 1 || len(fn.FreeVarNames) > 2 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return invalid, false
+	}
+	if accumulated, ok := integerTimesCapturedAccumulatorShape(fn); ok {
+		return accumulated, true
+	}
+	// OpSend has operands [method-constant, call-kind, argc, block-marker].
+	// The exact twelve-byte sequence is emitted for a plain one-argument send
+	// with no block; the callback parameter is intentionally unused.
+	instructions := fn.Instructions
+	receiverFreeIndex := byte(255)
+	freeIndex := byte(0)
+	constantIndex := 0
+	switch {
+	case len(instructions) == 12 && compiler.Opcode(instructions[0]) == compiler.OpSelf &&
+		compiler.Opcode(instructions[1]) == compiler.OpGetFree && compiler.Opcode(instructions[3]) == compiler.OpSend &&
+		instructions[6] == 0 && instructions[7] == 1 && instructions[8] == 255 &&
+		compiler.Opcode(instructions[9]) == compiler.OpSetFree && compiler.Opcode(instructions[11]) == compiler.OpBlockReturn &&
+		instructions[2] == instructions[10]:
+		freeIndex = instructions[2]
+		constantIndex = int(instructions[4])<<8 | int(instructions[5])
+	case len(instructions) == 13 && compiler.Opcode(instructions[0]) == compiler.OpGetFree &&
+		compiler.Opcode(instructions[2]) == compiler.OpGetFree && compiler.Opcode(instructions[4]) == compiler.OpSend &&
+		instructions[7] == 0 && instructions[8] == 1 && instructions[9] == 255 &&
+		compiler.Opcode(instructions[10]) == compiler.OpSetFree && compiler.Opcode(instructions[12]) == compiler.OpBlockReturn &&
+		instructions[3] == instructions[11] && instructions[1] != instructions[3]:
+		receiverFreeIndex = instructions[1]
+		freeIndex = instructions[3]
+		constantIndex = int(instructions[5])<<8 | int(instructions[6])
+	default:
+		return invalid, false
+	}
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil {
+		return invalid, false
+	}
+	name, ok := fn.Constants[constantIndex].Data.(string)
+	if !ok || name == "" {
+		return invalid, false
+	}
+	return integerTimesCapturedCallPlan{freeIndex: freeIndex, receiverFreeIndex: receiverFreeIndex, methodName: name}, true
+}
+
+// integerTimesCapturedAccumulatorShape recognizes the straight-line callback
+// emitted for `total += helper(index)` (and its equivalent `total = total +
+// helper(index)`).  Keeping this as a separate proof makes the legacy
+// captured-value forms above unchanged while allowing a typed call graph from
+// Integer#times into a pure one-argument Ruby method.
+func integerTimesCapturedAccumulatorShape(fn *object.Function) (integerTimesCapturedCallPlan, bool) {
+	invalid := integerTimesCapturedCallPlan{}
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 ||
+		len(fn.FreeVarNames) != 1 || !simpleBlockParameterPatterns(fn) ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return invalid, false
+	}
+	instructions := fn.Instructions
+	position := 0
+	readByte := func(op compiler.Opcode) (byte, bool) {
+		if position >= len(instructions) || compiler.Opcode(instructions[position]) != op || position+1 >= len(instructions) {
+			return 0, false
+		}
+		value := instructions[position+1]
+		position += 2
+		return value, true
+	}
+	freeIndex, ok := readByte(compiler.OpGetFree)
+	if !ok || position >= len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpSelf {
+		return invalid, false
+	}
+	position++
+	argumentLocal, ok := readByte(compiler.OpGetLocal)
+	if !ok {
+		argumentLocal, ok = readByte(compiler.OpGetLocalFast)
+	}
+	if !ok || int(argumentLocal) != fn.ParamLocalIndices[0] || position+6 > len(instructions) ||
+		compiler.Opcode(instructions[position]) != compiler.OpSend {
+		return invalid, false
+	}
+	// OpSend operands are [constant-index(2), call-kind, argc, block-marker].
+	if instructions[position+3] != 0 || instructions[position+4] != 1 || instructions[position+5] != 255 {
+		return invalid, false
+	}
+	constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+	position += 6
+	if position >= len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+		return invalid, false
+	}
+	position++
+	setFreeIndex, ok := readByte(compiler.OpSetFree)
+	if !ok || setFreeIndex != freeIndex || position >= len(instructions) ||
+		compiler.Opcode(instructions[position]) != compiler.OpBlockReturn || position+1 != len(instructions) {
+		return invalid, false
+	}
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil {
+		return invalid, false
+	}
+	name, ok := fn.Constants[constantIndex].Data.(string)
+	if !ok || name == "" {
+		return invalid, false
+	}
+	return integerTimesCapturedCallPlan{
+		freeIndex: freeIndex, receiverFreeIndex: 255, methodName: name,
+		accumulate: true, argumentLocal: argumentLocal,
+	}, true
+}
+
+func integerFunctionSingleBinary(plan *integerFunctionPlan) (compiler.Opcode, int64, bool) {
+	if plan == nil || len(plan.steps) != 4 || plan.steps[0].op != compiler.OpGetLocal && plan.steps[0].op != compiler.OpGetLocalFast || plan.steps[0].param != 0 ||
+		plan.steps[1].op != compiler.OpConstant || plan.steps[2].op != compiler.OpAdd && plan.steps[2].op != compiler.OpSub &&
+		plan.steps[2].op != compiler.OpMul || plan.steps[3].op != compiler.OpReturnValue {
+		return 0, 0, false
+	}
+	return plan.steps[2].op, plan.steps[1].value, true
+}
+
+func (vm *VM) tryExecuteIntegerTimesCapturedCall(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure || !integerTimesCapturedCallEnabled ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	// ReturnOwnerID is allowed here only because the exact structural shape
+	// admitted below contains OpBlockReturn but no OpReturnValue. A closure
+	// marked as owning a non-local return therefore cannot observe a return
+	// while this lowering is active; explicit-return bytecode misses the shape
+	// check and remains on the ordinary protocol.
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) < 1 || len(closure.Free) > 2 {
+		return nil, false
+	}
+	shape, ok := integerTimesCapturedCallShape(closure.Fn)
+	if !ok || int(shape.freeIndex) >= len(closure.Free) || shape.receiverFreeIndex != 255 && int(shape.receiverFreeIndex) >= len(closure.Free) {
+		return nil, false
+	}
+	current := derefClosureValue(closure.Free[shape.freeIndex])
+	if !smallIntegerValue(current) || count <= 0 {
+		if count <= 0 {
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	if shape.receiverFreeIndex != 255 {
+		self = derefClosureValue(closure.Free[shape.receiverFreeIndex])
+		if self == nil {
+			return nil, false
+		}
+	}
+	if self == nil {
+		return nil, false
+	}
+	methodObj, _, fallback := vm.lookupMethodForSend(self, shape.methodName, nil, false, false)
+	if fallback != nil || methodObj == nil || methodObj.DispatchOwner != nil || methodObj.Visibility == "undefined" || methodUsesRefinements(methodObj) ||
+		methodObj.Ruby2Keywords {
+		return nil, false
+	}
+	if shape.receiverFreeIndex != 255 && methodObj.Visibility != "" && methodObj.Visibility != "public" {
+		return nil, false
+	}
+	fn, ok := methodObj.Fn.(*object.Function)
+	if !ok || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, false
+	}
+	plan, ok := vm.cachedIntegerFunctionPlan(fn)
+	if !ok || plan == nil {
+		return nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	for _, step := range plan.steps {
+		switch step.op {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul:
+			if !vm.fusedIntegerOperationAvailable(step.op) {
+				return nil, false
+			}
+		}
+	}
+	// The accumulator form is a typed call graph: the callback's capture is
+	// loaded once, the pure callee is resolved once, and the loop index is passed
+	// as a raw int64.  Affine callees can be reduced to a closed form; a more
+	// general pure integer plan still stays entirely unboxed in the fallback
+	// loop.  Any overflow or generation change deopts before mutating the
+	// captured cell, so the compatibility executor can replay the whole block.
+	if shape.accumulate {
+		currentValue := current.Data.(int64)
+		if factor, offset, affine := affineIntegerFunctionPlan(plan); affine {
+			triangular, triangularOK := integerTriangular(count - 1)
+			offsetSum, offsetOK := checkedIntegerMul(offset, count)
+			slopeSum, slopeOK := checkedIntegerMul(factor, triangular)
+			delta, deltaOK := checkedIntegerAdd(offsetSum, slopeSum)
+			updated, updatedOK := checkedIntegerAdd(currentValue, delta)
+			if triangularOK && offsetOK && slopeOK && deltaOK && updatedOK && generation == object.CurrentMethodGeneration() {
+				setClosureValue(&closure.Free[shape.freeIndex], core.NewIntegerValue(updated))
+				core.LastBlockResult = nil
+				return receiver, true
+			}
+		}
+		value := currentValue
+		for index := int64(0); index < count; index++ {
+			if generation != object.CurrentMethodGeneration() {
+				return nil, false
+			}
+			updated, executed := vm.executeCachedIntegerFunctionPlan(fn, plan, []int64{index})
+			if !executed {
+				return nil, false
+			}
+			value, executed = checkedIntegerAdd(value, updated)
+			if !executed {
+				return nil, false
+			}
+		}
+		if generation != object.CurrentMethodGeneration() {
+			return nil, false
+		}
+		setClosureValue(&closure.Free[shape.freeIndex], core.NewIntegerValue(value))
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	// The single-binary affine form can be folded in one checked operation.
+	// For other pure integer expressions we still keep the loop entirely in
+	// raw int64 values, committing the captured cell only after every iteration
+	// succeeds; a BigInt/overflow therefore re-enters the original block with
+	// no partially applied capture.
+	if op, constant, simple := integerFunctionSingleBinary(plan); simple && (op == compiler.OpAdd || op == compiler.OpSub) {
+		delta, ok := checkedIntegerMul(constant, count)
+		if op == compiler.OpSub && ok {
+			if delta == math.MinInt64 {
+				ok = false
+			} else {
+				delta = -delta
+			}
+		}
+		updated, updatedOK := checkedIntegerAdd(current.Data.(int64), delta)
+		if !ok || !updatedOK {
+			return nil, false
+		}
+		setClosureValue(&closure.Free[shape.freeIndex], core.NewIntegerValue(updated))
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	value := current.Data.(int64)
+	for index := int64(0); index < count; index++ {
+		updated, ok := vm.executeCachedIntegerFunctionPlan(fn, plan, []int64{value})
+		if !ok {
+			return nil, false
+		}
+		value = updated
+	}
+	setClosureValue(&closure.Free[shape.freeIndex], core.NewIntegerValue(value))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+func stringCapturedBlockShape(fn *object.Function) (stringCapturedTimesPlan, bool) {
+	invalid := stringCapturedTimesPlan{}
+	if fn == nil || len(fn.Params) != 0 || len(fn.ParamLocalIndices) != 0 || len(fn.FreeVarNames) != 1 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return invalid, false
+	}
+	instructions := fn.Instructions
+	if len(instructions) != 7 || compiler.Opcode(instructions[0]) != compiler.OpGetFree ||
+		compiler.Opcode(instructions[2]) != compiler.OpConstant || compiler.Opcode(instructions[5]) != compiler.OpBitLeftShift ||
+		compiler.Opcode(instructions[6]) != compiler.OpBlockReturn {
+		return invalid, false
+	}
+	constantIndex := int(instructions[3])<<8 | int(instructions[4])
+	if constantIndex < 0 || constantIndex >= len(fn.Constants) {
+		return invalid, false
+	}
+	value := fn.Constants[constantIndex]
+	if value == nil || value.Type != object.ValueString || value.Class != core.R.Classes["String"] {
+		return invalid, false
+	}
+	if _, ok := value.Data.(string); !ok {
+		return invalid, false
+	}
+	return stringCapturedTimesPlan{freeIndex: instructions[1], value: value}, true
+}
+
+func (vm *VM) tryExecuteStringTimesCapturedBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure && block.Type != object.ValueProc ||
+		!integerTimesCapturedBlockEnabled || !registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) || len(closure.Free) != 1 {
+		return nil, false
+	}
+	plan, ok := stringCapturedBlockShape(closure.Fn)
+	if !ok || int(plan.freeIndex) >= len(closure.Free) || !core.StringAppendUsesBuiltinImplementation() {
+		return nil, false
+	}
+	current := derefClosureValue(closure.Free[plan.freeIndex])
+	if current == nil || current.Type != object.ValueString || current.Class != core.R.Classes["String"] ||
+		core.AttachedSingletonClass(current) != nil || current.Frozen {
+		return nil, false
+	}
+	if count <= 0 {
+		return receiver, true
+	}
+	core.LastBlockResult = nil
+	result, handled := core.AppendStringLiteralASCIIRepeated(current, plan.value, count)
+	if !handled {
+		return nil, false
+	}
+	if result != current && result != nil && result.Type == object.ValueException {
+		core.LastBlockResult = nil
+		return result, true
+	}
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+func integerCapturedBlockShape(fn *object.Function) (integerCapturedTimesPlan, bool) {
+	invalid := integerCapturedTimesPlan{}
+	if fn == nil || (len(fn.Params) != 0 && len(fn.Params) != 1) || len(fn.ParamLocalIndices) != len(fn.Params) || len(fn.FreeVarNames) != 1 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return invalid, false
+	}
+	if !simpleBlockParameterPatterns(fn) {
+		return invalid, false
+	}
+	instructions := fn.Instructions
+	if len(fn.Params) == 0 {
+		position := 0
+		readByte := func(op compiler.Opcode) (byte, bool) {
+			if position >= len(instructions) || compiler.Opcode(instructions[position]) != op || position+1 >= len(instructions) {
+				return 0, false
+			}
+			value := instructions[position+1]
+			position += 2
+			return value, true
+		}
+		freeIndex, ok := readByte(compiler.OpGetFree)
+		if !ok || position+3 > len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return invalid, false
+		}
+		constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil ||
+			!smallIntegerValue(fn.Constants[constantIndex]) || fn.Constants[constantIndex].Type != object.ValueInteger {
+			return invalid, false
+		}
+		constant := fn.Constants[constantIndex].Data.(int64)
+		position += 3
+		if position >= len(instructions) {
+			return invalid, false
+		}
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod, compiler.OpBitAnd:
+		default:
+			return invalid, false
+		}
+		position++
+		setFreeIndex, ok := readByte(compiler.OpSetFree)
+		if !ok || setFreeIndex != freeIndex || position >= len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpBlockReturn || position+1 != len(instructions) {
+			return invalid, false
+		}
+		return integerCapturedTimesPlan{freeIndex: freeIndex, capturedUpdate: true, capturedOpcode: op, capturedConst: constant}, true
+	}
+	position := 0
+	readByte := func(op compiler.Opcode) (byte, bool) {
+		if position >= len(instructions) || compiler.Opcode(instructions[position]) != op || position+1 >= len(instructions) {
+			return 0, false
+		}
+		value := instructions[position+1]
+		position += 2
+		return value, true
+	}
+	freeIndex, ok := readByte(compiler.OpGetFree)
+	if !ok {
+		return invalid, false
+	}
+	localIndex, ok := readByte(compiler.OpGetLocal)
+	if !ok {
+		localIndex, ok = readByte(compiler.OpGetLocalFast)
+	}
+	if !ok || int(localIndex) != fn.ParamLocalIndices[0] {
+		return invalid, false
+	}
+	plan := integerCapturedTimesPlan{freeIndex: freeIndex, termDirect: true}
+	if position < len(instructions) && compiler.Opcode(instructions[position]) == compiler.OpAdd {
+		position++
+	} else {
+		if position+3 > len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return invalid, false
+		}
+		constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil || !smallIntegerValue(fn.Constants[constantIndex]) || fn.Constants[constantIndex].Type != object.ValueInteger {
+			return invalid, false
+		}
+		plan.termConst = fn.Constants[constantIndex].Data.(int64)
+		position += 3
+		if position >= len(instructions) {
+			return invalid, false
+		}
+		plan.termOpcode = compiler.Opcode(instructions[position])
+		switch plan.termOpcode {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod, compiler.OpBitAnd:
+		default:
+			return invalid, false
+		}
+		plan.termDirect = false
+		position++
+		if position >= len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpAdd {
+			return invalid, false
+		}
+		position++
+	}
+	if position < len(instructions) && compiler.Opcode(instructions[position]) != compiler.OpSetFree {
+		if position+3 > len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpConstant {
+			return invalid, false
+		}
+		constantIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+		if constantIndex < 0 || constantIndex >= len(fn.Constants) || fn.Constants[constantIndex] == nil || !smallIntegerValue(fn.Constants[constantIndex]) || fn.Constants[constantIndex].Type != object.ValueInteger {
+			return invalid, false
+		}
+		plan.postConst = fn.Constants[constantIndex].Data.(int64)
+		position += 3
+		if position >= len(instructions) {
+			return invalid, false
+		}
+		plan.postOpcode = compiler.Opcode(instructions[position])
+		switch plan.postOpcode {
+		case compiler.OpAdd, compiler.OpSub, compiler.OpMul, compiler.OpMod, compiler.OpBitAnd:
+		default:
+			return invalid, false
+		}
+		plan.hasPostTerm = true
+		position++
+	}
+	setFreeIndex, ok := readByte(compiler.OpSetFree)
+	if !ok || setFreeIndex != freeIndex || position >= len(instructions) || compiler.Opcode(instructions[position]) != compiler.OpBlockReturn || position+1 != len(instructions) {
+		return invalid, false
+	}
+	return plan, true
+}
+
+func (vm *VM) integerCapturedBlockPlanAvailable(plan integerCapturedTimesPlan) bool {
+	if vm == nil || !vm.fusedIntegerOperationAvailable(compiler.OpAdd) {
+		return false
+	}
+	if plan.capturedUpdate {
+		return vm.fusedIntegerOperationAvailable(plan.capturedOpcode)
+	}
+	if !plan.termDirect && !vm.fusedIntegerOperationAvailable(plan.termOpcode) {
+		return false
+	}
+	return !plan.hasPostTerm || vm.fusedIntegerOperationAvailable(plan.postOpcode)
+}
+
+func checkedIntegerAdd(left, right int64) (int64, bool) {
+	if right > 0 && left > math.MaxInt64-right {
+		return 0, false
+	}
+	if right < 0 && left < math.MinInt64-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+func checkedIntegerSub(left, right int64) (int64, bool) {
+	if right > 0 && left < math.MinInt64+right {
+		return 0, false
+	}
+	if right < 0 && left > math.MaxInt64+right {
+		return 0, false
+	}
+	return left - right, true
+}
+
+func checkedIntegerMul(left, right int64) (int64, bool) {
+	if left == 0 || right == 0 {
+		return 0, true
+	}
+	if (left == math.MinInt64 && right == -1) || (right == math.MinInt64 && left == -1) {
+		return 0, false
+	}
+	product := left * right
+	if product/right != left {
+		return 0, false
+	}
+	return product, true
+}
+
+func checkedIntegerMod(left, right int64) (int64, bool) {
+	if right == 0 {
+		return 0, false
+	}
+	result := left % right
+	if result != 0 && (result < 0) != (right < 0) {
+		result += right
+	}
+	return result, true
+}
+
+func integerTriangular(count int64) (int64, bool) {
+	if count < 0 {
+		return 0, false
+	}
+	if count == math.MaxInt64 {
+		return 0, false
+	}
+	left, right := count, count+1
+	if left&1 == 0 {
+		left /= 2
+	} else {
+		right /= 2
+	}
+	return checkedIntegerMul(left, right)
+}
+
+func integerRangeCount(start, end int64, ascending bool) (int64, bool) {
+	if ascending {
+		if start > end {
+			return 0, true
+		}
+		distance := uint64(end) - uint64(start)
+		if distance == math.MaxUint64 {
+			return 0, false
+		}
+		return int64(distance + 1), true
+	}
+	if start < end {
+		return 0, true
+	}
+	distance := uint64(start) - uint64(end)
+	if distance == math.MaxUint64 {
+		return 0, false
+	}
+	return int64(distance + 1), true
+}
+
+func integerRangeSeries(start, end int64, ascending bool) (int64, int64, bool) {
+	count, ok := integerRangeCount(start, end, ascending)
+	if !ok || count == 0 {
+		return 0, count, ok
+	}
+	triangular, ok := integerTriangular(count - 1)
+	if !ok {
+		return 0, count, false
+	}
+	base, ok := checkedIntegerMul(count, start)
+	if !ok {
+		return 0, count, false
+	}
+	if ascending {
+		base, ok = checkedIntegerAdd(base, triangular)
+	} else {
+		base, ok = checkedIntegerSub(base, triangular)
+	}
+	return base, count, ok
+}
+
+func executeCapturedIntegerArithmeticSeries(plan integerCapturedTimesPlan, total, series, count int64) (int64, bool, bool) {
+	var termSum int64
+	var ok bool
+	switch {
+	case plan.termDirect:
+		termSum = series
+		ok = true
+	case integerBitAndSeriesEnabled && plan.termOpcode == compiler.OpBitAnd && !plan.hasPostTerm:
+		if plan.termConst == -1 {
+			termSum, ok = integerTriangular(count - 1)
+		} else if plan.termConst >= 0 {
+			termSum, ok = integerBitAndPrefix(count, plan.termConst)
+		} else {
+			return 0, false, false
+		}
+	case plan.termOpcode == compiler.OpAdd:
+		termOffset, offsetOK := checkedIntegerMul(count, plan.termConst)
+		termSum, ok = checkedIntegerAdd(series, termOffset)
+		ok = offsetOK && ok
+	case plan.termOpcode == compiler.OpSub:
+		termOffset, offsetOK := checkedIntegerMul(count, plan.termConst)
+		termSum, ok = checkedIntegerSub(series, termOffset)
+		ok = offsetOK && ok
+	case plan.termOpcode == compiler.OpMul:
+		termSum, ok = checkedIntegerMul(series, plan.termConst)
+	default:
+		return 0, false, false
+	}
+	if !ok {
+		return 0, false, true
+	}
+	if plan.hasPostTerm {
+		if plan.postOpcode != compiler.OpAdd {
+			return 0, false, false
+		}
+		postSum, postOK := checkedIntegerMul(count, plan.postConst)
+		if !postOK {
+			return 0, false, true
+		}
+		termSum, ok = checkedIntegerAdd(termSum, postSum)
+		if !ok {
+			return 0, false, true
+		}
+	}
+	total, ok = checkedIntegerAdd(total, termSum)
+	if !ok {
+		return 0, false, true
+	}
+	return total, true, true
+}
+
+// integerBitAndPrefix returns sum(i & mask) for 0 <= i < count. For a
+// non-negative mask, each bit repeats with a power-of-two period; counting set
+// bits directly avoids iterating a large Integer#times block. A result that
+// does not fit int64 declines so the existing BigInt-capable loop can run.
+func integerBitAndPrefix(count, mask int64) (int64, bool) {
+	if count < 0 || mask < 0 {
+		return 0, false
+	}
+	n := uint64(count)
+	uMask := uint64(mask)
+	var total uint64
+	for bit := uint64(1); bit != 0 && bit <= uMask; bit <<= 1 {
+		cycle := bit << 1
+		fullCycles := n / cycle
+		remainder := n % cycle
+		setBits := fullCycles * bit
+		if remainder > bit {
+			setBits += remainder - bit
+		}
+		if setBits != 0 && bit > ^uint64(0)/setBits {
+			return 0, false
+		}
+		contribution := setBits * bit
+		if contribution > ^uint64(0)-total {
+			return 0, false
+		}
+		total += contribution
+	}
+	if total > uint64(math.MaxInt64) {
+		return 0, false
+	}
+	return int64(total), true
+}
+
+func executeCapturedIntegerFastLoop(plan integerCapturedTimesPlan, total, count int64) (int64, bool, bool) {
+	if count >= 0 {
+		series, ok := integerTriangular(count - 1)
+		if ok {
+			if fastTotal, completed, handled := executeCapturedIntegerArithmeticSeries(plan, total, series, count); handled {
+				return fastTotal, completed, true
+			}
+		}
+		if integerBitAndSeriesEnabled && plan.termOpcode == compiler.OpBitAnd && !plan.hasPostTerm {
+			if fastTotal, completed, handled := executeCapturedIntegerArithmeticSeries(plan, total, 0, count); handled {
+				return fastTotal, completed, true
+			}
+		}
+	}
+	if plan.termDirect && !plan.hasPostTerm {
+		for index := int64(0); index < count; index++ {
+			if index > 0 && total > math.MaxInt64-index {
+				return 0, false, true
+			}
+			total += index
+		}
+		return total, true, true
+	}
+	if plan.termOpcode == compiler.OpBitAnd && !plan.hasPostTerm {
+		for index := int64(0); index < count; index++ {
+			term := index & plan.termConst
+			if term > 0 && total > math.MaxInt64-term || term < 0 && total < math.MinInt64-term {
+				return 0, false, true
+			}
+			total += term
+		}
+		return total, true, true
+	}
+	if plan.termOpcode == compiler.OpMul && (!plan.hasPostTerm || plan.postOpcode == compiler.OpAdd) {
+		for index := int64(0); index < count; index++ {
+			product := index * plan.termConst
+			if (index == -1 && plan.termConst == math.MinInt64) || (plan.termConst == -1 && index == math.MinInt64) ||
+				(index != 0 && product/index != plan.termConst) {
+				return 0, false, true
+			}
+			if product > 0 && total > math.MaxInt64-product || product < 0 && total < math.MinInt64-product {
+				return 0, false, true
+			}
+			total += product
+			if plan.hasPostTerm {
+				offset := plan.postConst
+				if offset > 0 && total > math.MaxInt64-offset || offset < 0 && total < math.MinInt64-offset {
+					return 0, false, true
+				}
+				total += offset
+			}
+		}
+		return total, true, true
+	}
+	return 0, false, false
+}
+
+func executeCapturedIntegerFastRange(plan integerCapturedTimesPlan, total, start, end int64, ascending bool) (int64, bool, bool) {
+	if ascending && start > end || !ascending && start < end {
+		return total, true, true
+	}
+	if series, count, ok := integerRangeSeries(start, end, ascending); ok {
+		if fastTotal, completed, handled := executeCapturedIntegerArithmeticSeries(plan, total, series, count); handled {
+			return fastTotal, completed, true
+		}
+	}
+	fast := plan.termDirect && (!plan.hasPostTerm || plan.postOpcode == compiler.OpAdd)
+	fast = fast || plan.termOpcode == compiler.OpAdd || plan.termOpcode == compiler.OpBitAnd ||
+		plan.termOpcode == compiler.OpMul && (!plan.hasPostTerm || plan.postOpcode == compiler.OpAdd)
+	if !fast {
+		return 0, false, false
+	}
+	for index := start; ; {
+		term := index
+		if !plan.termDirect {
+			switch plan.termOpcode {
+			case compiler.OpAdd:
+				if plan.termConst > 0 && index > math.MaxInt64-plan.termConst || plan.termConst < 0 && index < math.MinInt64-plan.termConst {
+					return 0, false, true
+				}
+				term = index + plan.termConst
+			case compiler.OpBitAnd:
+				term = index & plan.termConst
+			case compiler.OpMul:
+				term = index * plan.termConst
+				if (index == -1 && plan.termConst == math.MinInt64) || (plan.termConst == -1 && index == math.MinInt64) ||
+					(index != 0 && term/index != plan.termConst) {
+					return 0, false, true
+				}
+			}
+		}
+		if term > 0 && total > math.MaxInt64-term || term < 0 && total < math.MinInt64-term {
+			return 0, false, true
+		}
+		total += term
+		if plan.hasPostTerm {
+			offset := plan.postConst
+			if plan.postOpcode != compiler.OpAdd || offset > 0 && total > math.MaxInt64-offset || offset < 0 && total < math.MinInt64-offset {
+				return 0, false, true
+			}
+			total += offset
+		}
+		if index == end || ascending && index == math.MaxInt64 || !ascending && index == math.MinInt64 {
+			break
+		}
+		if ascending {
+			index++
+		} else {
+			index--
+		}
+	}
+	return total, true, true
+}
+
+// tryExecuteIntegerTimesFramedIRBlock reuses one Ruby Frame while an
+// Integer#times callback runs a framed Register IR body.  Prawn and other
+// object-heavy libraries use `n.times { |i| ... }` for short, repeated loops;
+// the old path paid the full argument binder/frame push-pop for every index
+// even after the block plan had already been compiled.  This tier keeps the
+// normal Frame visible to sends, locals, constants and exception reporting,
+// but resets only its argument/local slots between iterations.
+//
+// The admission is deliberately narrower than the ordinary framed block
+// executor: no autosplat, keyword/rest/block parameters, pattern/default
+// binding, refinement or non-local control flow.  A guard miss before the
+// first iteration returns false so the caller can replay the original block;
+// an execution error after a visible side effect is returned as handled.
+func (vm *VM) tryExecuteIntegerTimesFramedIRBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || vm.instructionLimit != 0 ||
+		DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 {
+		return nil, false
+	}
+	if count <= 0 {
+		// Integer#times does not invoke its block for a non-positive count, so
+		// no block-shape validation is observable on this path.
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil ||
+		closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(closure.Free) == 1 {
+		if integerPlan, integerOK := integerCapturedBlockShape(fn); integerOK && vm.integerCapturedBlockPlanAvailable(integerPlan) {
+			// The raw integer reducer below is substantially cheaper than a
+			// framed IR callback; let the captured-shape tier handle it.
+			return nil, false
+		}
+	}
+	if len(fn.Params) == 1 && simpleBlockParameterPatterns(fn) {
+		if leaf, found := vm.cachedBlockLeafPlan(fn); found && leaf.kind == leafMethodRegisterIR && leaf.registerIR != nil && leaf.registerIR.integerOnly && leaf.registerIR.integerLinear {
+			// The raw array reducer handles this immutable scalar body without a
+			// reusable Frame or per-element argument protocol.
+			return nil, false
+		}
+	}
+	if len(fn.Params) > 1 || len(fn.ParamLocalIndices) != len(fn.Params) || fn.HasRestParam ||
+		fn.HasBlockParam || len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.blockReturn || !plan.registerIR.requiresFrame || plan.registerIR.hasImplicitSends ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+	if result, handled := vm.tryExecuteIntegerTimesDirectIRBlock(receiver, count, block, plan.registerIR, fn, closure); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesAggressiveIRBlock(receiver, count, block, plan.registerIR, fn, closure); handled {
+		return result, true
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp >= len(vm.stack) || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	var oneArg [1]*object.EmeraldValue
+	batchGeneration := object.CurrentMethodGeneration()
+	var batchSendMask []bool
+	trustedNativeRegion := false
+	trustedNativeRegionChecked := false
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	for index := int64(0); index < count; index++ {
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		vm.sp = bp + 1 + fn.NumLocals
+		frame.Ip = -1
+		frame.Args = nil
+		if len(fn.Params) == 1 {
+			oneArg[0] = core.NewIntegerValue(index)
+			frame.Args = oneArg[:]
+			local := fn.ParamLocalIndices[0]
+			if local < 0 || local >= fn.NumLocals || bp+1+local >= len(vm.stack) {
+				cleanup()
+				return nil, false
+			}
+			vm.stack[bp+1+local] = oneArg[0]
+		}
+		core.LastBlockResult = nil
+		var result *object.EmeraldValue
+		var executed bool
+		if trustedNativeRegion && object.CurrentMethodGeneration() != batchGeneration {
+			// The trusted send ABI deliberately omits the per-send generation
+			// probe. A method-table change therefore invalidates the region before
+			// the next callback and rewarms the ordinary send cache.
+			trustedNativeRegion = false
+			trustedNativeRegionChecked = false
+			batchGeneration = object.CurrentMethodGeneration()
+			batchSendMask = nil
+		}
+		if trustedNativeRegion {
+			result, executed = vm.executeRegisterIRInstructionsWithFreeTrustedNativeRegion(
+				plan.registerIR, self, frame.Args, frame, nil, registerIRSendCacheEnabled,
+			)
+		} else if index == 0 || len(batchSendMask) == 0 {
+			// Let the first iteration populate every ordinary call-site cache. A
+			// batch ABI is considered only after all user-visible effects in that
+			// iteration have completed.
+			result, executed = vm.executeRegisterIRInstructions(plan.registerIR, self, frame.Args, frame, registerIRSendCacheEnabled)
+		} else {
+			result, executed = vm.executeRegisterIRInstructionsWithFreeBatchSend(plan.registerIR, self, frame.Args, frame, nil, batchGeneration, batchSendMask, registerIRSendCacheEnabled)
+		}
+		if !executed {
+			cleanup()
+			return nil, false
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException || frame.Returned || frame.BlockBreak || frame.BlockNextVal != nil || core.LastBlockResult != nil {
+			cleanup()
+			return result, true
+		}
+		if index == 0 && registerIRBatchSendEnabled && batchGeneration != 0 && index+1 < count {
+			batchSendMask = registerIRBatchSendMask(plan.registerIR, batchGeneration)
+		}
+		if !trustedNativeRegion && !trustedNativeRegionChecked {
+			trustedNativeRegionChecked = true
+			trustedNativeRegion = registerIRTrustedFramedNativeRegionReady(plan.registerIR, batchGeneration)
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteIntegerTimesReusableBytecodeBlock amortizes the ordinary block
+// Frame and positional binder over Integer#times iterations.  Unlike the
+// Register IR tiers above, the body remains in the compatibility bytecode
+// executor, so dynamic sends and mutable locals retain their normal behavior.
+// The opcode proof excludes operations that can observe a per-call Frame or
+// unwind through the caller; all other shapes stay on the original path.
+func (vm *VM) tryExecuteIntegerTimesReusableBytecodeBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !integerTimesBytecodeBlockReuseEnabled || !registerIRBatchBlockEnabled || receiver == nil ||
+		receiver.Type != object.ValueInteger || receiver.Class != core.R.Classes["Integer"] ||
+		core.AttachedSingletonClass(receiver) != nil || count <= 0 || block == nil || block.Type != object.ValueClosure ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 || len(vm.pendingEnsures) != 0 ||
+		vm.ensureActive || vm.pendingReturnTargetID > 0 || vm.pendingBreakTargetID > 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || closure.AutoSplat && blockWantsDestructuring(closure.Fn) ||
+		!reusableIntegerTimesBytecodeBlockShape(closure.Fn) {
+		return nil, false
+	}
+	if nestedPlan, nested := reusableIntegerTimesNestedClosurePlanFor(closure.Fn); nested {
+		if result, handled := vm.tryExecuteIntegerTimesNestedClosureBlock(receiver, count, block, closure, nestedPlan); handled {
+			return result, true
+		}
+	}
+	fn := closure.Fn
+	if len(fn.Params) == 1 {
+		paramLocal := fn.ParamLocalIndices[0]
+		if paramLocal < 0 || paramLocal >= fn.NumLocals {
+			return nil, false
+		}
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals >= len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var oneArg [1]*object.EmeraldValue
+	for index := int64(0); index < count; index++ {
+		vm.stack[bp] = self
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		vm.sp = bp + 1 + fn.NumLocals
+		frame.Args = nil
+		if len(fn.Params) == 1 {
+			oneArg[0] = core.NewIntegerValue(index)
+			frame.Args = oneArg[:]
+			vm.stack[bp+1+fn.ParamLocalIndices[0]] = oneArg[0]
+		}
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		core.LastBlockResult = nil
+		core.LastRaisedResult = nil
+		core.ForEachClearNext()
+		result, status := vm.executeReusableBlockFrame(frame, bp)
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException || status == reusableBlockError {
+			cleanup()
+			return result, true
+		}
+		if frame.Returned || vm.pendingReturnTargetID > 0 {
+			cleanup()
+			return result, true
+		}
+		if status == reusableBlockControl {
+			cleanup()
+			return result, true
+		}
+		if status == reusableBlockNext || frame.BlockNextVal != nil || core.ForEachConsumeNext() {
+			frame.BlockNextVal = nil
+			continue
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteIntegerTimesDirectIRBlock is the conservative frame-free sibling
+// of tryExecuteIntegerTimesAggressiveIRBlock. It admits only a Register IR
+// block whose sends can side-exit before user code and whose captured write is
+// the terminal operation. A miss on the first element lets the reusable-frame
+// tier take over; after a committed prefix, only the unexecuted suffix is
+// replayed through the ordinary block protocol.
+func (vm *VM) tryExecuteIntegerTimesDirectIRBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue, plan *registerIRPlan, fn *object.Function, closure *object.Closure) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || plan == nil || fn == nil || closure == nil ||
+		!registerIRBlockEnabled || !registerIRNoFrameEnabled || !registerIRDirectNoFrameEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || !plan.blockReturn || plan.hasImplicitSends ||
+		plan.hasExplicitReturn || !registerIRPlanSafeForDirectNoFrameWithOptions(plan, true, true, true) ||
+		!registerIRDirectConstantsSafe(vm, closure, plan) || closure.ReturnOwnerID > 0 && plan.hasExplicitReturn {
+		return nil, false
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	cleanup := func() {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	self := blockBindingSelf(block)
+	generation := object.CurrentMethodGeneration()
+	trustedRegion := false
+	var reusableIndex object.EmeraldValue
+	reusableIndex.Type = object.ValueInteger
+	reusableIndex.Class = core.R.Classes["Integer"]
+	var oneArg [1]*object.EmeraldValue
+	sideExit := func(start int64) (*object.EmeraldValue, bool) {
+		cleanup()
+		for rest := start; rest < count; rest++ {
+			fallbackArgs := []*object.EmeraldValue(nil)
+			if len(fn.Params) == 1 {
+				oneArg[0] = core.NewIntegerValue(rest)
+				fallbackArgs = oneArg[:]
+			}
+			fallback := vm.callBlockWithSelfArgs(block, self, fallbackArgs)
+			if fallback != nil && fallback.Type == object.ValueException {
+				return fallback, true
+			}
+			if core.LastBlockResult != nil {
+				breakResult := core.LastBlockResult
+				core.LastBlockResult = nil
+				return breakResult, true
+			}
+		}
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	for index := int64(0); index < count; index++ {
+		if object.CurrentMethodGeneration() != generation {
+			cleanup()
+			if index == 0 {
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		var args []*object.EmeraldValue
+		if len(fn.Params) == 1 {
+			if trustedRegion {
+				reusableIndex.Data = index
+				oneArg[0] = &reusableIndex
+			} else {
+				oneArg[0] = core.NewIntegerValue(index)
+			}
+			args = oneArg[:]
+		} else if len(fn.Params) != 0 {
+			cleanup()
+			return nil, false
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRDirectNoFrameWithFreeMode(
+			plan, fn, self, args, generation, closure.Free, trustedRegion,
+			true, true, true, false, trustedRegion,
+		)
+		if !executed {
+			cleanup()
+			if index == 0 {
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			breakResult := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return breakResult, true
+		}
+		if !trustedRegion && registerIRTrustedNativeRegionReady(plan, generation) &&
+			vm.prepareRegisterIRTrustedTopLevelConstants(plan) {
+			trustedRegion = true
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteIntegerTimesAggressiveIRBlock is the loop counterpart of the
+// compiled Array callback tier.  It commits each iteration through the
+// aggressive Register IR executor, so dynamic sends complete once instead of
+// forcing a Ruby Frame for every index.  It is deliberately opt-in because
+// the compatibility path must retain full exception/backtrace metadata.
+func (vm *VM) tryExecuteIntegerTimesAggressiveIRBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue, plan *registerIRPlan, fn *object.Function, closure *object.Closure) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || plan == nil || fn == nil || closure == nil ||
+		!registerIRAggressiveEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || !plan.blockReturn || !registerIRAggressivePlanSafe(plan, true) ||
+		!registerIRDirectConstantsSafe(vm, closure, plan) || closure.ReturnOwnerID > 0 && plan.hasExplicitReturn {
+		return nil, false
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	cleanup := func() {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	self := blockBindingSelf(block)
+	generation := object.CurrentMethodGeneration()
+	trustedRegion := false
+	var reusableIndex object.EmeraldValue
+	reusableIndex.Type = object.ValueInteger
+	reusableIndex.Class = core.R.Classes["Integer"]
+	var oneArg [1]*object.EmeraldValue
+	for index := int64(0); index < count; index++ {
+		// Aggressive execution is allowed to call Ruby-defined methods.  A
+		// method redefinition made by one iteration must therefore invalidate
+		// the loop before the next callback; the steady-state native region only
+		// skips the per-send proof after this single epoch check.
+		if object.CurrentMethodGeneration() != generation {
+			cleanup()
+			if index == 0 {
+				return nil, false
+			}
+			for rest := index; rest < count; rest++ {
+				fallbackArgs := []*object.EmeraldValue(nil)
+				if len(fn.Params) == 1 {
+					oneArg[0] = core.NewIntegerValue(rest)
+					fallbackArgs = oneArg[:]
+				}
+				fallback := vm.callBlockWithSelfArgs(block, self, fallbackArgs)
+				if fallback != nil && fallback.Type == object.ValueException {
+					return fallback, true
+				}
+				if core.LastBlockResult != nil {
+					breakResult := core.LastBlockResult
+					core.LastBlockResult = nil
+					return breakResult, true
+				}
+			}
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+		var args []*object.EmeraldValue
+		if len(fn.Params) == 1 {
+			if trustedRegion {
+				reusableIndex.Data = index
+				oneArg[0] = &reusableIndex
+			} else {
+				oneArg[0] = core.NewIntegerValue(index)
+			}
+			args = oneArg[:]
+		} else if len(fn.Params) != 0 {
+			cleanup()
+			return nil, false
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRDirectNoFrameWithFreeMode(plan, fn, self, args, generation, closure.Free, true, true, true, true, true, trustedRegion)
+		if !executed {
+			// A miss on the first iteration means the direct proof never entered
+			// user code.  Let the caller try the reusable-frame tier; falling back
+			// to callBlockWithSelfArgs for the whole loop would throw away the
+			// frame reuse that this helper is meant to precede.  Only a later miss
+			// can have a committed prefix, in which case replaying the remaining
+			// suffix through the ordinary protocol is the safe side-exit.
+			cleanup()
+			if index == 0 {
+				return nil, false
+			}
+			for rest := index; rest < count; rest++ {
+				fallbackArgs := []*object.EmeraldValue(nil)
+				if len(fn.Params) == 1 {
+					oneArg[0] = core.NewIntegerValue(rest)
+					fallbackArgs = oneArg[:]
+				}
+				fallback := vm.callBlockWithSelfArgs(block, self, fallbackArgs)
+				if fallback != nil && fallback.Type == object.ValueException {
+					return fallback, true
+				}
+				if core.LastBlockResult != nil {
+					breakResult := core.LastBlockResult
+					core.LastBlockResult = nil
+					return breakResult, true
+				}
+			}
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			breakResult := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return breakResult, true
+		}
+		if !trustedRegion && registerIRTrustedNativeRegionReady(plan, generation) &&
+			vm.prepareRegisterIRTrustedTopLevelConstants(plan) {
+			trustedRegion = true
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+func (vm *VM) tryExecuteIntegerTimesCapturedBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure || !integerTimesCapturedBlockEnabled ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	if result, handled := vm.tryExecuteStringTimesCapturedBlock(receiver, count, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesTypedStringStore(receiver, count, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesCapturedCall(receiver, count, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesTypedHotCall(receiver, count, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesFramedIRBlock(receiver, count, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteIntegerTimesReusableBytecodeBlock(receiver, count, block); handled {
+		return result, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) != 1 {
+		return nil, false
+	}
+	plan, ok := integerCapturedBlockShape(closure.Fn)
+	if !ok || int(plan.freeIndex) >= len(closure.Free) || !vm.integerCapturedBlockPlanAvailable(plan) {
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, false); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	current := derefClosureValue(closure.Free[plan.freeIndex])
+	if !smallIntegerValue(current) {
+		return nil, false
+	}
+	if count <= 0 {
+		return receiver, true
+	}
+	total := current.Data.(int64)
+	core.LastBlockResult = nil
+	if plan.capturedUpdate {
+		if plan.capturedOpcode != compiler.OpAdd && plan.capturedOpcode != compiler.OpSub {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		delta, ok := checkedIntegerMul(plan.capturedConst, count)
+		if plan.capturedOpcode == compiler.OpSub && ok {
+			if delta == math.MinInt64 {
+				ok = false
+			} else {
+				delta = -delta
+			}
+		}
+		if !ok {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		updated, ok := checkedIntegerAdd(total, delta)
+		if !ok {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(updated))
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	if fastTotal, completed, handled := executeCapturedIntegerFastLoop(plan, total, count); handled {
+		if !completed {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(fastTotal))
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	for index := int64(0); index < count; index++ {
+		term := index
+		if !plan.termDirect {
+			var termOK bool
+			term, termOK = applyRegisterIRIntegerLinearOpRaw(plan.termOpcode, index, plan.termConst)
+			if !termOK {
+				core.LastBlockResult = nil
+				return nil, false
+			}
+		}
+		var totalOK bool
+		total, totalOK = applyRegisterIRIntegerLinearOpRaw(compiler.OpAdd, total, term)
+		if !totalOK {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		if plan.hasPostTerm {
+			total, totalOK = applyRegisterIRIntegerLinearOpRaw(plan.postOpcode, total, plan.postConst)
+			if !totalOK {
+				core.LastBlockResult = nil
+				return nil, false
+			}
+		}
+	}
+	setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(total))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteIOEachLineCapturedBlock reuses one bytecode Frame while a
+// File#foreach/IO#each_line callback consumes a producer-owned stream.  The
+// AFM parser is a representative case: its callback contains branches, hash
+// writes and `next`, so it cannot enter the narrower Register IR framed tier,
+// but it still has a fixed one-argument block protocol.
+//
+// The admission rejects nested closures/yield, rescue/ensure, non-local
+// return and block sends. Those features can observe per-invocation frame
+// identity or unwind state; the normal CallBlockWithArgs path remains the
+// fallback. The producer is called only after admission and the frame is
+// committed, so a miss cannot replay a consumed line.
+func (vm *VM) tryExecuteIOEachLineCapturedBlock(receiver, block *object.EmeraldValue, _ []*object.EmeraldValue, next func() *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil ||
+		(block.Type != object.ValueClosure && block.Type != object.ValueProc) || next == nil ||
+		!ioEachLineCapturedBlockEnabled || !registerIRBlockEnabled || !registerIRBatchBlockEnabled || vm.instructionLimit != 0 || DevMode ||
+		core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 ||
+		len(vm.catchStack) != 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) || closure.AutoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	for index := 0; index < len(fn.Instructions); {
+		op := compiler.Opcode(fn.Instructions[index])
+		switch op {
+		case compiler.OpClosure, compiler.OpCurrentClosure, compiler.OpYield, compiler.OpYieldWithValue,
+			compiler.OpYieldWithSplat, compiler.OpSendWithBlock, compiler.OpSendSuper,
+			compiler.OpReturn, compiler.OpReturnValue, compiler.OpRescue, compiler.OpRescueMatch,
+			compiler.OpNonLocalReturnValue,
+			compiler.OpRetry, compiler.OpReraise, compiler.OpThrow, compiler.OpBeginRescue,
+			compiler.OpEndRescue, compiler.OpEnsure, compiler.OpEndEnsure, compiler.OpCatch,
+			compiler.OpEndCatch, compiler.OpBlock, compiler.OpBlockWithArg, compiler.OpLambda,
+			compiler.OpDefineMethod, compiler.OpDefineSingletonMethod, compiler.OpDefineClassMethod,
+			compiler.OpDefineFunction, compiler.OpOpenClass, compiler.OpOpenClassWithSuper,
+			compiler.OpClass, compiler.OpModule:
+			return nil, false
+		}
+		definition, found := compiler.Lookup(byte(op))
+		if !found {
+			return nil, false
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if width <= 0 || index+width > len(fn.Instructions) {
+			return nil, false
+		}
+		index += width
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var oneArg [1]*object.EmeraldValue
+	paramLocal := fn.ParamLocalIndices[0]
+	if paramLocal < 0 || paramLocal >= fn.NumLocals || bp+1+paramLocal >= len(vm.stack) {
+		cleanup()
+		return nil, false
+	}
+	for {
+		value := next()
+		if value == nil || value == core.R.NilVal {
+			cleanup()
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+		if value.Type == object.ValueException {
+			if value.Class == core.R.Classes["EOFError"] {
+				cleanup()
+				core.LastBlockResult = nil
+				return receiver, true
+			}
+			cleanup()
+			return value, true
+		}
+		// OpNext clears the reusable frame down to Bp, including its self slot;
+		// restore self before the next callback so implicit sends retain the
+		// lexical receiver just like a freshly-created Ruby block frame.
+		vm.stack[bp] = self
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		vm.sp = bp + 1 + fn.NumLocals
+		oneArg[0] = value
+		vm.stack[bp+1+paramLocal] = value
+		frame.Args = oneArg[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		core.LastBlockResult = nil
+		core.LastRaisedResult = nil
+		core.ForEachClearNext()
+
+		var result *object.EmeraldValue
+		instructions := frame.Fn.Instructions
+		for frame.Ip < len(instructions)-1 {
+			frame.Ip++
+			op := compiler.Opcode(instructions[frame.Ip])
+			if !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+				frame.InstructionException = core.LastException
+				frame.InstructionSnapshotSet = true
+			}
+			var err error
+			if vm.instructionLimit == 0 && !DevMode && simpleOpcodeFastPath[op] {
+				err = vm.executeSimpleOpcode(op, frame)
+			} else {
+				err = vm.execute(op, frame)
+			}
+			if err != nil {
+				result = core.NewRuntimeError(err.Error())
+				break
+			}
+			if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+				(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
+				break
+			}
+			frame = vm.frames[vm.fp]
+			if frame.BlockBreak || frame.BlockNextVal != nil || core.LastBlockResult != nil {
+				break
+			}
+			if vm.sp > frame.Bp {
+				top := vm.stack[vm.sp-1]
+				if top != nil && top.Type == object.ValueException &&
+					(core.LastRaisedResult == top || classInheritsFrom(top.Class, core.R.Classes["SystemExit"])) &&
+					!vm.frameHasActiveRescue(frame) {
+					result = top
+					break
+				}
+			}
+			instructions = frame.Fn.Instructions
+		}
+		if result == nil {
+			if frame.BlockBreak {
+				result = frame.BlockBreakVal
+			} else if frame.BlockNextVal != nil {
+				result = frame.BlockNextVal
+			} else if core.LastBlockResult != nil {
+				result = core.LastBlockResult
+			} else if vm.sp > bp {
+				result = vm.stack[vm.sp-1]
+			}
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.BlockBreak {
+			core.LastBlockResult = nil
+			cleanup()
+			return result, true
+		}
+		if frame.BlockNextVal != nil || core.ForEachConsumeNext() {
+			frame.BlockNextVal = nil
+			continue
+		}
+		if core.LastBlockResult != nil || frame.Returned {
+			control := core.LastBlockResult
+			if control == nil {
+				control = result
+			}
+			core.LastBlockResult = nil
+			cleanup()
+			return control, true
+		}
+	}
+}
+
+func (vm *VM) tryExecuteIntegerRangeCapturedBlock(receiver *object.EmeraldValue, start, end int64, ascending bool, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure || !integerRangeCapturedBlockEnabled ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	if (ascending && start > end) || (!ascending && start < end) {
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) != 1 {
+		return nil, false
+	}
+	plan, ok := integerCapturedBlockShape(closure.Fn)
+	if !ok || int(plan.freeIndex) >= len(closure.Free) || !vm.integerCapturedBlockPlanAvailable(plan) {
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, true); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	current := derefClosureValue(closure.Free[plan.freeIndex])
+	if !smallIntegerValue(current) {
+		return nil, false
+	}
+	total := current.Data.(int64)
+	if fastTotal, completed, handled := executeCapturedIntegerFastRange(plan, total, start, end, ascending); handled {
+		if !completed {
+			return nil, false
+		}
+		setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(fastTotal))
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	if ascending {
+		for index := start; ; index++ {
+			term := index
+			if !plan.termDirect {
+				var termOK bool
+				term, termOK = applyRegisterIRIntegerLinearOpRaw(plan.termOpcode, index, plan.termConst)
+				if !termOK {
+					return nil, false
+				}
+			}
+			var totalOK bool
+			total, totalOK = applyRegisterIRIntegerLinearOpRaw(compiler.OpAdd, total, term)
+			if !totalOK {
+				return nil, false
+			}
+			if plan.hasPostTerm {
+				total, totalOK = applyRegisterIRIntegerLinearOpRaw(plan.postOpcode, total, plan.postConst)
+				if !totalOK {
+					return nil, false
+				}
+			}
+			if index == end || index == math.MaxInt64 {
+				break
+			}
+		}
+	} else {
+		for index := start; ; index-- {
+			term := index
+			if !plan.termDirect {
+				var termOK bool
+				term, termOK = applyRegisterIRIntegerLinearOpRaw(plan.termOpcode, index, plan.termConst)
+				if !termOK {
+					return nil, false
+				}
+			}
+			var totalOK bool
+			total, totalOK = applyRegisterIRIntegerLinearOpRaw(compiler.OpAdd, total, term)
+			if !totalOK {
+				return nil, false
+			}
+			if plan.hasPostTerm {
+				total, totalOK = applyRegisterIRIntegerLinearOpRaw(plan.postOpcode, total, plan.postConst)
+				if !totalOK {
+					return nil, false
+				}
+			}
+			if index == end || index == math.MinInt64 {
+				break
+			}
+		}
+	}
+	setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(total))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+const (
+	reusableBlockCompleted = iota
+	reusableBlockNext
+	reusableBlockControl
+	reusableBlockError
+)
+
+func reusableEnumerableEachWithObjectBlockShape(fn *object.Function) bool {
+	if fn == nil || len(fn.Params) != 2 || len(fn.ParamLocalIndices) != 2 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	instructions := fn.Instructions
+	if len(instructions) == 0 || compiler.Opcode(instructions[len(instructions)-1]) != compiler.OpBlockReturn {
+		return false
+	}
+	for ip := 0; ip < len(instructions); {
+		op := compiler.Opcode(instructions[ip])
+		switch op {
+		case compiler.OpGetLocalCell,
+			compiler.OpReturn, compiler.OpReturnValue, compiler.OpNonLocalReturnValue,
+			compiler.OpBreak, compiler.OpBreakValue, compiler.OpNext, compiler.OpRedo,
+			compiler.OpYield, compiler.OpYieldWithValue, compiler.OpYieldWithSplat,
+			compiler.OpRescue, compiler.OpRescueMatch, compiler.OpEnsure,
+			compiler.OpRaise, compiler.OpRaiseNoMatchingPattern,
+			compiler.OpEnterForEach, compiler.OpExitForEach, compiler.OpSetWhileEnd,
+			compiler.OpFlipFlopGet, compiler.OpFlipFlopSet,
+			compiler.OpSendWithKeywords, compiler.OpSendSetter, compiler.OpSendWithBlock, compiler.OpSendSuper,
+			compiler.OpBlock, compiler.OpBlockWithArg:
+			return false
+		case compiler.OpBlockReturn:
+			if ip != len(instructions)-1 {
+				return false
+			}
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return false
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if ip+width > len(instructions) {
+			return false
+		}
+		ip += width
+	}
+	return true
+}
+
+func (vm *VM) executeReusableBlockFrame(frame *Frame, bp int) (*object.EmeraldValue, int) {
+	instructions := frame.Fn.Instructions
+	for !frame.Returned && frame.Ip < len(instructions)-1 {
+		frame.Ip++
+		op := compiler.Opcode(instructions[frame.Ip])
+		if !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+			frame.InstructionException = core.LastException
+			frame.InstructionSnapshotSet = true
+		}
+		var err error
+		if vm.instructionLimit == 0 && !DevMode && simpleOpcodeFastPath[op] {
+			err = vm.executeSimpleOpcode(op, frame)
+		} else {
+			err = vm.execute(op, frame)
+		}
+		if err != nil {
+			return core.NewRuntimeError(err.Error()), reusableBlockError
+		}
+		if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+			(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
+			break
+		}
+		if vm.sp > frame.Bp {
+			top := vm.stack[vm.sp-1]
+			if top != nil && top.Type == object.ValueException &&
+				(core.LastRaisedResult == top || classInheritsFrom(top.Class, core.R.Classes["SystemExit"])) &&
+				!vm.frameHasActiveRescue(frame) {
+				break
+			}
+		}
+		frame = vm.frames[vm.fp]
+		instructions = frame.Fn.Instructions
+	}
+
+	result := core.R.NilVal
+	if vm.sp > bp {
+		result = vm.stack[vm.sp-1]
+		if result == nil {
+			result = core.R.NilVal
+		}
+	}
+	if frame.BlockBreak {
+		result = frame.BlockBreakVal
+		if result == nil {
+			result = core.R.NilVal
+		}
+		core.LastBlockResult = result
+		return result, reusableBlockControl
+	}
+	if frame.BlockNextVal != nil {
+		return frame.BlockNextVal, reusableBlockNext
+	}
+	if core.LastBlockResult != nil {
+		return core.LastBlockResult, reusableBlockControl
+	}
+	if frame.Returned {
+		return result, reusableBlockError
+	}
+	return result, reusableBlockCompleted
+}
+
+// tryExecuteEnumerableEachWithObjectBytecodeBlock reuses one ordinary Ruby
+// Frame for exact Array/Hash#each_with_object callbacks whose leaf plan is not
+// admitted to a more aggressive IR tier. It deliberately keeps the original
+// bytecode interpreter and per-iteration Array/Hash mutation checks; only the
+// receiver/argument frame setup is amortized. Any closure-local cell or
+// non-local control opcode rejects the whole region before its first element.
+// tryExecuteEnumerableEachWithObjectFramedIRBlock reuses one Ruby Frame for an
+// exact Array/Hash#each_with_object callback whose body is already admitted to
+// the framed Register IR tier. The memo is passed as a normal second
+// positional argument; only callback frame setup is amortized.
+func (vm *VM) tryExecuteEnumerableEachWithObjectFramedIRBlock(receiver, block, memo *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure && block.Type != object.ValueProc ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 2 || len(fn.ParamLocalIndices) != 2 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		fn.ForLoopCollectAsPair || !simpleBlockParameterPatterns(fn) || closure.AutoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.blockReturn || !plan.registerIR.requiresFrame || plan.registerIR.hasImplicitSends ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+
+	var elems []*object.EmeraldValue
+	var keys []*object.EmeraldValue
+	var values map[*object.EmeraldValue]*object.EmeraldValue
+	switch receiver.Type {
+	case object.ValueArray:
+		if receiver.Class != core.R.Classes["Array"] || receiver.LazyArrayRegionValue() != nil {
+			return nil, false
+		}
+		var arrayOK bool
+		elems, arrayOK = receiver.Data.([]*object.EmeraldValue)
+		if !arrayOK || len(elems) < registerIRBatchBlockMinElements {
+			return nil, false
+		}
+	case object.ValueHash:
+		if receiver.Class != core.R.Classes["Hash"] {
+			return nil, false
+		}
+		keys, values = core.DirectHashIteration(receiver)
+		if values == nil || len(keys) < registerIRBatchBlockMinElements {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+
+	var argsStorage [2]*object.EmeraldValue
+	for index := 0; ; index++ {
+		var first *object.EmeraldValue
+		if receiver.Type == object.ValueArray {
+			current, arrayOK := receiver.Data.([]*object.EmeraldValue)
+			if !arrayOK || index >= len(current) {
+				break
+			}
+			first = current[index]
+			argsStorage[0] = first
+			argsStorage[1] = memo
+		} else {
+			if index >= len(keys) {
+				break
+			}
+			key := keys[index]
+			value, exists := values[key]
+			if !exists {
+				continue
+			}
+			argsStorage[0] = &object.EmeraldValue{
+				Type:  object.ValueArray,
+				Data:  []*object.EmeraldValue{key, value},
+				Class: core.R.Classes["Array"],
+			}
+			argsStorage[1] = memo
+		}
+		frame.Args = argsStorage[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.sp = bp + 1 + fn.NumLocals
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = core.R.NilVal
+		}
+		for paramIndex, paramLocal := range fn.ParamLocalIndices {
+			if paramLocal >= 0 && paramLocal < fn.NumLocals && bp+1+paramLocal < len(vm.stack) {
+				vm.stack[bp+1+paramLocal] = argsStorage[paramIndex]
+			}
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRInstructions(plan.registerIR, self, argsStorage[:], frame, registerIRSendCacheEnabled)
+		if !executed {
+			cleanup()
+			return nil, false
+		}
+		if result != nil && result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.BlockBreak {
+			result = frame.BlockBreakVal
+			if result == nil {
+				result = core.R.NilVal
+			}
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			result = core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return result, true
+		}
+		if core.ForEachConsumeNext() || frame.BlockNextVal != nil {
+			continue
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return memo, true
+}
+
+func (vm *VM) tryExecuteEnumerableEachWithObjectBytecodeBlock(receiver, block, memo *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if result, handled := vm.tryExecuteEnumerableEachWithObjectFramedIRBlock(receiver, block, memo); handled {
+		return result, true
+	}
+	if vm == nil || !enumerableEachWithObjectFrameReuseEnabled || receiver == nil || block == nil ||
+		block.Type != object.ValueClosure && block.Type != object.ValueProc || receiver.Class == nil || core.AttachedSingletonClass(receiver) != nil ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || !reusableEnumerableEachWithObjectBlockShape(closure.Fn) {
+		return nil, false
+	}
+	plan, found := vm.cachedBlockLeafPlan(closure.Fn)
+	if !found || plan.kind != leafMethodUnsupported {
+		return nil, false
+	}
+
+	var arrayValues []*object.EmeraldValue
+	var hashKeys []*object.EmeraldValue
+	var hashValues map[*object.EmeraldValue]*object.EmeraldValue
+	switch receiver.Type {
+	case object.ValueArray:
+		if receiver.Class != core.R.Classes["Array"] || receiver.LazyArrayRegionValue() != nil {
+			return nil, false
+		}
+		var arrayOK bool
+		arrayValues, arrayOK = receiver.Data.([]*object.EmeraldValue)
+		if !arrayOK || len(arrayValues) < 8 {
+			return nil, false
+		}
+	case object.ValueHash:
+		if receiver.Class != core.R.Classes["Hash"] {
+			return nil, false
+		}
+		hashKeys, hashValues = core.DirectHashIteration(receiver)
+		if hashValues == nil || len(hashKeys) < 8 {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	self := blockBindingSelf(block)
+	if len(closure.ClassStack) > 0 {
+		vm.classStack = closure.ClassStack
+		if self != nil && (self.Type == object.ValueClass || self.Type == object.ValueModule) && !singletonClassStackTargets(vm.classStack, self) {
+			vm.classStack = append(vm.classStack, self)
+		}
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+closure.Fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	vm.stack[bp] = self
+	var argsStorage [2]*object.EmeraldValue
+	vm.bindSimpleFunctionArguments(closure.Fn, argsStorage[:], bp)
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: closure.Fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+
+	invoke := func(value *object.EmeraldValue) (*object.EmeraldValue, int) {
+		argsStorage[0] = value
+		argsStorage[1] = memo
+		frame.Args = argsStorage[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		core.LastBlockResult = nil
+		core.ForEachClearNext()
+		vm.bindSimpleFunctionArguments(closure.Fn, frame.Args, bp)
+		return vm.executeReusableBlockFrame(frame, bp)
+	}
+
+	finish := func(result *object.EmeraldValue, status int) (*object.EmeraldValue, bool) {
+		vm.setStackPointer(bp)
+		if result != nil && result.Type == object.ValueException && core.LastException == result {
+			cleanup()
+			return result, true
+		}
+		switch status {
+		case reusableBlockControl:
+			control := result
+			core.LastBlockResult = nil
+			cleanup()
+			return control, true
+		case reusableBlockError:
+			cleanup()
+			return result, true
+		}
+		return nil, false
+	}
+
+	switch receiver.Type {
+	case object.ValueArray:
+		for index := 0; ; index++ {
+			current, arrayOK := receiver.Data.([]*object.EmeraldValue)
+			if !arrayOK || index >= len(current) {
+				break
+			}
+			result, status := invoke(current[index])
+			if result, handled := finish(result, status); handled {
+				return result, true
+			}
+			if status == reusableBlockNext {
+				core.ForEachConsumeNext()
+				continue
+			}
+			if core.ForEachConsumeNext() {
+				continue
+			}
+		}
+	case object.ValueHash:
+		for _, key := range hashKeys {
+			value, exists := hashValues[key]
+			if !exists {
+				continue
+			}
+			pair := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{key, value}, Class: core.R.Classes["Array"]}
+			result, status := invoke(pair)
+			if result, handled := finish(result, status); handled {
+				return result, true
+			}
+			if status == reusableBlockNext {
+				core.ForEachConsumeNext()
+				continue
+			}
+			if core.ForEachConsumeNext() {
+				continue
+			}
+		}
+	}
+	cleanup()
+	return memo, true
+}
+
+// tryExecuteArrayReduceCapturedBlock reuses one Ruby Frame for the common
+// two-argument Array#reduce block. The accumulator is still a real Ruby value
+// and every send/allocation remains inside the normal framed Register IR
+// executor; only argument binding and frame creation are amortized. If a
+// speculative IR execution declines for the current element, the already
+// committed prefix is preserved and the suffix is resumed through the normal
+// block protocol instead of replaying it.
+func (vm *VM) tryExecuteArrayReduceCapturedBlock(receiver, block, accumulator *object.EmeraldValue, start int) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || receiver.Class != core.R.Classes["Array"] ||
+		core.AttachedSingletonClass(receiver) != nil || block == nil || block.Type != object.ValueClosure ||
+		accumulator == nil || start < 0 || !registerIRBlockEnabled || !registerIRBatchBlockEnabled ||
+		!registerIRFramedBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 {
+		return nil, false
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok || start > len(elems) {
+		return nil, false
+	}
+	if len(elems)-start < 2 {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 2 || len(fn.ParamLocalIndices) != 2 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		fn.SingleDestructure || fn.TrailingCommaParam || !simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.blockReturn ||
+		!plan.registerIR.requiresFrame || plan.registerIR.hasImplicitSends ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for index := 0; index < fn.NumLocals; index++ {
+		vm.stack[bp+1+index] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+
+	fallback := func(index int, currentAccumulator *object.EmeraldValue) (*object.EmeraldValue, bool) {
+		cleanup()
+		for ; index < len(elems); index++ {
+			args := []*object.EmeraldValue{currentAccumulator, elems[index]}
+			core.LastBlockResult = nil
+			currentAccumulator = vm.callBlockWithSelfArgs(block, self, args)
+			if core.LastBlockResult != nil {
+				result := core.LastBlockResult
+				core.LastBlockResult = nil
+				return result, true
+			}
+			if currentAccumulator != nil && currentAccumulator.Type == object.ValueException {
+				return currentAccumulator, true
+			}
+		}
+		return currentAccumulator, true
+	}
+
+	var argsStorage [2]*object.EmeraldValue
+	for index := start; index < len(elems); index++ {
+		argsStorage[0], argsStorage[1] = accumulator, elems[index]
+		frame.Args = argsStorage[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.sp = bp + 1 + fn.NumLocals
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		for paramIndex, paramLocal := range fn.ParamLocalIndices {
+			if paramLocal >= 0 && paramLocal < fn.NumLocals && bp+1+paramLocal < len(vm.stack) {
+				vm.stack[bp+1+paramLocal] = argsStorage[paramIndex]
+			}
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRInstructions(plan.registerIR, self, argsStorage[:], frame, registerIRSendCacheEnabled)
+		if !executed {
+			return fallback(index, accumulator)
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.BlockBreak {
+			breakValue := frame.BlockBreakVal
+			if breakValue == nil {
+				breakValue = core.R.NilVal
+			}
+			cleanup()
+			return breakValue, true
+		}
+		if core.LastBlockResult != nil {
+			control := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return control, true
+		}
+		accumulator = result
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return accumulator, true
+}
+
+// tryExecuteHashFramedIRBlock reuses one Ruby Frame while Hash#each invokes a
+// straight-line or branch-bearing two-argument Register IR block. The ordered
+// key slice and live pair map come from core's normal Hash iteration snapshot;
+// missing keys are skipped exactly as the ordinary loop does. Blocks that can
+// observe control flow, yield, or an unsupported parameter shape stay on the
+// ordinary callback path.
+func (vm *VM) tryExecuteHashFramedIRBlock(receiver, block *object.EmeraldValue, keys []*object.EmeraldValue, hash map[*object.EmeraldValue]*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueHash || receiver.Class != core.R.Classes["Hash"] ||
+		core.AttachedSingletonClass(receiver) != nil || block == nil || block.Type != object.ValueClosure ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 ||
+		len(keys) < registerIRBatchBlockMinElements || hash == nil || !core.HashEachUsesBuiltinImplementation() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) ||
+		closure.Fn.ForLoopCollectAsPair {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 2 || len(fn.ParamLocalIndices) != 2 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.blockReturn ||
+		!plan.registerIR.requiresFrame || plan.registerIR.hasImplicitSends ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		switch instruction.op {
+		case registerIRLoadParam, registerIRLoadLocal, registerIRLoadLiteral, registerIRLoadConstantValue,
+			registerIRLoadFrozenString, registerIRLoadConstant, registerIRLoadScopedConstant,
+			registerIRLoadInstanceVar, registerIRLoadSelf, registerIRLoadFree,
+			registerIRMove, registerIRSwap, registerIRBang, registerIRArray,
+			registerIRHash, registerIRHashMerge, registerIRMarkKeywordHash,
+			registerIRRange, registerIRSetStringEncoding, registerIREqual, registerIRDynamicEqual,
+			registerIRBinary, registerIRCompare, registerIRDynamicCompare,
+			registerIRStoreLocal, registerIRStoreFree, registerIRStoreInstanceVar,
+			registerIRJump, registerIRJumpTruthy, registerIRJumpNotTruthy, registerIRJumpNotNil,
+			registerIRSend, registerIRRaise, registerIRReturn:
+			if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+				return nil, false
+			}
+		case registerIRJumpLocalPresent, registerIRLoadCapture,
+			registerIRClosure, registerIRLogicalSendAssignment, registerIRBlockGiven:
+			return nil, false
+		case registerIRIndex, registerIRSlice, registerIRIndexAssign:
+		default:
+			return nil, false
+		}
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	vm.stack[bp] = blockBindingSelf(block)
+	vm.sp = bp + 1 + fn.NumLocals
+	for index := 0; index < fn.NumLocals; index++ {
+		vm.stack[bp+1+index] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: vm.stack[bp],
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var argsStorage [2]*object.EmeraldValue
+	for _, key := range keys {
+		value, exists := hash[key]
+		if !exists {
+			continue
+		}
+		args := argsStorage[:]
+		args[0], args[1] = key, value
+		frame.Args = args
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockNextVal = nil
+		vm.sp = bp + 1 + fn.NumLocals
+		for index := 0; index < fn.NumLocals; index++ {
+			vm.stack[bp+1+index] = nil
+		}
+		for paramIndex, paramLocal := range fn.ParamLocalIndices {
+			if paramLocal >= 0 && bp+1+paramLocal < len(vm.stack) {
+				vm.stack[bp+1+paramLocal] = args[paramIndex]
+			}
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRInstructions(plan.registerIR, vm.stack[bp], args, frame, registerIRSendCacheEnabled)
+		if !executed {
+			cleanup()
+			return nil, false
+		}
+		if result != nil && result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			control := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return control, true
+		}
+		if core.ForEachConsumeNext() {
+			continue
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteArrayFramedIRBlock reuses one Ruby Frame while an Array#each/map
+// callback runs a straight-line Register IR body for every element.  The
+// callback still uses the normal framed executor for sends, allocation and
+// exception state; only the per-element binder/frame push-pop is removed.
+// Ordinary instance stores are safe because the callback keeps the same
+// receiver and frame. Local branches/stores remain inside that reused frame;
+// block sends and non-local owners stay on the ordinary path because their
+// state can escape between iterations.
+func (vm *VM) tryExecuteArrayFramedIRBlock(receiver *object.EmeraldValue, block *object.EmeraldValue, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || block == nil || block.Type != object.ValueClosure ||
+		!registerIRBlockEnabled || !registerIRFramedBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(closure.Free) == 1 {
+		if integerPlan, integerOK := integerCapturedBlockShape(fn); integerOK && vm.integerCapturedBlockPlanAvailable(integerPlan) {
+			// The raw integer reducer below is substantially cheaper than a
+			// framed IR callback; let the captured-shape tier handle it.
+			return nil, false
+		}
+	}
+	if (len(fn.Params) != 1 && len(fn.Params) != 2) || len(fn.ParamLocalIndices) != len(fn.Params) ||
+		len(fn.Params) == 2 && !closure.AutoSplat || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.blockReturn && !plan.registerIR.hasExplicitReturn || !plan.registerIR.requiresFrame {
+		return nil, false
+	}
+	planSafe := registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm)
+	if plan.registerIR.hasExplicitReturn {
+		planSafe = registerIRPlanSafeForFramedExplicitBlockReturn(plan.registerIR, vm)
+	}
+	if !planSafe {
+		return nil, false
+	}
+	if plan.registerIR.hasImplicitSends && !registerIRImplicitFramedBlockEnabled {
+		return nil, false
+	}
+	if plan.registerIR.hasExplicitReturn && closure.ReturnOwnerID > 0 &&
+		(vm.threadDepth > 0 || !vm.frameIDActive(closure.ReturnOwnerID)) {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		switch instruction.op {
+		case registerIRLoadParam, registerIRLoadLocal, registerIRLoadLiteral, registerIRLoadConstantValue,
+			registerIRLoadFrozenString, registerIRLoadConstant, registerIRLoadScopedConstant,
+			registerIRLoadInstanceVar, registerIRLoadSelf, registerIRLoadFree,
+			registerIRMove, registerIRSwap, registerIRBang, registerIRArray,
+			registerIRHash, registerIRHashMerge, registerIRMarkKeywordHash,
+			registerIRRange, registerIRSetStringEncoding, registerIREqual, registerIRDynamicEqual,
+			registerIRBinary, registerIRCompare, registerIRDynamicCompare,
+			registerIRStoreLocal, registerIRStoreFree, registerIRStoreInstanceVar,
+			registerIRJump, registerIRJumpTruthy,
+			registerIRJumpNotTruthy, registerIRJumpNotNil,
+			registerIRSend, registerIRRaise, registerIRReturn:
+			if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+				return nil, false
+			}
+		case registerIRJumpLocalPresent, registerIRLoadCapture,
+			registerIRClosure, registerIRLogicalSendAssignment, registerIRBlockGiven:
+			return nil, false
+		case registerIRIndex, registerIRSlice, registerIRIndexAssign:
+		default:
+			return nil, false
+		}
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	// The reusable frame has a fixed setup/cleanup cost.  For tiny arrays the
+	// ordinary one-shot block fast path is cheaper; reserve this tier for the
+	// repeated callbacks it is meant to amortize.
+	minElements := registerIRBatchBlockMinElements
+	if registerIRSmallFramedBlockEnabled && plan.registerIR.sendCount >= 2 {
+		minElements = registerIRSmallFramedBlockMinElements
+	}
+	if len(elems) < minElements {
+		return nil, false
+	}
+	if len(fn.Params) == 2 {
+		// The compiler marks a two-parameter block as autosplat. Preflight the
+		// pair shape so a later non-array element cannot force a replay after an
+		// earlier iteration has already mutated user-visible state.
+		for _, elem := range elems {
+			if elem == nil || elem.Type != object.ValueArray {
+				return nil, false
+			}
+		}
+	}
+	if result, handled := vm.tryExecuteArrayAggressiveIRBlock(receiver, block, collect, plan.registerIR, fn, closure, elems); handled {
+		return result, true
+	}
+	var collected []*object.EmeraldValue
+	if collect {
+		collected = make([]*object.EmeraldValue, 0, len(elems))
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp >= len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	vm.stack[bp] = blockBindingSelf(block)
+	vm.sp = bp + 1 + fn.NumLocals
+	for index := 0; index < fn.NumLocals && bp+1+index < len(vm.stack); index++ {
+		vm.stack[bp+1+index] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: vm.stack[bp],
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var argsStorage [2]*object.EmeraldValue
+	trustedNativeRegion := false
+	trustedNativeRegionChecked := false
+	generation := object.CurrentMethodGeneration()
+	for _, elem := range elems {
+		if elem == nil {
+			elem = core.R.NilVal
+		}
+		args := argsStorage[:len(fn.Params)]
+		if len(fn.Params) == 1 {
+			args[0] = elem
+		} else {
+			pair := elem.Data.([]*object.EmeraldValue)
+			args[0], args[1] = core.R.NilVal, core.R.NilVal
+			if len(pair) > 0 && pair[0] != nil {
+				args[0] = pair[0]
+			}
+			if len(pair) > 1 && pair[1] != nil {
+				args[1] = pair[1]
+			}
+		}
+		frame.Args = args
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockNextVal = nil
+		vm.sp = bp + 1 + fn.NumLocals
+		for index := 0; index < fn.NumLocals && bp+1+index < len(vm.stack); index++ {
+			vm.stack[bp+1+index] = nil
+		}
+		for paramIndex, paramLocal := range fn.ParamLocalIndices {
+			if paramLocal >= 0 && bp+1+paramLocal < len(vm.stack) {
+				vm.stack[bp+1+paramLocal] = args[paramIndex]
+			}
+		}
+		core.LastBlockResult = nil
+		if trustedNativeRegion && object.CurrentMethodGeneration() != generation {
+			trustedNativeRegion = false
+			trustedNativeRegionChecked = false
+			generation = object.CurrentMethodGeneration()
+		}
+		var result *object.EmeraldValue
+		var executed bool
+		if trustedNativeRegion {
+			result, executed = vm.executeRegisterIRInstructionsWithFreeTrustedNativeRegion(plan.registerIR, vm.stack[bp], args, frame, closure.Free, registerIRSendCacheEnabled)
+		} else {
+			result, executed = vm.executeRegisterIRInstructions(plan.registerIR, vm.stack[bp], args, frame, registerIRSendCacheEnabled)
+		}
+		if !executed {
+			cleanup()
+			return nil, false
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.Returned || vm.pendingReturnTargetID > 0 {
+			cleanup()
+			return result, true
+		}
+		if collect {
+			collected = append(collected, result)
+		}
+		if !trustedNativeRegion && !trustedNativeRegionChecked {
+			trustedNativeRegionChecked = true
+			trustedNativeRegion = registerIRTrustedFramedNativeRegionReady(plan.registerIR, generation)
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	if collect {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: collected, Class: core.R.Classes["Array"]}, true
+	}
+	return receiver, true
+}
+
+// tryExecuteFramedIRBlockValueStream is the stream-shaped sibling of the
+// Array framed tier.  The producer is called immediately before each callback
+// so callers such as PDF::Core::ObjectStore#each can preserve live Hash lookup
+// and mutation semantics without first materializing a value slice.  A miss
+// falls back from the current index, never replays the already committed
+// prefix.
+func (vm *VM) tryExecuteFramedIRBlockValueStream(block *object.EmeraldValue, count int,
+	valueAt func(int) (*object.EmeraldValue, bool), fallback func(int) (*object.EmeraldValue, bool),
+) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || block.Type != object.ValueClosure || count < registerIRBatchBlockMinElements ||
+		valueAt == nil || !registerIRBlockEnabled || !registerIRBatchBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.blockReturn ||
+		!plan.registerIR.requiresFrame || !registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if plan.registerIR.hasImplicitSends && !registerIRImplicitFramedBlockEnabled {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for index := 0; index < fn.NumLocals; index++ {
+		vm.stack[bp+1+index] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	fallbackFrom := func(start int) (*object.EmeraldValue, bool) {
+		cleanup()
+		core.LastBlockResult = nil
+		if fallback == nil {
+			return nil, false
+		}
+		return fallback(start)
+	}
+	var oneArg [1]*object.EmeraldValue
+	for index := 0; index < count; index++ {
+		value, valueOK := valueAt(index)
+		if !valueOK {
+			return fallbackFrom(index)
+		}
+		if value == nil {
+			value = core.R.NilVal
+		}
+		oneArg[0] = value
+		frame.Args = oneArg[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockNextVal = nil
+		vm.sp = bp + 1 + fn.NumLocals
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		paramLocal := fn.ParamLocalIndices[0]
+		if paramLocal < 0 || paramLocal >= fn.NumLocals || bp+1+paramLocal >= len(vm.stack) {
+			return fallbackFrom(index)
+		}
+		vm.stack[bp+1+paramLocal] = value
+		core.LastBlockResult = nil
+		core.ForEachClearNext()
+		result, executed := vm.executeRegisterIRInstructions(plan.registerIR, self, frame.Args, frame, registerIRSendCacheEnabled)
+		if !executed {
+			return fallbackFrom(index)
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.BlockBreak {
+			breakValue := frame.BlockBreakVal
+			if breakValue == nil {
+				breakValue = core.R.NilVal
+			}
+			cleanup()
+			return breakValue, true
+		}
+		if core.LastBlockResult != nil {
+			breakValue := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return breakValue, true
+		}
+		if frame.BlockNextVal != nil || core.ForEachConsumeNext() {
+			frame.BlockNextVal = nil
+			continue
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return nil, true
+}
+
+// tryExecuteArrayAggressiveIRBlock is the compiled-mode counterpart of the
+// reusable-frame tier above.  A plan admitted by registerIRAggressivePlanSafe
+// has no yield/closure/rescue/non-local-control operation; its sends are
+// completed exactly once through the normal method cache when a leaf proof is
+// unavailable.  Consequently it can run without manufacturing a Ruby Frame
+// for every element.  This entry is opt-in (compiled/aggressive mode) because
+// exception backtraces and unusual constant environments still belong to the
+// compatibility executor.
+func (vm *VM) tryExecuteArrayAggressiveIRBlock(receiver, block *object.EmeraldValue, collect bool, plan *registerIRPlan, fn *object.Function, closure *object.Closure, elems []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || plan == nil || fn == nil || closure == nil ||
+		!registerIRAggressiveEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || !plan.blockReturn || !registerIRAggressivePlanSafe(plan, true) ||
+		!registerIRDirectConstantsSafe(vm, closure, plan) || closure.ReturnOwnerID > 0 && plan.hasExplicitReturn {
+		return nil, false
+	}
+	if len(elems) == 0 {
+		core.LastBlockResult = nil
+		if collect {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}, true
+		}
+		return receiver, true
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	cleanup := func() {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var collected []*object.EmeraldValue
+	if collect {
+		collected = make([]*object.EmeraldValue, 0, len(elems))
+	}
+	self := blockBindingSelf(block)
+	generation := object.CurrentMethodGeneration()
+	trustedRegion := false
+	var argsStorage [2]*object.EmeraldValue
+	sideExit := func(start int) (*object.EmeraldValue, bool) {
+		cleanup()
+		for rest := start; rest < len(elems); rest++ {
+			value := elems[rest]
+			if value == nil {
+				value = core.R.NilVal
+			}
+			core.LastBlockResult = nil
+			fallback := vm.callBlockWithSelfArgs(block, self, []*object.EmeraldValue{value})
+			if fallback != nil && fallback.Type == object.ValueException {
+				return fallback, true
+			}
+			if collect {
+				collected = append(collected, fallback)
+			}
+			if core.LastBlockResult != nil {
+				breakResult := core.LastBlockResult
+				core.LastBlockResult = nil
+				return breakResult, true
+			}
+		}
+		core.LastBlockResult = nil
+		if collect {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: collected, Class: core.R.Classes["Array"]}, true
+		}
+		return receiver, true
+	}
+	for index, elem := range elems {
+		if object.CurrentMethodGeneration() != generation {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		if elem == nil {
+			elem = core.R.NilVal
+		}
+		args := argsStorage[:len(fn.Params)]
+		if len(fn.Params) == 1 {
+			args[0] = elem
+		} else {
+			pair, ok := elem.Data.([]*object.EmeraldValue)
+			if !ok {
+				cleanup()
+				return nil, false
+			}
+			args[0], args[1] = core.R.NilVal, core.R.NilVal
+			if len(pair) > 0 && pair[0] != nil {
+				args[0] = pair[0]
+			}
+			if len(pair) > 1 && pair[1] != nil {
+				args[1] = pair[1]
+			}
+		}
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRDirectNoFrameWithFreeMode(plan, fn, self, args, generation, closure.Free, true, true, true, true, true, trustedRegion)
+		if !executed {
+			// Aggressive execution is committed per element.  A miss is only
+			// expected before user code for malformed metadata; continue from the
+			// next element through the ordinary block protocol instead of replaying
+			// the already completed prefix.
+			return sideExit(index)
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			breakResult := core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return breakResult, true
+		}
+		if !trustedRegion && len(fn.Params) == 1 && registerIRTrustedNativeRegionReady(plan, generation) &&
+			vm.prepareRegisterIRTrustedTopLevelConstants(plan) {
+			trustedRegion = true
+		}
+		if collect {
+			collected = append(collected, result)
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	if collect {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: collected, Class: core.R.Classes["Array"]}, true
+	}
+	return receiver, true
+}
+
+type lazyStringLengthPayload interface {
+	lazyLength() int
+	stringLengthAt(index int) (int64, bool)
+}
+
+type lazyStringConstantLengthPayload interface {
+	constantStringLength() (int64, bool)
+}
+
+// tryExecuteLazyArrayStringLengthReduce consumes a proven lazy String map
+// without materializing its intermediate String objects. The block shape is
+// the same six-instruction capture reducer used by the ordinary field-reduce
+// tier, but the input String length comes from the producer's immutable raw
+// payload. Any unsupported encoding, redefined builtin, or overflow declines
+// before the captured value is changed; Array#each then materializes and uses
+// the normal Ruby protocol.
+func (vm *VM) tryExecuteLazyArrayStringLengthReduce(receiver, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || receiver.Type != object.ValueArray ||
+		block.Type != object.ValueClosure || !lazyStringArrayEachConsumerEnabled {
+		return nil, false
+	}
+	region := receiver.LazyArrayRegionValue()
+	if region == nil {
+		return nil, false
+	}
+	payload, ok := region.Payload.(lazyStringLengthPayload)
+	if !ok || payload == nil || payload.lazyLength() < typedSSAFieldReduceMinElements {
+		return nil, false
+	}
+	shape, ok := vm.prepareTypedSSAFieldReduceShape(block)
+	if !ok || shape.send == nil || shape.send.name != "length" || shape.send.argc != 0 ||
+		!core.StringLengthUsesBuiltinImplementation() || !vm.fusedIntegerOperationAvailable(shape.op) ||
+		int(shape.freeIndex) >= len(shape.closure.Free) {
+		return nil, false
+	}
+	current := derefClosureValue(shape.closure.Free[shape.freeIndex])
+	if !typedIntegerArgument(current) || core.AttachedSingletonClass(current) != nil {
+		return nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	total := current.Data.(int64)
+	if constantPayload, constantOK := payload.(lazyStringConstantLengthPayload); constantOK {
+		if length, lengthOK := constantPayload.constantStringLength(); lengthOK {
+			repeated, repeatedOK := applyRegisterIRIntegerLinearOpRaw(compiler.OpMul, length, int64(payload.lazyLength()))
+			if !repeatedOK {
+				return nil, false
+			}
+			updated, updatedOK := applyRegisterIRIntegerLinearOpRaw(shape.op, total, repeated)
+			if !updatedOK || object.CurrentMethodGeneration() != generation {
+				return nil, false
+			}
+			setClosureValue(&shape.closure.Free[shape.freeIndex], core.NewIntegerValue(updated))
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+	}
+	for index := 0; index < payload.lazyLength(); index++ {
+		if object.CurrentMethodGeneration() != generation {
+			return nil, false
+		}
+		length, lengthOK := payload.stringLengthAt(index)
+		if !lengthOK {
+			return nil, false
+		}
+		updated, updatedOK := applyRegisterIRIntegerLinearOpRaw(shape.op, total, length)
+		if !updatedOK {
+			return nil, false
+		}
+		total = updated
+	}
+	if object.CurrentMethodGeneration() != generation {
+		return nil, false
+	}
+	setClosureValue(&shape.closure.Free[shape.freeIndex], core.NewIntegerValue(total))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteArrayFindCapturedBlock reuses one framed Register IR callback for
+// Array#find. The built-in find loop stops on the first truthy result, so the
+// helper keeps the live array lookup and exact result semantics while removing
+// the per-element binder/frame setup from the common fixed one-argument block.
+func (vm *VM) tryExecuteArrayFindCapturedBlock(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !arrayFindCapturedBlockEnabled || receiver == nil || receiver.Type != object.ValueArray ||
+		receiver.Class != core.R.Classes["Array"] || receiver.LazyArrayRegionValue() != nil ||
+		core.AttachedSingletonClass(receiver) != nil || block == nil || block.Type != object.ValueClosure && block.Type != object.ValueProc ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() ||
+		vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) ||
+		closure.AutoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.blockReturn || !plan.registerIR.requiresFrame || plan.registerIR.hasImplicitSends ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok || len(elems) < 2 {
+		return nil, false
+	}
+
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals > len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+
+	var argsStorage [1]*object.EmeraldValue
+	for index := 0; ; index++ {
+		current, arrayOK := receiver.Data.([]*object.EmeraldValue)
+		if !arrayOK || index >= len(current) {
+			break
+		}
+		argsStorage[0] = current[index]
+		frame.Args = argsStorage[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.sp = bp + 1 + fn.NumLocals
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = core.R.NilVal
+		}
+		paramLocal := fn.ParamLocalIndices[0]
+		if paramLocal < 0 || paramLocal >= fn.NumLocals || bp+1+paramLocal >= len(vm.stack) {
+			cleanup()
+			return nil, false
+		}
+		vm.stack[bp+1+paramLocal] = argsStorage[0]
+		core.LastBlockResult = nil
+		result, executed := vm.executeRegisterIRInstructions(plan.registerIR, self, argsStorage[:], frame, registerIRSendCacheEnabled)
+		if !executed {
+			cleanup()
+			return nil, false
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			cleanup()
+			return result, true
+		}
+		if frame.BlockBreak {
+			result = frame.BlockBreakVal
+			if result == nil {
+				result = core.R.NilVal
+			}
+			cleanup()
+			return result, true
+		}
+		if core.LastBlockResult != nil {
+			result = core.LastBlockResult
+			core.LastBlockResult = nil
+			cleanup()
+			return result, true
+		}
+		if result.IsTruthy() {
+			foundValue := current[index]
+			cleanup()
+			core.LastBlockResult = nil
+			return foundValue, true
+		}
+		if core.ForEachConsumeNext() || frame.BlockNextVal != nil {
+			continue
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return core.R.NilVal, true
+}
+
+func reusableArrayBytecodeBlockShape(fn *object.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if fn.ArrayBytecodeBlockReuseChecked {
+		return fn.ArrayBytecodeBlockReuseEligible
+	}
+	eligible := reusableArrayBytecodeBlockShapeUncached(fn)
+	fn.ArrayBytecodeBlockReuseChecked = true
+	fn.ArrayBytecodeBlockReuseEligible = eligible
+	return eligible
+}
+
+func reusableArrayBytecodeBlockShapeUncached(fn *object.Function) bool {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	return reusableBytecodeBlockInstructionsSafe(fn.Instructions)
+}
+
+func reusableIntegerTimesBytecodeBlockShape(fn *object.Function) bool {
+	if fn == nil || len(fn.Params) > 1 || len(fn.ParamLocalIndices) != len(fn.Params) || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.ForLoopCollectAsPair ||
+		!simpleBlockParameterPatterns(fn) {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	if reusableBytecodeBlockInstructionsSafe(fn.Instructions) {
+		return true
+	}
+	return reusableIntegerTimesNestedClosureShape(fn)
+}
+
+// reusableIntegerTimesNestedClosureShape admits the narrow bytecode emitted
+// for a times body that only forwards a captured receiver to one ordinary
+// block call, for example:
+//
+//	values.each { |value| counter.add(value) }
+//
+// The outer body otherwise has no user-visible work.  Reusing its Frame is
+// safe only when the receiver load is followed by exactly the free captures
+// consumed by one OpClosure, one block-bearing OpSend, and the final
+// OpBlockReturn.  The nested block is checked separately and cannot contain
+// another closure or non-local/control-flow operation.
+func reusableIntegerTimesNestedClosureShape(fn *object.Function) bool {
+	if fn == nil || fn.Constants == nil || len(fn.Instructions) == 0 {
+		return false
+	}
+	instructions := fn.Instructions
+	position := 0
+	if compiler.Opcode(instructions[position]) != compiler.OpGetFree {
+		return false
+	}
+	definition, ok := compiler.Lookup(byte(compiler.OpGetFree))
+	if !ok || position+1+sumOperandWidths(definition.OperandWidths) > len(instructions) {
+		return false
+	}
+	position += 1 + sumOperandWidths(definition.OperandWidths)
+
+	closureSeen := false
+	sendSeen := false
+	captureCount := 0
+	for position < len(instructions) {
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpGetFree, compiler.OpGetFreeCell:
+			if closureSeen {
+				return false
+			}
+			captureCount++
+		case compiler.OpClosure:
+			if closureSeen || sendSeen || position+4 > len(instructions) {
+				return false
+			}
+			fnIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+			numFree := int(instructions[position+3])
+			if captureCount != numFree || fnIndex < 0 || fnIndex >= len(fn.Constants) {
+				return false
+			}
+			constant := fn.Constants[fnIndex]
+			child, ok := constant.Data.(*object.Function)
+			if !ok || !reusableIntegerTimesNestedBlockShape(child) {
+				return false
+			}
+			closureSeen = true
+		case compiler.OpSend:
+			if !closureSeen || sendSeen || position+6 > len(instructions) {
+				return false
+			}
+			// The closure is passed as the explicit block argument.  There
+			// are no positional/splat arguments in this outer forwarding
+			// shape; the nested callback receives its own arguments.
+			if instructions[position+3] != 1 || instructions[position+4] != 0 || instructions[position+5] != 255 {
+				return false
+			}
+			sendSeen = true
+		case compiler.OpBlockReturn:
+			return closureSeen && sendSeen && position == len(instructions)-1
+		default:
+			return false
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return false
+		}
+		width := 1 + sumOperandWidths(definition.OperandWidths)
+		if width <= 0 || position+width > len(instructions) {
+			return false
+		}
+		position += width
+	}
+	return false
+}
+
+type reusableIntegerTimesNestedClosurePlan struct {
+	receiverFreeIndex uint8
+	child             *object.Function
+	captures          []reusableIntegerTimesNestedClosureCapture
+	method            string
+}
+
+type reusableIntegerTimesNestedClosureCapture struct {
+	index uint8
+	cell  bool
+}
+
+func reusableIntegerTimesNestedClosurePlanFor(fn *object.Function) (reusableIntegerTimesNestedClosurePlan, bool) {
+	if fn == nil || len(fn.Params) != 0 || !reusableIntegerTimesNestedClosureShape(fn) {
+		return reusableIntegerTimesNestedClosurePlan{}, false
+	}
+	instructions := fn.Instructions
+	plan := reusableIntegerTimesNestedClosurePlan{receiverFreeIndex: instructions[1]}
+	position := 2
+	for position < len(instructions) {
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpGetFree, compiler.OpGetFreeCell:
+			if position+2 > len(instructions) {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			plan.captures = append(plan.captures, reusableIntegerTimesNestedClosureCapture{
+				index: instructions[position+1], cell: op == compiler.OpGetFreeCell,
+			})
+			position += 2
+		case compiler.OpClosure:
+			if position+4 > len(instructions) || int(instructions[position+3]) != len(plan.captures) {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			fnIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if fnIndex < 0 || fnIndex >= len(fn.Constants) {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			child, ok := fn.Constants[fnIndex].Data.(*object.Function)
+			if !ok || child == nil {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			plan.child = child
+			position += 4
+		case compiler.OpSend:
+			if plan.child == nil || position+6 > len(instructions) || instructions[position+3] != 1 ||
+				instructions[position+4] != 0 || instructions[position+5] != 255 {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			methodIndex := int(instructions[position+1])<<8 | int(instructions[position+2])
+			if methodIndex < 0 || methodIndex >= len(fn.Constants) {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			method, ok := fn.Constants[methodIndex].Data.(string)
+			if !ok || method != "each" {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			plan.method = method
+			position += 6
+		case compiler.OpBlockReturn:
+			if plan.child == nil || plan.method == "" || position != len(instructions)-1 {
+				return reusableIntegerTimesNestedClosurePlan{}, false
+			}
+			return plan, true
+		default:
+			return reusableIntegerTimesNestedClosurePlan{}, false
+		}
+	}
+	return reusableIntegerTimesNestedClosurePlan{}, false
+}
+
+func reusableIntegerTimesNestedBlockShape(fn *object.Function) bool {
+	if fn == nil || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) ||
+		len(fn.Instructions) == 0 || compiler.Opcode(fn.Instructions[len(fn.Instructions)-1]) != compiler.OpBlockReturn {
+		return false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return false
+		}
+	}
+	if !reusableBytecodeBlockInstructionsSafe(fn.Instructions) {
+		return false
+	}
+	for position := 0; position < len(fn.Instructions); {
+		op := compiler.Opcode(fn.Instructions[position])
+		switch op {
+		case compiler.OpReturnValue, compiler.OpNonLocalReturnValue,
+			compiler.OpNext, compiler.OpRedo, compiler.OpSetFree, compiler.OpGetFreeCell:
+			return false
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return false
+		}
+		width := 1 + sumOperandWidths(definition.OperandWidths)
+		if width <= 0 || position+width > len(fn.Instructions) {
+			return false
+		}
+		position += width
+	}
+	return true
+}
+
+func sumOperandWidths(widths []int) int {
+	total := 0
+	for _, width := range widths {
+		total += width
+	}
+	return total
+}
+
+// tryExecuteIntegerTimesNestedClosureBlock removes the outer bytecode send
+// for the closed shape `times { values.each { receiver.update(value) } }`.
+// The nested callback is still admitted by the ordinary typed Array proof;
+// this helper only amortizes the outer OpClosure/OpSend protocol and keeps a
+// normal times suffix fallback if the typed edge stops being valid.
+func (vm *VM) tryExecuteIntegerTimesNestedClosureBlock(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue, closure *object.Closure, plan reusableIntegerTimesNestedClosurePlan) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || closure == nil || closure.Fn == nil || plan.child == nil ||
+		plan.method != "each" || !core.ArrayEachUsesBuiltinImplementation() ||
+		int(plan.receiverFreeIndex) >= len(closure.Free) {
+		return nil, false
+	}
+	values := derefClosureValue(closure.Free[plan.receiverFreeIndex])
+	if values == nil || values.Type != object.ValueArray || values.Class != core.R.ArrayClass ||
+		values.LazyArrayRegionValue() != nil || core.AttachedSingletonClass(values) != nil {
+		return nil, false
+	}
+	elems, ok := values.Data.([]*object.EmeraldValue)
+	if !ok || len(elems) < registerIRBatchBlockMinElements {
+		return nil, false
+	}
+	constants := closure.Fn.Constants
+	childFn := functionWithConstants(plan.child, constants)
+	free := make([]*object.EmeraldValue, len(plan.captures))
+	for index, capture := range plan.captures {
+		if int(capture.index) >= len(closure.Free) {
+			return nil, false
+		}
+		value := closure.Free[capture.index]
+		if !capture.cell {
+			value = derefClosureValue(value)
+		}
+		if value == nil {
+			value = core.R.NilVal
+		}
+		free[index] = snapshotClosureCapture(value)
+	}
+	inner := &object.Closure{
+		Fn: childFn, Free: free, Block: closure.Block, Binding: closure.Binding,
+		ClassStack: closure.ClassStack, AutoSplat: true,
+		ReturnOwnerID: closure.ReturnOwnerID, BreakOwnerID: closure.BreakOwnerID,
+	}
+	if closure.Refinements != nil {
+		inner.Refinements = append([]*object.EmeraldValue(nil), closure.Refinements...)
+		inner.RefinementsFixed = closure.RefinementsFixed
+	}
+	innerBlock := &object.EmeraldValue{Type: object.ValueClosure, Data: inner, Class: core.R.Classes["Proc"]}
+	self := blockBindingSelf(block)
+	fallback := func(start int64) (*object.EmeraldValue, bool) {
+		for index := start; index < count; index++ {
+			core.LastBlockResult = nil
+			result := vm.callBlockWithSelfArgs(block, self, nil)
+			if result == nil {
+				result = core.R.NilVal
+			}
+			if result.Type == object.ValueException || vm.pendingReturnTargetID > 0 || vm.pendingBreakTargetID > 0 {
+				return result, true
+			}
+			if core.LastBlockResult != nil {
+				control := core.LastBlockResult
+				core.LastBlockResult = nil
+				return control, true
+			}
+		}
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	generation := object.CurrentMethodGeneration()
+	for index := int64(0); index < count; index++ {
+		if index > 0 && object.CurrentMethodGeneration() != generation {
+			return fallback(index)
+		}
+		result, handled := vm.tryExecuteArrayTypedSSAEffectfulIntegerUpdate(values, innerBlock, elems, false)
+		if !handled {
+			if index == 0 {
+				return nil, false
+			}
+			return fallback(index)
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException {
+			return result, true
+		}
+		if object.CurrentMethodGeneration() != generation {
+			return fallback(index + 1)
+		}
+	}
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+func reusableBytecodeBlockInstructionsSafe(instructions []byte) bool {
+	if len(instructions) == 0 {
+		return false
+	}
+	for position := 0; position < len(instructions); {
+		op := compiler.Opcode(instructions[position])
+		switch op {
+		case compiler.OpClosure, compiler.OpCurrentClosure,
+			compiler.OpYield, compiler.OpYieldWithValue, compiler.OpYieldWithSplat,
+			compiler.OpSendWithBlock, compiler.OpSendSuper,
+			compiler.OpGetLocalCell, compiler.OpGetFreeCell,
+			compiler.OpGetOuterCell, compiler.OpGetOuterFreeCell,
+			compiler.OpSetOuter, compiler.OpSetOuterFree,
+			compiler.OpReturn, compiler.OpRescue, compiler.OpRescueMatch,
+			compiler.OpRetry, compiler.OpReraise, compiler.OpThrow,
+			compiler.OpBeginRescue, compiler.OpEndRescue,
+			compiler.OpEnsure, compiler.OpEndEnsure, compiler.OpCatch,
+			compiler.OpRaise, compiler.OpRaiseNoMatchingPattern,
+			compiler.OpEnterForEach, compiler.OpExitForEach, compiler.OpSetWhileEnd,
+			compiler.OpBreak, compiler.OpBreakValue,
+			compiler.OpBlock, compiler.OpBlockWithArg, compiler.OpLambda,
+			compiler.OpDefineMethod, compiler.OpDefineSingletonMethod,
+			compiler.OpDefineClassMethod, compiler.OpDefineFunction,
+			compiler.OpOpenClass, compiler.OpOpenClassWithSuper,
+			compiler.OpClass, compiler.OpModule:
+			return false
+		case compiler.OpBlockReturn:
+			if position != len(instructions)-1 {
+				return false
+			}
+		}
+		definition, ok := compiler.Lookup(byte(op))
+		if !ok {
+			return false
+		}
+		width := 1
+		for _, operandWidth := range definition.OperandWidths {
+			width += operandWidth
+		}
+		if width <= 0 || position+width > len(instructions) {
+			return false
+		}
+		position += width
+	}
+	return true
+}
+
+// tryExecuteArrayReusableBytecodeBlock keeps the ordinary bytecode and
+// unwind protocol but amortizes the fixed block Frame and argument binder over
+// Array#each/map iterations. It is deliberately separate from Register IR:
+// complex blocks can contain dynamic sends, keyword sends, writes and an
+// explicit non-local return while still being safe to run in one reusable
+// Frame, whereas replayable speculative IR must reject those shapes.
+func (vm *VM) tryExecuteArrayReusableBytecodeBlock(receiver *object.EmeraldValue, block *object.EmeraldValue, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || !arrayBytecodeBlockReuseEnabled || !registerIRBatchBlockEnabled || receiver == nil ||
+		receiver.Type != object.ValueArray || receiver.Class != core.R.Classes["Array"] ||
+		receiver.LazyArrayRegionValue() != nil || core.AttachedSingletonClass(receiver) != nil ||
+		block == nil || block.Type != object.ValueClosure && block.Type != object.ValueProc ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 || len(vm.catchStack) != 0 ||
+		len(vm.activeRescues) != 0 || len(vm.pendingEnsures) != 0 || vm.ensureActive ||
+		vm.pendingReturnTargetID > 0 || vm.pendingBreakTargetID > 0 {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) ||
+		!reusableArrayBytecodeBlockShape(closure.Fn) || closure.AutoSplat && blockWantsDestructuring(closure.Fn) {
+		return nil, false
+	}
+	fn := closure.Fn
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok || len(elems) < registerIRBatchBlockMinElements {
+		return nil, false
+	}
+	paramLocal := fn.ParamLocalIndices[0]
+	if paramLocal < 0 || paramLocal >= fn.NumLocals {
+		return nil, false
+	}
+	prevBlock := vm.currentBlock
+	prevClassStack := vm.classStack
+	prevCatchStack := vm.catchStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	bp := vm.sp
+	if bp < 0 || bp+1+fn.NumLocals >= len(vm.stack) {
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	vm.stack[bp] = self
+	vm.sp = bp + 1 + fn.NumLocals
+	for local := 0; local < fn.NumLocals; local++ {
+		vm.stack[bp+1+local] = core.R.NilVal
+	}
+	methodName := ""
+	if closure.Binding != nil {
+		methodName = closure.Binding.Method
+	}
+	frame := vm.pushReusableFrame()
+	*frame = Frame{
+		ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure,
+		MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block,
+		BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self,
+	}
+	cleanup := func() {
+		vm.setStackPointer(bp)
+		vm.endActiveRescuesForFrame(frame)
+		for index := len(vm.rescueStack) - 1; index >= 0; index-- {
+			if vm.rescueStack[index].Frame == frame {
+				vm.rescueStack = append(vm.rescueStack[:index], vm.rescueStack[index+1:]...)
+			}
+		}
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		vm.frames = vm.frames[:vm.fp]
+		vm.fp--
+		vm.currentBlock = prevBlock
+		vm.classStack = prevClassStack
+		vm.catchStack = prevCatchStack
+	}
+	var oneArg [1]*object.EmeraldValue
+	var collected []*object.EmeraldValue
+	if collect {
+		collected = make([]*object.EmeraldValue, 0, len(elems))
+	}
+	for index := 0; ; index++ {
+		current, arrayOK := receiver.Data.([]*object.EmeraldValue)
+		if !arrayOK || index >= len(current) {
+			break
+		}
+		value := current[index]
+		if value == nil {
+			value = core.R.NilVal
+		}
+		vm.stack[bp] = self
+		for local := 0; local < fn.NumLocals; local++ {
+			vm.stack[bp+1+local] = nil
+		}
+		vm.sp = bp + 1 + fn.NumLocals
+		oneArg[0] = value
+		vm.stack[bp+1+paramLocal] = value
+		frame.Args = oneArg[:]
+		frame.Ip = -1
+		frame.Returned = false
+		frame.BlockBreak = false
+		frame.BlockBreakVal = nil
+		frame.BlockNextVal = nil
+		frame.InstructionException = nil
+		frame.InstructionSnapshotSet = false
+		core.LastBlockResult = nil
+		core.LastRaisedResult = nil
+		core.ForEachClearNext()
+		result, status := vm.executeReusableBlockFrame(frame, bp)
+		if result == nil {
+			result = core.R.NilVal
+		}
+		if result.Type == object.ValueException || status == reusableBlockError {
+			cleanup()
+			return result, true
+		}
+		if frame.Returned || vm.pendingReturnTargetID > 0 {
+			cleanup()
+			return result, true
+		}
+		if status == reusableBlockControl {
+			cleanup()
+			return result, true
+		}
+		if status == reusableBlockNext || frame.BlockNextVal != nil || core.ForEachConsumeNext() {
+			frame.BlockNextVal = nil
+			continue
+		}
+		if collect {
+			collected = append(collected, result)
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	if collect {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: collected, Class: core.R.Classes["Array"]}, true
+	}
+	return receiver, true
+}
+
+func (vm *VM) tryExecuteArrayEachCapturedBlock(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || block == nil || block.Type != object.ValueClosure || !arrayEachCapturedBlockEnabled ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	if receiver.LazyArrayRegionValue() != nil {
+		if result, handled := vm.tryExecuteLazyArrayStringLengthReduce(receiver, block); handled {
+			return result, true
+		}
+		receiver.MaterializeLazyArray()
+	}
+	if result, handled := vm.tryExecuteArrayTypedSSACallBlock(receiver, block, false); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayTypedHotCall(receiver, block, false); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayTypedSSAFieldReduce(receiver, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayDestructureBlock(receiver, block, false); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, false); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayReusableBytecodeBlock(receiver, block, false); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayFramedIRBlock(receiver, block, false); handled {
+		return result, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) != 1 {
+		if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+			return nil, false
+		}
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, false); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	plan, ok := integerCapturedBlockShape(closure.Fn)
+	if !ok || int(plan.freeIndex) >= len(closure.Free) || !vm.integerCapturedBlockPlanAvailable(plan) {
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, false); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok || len(elems) == 0 {
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	current := derefClosureValue(closure.Free[plan.freeIndex])
+	if !smallIntegerValue(current) {
+		return nil, false
+	}
+	total := current.Data.(int64)
+	for _, elem := range elems {
+		if !smallIntegerValue(elem) {
+			return nil, false
+		}
+		term := elem.Data.(int64)
+		if !plan.termDirect {
+			var termOK bool
+			term, termOK = applyRegisterIRIntegerLinearOpRaw(plan.termOpcode, term, plan.termConst)
+			if !termOK {
+				return nil, false
+			}
+		}
+		var totalOK bool
+		total, totalOK = applyRegisterIRIntegerLinearOpRaw(compiler.OpAdd, total, term)
+		if !totalOK {
+			return nil, false
+		}
+		if plan.hasPostTerm {
+			total, totalOK = applyRegisterIRIntegerLinearOpRaw(plan.postOpcode, total, plan.postConst)
+			if !totalOK {
+				return nil, false
+			}
+		}
+	}
+	setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(total))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+func (vm *VM) tryExecuteArrayMapCapturedBlock(receiver *object.EmeraldValue, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || block == nil || block.Type != object.ValueClosure || !arrayMapCapturedBlockEnabled ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	if receiver != nil && receiver.LazyArrayRegionValue() != nil {
+		if result, handled := vm.tryExecuteLazyObjectArrayMap(receiver, block); handled {
+			return result, true
+		}
+		receiver.MaterializeLazyArray()
+	}
+	if result, handled := vm.tryExecuteArrayLiteralIndexDeadElement(receiver, block); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayTypedSSACallBlock(receiver, block, true); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayTypedHotCall(receiver, block, true); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayDestructureBlock(receiver, block, true); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, true); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayReusableBytecodeBlock(receiver, block, true); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayFramedIRBlock(receiver, block, true); handled {
+		return result, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) != 1 {
+		if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+			return nil, false
+		}
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, true); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	plan, ok := integerCapturedBlockShape(closure.Fn)
+	if !ok || int(plan.freeIndex) >= len(closure.Free) || !vm.integerCapturedBlockPlanAvailable(plan) {
+		if result, handled := vm.tryExecuteArrayRegisterIRBlock(receiver, block, true); handled {
+			return result, true
+		}
+		return nil, false
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	result := make([]*object.EmeraldValue, 0, len(elems))
+	if len(elems) == 0 {
+		core.LastBlockResult = nil
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}, true
+	}
+	current := derefClosureValue(closure.Free[plan.freeIndex])
+	if !smallIntegerValue(current) {
+		return nil, false
+	}
+	total := current.Data.(int64)
+	for _, elem := range elems {
+		if !smallIntegerValue(elem) {
+			return nil, false
+		}
+		term := elem.Data.(int64)
+		if !plan.termDirect {
+			var termOK bool
+			term, termOK = applyRegisterIRIntegerLinearOpRaw(plan.termOpcode, term, plan.termConst)
+			if !termOK {
+				return nil, false
+			}
+		}
+		var totalOK bool
+		total, totalOK = applyRegisterIRIntegerLinearOpRaw(compiler.OpAdd, total, term)
+		if !totalOK {
+			return nil, false
+		}
+		if plan.hasPostTerm {
+			total, totalOK = applyRegisterIRIntegerLinearOpRaw(plan.postOpcode, total, plan.postConst)
+			if !totalOK {
+				return nil, false
+			}
+		}
+		result = append(result, core.NewIntegerValue(total))
+	}
+	setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(total))
+	core.LastBlockResult = nil
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}, true
+}
+
+// tryExecuteIntegerRangeLinearBlock fuses a finite Integer range with a
+// straight-line one-argument arithmetic block. Range#map otherwise creates a
+// boxed integer and enters CallBlockOne for every element; the linear plan is
+// already proven overflow-safe, so the loop can keep raw int64 values until
+// the result array is materialized.
+func (vm *VM) tryExecuteIntegerRangeLinearBlock(receiver *object.EmeraldValue, start, end int64, exclusive, collect bool, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !integerRangeLinearBlockEnabled || !registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode ||
+		core.AnyTracePointActive() || receiver == nil || block == nil || block.Type != object.ValueClosure && block.Type != object.ValueProc {
+		return nil, false
+	}
+	var fn *object.Function
+	var autoSplat bool
+	switch block.Type {
+	case object.ValueClosure:
+		closure, ok := block.Data.(*object.Closure)
+		if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+			return nil, false
+		}
+		fn, autoSplat = closure.Fn, closure.AutoSplat
+	case object.ValueProc:
+		proc, ok := block.Data.(*object.Proc)
+		if !ok || proc == nil || proc.Native != nil || proc.Fn == nil || proc.BreakOwnerID > 0 || len(proc.Refinements) > 0 {
+			return nil, false
+		}
+		fn, autoSplat = proc.Fn, proc.AutoSplat
+	}
+	if autoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, false
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.integerOnly || !plan.registerIR.integerLinear {
+		return nil, false
+	}
+	if !registerIRIntegerLinearInputMatchesParameter(plan.registerIR, fn) {
+		return nil, false
+	}
+	if exclusive {
+		if end == math.MinInt64 {
+			return nil, false
+		}
+		end--
+	}
+	if start > end {
+		if collect {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}, true
+		}
+		return receiver, true
+	}
+	count, ok := integerRangeCount(start, end, true)
+	if !ok || count < 0 || count > int64(int(^uint(0)>>1)) ||
+		!vm.fusedIntegerOperationAvailable(plan.registerIR.integerLinearOpA) ||
+		plan.registerIR.integerLinearKind == 2 && !vm.fusedIntegerOperationAvailable(plan.registerIR.integerLinearOpB) {
+		return nil, false
+	}
+	if !collect {
+		return receiver, true
+	}
+	result := make([]*object.EmeraldValue, 0, int(count))
+	for index := start; ; index++ {
+		value, ok := applyRegisterIRIntegerLinearOpRaw(plan.registerIR.integerLinearOpA, index, plan.registerIR.integerLinearConstA)
+		if ok && plan.registerIR.integerLinearKind == 2 {
+			value, ok = applyRegisterIRIntegerLinearOpRaw(plan.registerIR.integerLinearOpB, value, plan.registerIR.integerLinearConstB)
+		}
+		if !ok {
+			return nil, false
+		}
+		result = append(result, core.NewIntegerValue(value))
+		if index == end || index == math.MaxInt64 {
+			break
+		}
+	}
+	core.LastBlockResult = nil
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}, true
+}
+
+// tryExecuteArrayRegisterIRBlock runs a pure one-argument Array callback
+// without entering CallBlockOne for every element.  The plan admission is
+// deliberately narrower than the framed tier: only direct built-in sends and
+// read-only captures are allowed; stores, dynamic sends and branches stay out,
+// so a failed type/overflow guard can fall back without replaying user-visible
+// effects from earlier elements.
+func (vm *VM) tryExecuteArrayRegisterIRBlock(receiver, block *object.EmeraldValue, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || block == nil || block.Type != object.ValueClosure || !registerIRBatchBlockEnabled || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	if result, handled := vm.tryExecuteArrayCaseDispatchBlock(receiver, block, collect); handled {
+		return result, true
+	}
+	if result, handled := vm.tryExecuteArrayTypedSSACallBlock(receiver, block, collect); handled {
+		return result, true
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) > 0 ||
+		fn.KeywordRestParam != "" || fn.KeywordRestOnly || !simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil {
+		return nil, false
+	}
+	if plan.registerIR.integerLinear && !registerIRIntegerLinearInputMatchesParameter(plan.registerIR, fn) {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	if !plan.registerIR.integerOnly && !registerIRPlanSafeForFramelessBlock(plan.registerIR) {
+		return nil, false
+	}
+	trustedArrayIndex := registerIRTrustedArrayIndexEnabled &&
+		registerIRPlanTrustedArrayLiteralIndex(plan.registerIR) &&
+		core.ArrayIndexUsesBuiltinImplementation()
+	if trustedArrayIndex {
+		prepareRegisterIRArrayLiteralIndexFolds(plan.registerIR)
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	blockSelf := blockBindingSelf(block)
+	var result []*object.EmeraldValue
+	core.LastBlockResult = nil
+	if plan.registerIR.integerOnly && plan.registerIR.integerLinear {
+		if !vm.fusedIntegerOperationAvailable(plan.registerIR.integerLinearOpA) ||
+			plan.registerIR.integerLinearKind == 2 && !vm.fusedIntegerOperationAvailable(plan.registerIR.integerLinearOpB) {
+			return nil, false
+		}
+		// Array#each discards the callback value.  For a pure integer-linear
+		// block, preflight the element types once and omit all arithmetic and
+		// callback frames when the operation cannot raise.  This is deliberately
+		// only a no-collect path; Array#map must still materialize each result.
+		if !collect && integerLinearArrayNoopSafe(plan.registerIR, elems) {
+			core.LastBlockResult = nil
+			return receiver, true
+		}
+		if result, handled := vm.tryExecuteArrayIntegerLinearLazyResult(elems, plan.registerIR, collect); handled {
+			return result, true
+		}
+		if collect {
+			result = make([]*object.EmeraldValue, 0, len(elems))
+		}
+		for _, elem := range elems {
+			if elem == nil || elem.Type != object.ValueInteger || !smallIntegerValue(elem) {
+				core.LastBlockResult = nil
+				return nil, false
+			}
+			value, ok := applyRegisterIRIntegerLinearOpRaw(plan.registerIR.integerLinearOpA, elem.Data.(int64), plan.registerIR.integerLinearConstA)
+			if ok && plan.registerIR.integerLinearKind == 2 {
+				value, ok = applyRegisterIRIntegerLinearOpRaw(plan.registerIR.integerLinearOpB, value, plan.registerIR.integerLinearConstB)
+			}
+			if !ok {
+				core.LastBlockResult = nil
+				return nil, false
+			}
+			if collect {
+				result = append(result, core.NewIntegerValue(value))
+			}
+		}
+		if !collect {
+			return receiver, true
+		}
+		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}, true
+	}
+	if collect {
+		result = make([]*object.EmeraldValue, 0, len(elems))
+	}
+	for _, elem := range elems {
+		args := [1]*object.EmeraldValue{elem}
+		var value *object.EmeraldValue
+		var executed bool
+		if plan.registerIR.integerOnly {
+			if elem != nil && elem.Type == object.ValueInteger && smallIntegerValue(elem) {
+				value, executed = vm.executeRegisterIRIntegerOnlySingleArg(plan.registerIR, fn, blockSelf, elem.Data.(int64))
+			}
+		} else {
+			if trustedArrayIndex {
+				value, executed = vm.executeRegisterIRInstructionsWithFreeTrustedArrayIndex(plan.registerIR, blockSelf, args[:], nil, closure.Free, true)
+			} else {
+				value, executed = vm.executeRegisterIRInstructionsWithFree(plan.registerIR, blockSelf, args[:], nil, closure.Free, true)
+			}
+		}
+		if !executed {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		if collect {
+			result = append(result, value)
+		}
+	}
+	core.LastBlockResult = nil
+	if !collect {
+		return receiver, true
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: core.R.Classes["Array"]}, true
+}
+
+type registerIRIntegerLinearLazyPayload struct {
+	outputs  []int64
+	output   int64
+	length   int
+	constant bool
+}
+
+func (payload *registerIRIntegerLinearLazyPayload) valueAt(index int) (*object.EmeraldValue, bool) {
+	if payload == nil || index < 0 || index >= payload.length {
+		return nil, false
+	}
+	value := payload.output
+	if !payload.constant {
+		value = payload.outputs[index]
+	}
+	return core.NewIntegerValue(value), true
+}
+
+func (payload *registerIRIntegerLinearLazyPayload) materialize() []*object.EmeraldValue {
+	if payload == nil {
+		return nil
+	}
+	values := make([]*object.EmeraldValue, payload.length)
+	for index := range values {
+		value, ok := payload.valueAt(index)
+		if !ok {
+			values[index] = core.R.NilVal
+			continue
+		}
+		values[index] = value
+	}
+	return values
+}
+
+func (payload *registerIRIntegerLinearLazyPayload) elementAt(index int) (*object.EmeraldValue, bool) {
+	return payload.valueAt(index)
+}
+
+func (vm *VM) tryExecuteArrayIntegerLinearLazyResult(elems []*object.EmeraldValue, plan *registerIRPlan, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || !registerIRIntegerLinearLazyResultEnabled || !collect || plan == nil || !plan.integerOnly || !plan.integerLinear ||
+		(plan.integerLinearKind != 1 && plan.integerLinearKind != 2) || len(elems) < typedSSABatchCallMinElements || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	integerClass := core.R.IntegerClass
+	if integerClass == nil {
+		return nil, false
+	}
+	generation := object.CurrentMethodGeneration()
+	first, exact := typedSSAExactIntegerValueForClass(elems[0], integerClass)
+	if !exact || core.AttachedSingletonClass(elems[0]) != nil {
+		return nil, false
+	}
+	firstOutput, ok := applyRegisterIRIntegerLinearOpRaw(plan.integerLinearOpA, first, plan.integerLinearConstA)
+	if ok && plan.integerLinearKind == 2 {
+		firstOutput, ok = applyRegisterIRIntegerLinearOpRaw(plan.integerLinearOpB, firstOutput, plan.integerLinearConstB)
+	}
+	if !ok {
+		return nil, false
+	}
+	constantInput := true
+	for _, elem := range elems[1:] {
+		if elem != elems[0] {
+			constantInput = false
+			break
+		}
+	}
+	if constantInput {
+		if object.CurrentMethodGeneration() != generation {
+			return nil, false
+		}
+		payload := &registerIRIntegerLinearLazyPayload{
+			output: firstOutput, length: len(elems), constant: true,
+		}
+		result := &object.EmeraldValue{Type: object.ValueArray, Class: core.R.ArrayClass}
+		result.SetLazyArrayRegion(&object.LazyArrayRegion{
+			Length: len(elems), Payload: payload, Materialize: payload.materialize,
+			ElementAt: payload.elementAt, MethodGeneration: generation,
+		})
+		core.RegisterLazyArrayRegion(result)
+		core.LastBlockResult = nil
+		return result, true
+	}
+	outputs := make([]int64, len(elems))
+	outputs[0] = firstOutput
+	for index, elem := range elems[1:] {
+		if object.CurrentMethodGeneration() != generation {
+			return nil, false
+		}
+		value, exact := typedSSAExactIntegerValueForClass(elem, integerClass)
+		if !exact || core.AttachedSingletonClass(elem) != nil {
+			return nil, false
+		}
+		value, ok = applyRegisterIRIntegerLinearOpRaw(plan.integerLinearOpA, value, plan.integerLinearConstA)
+		if ok && plan.integerLinearKind == 2 {
+			value, ok = applyRegisterIRIntegerLinearOpRaw(plan.integerLinearOpB, value, plan.integerLinearConstB)
+		}
+		if !ok {
+			return nil, false
+		}
+		outputs[index+1] = value
+	}
+	if object.CurrentMethodGeneration() != generation {
+		return nil, false
+	}
+	payload := &registerIRIntegerLinearLazyPayload{
+		outputs: outputs, length: len(outputs),
+	}
+	result := &object.EmeraldValue{Type: object.ValueArray, Class: core.R.ArrayClass}
+	result.SetLazyArrayRegion(&object.LazyArrayRegion{
+		Length: len(outputs), Payload: payload, Materialize: payload.materialize,
+		ElementAt: payload.elementAt, MethodGeneration: generation,
+	})
+	core.RegisterLazyArrayRegion(result)
+	core.LastBlockResult = nil
+	return result, true
+}
+
+// tryExecuteArrayCaseDispatchBlock handles the very common straight-line
+// callback `items.map { |item| receiver.classify(item, capture) }` when the
+// callee is a case-dispatch method whose selected arm is an immutable literal.
+// It preflights every element before producing a result, so a later non-literal
+// arm deopts without having entered Ruby code or mutating the input array.
+func (vm *VM) tryExecuteArrayCaseDispatchBlock(receiver, block *object.EmeraldValue, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || block == nil || block.Type != object.ValueClosure ||
+		!registerIRBatchBlockEnabled || core.ObjectSpaceAllocationTracing() || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.AutoSplat || closure.BreakOwnerID > 0 || closure.ReturnOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Fn.Params) != 1 || len(closure.Fn.ParamLocalIndices) != 1 ||
+		closure.Fn.HasRestParam || closure.Fn.HasBlockParam || len(closure.Fn.KeywordParams) > 0 || closure.Fn.KeywordRestParam != "" ||
+		closure.Fn.KeywordRestOnly || len(closure.Fn.ParamPatterns) > 0 {
+		return nil, false
+	}
+	blockPlan, found := vm.cachedBlockLeafPlan(closure.Fn)
+	if !found || blockPlan.kind != leafMethodRegisterIR || blockPlan.registerIR == nil || blockPlan.registerIR.hasBranches ||
+		blockPlan.registerIR.sendCount != 1 || !blockPlan.registerIR.blockReturn {
+		return nil, false
+	}
+	plan := blockPlan.registerIR
+	var send *registerIRInstruction
+	for index := range plan.instructions {
+		instruction := &plan.instructions[index]
+		switch instruction.op {
+		case registerIRLoadParam:
+			if instruction.param != 0 {
+				return nil, false
+			}
+		case registerIRLoadLocal:
+			if int(instruction.param) != closure.Fn.ParamLocalIndices[0] {
+				return nil, false
+			}
+		case registerIRLoadConstant, registerIRLoadScopedConstant, registerIRLoadFree, registerIRLoadSelf, registerIRMove, registerIRReturn:
+			if instruction.op == registerIRLoadConstant && instruction.name == "" || instruction.op == registerIRLoadScopedConstant && instruction.name == "" {
+				return nil, false
+			}
+		case registerIRSend:
+			if send != nil || instruction.opcode != compiler.OpSend || instruction.blockPresent || instruction.argc > 4 {
+				return nil, false
+			}
+			send = instruction
+		default:
+			return nil, false
+		}
+	}
+	if send == nil || send.name == "" || registerIRDirectNativeName(send.name) {
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	if self == nil {
+		return nil, false
+	}
+	elems, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	if len(elems) == 0 {
+		core.LastBlockResult = nil
+		if collect {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: core.R.Classes["Array"]}, true
+		}
+		return receiver, true
+	}
+
+	// Build the fixed receiver/argument register shape once. The only changing
+	// input is parameter zero, so the callee lookup itself is stable for the
+	// complete preflight below.
+	buildRegisters := func(elem *object.EmeraldValue) ([16]*object.EmeraldValue, bool) {
+		var registers [16]*object.EmeraldValue
+		for _, instruction := range plan.instructions {
+			switch instruction.op {
+			case registerIRLoadParam:
+				registers[instruction.dst] = elem
+			case registerIRLoadLocal:
+				registers[instruction.dst] = elem
+			case registerIRLoadFree:
+				if int(instruction.param) >= len(closure.Free) {
+					return registers, false
+				}
+				registers[instruction.dst] = derefClosureValue(closure.Free[instruction.param])
+			case registerIRLoadConstant:
+				name := strings.TrimPrefix(instruction.name, "::")
+				value, found := vm.rubyConsts[name]
+				if !found {
+					if class, classFound := core.R.Classes[name]; classFound {
+						value = &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: core.R.Classes["Class"]}
+						found = true
+					}
+				}
+				if !found || value == nil || value.Type == object.ValueException {
+					return registers, false
+				}
+				registers[instruction.dst] = value
+			case registerIRLoadScopedConstant:
+				container := registers[instruction.left]
+				if container == nil {
+					return registers, false
+				}
+				value, found := directConstantValue(container, instruction.name)
+				if !found || value == nil || value.Type == object.ValueException {
+					return registers, false
+				}
+				registers[instruction.dst] = value
+			case registerIRLoadSelf:
+				registers[instruction.dst] = self
+			case registerIRMove:
+				registers[instruction.dst] = registers[instruction.left]
+			}
+		}
+		return registers, true
+	}
+
+	firstRegisters, ok := buildRegisters(elems[0])
+	if !ok {
+		return nil, false
+	}
+	firstReceiver := firstRegisters[send.left]
+	if firstReceiver == nil {
+		firstReceiver = core.R.NilVal
+	}
+	firstReceiver = derefClosureValue(firstReceiver)
+	var firstArgsStorage [4]*object.EmeraldValue
+	for index := 0; index < int(send.argc); index++ {
+		firstArgsStorage[index] = firstRegisters[send.args[index]]
+	}
+	firstArgs := firstArgsStorage[:int(send.argc)]
+	methodObj, _, fallback := vm.lookupMethodForSend(firstReceiver, send.name, firstArgs, false, true)
+	if fallback != nil || methodObj == nil || methodObj.DispatchOwner != nil || methodObj.Visibility == "undefined" ||
+		methodObj.Visibility != "" && methodObj.Visibility != "public" || methodObj.Ruby2Keywords || methodUsesRefinements(methodObj) {
+		return nil, false
+	}
+	calleeFn, ok := methodObj.Fn.(*object.Function)
+	if !ok || len(calleeFn.Params) != int(send.argc) || len(calleeFn.ParamLocalIndices) != len(calleeFn.Params) || calleeFn.HasRestParam || calleeFn.HasBlockParam ||
+		len(calleeFn.KeywordParams) > 0 || calleeFn.KeywordRestParam != "" || calleeFn.KeywordRestOnly || len(calleeFn.ParamPatterns) > 0 {
+		return nil, false
+	}
+	calleeLeaf, found := vm.cachedBlockLeafPlan(calleeFn)
+	if !found || calleeLeaf.kind != leafMethodCaseDispatch || calleeLeaf.caseDispatch == nil {
+		return nil, false
+	}
+	var mapped []*object.EmeraldValue
+	if collect {
+		mapped = make([]*object.EmeraldValue, len(elems))
+	}
+	for index, elem := range elems {
+		registers, registersOK := buildRegisters(elem)
+		if !registersOK {
+			return nil, false
+		}
+		callReceiver := registers[send.left]
+		if callReceiver == nil {
+			callReceiver = core.R.NilVal
+		}
+		callReceiver = derefClosureValue(callReceiver)
+		var callArgsStorage [4]*object.EmeraldValue
+		for argIndex := 0; argIndex < int(send.argc); argIndex++ {
+			callArgsStorage[argIndex] = registers[send.args[argIndex]]
+		}
+		callArgs := callArgsStorage[:int(send.argc)]
+		if callReceiver != firstReceiver {
+			// The method body is still structurally the same, but a changing
+			// receiver can alter singleton/class dispatch. Resolve the exact
+			// method again and require the same immutable case plan.
+			methodObj, _, fallback = vm.lookupMethodForSend(callReceiver, send.name, callArgs, false, true)
+			if fallback != nil || methodObj == nil || methodObj.DispatchOwner != nil || methodObj.Visibility == "undefined" ||
+				methodObj.Visibility != "" && methodObj.Visibility != "public" || methodObj.Ruby2Keywords || methodUsesRefinements(methodObj) {
+				return nil, false
+			}
+			callee, methodOK := methodObj.Fn.(*object.Function)
+			if !methodOK || callee != calleeFn {
+				return nil, false
+			}
+		}
+		_, direct, directOK := vm.caseDispatchStart(calleeLeaf.caseDispatch, callArgs)
+		if !directOK || direct == nil {
+			return nil, false
+		}
+		if collect {
+			mapped[index] = direct
+		}
+	}
+	core.LastBlockResult = nil
+	if !collect {
+		return receiver, true
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: mapped, Class: core.R.Classes["Array"]}, true
+}
+
+// executeRegisterIRBranchNoFrameBlock runs the branch-only block tier without
+// allocating a Ruby Frame.  Unlike the general Register IR executor it keeps
+// local slots in a small Go array, which admits block-local assignments while
+// still rejecting every operation that could observe a missing frame.  The
+// caller has already checked the structural branch proof; this function only
+// returns false for malformed slot/target metadata so the ordinary block path
+// can replay the body.
+func (vm *VM) executeRegisterIRBranchNoFrameBlock(plan *registerIRPlan, fn *object.Function, receiver *object.EmeraldValue, args []*object.EmeraldValue, free []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || plan == nil || fn == nil || !registerIRPlanSafeForBranchNoFrameBlock(plan) || !plan.blockReturn || !plan.hasBranches || plan.hasSends || plan.hasImplicitSends {
+		return nil, false
+	}
+	var registers [16]*object.EmeraldValue
+	var locals [64]*object.EmeraldValue
+	for index, local := range fn.ParamLocalIndices {
+		if local < 0 || local >= len(locals) {
+			return nil, false
+		}
+		if index < len(args) && args[index] != nil {
+			locals[local] = args[index]
+		} else {
+			locals[local] = core.R.NilVal
+		}
+	}
+	for pc := 0; pc < len(plan.instructions); {
+		instruction := plan.instructions[pc]
+		switch instruction.op {
+		case registerIRLoadParam:
+			if int(instruction.param) >= len(args) {
+				return nil, false
+			}
+			value := args[instruction.param]
+			if value == nil {
+				value = core.R.NilVal
+			}
+			registers[instruction.dst] = value
+		case registerIRLoadLocal:
+			local := int(instruction.param)
+			if local < 0 || local >= len(locals) {
+				return nil, false
+			}
+			value := locals[local]
+			if value == nil {
+				value = core.R.NilVal
+			}
+			registers[instruction.dst] = derefClosureValue(value)
+		case registerIRStoreLocal:
+			local := int(instruction.param)
+			if local < 0 || local >= len(locals) {
+				return nil, false
+			}
+			value := registers[instruction.left]
+			if value == nil {
+				value = core.R.NilVal
+			}
+			locals[local] = value
+		case registerIRLoadLiteral:
+			registers[instruction.dst] = instruction.value
+		case registerIRLoadSelf:
+			registers[instruction.dst] = receiver
+		case registerIRLoadInstanceVar:
+			value := core.DynamicInstanceVar(receiver, instruction.name)
+			if value == nil {
+				value = core.R.NilVal
+			}
+			registers[instruction.dst] = value
+		case registerIRLoadFree:
+			if int(instruction.param) >= len(free) {
+				return nil, false
+			}
+			value := derefClosureValue(free[instruction.param])
+			if value == nil {
+				value = core.R.NilVal
+			}
+			registers[instruction.dst] = value
+		case registerIRMove:
+			registers[instruction.dst] = registers[instruction.left]
+		case registerIRSwap:
+			registers[instruction.left], registers[instruction.right] = registers[instruction.right], registers[instruction.left]
+		case registerIRBang:
+			registers[instruction.dst] = registerIRBangValue(registers[instruction.left])
+		case registerIRJump:
+			if instruction.target < 0 || instruction.target >= len(plan.instructions) {
+				return nil, false
+			}
+			pc = instruction.target
+			continue
+		case registerIRJumpTruthy:
+			value := registers[instruction.left]
+			if value != nil && value.IsTruthy() {
+				if instruction.target < 0 || instruction.target >= len(plan.instructions) {
+					return nil, false
+				}
+				pc = instruction.target
+				continue
+			}
+		case registerIRJumpNotTruthy:
+			value := registers[instruction.left]
+			if value == nil || !value.IsTruthy() {
+				if instruction.target < 0 || instruction.target >= len(plan.instructions) {
+					return nil, false
+				}
+				pc = instruction.target
+				continue
+			}
+		case registerIRJumpNotNil:
+			value := registers[instruction.left]
+			if value != nil && value.Type != object.ValueNil {
+				if instruction.target < 0 || instruction.target >= len(plan.instructions) {
+					return nil, false
+				}
+				pc = instruction.target
+				continue
+			}
+		case registerIRReturn:
+			result := registers[instruction.left]
+			if result == nil {
+				result = core.R.NilVal
+			}
+			core.LastBlockResult = nil
+			return result, true
+		default:
+			return nil, false
+		}
+		pc++
+	}
+	return nil, false
+}
+
+// tryExecuteSingleIntegerBlock is the zero-frame block entry used by
+// CallBlockOne.  Array#each/map/select invoke one-argument blocks extremely
+// frequently; the regular block path still performs closure normalization,
+// keyword checks, plan lookup and Frame setup for every element.  A block is
+// eligible only when its already-cached Register IR is integer-only and has no
+// non-local control-flow or refinement context.  Any type miss/overflow or
+// unsupported shape returns false before user-visible state changes, so the
+// caller can run the ordinary block path unchanged.
+func (vm *VM) fastClosureForBlock(block *object.EmeraldValue) (*object.Closure, bool) {
+	if vm == nil || block == nil {
+		return nil, false
+	}
+	switch block.Type {
+	case object.ValueClosure:
+		closure, ok := block.Data.(*object.Closure)
+		return closure, ok && closure != nil && closure.Fn != nil
+	case object.ValueProc:
+		proc, ok := block.Data.(*object.Proc)
+		if !ok || proc == nil || proc.Native != nil || proc.Fn == nil ||
+			proc.BreakOwnerID > 0 || proc.ReturnOwnerID > 0 || proc.IsLambda || len(proc.Refinements) > 0 ||
+			!procClosureCacheEnabled {
+			return nil, false
+		}
+		closure := proc.CachedClosure
+		if closure == nil {
+			closure = &object.Closure{}
+			proc.CachedClosure = closure
+		}
+		closure.Fn = proc.Fn
+		closure.Free = proc.Env
+		closure.Block = proc.Block
+		closure.Binding = proc.Binding
+		closure.ClassStack = proc.ClassStack
+		closure.Refinements = nil
+		closure.RefinementsFixed = proc.RefinementsFixed
+		closure.RefinementCheckGeneration = 0
+		closure.RefinementCheckValid = false
+		closure.AutoSplat = proc.AutoSplat
+		closure.ReturnOwnerID = proc.ReturnOwnerID
+		closure.BreakOwnerID = proc.BreakOwnerID
+		closure.FlipFlopStates = proc.FlipFlopStates
+		if proc.FlipFlopStates == nil {
+			proc.FlipFlopStates = make(map[int]bool)
+			closure.FlipFlopStates = proc.FlipFlopStates
+		}
+		return closure, true
+	default:
+		return nil, false
+	}
+}
+
+func (vm *VM) tryExecuteSingleIntegerBlock(block, arg *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || arg == nil ||
+		!registerIRBlockEnabled || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() {
+		return nil, false
+	}
+	// CallBlockOne is also used by Array/Enumerable callbacks whose argument is
+	// a String, Object, or another boxed value.  The integer-only tier cannot
+	// succeed for those inputs; reject them before touching closure metadata or
+	// the per-function leaf-plan cache.  This keeps the common non-integer
+	// callback path at the cost of one type tag check instead of a speculative
+	// integer plan probe on every element.
+	if arg.Type != object.ValueInteger || !smallIntegerValue(arg) {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.AutoSplat || closure.ReturnOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+		return nil, false
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || !plan.registerIR.integerOnly ||
+		plan.registerIR.blockReturn {
+		// The generic frameless block tier below can still handle a block whose
+		// result allocates an exact Array/Hash.  Only the scalar entry requires
+		// an integer argument and a non-block-return plan.
+		if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil {
+			return nil, false
+		}
+	}
+	core.LastBlockResult = nil
+	args := [1]*object.EmeraldValue{arg}
+	if plan.registerIR.integerOnly && !plan.registerIR.blockReturn {
+		return vm.executeRegisterIR(plan.registerIR, fn, blockBindingSelf(block), args[:], "", nil, nil)
+	}
+	if registerIRBatchBlockEnabled && !core.ObjectSpaceAllocationTracing() && !plan.registerIR.integerOnly &&
+		!closureUsesRefinements(closure) && registerIRPlanSafeForFramelessBlock(plan.registerIR) {
+		return vm.executeRegisterIRInstructionsWithFree(plan.registerIR, blockBindingSelf(block), args[:], nil, closure.Free, true)
+	}
+	return nil, false
+}
+
+// tryExecuteSingleFramelessBlock is the non-integer companion to
+// tryExecuteSingleIntegerBlock.  Array/Enumerable callbacks normally enter
+// callBlockWithSelfArgs, which repeats closure normalization, parameter
+// protocol checks, leaf-plan lookup and Frame setup for every element.  A
+// one-argument Register IR body already proven safe for the frameless block
+// tier has none of the observable unwind state that those steps establish, so
+// CallBlockOne can execute it directly.  The proof intentionally excludes
+// destructuring/defaults, refinements, non-local returns, captures with
+// control-flow side effects and ObjectSpace tracing; every other shape keeps
+// the complete block path.
+func (vm *VM) tryExecuteSingleFramelessBlock(block, arg *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || arg == nil ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || vm.instructionLimit != 0 ||
+		DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) || closure.AutoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil || plan.registerIR.integerOnly ||
+		closure.ReturnOwnerID > 0 ||
+		!registerIRPlanSafeForFramelessBlock(plan.registerIR) {
+		return nil, false
+	}
+	args := [1]*object.EmeraldValue{arg}
+	core.LastBlockResult = nil
+	return vm.executeRegisterIRInstructionsWithFree(plan.registerIR, blockBindingSelf(block), args[:], nil, closure.Free, true)
+}
+
+// tryExecuteSingleFramedBlock is the one-shot counterpart of the reusable
+// framed collection tiers.  Native iterators such as PDF::Core's ObjectStore
+// call CallBlockOne for each value, so a reusable batch frame is unavailable;
+// nevertheless, a proven framed Register IR body can skip the repeated
+// typed/stateful/no-frame probes and enter the ordinary Frame protocol once.
+//
+// The proof is deliberately narrower than the generic framed executor.  It
+// admits only a Closure with either one ordinary positional parameter or the
+// exact `|(left, right)|` single-array destructuring shape.  Explicit returns,
+// block/splat sends, refinements, and control-flow owners remain on the normal
+// path.  A miss in any preflight guard occurs before current VM state changes.
+func (vm *VM) tryExecuteSingleFramedBlock(block, arg *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || arg == nil || block.Type != object.ValueClosure ||
+		!singleFramedBlockEnabled || !registerIRBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	destructure := closure.AutoSplat && blockWantsDestructuring(fn)
+	if destructure {
+		if arg.Type != object.ValueArray || !simpleDestructurePairShape(fn) {
+			return nil, false
+		}
+	} else {
+		if closure.AutoSplat || !registerIRSimpleBlockProtocolEnabled ||
+			len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 ||
+			fn.HasRestParam || fn.HasBlockParam || fn.RejectBlock ||
+			fn.SingleDestructure || fn.TrailingCommaParam ||
+			len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+			!simpleBlockParameterPatterns(fn) || !vm.simpleBlockCallShape(fn) {
+			return nil, false
+		}
+		for _, defaultValue := range fn.ParamDefaults {
+			if defaultValue != nil {
+				return nil, false
+			}
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.requiresFrame || !plan.registerIR.blockReturn ||
+		plan.registerIR.hasExplicitReturn ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+	args := [1]*object.EmeraldValue{arg}
+	return vm.callBlockWithSelfArgsFramed(block, blockBindingSelf(block), args[:], &plan), true
+}
+
+// tryExecuteZeroArgFramedBlock is the corresponding narrow entry for native
+// wrappers that yield without arguments.  It is intentionally not installed
+// in every CallBlock site: the current Prawn text-state wrapper is already a
+// proven native caller, so keeping the probe there avoids adding a plan lookup
+// to unrelated zero-argument Ruby blocks.
+func (vm *VM) tryExecuteZeroArgFramedBlock(block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || block.Type != object.ValueClosure ||
+		!singleFramedBlockEnabled || !registerIRBlockEnabled || !registerIRFramedBlockEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || closure.AutoSplat {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 0 || len(fn.ParamLocalIndices) != 0 || fn.HasRestParam ||
+		fn.HasBlockParam || fn.RejectBlock || fn.ImplicitItParameter ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!plan.registerIR.requiresFrame || !plan.registerIR.blockReturn ||
+		plan.registerIR.hasExplicitReturn ||
+		!registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm) {
+		return nil, false
+	}
+	for _, instruction := range plan.registerIR.instructions {
+		if instruction.op == registerIRSend && (instruction.blockPresent || instruction.splatIndex != 255) {
+			return nil, false
+		}
+	}
+	return vm.callBlockWithSelfArgsFramed(block, blockBindingSelf(block), nil, &plan), true
+}
+
+type destructurePairBlockPlan struct {
+	closure           *object.Closure
+	fn                *object.Function
+	directFn          *object.Function
+	register          *registerIRPlan
+	self              *object.EmeraldValue
+	direct            bool
+	trustedGeneration uint64
+}
+
+// prepareDestructurePairBlock proves the common native-iterator shape
+// `block.call([left, right])` with a Ruby block declared as `|left, right|`.
+// Ruby's block autosplat protocol expands one Array argument before binding
+// positional parameters.  The generic path currently allocates a temporary
+// argument slice, binds a Frame and tears it down again for every pair.  This
+// helper returns a plan that can feed the expanded values directly into a
+// proven frameless Register IR plan.  Keeping the proof separate lets the
+// Array batch entry reuse it without allocating a temporary pair Array for
+// every callback.
+func (vm *VM) prepareDestructurePairBlock(block *object.EmeraldValue) (destructurePairBlockPlan, bool) {
+	invalid := destructurePairBlockPlan{}
+	if vm == nil || block == nil ||
+		!registerIRBlockEnabled || !registerIRBatchBlockEnabled || vm.instructionLimit != 0 ||
+		DevMode || core.AnyTracePointActive() || core.ObjectSpaceAllocationTracing() {
+		return invalid, false
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.AutoSplat == false ||
+		closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+		return invalid, false
+	}
+	fn := closure.Fn
+	directFn := fn
+	physicalPair := len(fn.Params) == 2 && len(fn.ParamLocalIndices) == 2 && !fn.HasRestParam && !fn.HasBlockParam &&
+		len(fn.KeywordParams) == 0 && fn.KeywordRestParam == "" && !fn.KeywordRestOnly &&
+		simpleBlockParameterPatterns(fn)
+	if !physicalPair {
+		// `|(left, right)|` is represented as one physical parameter plus a
+		// two-child pattern. The direct executor only needs the resulting local
+		// slots, so create a short-lived shape view with those child locals as
+		// positional parameters; the original Function remains untouched for the
+		// framed fallback and Binding/arity observations.
+		if !simpleDestructurePairShape(fn) {
+			return invalid, false
+		}
+		pattern := fn.ParamPatterns[0]
+		leftLocal, leftOK := fn.LocalNames[pattern.Children[0].Name]
+		rightLocal, rightOK := fn.LocalNames[pattern.Children[1].Name]
+		if !leftOK || !rightOK {
+			return invalid, false
+		}
+		shape := *fn
+		shape.Params = []string{pattern.Children[0].Name, pattern.Children[1].Name}
+		shape.ParamLocalIndices = []int{leftLocal, rightLocal}
+		shape.ParamPatterns = nil
+		shape.ParamDefaults = []*object.EmeraldValue{nil, nil}
+		shape.SingleDestructure = false
+		shape.TrailingCommaParam = false
+		directFn = &shape
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return invalid, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+		!registerIRPlanSafeForFramelessBlock(plan.registerIR) {
+		if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil ||
+			!registerIRBlockEnabled || !registerIRNoFrameEnabled || !registerIRDirectNoFrameEnabled ||
+			closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn ||
+			plan.registerIR.hasImplicitSends ||
+			!registerIRPlanSafeForDirectNoFrameWithOptions(plan.registerIR, true, true, true) ||
+			!registerIRDirectConstantsSafe(vm, closure, plan.registerIR) && !registerIRAggressiveEnabled {
+			return invalid, false
+		}
+		return destructurePairBlockPlan{closure: closure, fn: fn, directFn: directFn, register: plan.registerIR, self: blockBindingSelf(block), direct: true}, true
+	}
+	// A closure normally carries its enclosing method's ReturnOwnerID even
+	// when its body has no explicit `return`.  That owner is only observable
+	// if the compiled block actually contains OpReturnValue (recorded as
+	// hasExplicitReturn); an ordinary OpBlockReturn cannot jump out of the
+	// owner.  Keep explicit-return blocks on the framed path, but admit the
+	// common implicit-return shape.
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn && !registerIRAggressiveEnabled {
+		return invalid, false
+	}
+	if !physicalPair {
+		return invalid, false
+	}
+	return destructurePairBlockPlan{closure: closure, fn: fn, directFn: directFn, register: plan.registerIR, self: blockBindingSelf(block)}, true
+}
+
+func (vm *VM) executeDestructurePairBlock(plan *destructurePairBlockPlan, left, right *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || plan == nil || plan.register == nil {
+		return nil, false
+	}
+	if left == nil {
+		left = core.R.NilVal
+	}
+	if right == nil {
+		right = core.R.NilVal
+	}
+	args := [2]*object.EmeraldValue{left, right}
+	core.LastBlockResult = nil
+	if plan.direct {
+		generation := object.CurrentMethodGeneration()
+		var result *object.EmeraldValue
+		var executed bool
+		// The batch caller has already proved the block shape and generation.
+		// Use the trusted ABI even on the first element so a cold nested leaf can
+		// populate its cache and return a per-element miss without permanently
+		// disabling the shared block plan.  The ordinary single-call entry keeps
+		// its warmup/disable policy; batch data is often polymorphic, so that
+		// policy would turn one cold accessor into a permanent framed fallback.
+		result, executed = vm.executeRegisterIRDirectNoFrameWithFreeMode(plan.register, plan.directFn, plan.self, args[:], generation, plan.closure.Free, true, true, true, true, registerIRAggressiveEnabled)
+		if executed {
+			plan.trustedGeneration = generation
+		}
+		if !executed {
+			core.LastBlockResult = nil
+			return nil, false
+		}
+		if result == nil {
+			result = core.R.NilVal
+		}
+		core.LastBlockResult = nil
+		return result, true
+	}
+	result, executed := vm.executeRegisterIRInstructionsWithFree(plan.register, plan.self, args[:], nil, nil, true)
+	if result == nil && executed {
+		result = core.R.NilVal
+	}
+	core.LastBlockResult = nil
+	return result, executed
+}
+
+// tryExecuteSingleDestructureBlock handles one native-iterator pair while
+// preserving the ordinary binder as a fallback for malformed/non-Array input.
+func (vm *VM) tryExecuteSingleDestructureBlock(block, arg *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if arg == nil || arg.Type != object.ValueArray {
+		return nil, false
+	}
+	plan, ok := vm.prepareDestructurePairBlock(block)
+	if !ok {
+		return nil, false
+	}
+	elements, ok := arg.Data.([]*object.EmeraldValue)
+	if !ok {
+		return nil, false
+	}
+	left, right := core.R.NilVal, core.R.NilVal
+	if len(elements) > 0 && elements[0] != nil {
+		left = elements[0]
+	}
+	if len(elements) > 1 && elements[1] != nil {
+		right = elements[1]
+	}
+	return vm.executeDestructurePairBlock(&plan, left, right)
+}
+
+// tryExecuteArrayDestructureBlock batches an Array#each/map callback declared
+// as `|(left, right)|`. Hash#sort_by materializes pairs as two-element Arrays;
+// feeding those pairs through CallBlockOne otherwise repeats closure
+// normalization, autosplat binding and Frame setup for every element. The
+// direct tier is speculative per pair. Once a guard misses, the helper
+// continues the remaining suffix through the ordinary protocol instead of
+// replaying already-completed user-visible work.
+func (vm *VM) tryExecuteArrayDestructureBlock(receiver, block *object.EmeraldValue, collect bool) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueArray || block == nil ||
+		block.Type != object.ValueClosure || !registerIRBatchBlockEnabled ||
+		core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	elements, ok := receiver.Data.([]*object.EmeraldValue)
+	if !ok || len(elements) < registerIRBatchBlockMinElements {
+		return nil, false
+	}
+	plan, ok := vm.prepareDestructurePairBlock(block)
+	if !ok || !plan.direct || plan.self == nil {
+		return nil, false
+	}
+	// Array#each/map has already established a repeated callback shape.  The
+	// trusted batch ABI below performs the nested guards per element, so the
+	// shared no-frame warmup counter is deliberately not mutated here.  A cold
+	// nested leaf must be allowed to miss for one element without permanently
+	// disabling this batch plan.
+	var collected []*object.EmeraldValue
+	if collect {
+		collected = make([]*object.EmeraldValue, 0, len(elements))
+	}
+	finish := func() (*object.EmeraldValue, bool) {
+		core.LastBlockResult = nil
+		if collect {
+			return &object.EmeraldValue{Type: object.ValueArray, Data: collected, Class: core.R.Classes["Array"]}, true
+		}
+		return receiver, true
+	}
+	fallback := func(start int) (*object.EmeraldValue, bool) {
+		for index := start; index < len(elements); index++ {
+			core.LastBlockResult = nil
+			if !collect {
+				core.ForEachClearNext()
+			}
+			fallbackArgs := [1]*object.EmeraldValue{elements[index]}
+			value := vm.callBlockWithSelfArgs(block, plan.self, fallbackArgs[:])
+			if core.LastBlockResult != nil {
+				result := core.LastBlockResult
+				core.LastBlockResult = nil
+				return result, true
+			}
+			if value != nil && value.Type == object.ValueException && (collect || core.LastException == value) {
+				return value, true
+			}
+			if !collect && core.ForEachConsumeNext() {
+				continue
+			}
+			if collect {
+				collected = append(collected, value)
+			}
+		}
+		return finish()
+	}
+	for index, element := range elements {
+		if element == nil || element.Type != object.ValueArray {
+			return fallback(index)
+		}
+		pair, pairOK := element.Data.([]*object.EmeraldValue)
+		if !pairOK {
+			return fallback(index)
+		}
+		left, right := core.R.NilVal, core.R.NilVal
+		if len(pair) > 0 && pair[0] != nil {
+			left = pair[0]
+		}
+		if len(pair) > 1 && pair[1] != nil {
+			right = pair[1]
+		}
+		value, executed := vm.executeDestructurePairBlock(&plan, left, right)
+		if !executed {
+			return fallback(index)
+		}
+		if value != nil && value.Type == object.ValueException {
+			return value, true
+		}
+		if collect {
+			collected = append(collected, value)
+		}
+	}
+	return finish()
+}
+
+// tryExecuteFixedArityDirectBlock handles the common native-iterator shape
+// `yield key, value` with a fixed two-parameter Ruby block.  Hash#each and a
+// number of Gem iterators enter this path through CallBlockWithArgs rather
+// than CallBlockOne, so the one-argument fast tiers cannot help them.  The
+// direct executor keeps the same generation/type/cache guards as the method
+// direct tier and returns false before user-visible work on a miss; the
+// caller then replays the ordinary binder/frame protocol.
+//
+// A straight-line block uses the cheaper frameless executor.  Branching
+// blocks with cached native/leaf sends use the guarded direct executor, which
+// admits local control flow and case-dispatch leaves but still rejects block,
+// keyword, refinement, and non-local-control shapes.
+func (vm *VM) tryExecuteFixedArityDirectBlock(block *object.EmeraldValue, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || len(args) != 2 ||
+		!registerIRBlockEnabled || !registerIRNoFrameEnabled || !registerIRDirectNoFrameEnabled ||
+		vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
+		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 {
+		return nil, false
+	}
+	if result, executed := vm.tryExecuteIntegerArrayReduceBlock(block, args); executed {
+		return result, true
+	}
+	closure, ok := vm.fastClosureForBlock(block)
+	if !ok || closure == nil || closure.BreakOwnerID > 0 || closureUsesRefinements(closure) {
+		return nil, false
+	}
+	fn := closure.Fn
+	if fn == nil || len(fn.Params) != len(args) || len(fn.ParamLocalIndices) != len(args) ||
+		fn.SingleDestructure || fn.TrailingCommaParam || !simpleBlockParameterPatterns(fn) ||
+		!vm.simpleBlockCallShape(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if !found || plan.kind != leafMethodRegisterIR || plan.registerIR == nil {
+		return nil, false
+	}
+	if closure.ReturnOwnerID > 0 && plan.registerIR.hasExplicitReturn {
+		return nil, false
+	}
+	directSafe := registerIRPlanSafeForDirectNoFrameWithOptions(plan.registerIR, true, true, true)
+	constantsSafe := registerIRDirectConstantsSafe(vm, closure, plan.registerIR)
+	if !plan.registerIR.hasImplicitSends && directSafe && constantsSafe {
+		core.LastBlockResult = nil
+		result, executed := vm.tryExecuteRegisterIRDirectNoFrameWithFree(
+			plan.registerIR, fn, blockBindingSelf(block), args, closure.Free, true, true, true,
+		)
+		if executed {
+			if result == nil {
+				result = core.R.NilVal
+			}
+			core.LastBlockResult = nil
+			return result, true
+		}
+		core.LastBlockResult = nil
+	}
+	// In compiled/aggressive mode, a fixed-arity block may contain a public
+	// Ruby helper whose leaf is not eligible for the conservative replay-safe
+	// tier.  The aggressive graph completes that send exactly once and falls
+	// back at the send boundary, so it can remove the per-yield Frame without
+	// replaying a partially executed block.  The plan proof rejects yield,
+	// rescue/ensure, closures, and non-local control flow before this branch.
+	if registerIRAggressiveEnabled {
+		if aggressivePlan, aggressiveOK := vm.aggressiveIRPlanForFunction(fn, true); aggressiveOK {
+			core.LastBlockResult = nil
+			result, executed := vm.executeRegisterIRDirectNoFrameWithFreeMode(
+				aggressivePlan, fn, blockBindingSelf(block), args, object.CurrentMethodGeneration(), closure.Free,
+				true, true, true, true, true,
+			)
+			if executed {
+				if result == nil {
+					result = core.R.NilVal
+				}
+				return result, true
+			}
+			core.LastBlockResult = nil
+		}
+	}
+	return nil, false
+}
+
+// typedStatefulBlockPairTable converts the frozen integer Hash used by the
+// stateful byte callback into a Go key table once.  The table is shared by the
+// per-byte fallback and the whole String#each_byte region below; malformed
+// entries deliberately reject the optimization instead of changing Hash
+// coercion/default semantics.
+func (vm *VM) typedStatefulBlockPairTable(table *object.RHash) (map[[2]int64]*object.EmeraldValue, bool) {
+	if vm == nil || table == nil {
+		return nil, false
+	}
+	if pairs, found := vm.statefulBlockTables[table]; found {
+		return pairs, true
+	}
+	pairs := make(map[[2]int64]*object.EmeraldValue, len(table.Keys))
+	for _, key := range table.Keys {
+		if key == nil || key.Type != object.ValueArray || key.Class != core.R.Classes["Array"] {
+			continue
+		}
+		elements, ok := key.Data.([]*object.EmeraldValue)
+		if !ok || len(elements) != 2 || !smallIntegerValue(elements[0]) || !smallIntegerValue(elements[1]) {
+			continue
+		}
+		value := table.Pairs[key]
+		if value != nil && value.Type != object.ValueNil && !smallIntegerValue(value) {
+			return nil, false
+		}
+		if value != nil && value.Type == object.ValueInteger && value.Data.(int64) == math.MinInt64 {
+			return nil, false
+		}
+		pairs[[2]int64{elements[0].Data.(int64), elements[1].Data.(int64)}] = value
+	}
+	vm.statefulBlockTables[table] = pairs
+	return pairs, true
+}
+
+func typedStatefulBlockString(value *object.EmeraldValue) (string, bool) {
+	if value == nil || value.Type != object.ValueString || value.Class != core.R.Classes["String"] {
+		return "", false
+	}
+	switch data := value.Data.(type) {
+	case string:
+		return data, true
+	case *object.RString:
+		if data != nil {
+			return data.Value, true
+		}
+	}
+	return "", false
+}
+
+// tryExecuteStringEachByteCapturedBlock lowers the complete each_byte call
+// for the same structural stateful callback that the single-call fallback
+// recognizes.  The callback keeps only two captured cells (`last_byte` and
+// `kerned`), performs an exact frozen-Hash lookup, and appends to exact Array
+// values.  All shape, generation and overflow guards happen before the first
+// mutation; once admitted, the loop contains no Integer allocation, block
+// binder, Frame, or bytecode dispatch.  This is the first object-layout hot
+// region rather than another per-op fast path.
+func (vm *VM) tryExecuteStringEachByteCapturedBlock(receiver, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !statefulBlockFastEnabled || receiver == nil || receiver.Type != object.ValueString ||
+		receiver.Class != core.R.Classes["String"] || block == nil || block.Type != object.ValueClosure ||
+		core.ObjectSpaceAllocationTracing() || core.LastBlockResult != nil ||
+		!core.ArrayIndexUsesBuiltinImplementation() || !core.ArrayAppendUsesBuiltinImplementation() ||
+		!core.HashIndexUsesBuiltinImplementation() {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+		closureUsesRefinements(closure) || len(closure.Free) != 2 {
+		return nil, false
+	}
+	fn := closure.Fn
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		!simpleBlockParameterPatterns(fn) {
+		return nil, false
+	}
+	eligible, found := vm.statefulBlockEligible[fn]
+	if !found {
+		eligible = len(fn.FreeVarNames) == 2 && fn.FreeVarNames[0] == "last_byte" && fn.FreeVarNames[1] == "kerned" &&
+			registerIROpcodeSequence(fn) == "OpGetFree>OpDup>OpJumpNotTruthy>OpPop>OpGetInstanceVar>OpGetFree>OpGetLocal>OpArray>OpIndex>OpSetLocal>OpPop>OpGetLocal>OpJumpNotTruthy>OpGetFree>OpGetLocal>OpNeg>OpBitLeftShift>OpGetLocal>OpArray>OpBitLeftShift>OpJump>OpGetFree>OpSend>OpGetLocal>OpBitLeftShift>OpPop>OpGetLocal>OpSetFree>OpBlockReturn"
+		vm.statefulBlockEligible[fn] = eligible
+	}
+	if !eligible {
+		return nil, false
+	}
+	raw, ok := typedStatefulBlockString(receiver)
+	if !ok {
+		return nil, false
+	}
+	lastByte := derefClosureValue(closure.Free[0])
+	if lastByte == nil || (lastByte.Type != object.ValueNil && !smallIntegerValue(lastByte)) {
+		return nil, false
+	}
+	kerned := derefClosureValue(closure.Free[1])
+	if kerned == nil || kerned.Type != object.ValueArray || kerned.Class != core.R.Classes["Array"] || kerned.Frozen {
+		return nil, false
+	}
+	kernedElements, ok := kerned.Data.([]*object.EmeraldValue)
+	if !ok || len(kernedElements) == 0 {
+		return nil, false
+	}
+	// The existing Ruby callback reads only the current tail. Validate it now;
+	// newly-created groups below use the same exact layout.
+	tail := kernedElements[len(kernedElements)-1]
+	if tail == nil || tail.Type != object.ValueArray || tail.Class != core.R.Classes["Array"] || tail.Frozen {
+		return nil, false
+	}
+	if _, ok := tail.Data.([]*object.EmeraldValue); !ok {
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	tableValue := core.DynamicInstanceVar(self, "@kern_pair_table")
+	if tableValue == nil || tableValue.Type != object.ValueHash || tableValue.Class != core.R.Classes["Hash"] ||
+		!tableValue.Frozen {
+		return nil, false
+	}
+	table, ok := tableValue.Data.(*object.RHash)
+	if !ok || table == nil {
+		return nil, false
+	}
+	pairs, ok := vm.typedStatefulBlockPairTable(table)
+	if !ok {
+		return nil, false
+	}
+	last, hasLast := int64(0), false
+	if lastByte.Type == object.ValueInteger {
+		last = lastByte.Data.(int64)
+		hasLast = true
+	}
+	// Preflight every lookup before mutating either captured array.  The table
+	// cache has already checked all stored values; this loop also proves that
+	// every key used by the input has a representable negation.
+	for index := 0; index < len(raw); index++ {
+		current := int64(raw[index])
+		if hasLast {
+			value := pairs[[2]int64{last, current}]
+			if value != nil && value.Type != object.ValueNil && !smallIntegerValue(value) {
+				return nil, false
+			}
+		}
+		last, hasLast = current, true
+	}
+	if len(raw) == 0 {
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	last, hasLast = 0, false
+	for index := 0; index < len(raw); index++ {
+		current := int64(raw[index])
+		byteValue := core.NewIntegerValue(current)
+		var pairValue *object.EmeraldValue
+		if hasLast {
+			pairValue = pairs[[2]int64{last, current}]
+		}
+		if pairValue != nil && pairValue.Type != object.ValueNil {
+			negative := core.NewIntegerValue(-pairValue.Data.(int64))
+			group := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{byteValue}, Class: core.R.Classes["Array"]}
+			kernedElements = append(kernedElements, negative, group)
+		} else {
+			tail = kernedElements[len(kernedElements)-1]
+			tailData := tail.Data.([]*object.EmeraldValue)
+			tail.Data = append(tailData, byteValue)
+		}
+		last, hasLast = current, true
+	}
+	kerned.Data = kernedElements
+	setClosureValue(&closure.Free[0], core.NewIntegerValue(last))
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
+// tryExecuteStatefulBlockFast handles a small, fully decoded closure shape
+// whose bytecode would otherwise allocate a Ruby Frame for every byte/value.
+// It is deliberately structural rather than Gem-name based: the captured
+// locals, exact opcode sequence, and concrete Array/Hash methods all have to
+// match.  The shape covers the common stateful `each_byte` callback that keeps
+// a previous byte and appends into an array.  All guards are checked before
+// the first mutation; a miss therefore falls back without replaying a prefix.
+func (vm *VM) tryExecuteStatefulBlockFast(block, self *object.EmeraldValue, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || !statefulBlockFastEnabled || len(args) != 1 || args[0] == nil ||
+		block == nil || core.ObjectSpaceAllocationTracing() {
+		return nil, false
+	}
+	var fn *object.Function
+	var free []*object.EmeraldValue
+	autoSplat := false
+	switch block.Type {
+	case object.ValueClosure:
+		closure, ok := block.Data.(*object.Closure)
+		if !ok || closure == nil || closure.Fn == nil || closure.BreakOwnerID > 0 ||
+			closureUsesRefinements(closure) {
+			return nil, false
+		}
+		fn, free, autoSplat = closure.Fn, closure.Free, closure.AutoSplat
+	case object.ValueProc:
+		proc, ok := block.Data.(*object.Proc)
+		if !ok || proc == nil || proc.Native != nil || proc.Fn == nil || proc.BreakOwnerID > 0 ||
+			len(proc.Refinements) > 0 {
+			return nil, false
+		}
+		fn, free, autoSplat = proc.Fn, proc.Env, proc.AutoSplat
+	default:
+		return nil, false
+	}
+	if len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.HasRestParam || fn.HasBlockParam ||
+		len(fn.KeywordParams) > 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		(autoSplat && blockWantsDestructuring(fn)) {
+		return nil, false
+	}
+	eligible, found := vm.statefulBlockEligible[fn]
+	if !found {
+		eligible = len(fn.FreeVarNames) == 2 && fn.FreeVarNames[0] == "last_byte" && fn.FreeVarNames[1] == "kerned" &&
+			registerIROpcodeSequence(fn) == "OpGetFree>OpDup>OpJumpNotTruthy>OpPop>OpGetInstanceVar>OpGetFree>OpGetLocal>OpArray>OpIndex>OpSetLocal>OpPop>OpGetLocal>OpJumpNotTruthy>OpGetFree>OpGetLocal>OpNeg>OpBitLeftShift>OpGetLocal>OpArray>OpBitLeftShift>OpJump>OpGetFree>OpSend>OpGetLocal>OpBitLeftShift>OpPop>OpGetLocal>OpSetFree>OpBlockReturn"
+		vm.statefulBlockEligible[fn] = eligible
+	}
+	if !eligible {
+		return nil, false
+	}
+	if len(free) != 2 {
+		return nil, false
+	}
+	lastByte := derefClosureValue(free[0])
+	kerned := derefClosureValue(free[1])
+	if lastByte == nil || (lastByte.Type != object.ValueNil && !smallIntegerValue(lastByte)) ||
+		kerned == nil || kerned.Type != object.ValueArray || kerned.Class != core.R.Classes["Array"] || kerned.Frozen {
+		return nil, false
+	}
+	if !core.ArrayIndexUsesBuiltinImplementation() || !core.ArrayAppendUsesBuiltinImplementation() ||
+		!core.ArrayLastUsesBuiltinImplementation() {
+		return nil, false
+	}
+	tableValue := core.DynamicInstanceVar(self, "@kern_pair_table")
+	if tableValue == nil || tableValue.Type != object.ValueHash || tableValue.Class != core.R.Classes["Hash"] || !tableValue.Frozen ||
+		!core.HashIndexUsesBuiltinImplementation() {
+		return nil, false
+	}
+	table, ok := tableValue.Data.(*object.RHash)
+	if !ok || table == nil {
+		return nil, false
+	}
+	pairs, ok := vm.typedStatefulBlockPairTable(table)
+	if !ok {
+		return nil, false
+	}
+	bytes, ok := args[0].Data.(int64)
+	if !ok || bytes < 0 || bytes > 255 {
+		return nil, false
+	}
+	// each_byte passes one byte per call. The callback itself only needs the
+	// byte value; keep the integer object stable through the runtime cache.
+	byteValue := args[0]
+	if byteValue.Type != object.ValueInteger || !smallIntegerValue(byteValue) {
+		return nil, false
+	}
+	if len(kerned.Data.([]*object.EmeraldValue)) == 0 {
+		return nil, false
+	}
+	last, hasLast := lastByte.Data.(int64)
+	if lastByte.Type == object.ValueNil {
+		hasLast = false
+	}
+	var k *object.EmeraldValue
+	if hasLast {
+		k = pairs[[2]int64{last, bytes}]
+		if k != nil && k.Type != object.ValueNil && !smallIntegerValue(k) {
+			return nil, false
+		}
+	}
+	// Validate every mutable target before changing either captured cell.
+	kernedElements := kerned.Data.([]*object.EmeraldValue)
+	tail := kernedElements[len(kernedElements)-1]
+	if tail == nil || tail.Type != object.ValueArray || tail.Class != core.R.Classes["Array"] || tail.Frozen {
+		return nil, false
+	}
+	if k != nil && k.Type != object.ValueNil {
+		if k.Data.(int64) == math.MinInt64 {
+			return nil, false
+		}
+	}
+	one := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{byteValue}, Class: core.R.Classes["Array"]}
+	if k != nil && k.Type != object.ValueNil {
+		negative := core.NewIntegerValue(-k.Data.(int64))
+		if !core.AppendArrayValues(kerned, []*object.EmeraldValue{negative}) {
+			return nil, false
+		}
+		if !core.AppendArrayValues(kerned, []*object.EmeraldValue{one}) {
+			return nil, false
+		}
+	} else if !core.AppendArrayValues(tail, []*object.EmeraldValue{byteValue}) {
+		return nil, false
+	}
+	setClosureValue(&free[0], byteValue)
+	core.LastBlockResult = nil
+	return byteValue, true
+}
+
+func (vm *VM) callBlockArgs(block *object.EmeraldValue, args []*object.EmeraldValue) *object.EmeraldValue {
 	if debugForLoopEnabled {
 		blockType := object.ValueNil
 		if block != nil {
@@ -13445,16 +27229,125 @@ func (vm *VM) callBlock(block *object.EmeraldValue, args ...*object.EmeraldValue
 		}
 		fmt.Printf("callBlock: blockType=%v args=%d first=%s\n", blockType, len(args), argType)
 	}
+	if result, executed := vm.callNativeProcBlock(block, args); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteFixedArityDirectBlock(block, args); executed {
+		return result
+	}
+	// Native iterators such as Enumerable#sort_by pass a single Array pair to
+	// a block declared with a destructuring parameter (`|(key, value)|`).  The
+	// explicit one-argument entry above already uses the speculative
+	// destructure tier, but most iterator helpers arrive here with a variadic
+	// argument slice.  Keep the same guarded path at this entry point so those
+	// calls do not allocate/bind a temporary Frame on every pair.
+	if len(args) == 1 {
+		if result, executed := vm.tryExecuteSingleDestructureBlock(block, args[0]); executed {
+			return result
+		}
+		if result, executed := vm.tryExecuteSingleFramelessBlock(block, args[0]); executed {
+			return result
+		}
+	}
 	if block != nil && block.Type == object.ValueProc {
 		proc, _ := block.Data.(*object.Proc)
 		if proc != nil && proc.Native == nil && !proc.IsLambda {
 			vm.procCallDepth++
-			defer func() {
-				vm.procCallDepth--
-			}()
+			result := vm.callBlockWithSelfArgs(block, blockBindingSelf(block), args)
+			vm.procCallDepth--
+			return result
 		}
 	}
-	return vm.callBlockWithSelf(block, blockBindingSelf(block), args...)
+	return vm.callBlockWithSelfArgs(block, blockBindingSelf(block), args)
+}
+
+// callBlockOneExplicit is the explicit-block counterpart of CallBlockOne.
+// Native helpers sometimes receive a block value directly instead of placing
+// it in VM.currentBlock; keeping the guarded one-argument entry here avoids
+// forcing those helpers through the variadic binder/frame path. Every fast
+// tier is speculative and must return executed=false before observable state
+// changes, so the ordinary block protocol remains the fallback.
+func (vm *VM) callBlockOneExplicit(block, arg *object.EmeraldValue) *object.EmeraldValue {
+	if vm == nil || block == nil {
+		return core.R.NilVal
+	}
+	args := [1]*object.EmeraldValue{arg}
+	if result, executed := vm.callNativeProcBlock(block, args[:]); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteSingleIntegerBlock(block, arg); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteSingleDestructureBlock(block, arg); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteSingleFramelessBlock(block, arg); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteSingleTypedSSABlock(block, arg); executed {
+		return result
+	}
+	if result, executed := vm.tryExecuteSingleFramedBlock(block, arg); executed {
+		return result
+	}
+	// The one-argument probes above are the same probes that callBlockArgs
+	// would repeat.  Continue directly to the common binding path after a
+	// miss; preserve the Proc call-depth owner bookkeeping that callBlockArgs
+	// normally establishes for non-lambda Ruby Procs.
+	if block.Type == object.ValueProc {
+		proc, _ := block.Data.(*object.Proc)
+		if proc != nil && proc.Native == nil && !proc.IsLambda {
+			vm.procCallDepth++
+			result := vm.callBlockWithSelfArgs(block, blockBindingSelf(block), args[:])
+			vm.procCallDepth--
+			return result
+		}
+	}
+	return vm.callBlockWithSelfArgs(block, blockBindingSelf(block), args[:])
+}
+
+// tryExecuteSingleTypedSSABlock is the one-argument bridge for native
+// iterators that call CallBlockOne directly. The regular typed block probe is
+// normally reached from callBlockWithSelfArgs, but that route is deliberately
+// skipped by the framed-only fast probe above. Keep this entry Closure-only so
+// Proc ownership and return/break bookkeeping remain on the complete protocol.
+func (vm *VM) tryExecuteSingleTypedSSABlock(block, arg *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || arg == nil || block.Type != object.ValueClosure ||
+		!registerIRBlockEnabled {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closure.Fn == nil || closure.AutoSplat ||
+		closure.ReturnOwnerID > 0 || closure.BreakOwnerID > 0 ||
+		!simpleBlockParameterPatterns(closure.Fn) || !vm.simpleBlockCallShape(closure.Fn) {
+		return nil, false
+	}
+	args := [1]*object.EmeraldValue{arg}
+	core.LastBlockResult = nil
+	return vm.tryExecuteTypedSSABlock(closure.Fn, closure, blockBindingSelf(block), args[:], false)
+}
+
+// callNativeProcBlock handles the internal nativeProc callbacks used by
+// Enumerable helpers before probing Ruby block plans. Native procs have no
+// Ruby Function shape to optimize, so running the speculative block guards
+// first only adds work. Symbol procs retain the same current-block isolation
+// as callBlockWithSelfArgs.
+func (vm *VM) callNativeProcBlock(block *object.EmeraldValue, args []*object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || block == nil || block.Type != object.ValueProc {
+		return nil, false
+	}
+	proc, ok := block.Data.(*object.Proc)
+	if !ok || proc == nil || proc.Native == nil {
+		return nil, false
+	}
+	if proc.SymbolProc {
+		previousBlock := vm.currentBlock
+		vm.currentBlock = nil
+		result := proc.Native(args...)
+		vm.currentBlock = previousBlock
+		return result, true
+	}
+	return proc.Native(args...), true
 }
 
 func (vm *VM) yieldBlock() *object.EmeraldValue {
@@ -13468,6 +27361,22 @@ func (vm *VM) yieldBlock() *object.EmeraldValue {
 }
 
 func (vm *VM) methodBlockGiven() bool {
+	if vm.fp >= 0 && vm.fp < len(vm.frames) {
+		frame := vm.frames[vm.fp]
+		if frame != nil && frame.Fn != nil && frame.Fn.Name == "__block__" && frame.Closure != nil && frame.Closure.ReturnOwnerID > 0 {
+			for i := vm.fp - 1; i >= 0; i-- {
+				owner := vm.frames[i]
+				if owner == nil || owner.ID != frame.Closure.ReturnOwnerID {
+					continue
+				}
+				if owner.DefinedByDefineMethod || (owner.Fn != nil && owner.Fn.DefinedByDefineMethod) {
+					return false
+				}
+				return owner.Block != nil
+			}
+			return false
+		}
+	}
 	for i := vm.fp; i >= 0; i-- {
 		frame := vm.frames[i]
 		if frame == nil {
@@ -13503,7 +27412,30 @@ func blockBindingSelf(block *object.EmeraldValue) *object.EmeraldValue {
 	return core.R.Main
 }
 
+func blockHasNonLocalReturn(closure *object.Closure, fn *object.Function, plan *registerIRPlan) bool {
+	if closure == nil || closure.ReturnOwnerID <= 0 {
+		return false
+	}
+	if plan != nil {
+		return plan.hasExplicitReturn
+	}
+	return fn != nil && len(fn.Instructions) > 0 &&
+		compiler.Opcode(fn.Instructions[len(fn.Instructions)-1]) == compiler.OpReturnValue
+}
+
 func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return vm.callBlockWithSelfArgs(block, self, args)
+}
+
+func (vm *VM) callBlockWithSelfArgs(block, self *object.EmeraldValue, args []*object.EmeraldValue) *object.EmeraldValue {
+	return vm.callBlockWithSelfArgsMode(block, self, args, false, nil)
+}
+
+func (vm *VM) callBlockWithSelfArgsFramed(block, self *object.EmeraldValue, args []*object.EmeraldValue, framedPlan *leafMethodPlan) *object.EmeraldValue {
+	return vm.callBlockWithSelfArgsMode(block, self, args, true, framedPlan)
+}
+
+func (vm *VM) callBlockWithSelfArgsMode(block, self *object.EmeraldValue, args []*object.EmeraldValue, framedOnly bool, framedPlanHint *leafMethodPlan) *object.EmeraldValue {
 	if block == nil {
 		return core.R.NilVal
 	}
@@ -13524,28 +27456,63 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		if len(args) == 0 {
 			return core.R.NilVal
 		}
-		return vm.send(args[0], name, args[1:])
+		previousBlock := vm.currentBlock
+		vm.currentBlock = nil
+		result := vm.send(args[0], name, args[1:])
+		vm.currentBlock = previousBlock
+		return result
 	case object.ValueProc:
 		proc := block.Data.(*object.Proc)
 		procData = proc
 		if proc.Native != nil {
+			if proc.SymbolProc {
+				previousBlock := vm.currentBlock
+				vm.currentBlock = nil
+				result := proc.Native(args...)
+				vm.currentBlock = previousBlock
+				return result
+			}
 			return proc.Native(args...)
 		}
 		fn = proc.Fn
 		isLambda = proc.IsLambda
 		autoSplat = proc.AutoSplat
-		closure = &object.Closure{
-			Fn:               fn,
-			Free:             proc.Env,
-			Block:            proc.Block,
-			Binding:          proc.Binding,
-			ClassStack:       proc.ClassStack,
-			Refinements:      append([]*object.EmeraldValue(nil), proc.Refinements...),
-			RefinementsFixed: proc.RefinementsFixed,
-			AutoSplat:        proc.AutoSplat,
-			ReturnOwnerID:    proc.ReturnOwnerID,
-			BreakOwnerID:     proc.BreakOwnerID,
-			FlipFlopStates:   proc.FlipFlopStates,
+		if procClosureCacheEnabled && len(proc.Refinements) == 0 {
+			closure = proc.CachedClosure
+			if closure == nil {
+				closure = &object.Closure{}
+				proc.CachedClosure = closure
+			}
+			// Proc environments and control-flow owners can be updated after the
+			// Proc is created; refresh the cached view without allocating a new
+			// Closure for every `yield`/`each` invocation.
+			closure.Fn = fn
+			closure.Free = proc.Env
+			closure.Block = proc.Block
+			closure.Binding = proc.Binding
+			closure.ClassStack = proc.ClassStack
+			closure.Refinements = nil
+			closure.RefinementsFixed = proc.RefinementsFixed
+			closure.RefinementCheckGeneration = 0
+			closure.RefinementCheckValid = false
+			closure.AutoSplat = proc.AutoSplat
+			closure.ReturnOwnerID = proc.ReturnOwnerID
+			closure.BreakOwnerID = proc.BreakOwnerID
+			closure.FlipFlopStates = proc.FlipFlopStates
+		} else {
+			closure = &object.Closure{
+				Fn:               fn,
+				Free:             proc.Env,
+				Block:            proc.Block,
+				Binding:          proc.Binding,
+				ClassStack:       proc.ClassStack,
+				Refinements:      append([]*object.EmeraldValue(nil), proc.Refinements...),
+				RefinementsFixed: proc.RefinementsFixed,
+				AutoSplat:        proc.AutoSplat,
+				ReturnOwnerID:    proc.ReturnOwnerID,
+				BreakOwnerID:     proc.BreakOwnerID,
+				FlipFlopStates:   proc.FlipFlopStates,
+			}
 		}
 		if proc.FlipFlopStates == nil {
 			proc.FlipFlopStates = make(map[int]bool)
@@ -13558,30 +27525,177 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if fn == nil {
 		return core.R.NilVal
 	}
-	args = dropAnonymousKeywordRestNonSymbolHash(fn, args)
+	if profile := vm.rubyMethodProfile; profile != nil {
+		profile.mu.Lock()
+		profile.counts[fn]++
+		profile.mu.Unlock()
+	}
 	core.LastBlockResult = nil
-	if autoSplat && (!isLambda || fn.SingleDestructure) {
-		expanded, errVal := vm.blockAutosplatArgs(fn, args)
-		if errVal != nil {
+	autoSplatDestructure := autoSplat && blockWantsDestructuring(fn)
+	preserveSingleDestructureArgs := framedOnly && autoSplatDestructure && len(args) == 1 && simpleDestructurePairShape(fn)
+	// Most Gem callbacks have a fixed positional signature with no keyword,
+	// rest, destructuring, or autosplat protocol.  Their four argument-protocol
+	// helpers are provably no-ops; keep the lambda arity check (the only
+	// observable check for this shape) and avoid re-reading the function shape
+	// on every block invocation. Ruby2-keyword and Proc-specific exclusions are
+	// retained by the local simpleBlockBinding guard below.
+	simpleBlockCall := registerIRSimpleBlockProtocolEnabled && !autoSplatDestructure && vm.simpleBlockCallShape(fn)
+	if simpleBlockCall {
+		if isLambda {
+			if errVal := methodArityError(fn, positionalArityArgCount(fn, args)); errVal != nil {
+				return errVal
+			}
+		}
+	} else {
+		args = dropAnonymousKeywordRestNonSymbolHash(fn, args)
+		if autoSplat && (!isLambda || fn.SingleDestructure) && !preserveSingleDestructureArgs {
+			expanded, errVal := vm.blockAutosplatArgs(fn, args)
+			if errVal != nil {
+				return errVal
+			}
+			args = expanded
+		}
+		if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
 			return errVal
 		}
-		args = expanded
-	}
-	if errVal := missingRequiredKeywordArgument(fn, args); errVal != nil {
-		return errVal
-	}
-	if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
-		return errVal
-	}
-	if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
-		return errVal
-	}
-	if isLambda {
-		if errVal := methodArityError(fn, positionalArityArgCount(fn, args)); errVal != nil {
+		if errVal := rejectedKeywordArgument(fn, args); errVal != nil {
 			return errVal
 		}
+		if errVal := rejectedPositionalForKeywordRestOnly(fn, args); errVal != nil {
+			return errVal
+		}
+		if isLambda {
+			if errVal := methodArityError(fn, positionalArityArgCount(fn, args)); errVal != nil {
+				return errVal
+			}
+		}
 	}
+	// `simpleFunctionArgumentBinding` repeats the same shape-map lookup made
+	// above. Keep its two observable exclusions (Proc Ruby2 keywords and a
+	// marked trailing keyword hash) as a local boolean so the hot block path
+	// can bind slots without another helper call on every element.
+	simpleBlockBinding := simpleBlockCall
+	if simpleBlockBinding && procData != nil && core.ProcRuby2Keywords(procData) {
+		simpleBlockBinding = false
+	}
+	if simpleBlockBinding && len(args) > 0 {
+		last := args[len(args)-1]
+		if last != nil && last.Type == object.ValueHash && core.Ruby2KeywordHash(last) {
+			simpleBlockBinding = false
+		}
+	}
+	var compiledBlockPlan leafMethodPlan
+	compiledBlockPlanReady := false
+	fastRegisterBlock := false
+	fastFramedRegisterBlock := false
+	if framedOnly && framedPlanHint != nil {
+		compiledBlockPlan = *framedPlanHint
+		compiledBlockPlanReady = true
+	}
+	if !framedOnly {
+		// Scalar block bodies can use the typed SSA executor directly.  Keep this
+		// after the normal argument-protocol checks above: a Ruby2 keyword hash,
+		// autosplat, lambda arity, or a thread block must retain the observable
+		// binder/unwind behavior of the framed path.
+		if registerIRBlockEnabled && simpleBlockBinding && !isThreadBlock && !isLambda &&
+			!autoSplatDestructure && vm.instructionLimit == 0 && !DevMode && !core.AnyTracePointActive() {
+			if result, executed := vm.tryExecuteTypedSSABlock(fn, closure, self, args, isLambda); executed {
+				return result
+			}
+		}
+		if registerIRBlockEnabled && vm.instructionLimit == 0 && !DevMode && !core.AnyTracePointActive() &&
+			!isThreadBlock && !isLambda {
+			if result, executed := vm.tryExecuteStatefulBlockFast(block, self, args); executed {
+				return result
+			}
+		}
 
+		// Pure register plans do not need a Ruby frame, local-cell binding, or
+		// block cleanup. Try them before allocating the frame used by the general
+		// block path. Refinements are deliberately excluded because arithmetic and
+		// comparison in such a block may be dynamically overridden.
+		if registerIRBlockEnabled && vm.instructionLimit == 0 && !DevMode && !core.AnyTracePointActive() {
+			compiledBlockPlan, compiledBlockPlanReady = vm.cachedBlockLeafPlan(fn)
+			nonLocalReturnBlock := blockHasNonLocalReturn(closure, fn, compiledBlockPlan.registerIR)
+			if compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR && compiledBlockPlan.registerIR != nil &&
+				compiledBlockPlan.registerIR.integerOnly && simpleBlockParameterPatterns(fn) && !nonLocalReturnBlock && !closureUsesRefinements(closure) {
+				if result, executed := vm.executeRegisterIR(compiledBlockPlan.registerIR, fn, self, args, "", nil, nil); executed {
+					return result
+				}
+			}
+			if registerIRNoFrameEnabled && compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR &&
+				compiledBlockPlan.registerIR != nil && compiledBlockPlan.registerIR.sendCount >= 3 &&
+				!compiledBlockPlan.registerIR.requiresFrame && !compiledBlockPlan.registerIR.integerOnly &&
+				simpleBlockParameterPatterns(fn) &&
+				!registerIRPlanMayDeopt(compiledBlockPlan.registerIR) && registerIRPlanSafeForActiveRescues(compiledBlockPlan.registerIR, vm) &&
+				!nonLocalReturnBlock && !closureUsesRefinements(closure) {
+				if result, executed := vm.tryExecuteRegisterIRNoFrame(compiledBlockPlan.registerIR, self, args); executed {
+					return result
+				}
+			}
+			fastRegisterBlock = compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR &&
+				compiledBlockPlan.registerIR != nil && simpleBlockParameterPatterns(fn) && !compiledBlockPlan.registerIR.requiresFrame && !compiledBlockPlan.registerIR.integerOnly && !nonLocalReturnBlock &&
+				!closureUsesRefinements(closure) && !registerIRPlanMayDeopt(compiledBlockPlan.registerIR) &&
+				registerIRPlanSafeForActiveRescues(compiledBlockPlan.registerIR, vm)
+			if !fastRegisterBlock && simpleBlockBinding && !autoSplatDestructure && !isLambda && !isThreadBlock &&
+				compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR && compiledBlockPlan.registerIR != nil &&
+				compiledBlockPlan.registerIR.requiresFrame && simpleBlockParameterPatterns(fn) && !nonLocalReturnBlock &&
+				!closureUsesRefinements(closure) && registerIRFramedBlockEnabled {
+				plan := compiledBlockPlan.registerIR
+				if plan.blockReturn {
+					fastFramedRegisterBlock = registerIRPlanSafeForFramedBlockReturn(plan, vm)
+				} else {
+					fastFramedRegisterBlock = registerIRPlanSafeForFramedBlock(plan, vm)
+				}
+			}
+		}
+		// A small allocation-shaped block can avoid both argument binding and
+		// Frame setup.  Array/Hash literals are still real Ruby objects; the tier is
+		// limited to direct indexing and scalar operations whose guard miss occurs
+		// before the first allocation, and is disabled while ObjectSpace is
+		// recording allocation locations.
+		if registerIRBatchBlockEnabled && simpleBlockParameterPatterns(fn) && !core.ObjectSpaceAllocationTracing() && compiledBlockPlanReady &&
+			compiledBlockPlan.kind == leafMethodRegisterIR && compiledBlockPlan.registerIR != nil &&
+			!compiledBlockPlan.registerIR.integerOnly && !(closure != nil && closure.ReturnOwnerID > 0 && len(fn.Instructions) > 0 &&
+			compiler.Opcode(fn.Instructions[len(fn.Instructions)-1]) == compiler.OpReturnValue) && !closureUsesRefinements(closure) &&
+			registerIRPlanSafeForFramelessBlock(compiledBlockPlan.registerIR) {
+			if result, executed := vm.executeRegisterIRInstructionsWithFree(compiledBlockPlan.registerIR, self, args, nil, closure.Free, true); executed {
+				return result
+			}
+		}
+		// A branch-only scalar block has no frame-dependent operation or unwind
+		// point. Execute its truthiness jumps directly; blocks with sends,
+		// allocations, stores, or non-local returns remain on the framed path.
+		branchNoLocalReturn := blockHasNonLocalReturn(closure, fn, compiledBlockPlan.registerIR)
+		if registerIRBranchNoFrameBlockEnabled && registerIRBlockEnabled && vm.instructionLimit == 0 && !DevMode &&
+			!core.AnyTracePointActive() && !isThreadBlock && !isLambda && !core.ObjectSpaceAllocationTracing() &&
+			closure != nil && compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR &&
+			!autoSplatDestructure && vm.simpleBlockCallShape(fn) && simpleBlockParameterPatterns(fn) && compiledBlockPlan.registerIR != nil &&
+			!compiledBlockPlan.registerIR.integerOnly && !branchNoLocalReturn &&
+			!closureUsesRefinements(closure) && registerIRPlanSafeForBranchNoFrameBlock(compiledBlockPlan.registerIR) {
+			if result, executed := vm.executeRegisterIRBranchNoFrameBlock(compiledBlockPlan.registerIR, fn, self, args, closure.Free); executed {
+				return result
+			}
+			if result, executed := vm.executeRegisterIRInstructionsWithFree(compiledBlockPlan.registerIR, self, args, nil, closure.Free, true); executed {
+				return result
+			}
+		}
+		// A branch-heavy block-return plan can still be frame-free when every
+		// operation is a guarded native/accessor send and its constants resolve from
+		// the top-level namespace. The direct executor returns only after all guards
+		// pass, so a miss re-enters the complete framed block without replaying user
+		// code. This is particularly useful for collection callbacks with a small
+		// conditional conversion/encoding pipeline.
+		if registerIRDirectNoFrameEnabled && simpleBlockParameterPatterns(fn) && !isThreadBlock && !isLambda && !core.ObjectSpaceAllocationTracing() &&
+			compiledBlockPlanReady && compiledBlockPlan.kind == leafMethodRegisterIR && compiledBlockPlan.registerIR != nil &&
+			!compiledBlockPlan.registerIR.integerOnly && !closureUsesRefinements(closure) &&
+			registerIRPlanSafeForDirectNoFrameBlock(compiledBlockPlan.registerIR) &&
+			registerIRDirectConstantsSafe(vm, closure, compiledBlockPlan.registerIR) {
+			if result, executed := vm.tryExecuteRegisterIRDirectNoFrameWithFree(compiledBlockPlan.registerIR, fn, self, args, closure.Free, true, true); executed {
+				return result
+			}
+		}
+	}
 	prevBlock := vm.currentBlock
 	vm.currentBlock = nil
 	prevClassStack := vm.classStack
@@ -13594,25 +27708,44 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 		vm.catchStack = nil
 	}
 	if len(closure.ClassStack) > 0 {
-		vm.classStack = append([]*object.EmeraldValue(nil), closure.ClassStack...)
+		vm.classStack = closure.ClassStack
 		if self != nil && (self.Type == object.ValueClass || self.Type == object.ValueModule) && !singletonClassStackTargets(vm.classStack, self) {
 			vm.classStack = append(vm.classStack, self)
 		}
 	}
-	defer func() {
-		vm.currentBlock = prevBlock
-		vm.classStack = prevClassStack
-		vm.catchStack = prevCatchStack
-	}()
-
 	bp := vm.sp
 
 	vm.stack[vm.sp] = self
-	markRuby2Keywords := procData != nil && core.ProcRuby2Keywords(procData)
-	vm.bindFunctionArguments(fn, args, prevBlock, markRuby2Keywords)
-	if errVal := vm.bindParameterPatterns(fn, bp); errVal != nil {
-		vm.sp = bp
-		return errVal
+	if fastRegisterBlock {
+		vm.sp++
+	} else if fastFramedRegisterBlock {
+		// The caller has already passed the fixed positional block protocol
+		// guard.  Keep the real Frame (required for sends, allocations and
+		// unwind), but avoid the full keyword/rest/destructure binder on every
+		// callback invocation.
+		vm.bindSimpleFunctionArguments(fn, args, bp)
+	}
+	if !fastRegisterBlock {
+		if !fastFramedRegisterBlock {
+			markRuby2Keywords := procData != nil && core.ProcRuby2Keywords(procData)
+			patternBound := false
+			if simpleBlockBinding {
+				vm.bindSimpleFunctionArguments(fn, args, bp)
+			} else if vm.bindSimpleDestructurePair(fn, args, bp) {
+				patternBound = true
+			} else {
+				vm.bindFunctionArguments(fn, args, prevBlock, markRuby2Keywords)
+			}
+			if !patternBound {
+				if errVal := vm.bindParameterPatterns(fn, bp); errVal != nil {
+					vm.setStackPointer(bp)
+					vm.currentBlock = prevBlock
+					vm.classStack = prevClassStack
+					vm.catchStack = prevCatchStack
+					return errVal
+				}
+			}
+		}
 	}
 
 	methodName := ""
@@ -13623,7 +27756,8 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if core.TracePointEventActive("b_call") || core.TracePointEventActive("b_return") {
 		parameters = core.TracePointParameters(fn, isLambda)
 	}
-	vm.pushReusableFrame(Frame{ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure, MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block, IsLambda: isLambda, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self, TraceParameters: parameters})
+	blockFrame := vm.pushReusableFrame()
+	*blockFrame = Frame{ID: vm.allocateFrameID(), Fn: fn, Ip: -1, Bp: bp, Closure: closure, MethodName: methodName, OriginalMethodName: methodName, Block: closure.Block, IsLambda: isLambda, BlockBreakAddr: -1, WhileStart: -1, WhileEnd: -1, TraceSelf: self, TraceParameters: parameters}
 	if core.TracePointEventActive("b_call") {
 		binding := vm.currentFrameBinding()
 		binding.Line = fn.DefinitionLine
@@ -13631,17 +27765,70 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	}
 
 	frame := vm.frames[vm.fp]
+	irExecuted := false
+	var irResult *object.EmeraldValue
+	if registerIRBlockEnabled && vm.instructionLimit == 0 && !DevMode && !core.AnyTracePointActive() {
+		plan, found := compiledBlockPlan, compiledBlockPlanReady
+		if !found {
+			plan, found = vm.cachedBlockLeafPlan(fn)
+		}
+		nonLocalReturnBlock := blockHasNonLocalReturn(closure, fn, plan.registerIR)
+		if plan.kind == leafMethodRegisterIR && plan.registerIR != nil && !nonLocalReturnBlock &&
+			!closureUsesRefinements(closure) && registerIRPlanSafeForActiveRescues(plan.registerIR, vm) {
+			// Integer-only plans already had their zero-frame speculative entry
+			// above.  If that entry missed (for example a BigInt/overflow value),
+			// replaying the same plan through dynamic arithmetic could execute a
+			// prefix twice, so leave that narrow tier on the bytecode fallback.
+			framedPlan := !plan.registerIR.requiresFrame ||
+				(registerIRFramedBlockEnabled && !plan.registerIR.integerOnly &&
+					((plan.registerIR.blockReturn && registerIRPlanSafeForFramedBlockReturn(plan.registerIR, vm)) ||
+						(!plan.registerIR.blockReturn && registerIRPlanSafeForFramedBlock(plan.registerIR, vm))))
+			if framedPlan {
+				if plan.registerIR.integerOnly {
+					irResult, irExecuted = vm.executeRegisterIR(plan.registerIR, fn, self, args, methodName, nil, nil)
+				} else {
+					cacheSends := registerIRSendCacheEnabled && registerIRBlockSendCacheEnabled && !closureUsesRefinements(closure)
+					irResult, irExecuted = vm.executeRegisterIRInstructions(plan.registerIR, self, args, frame, cacheSends)
+				}
+			}
+		}
+	}
+	// A framed Register IR guard miss is speculative: the bytecode fallback
+	// must replay the block from its first instruction.  IR helpers update
+	// Frame.Ip before sends/constant reads so exception backtraces remain
+	// precise when they handle an operation; if a later guard rejects the plan,
+	// leaving that IP in place would resume bytecode in the middle of an
+	// instruction (and can turn a harmless fallback into an invalid constant
+	// index or a skipped side effect).
+	if !irExecuted {
+		frame.Ip = -1
+	}
 	instructions := frame.Fn.Instructions
-	for frame.Ip < len(instructions)-1 {
+	for !irExecuted && frame.Ip < len(instructions)-1 {
 		frame.Ip++
 		op := compiler.Opcode(instructions[frame.Ip])
-		vm.fireTracePointLine(frame, op)
-		frame.InstructionException = core.LastException
-		frame.InstructionSnapshotSet = true
-		if err := vm.execute(op, frame); err != nil {
+		traceLineActive := false
+		if core.AnyTracePointActive() {
+			traceLineActive = vm.fireTracePointLine(frame, op)
+		}
+		if traceLineActive || !instructionExceptionSnapshotNotNeeded[op] && core.LastException != nil {
+			frame.InstructionException = core.LastException
+			frame.InstructionSnapshotSet = true
+		}
+		var err error
+		if vm.instructionLimit == 0 && !DevMode && !traceLineActive && simpleOpcodeFastPath[op] {
+			err = vm.executeSimpleOpcode(op, frame)
+		} else {
+			err = vm.execute(op, frame)
+		}
+		if err != nil {
+			vm.currentBlock = prevBlock
+			vm.classStack = prevClassStack
+			vm.catchStack = prevCatchStack
 			return core.NewRuntimeError(err.Error())
 		}
-		if vm.handlePendingNonLocalReturn(frame) || vm.handlePendingNonLocalBreak(frame) || frame.Returned {
+		if (vm.pendingReturnTargetID > 0 && vm.handlePendingNonLocalReturn(frame)) ||
+			(vm.pendingBreakTargetID > 0 && vm.handlePendingNonLocalBreak(frame)) || frame.Returned {
 			break
 		}
 		if vm.sp > frame.Bp {
@@ -13661,10 +27848,12 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	}
 
 	result := core.R.NilVal
-	if vm.sp > bp {
+	if irExecuted {
+		result = irResult
+	} else if vm.sp > bp {
 		result = vm.stack[vm.sp-1]
 	}
-	vm.sp = bp
+	vm.setStackPointer(bp)
 
 	if frame.Returned && !isLambda && procData != nil && procData.ReturnOwnerID > 0 && !vm.procReturnOwnerActive(procData) {
 		result = core.NewLocalJumpErrorWithReturn(result)
@@ -13715,7 +27904,69 @@ func (vm *VM) callBlockWithSelf(block, self *object.EmeraldValue, args ...*objec
 	if result == nil || result.Type != object.ValueException {
 		core.LastRaisedResult = nil
 	}
+	vm.currentBlock = prevBlock
+	vm.classStack = prevClassStack
+	vm.catchStack = prevCatchStack
 	return result
+}
+
+func (vm *VM) cachedBlockLeafPlan(fn *object.Function) (leafMethodPlan, bool) {
+	if vm == nil || fn == nil {
+		return leafMethodPlan{}, false
+	}
+	key := makeBlockLeafPlanCacheKey(fn)
+	if key.template == nil {
+		return buildLeafMethodPlan(fn), true
+	}
+	if entry, found := vm.blockLeafPlanCache[key.template]; found && entry.key == key {
+		return entry.plan, true
+	}
+	if plan, found := vm.blockLeafPlanVariants[key]; found {
+		vm.blockLeafPlanCache[key.template] = blockLeafPlanCacheEntry{key: key, plan: plan}
+		return plan, true
+	}
+	plan := buildLeafMethodPlan(fn)
+	if entry, found := vm.blockLeafPlanCache[key.template]; found {
+		vm.blockLeafPlanVariants[entry.key] = entry.plan
+	}
+	vm.blockLeafPlanCache[key.template] = blockLeafPlanCacheEntry{key: key, plan: plan}
+	if os.Getenv("RGO_PROFILE_RUBY_BLOCK_PLANS") != "" {
+		path := fn.SourcePath
+		if path == "" {
+			path = "(eval)"
+		}
+		fmt.Fprintf(os.Stderr, "RGO_RUBY_BLOCK_PLAN %s:%d %s kind=%s", path, fn.DefinitionLine, fn.Name, leafMethodPlanKindName(plan.kind))
+		if plan.kind == leafMethodRegisterIR && plan.registerIR != nil {
+			directBlockSafe := registerIRPlanSafeForDirectNoFrameWithOptions(plan.registerIR, true, true, true)
+			fmt.Fprintf(os.Stderr, " ir_ops=%d sends=%d frame=%t branches=%t integer=%t block_return=%t frameless=%t direct_block=%t", len(plan.registerIR.instructions), plan.registerIR.sendCount, plan.registerIR.requiresFrame, plan.registerIR.hasBranches, plan.registerIR.integerOnly, plan.registerIR.blockReturn, registerIRPlanSafeForFramelessBlock(plan.registerIR), directBlockSafe)
+			fmt.Fprintf(os.Stderr, " sequence=%s", registerIROpcodeSequence(fn))
+		} else if plan.kind == leafMethodUnsupported {
+			fmt.Fprintf(os.Stderr, " opcodes=%s sequence=%s", registerIRUnsupportedOpcodeSummary(fn), registerIROpcodeSequence(fn))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+	return plan, true
+}
+
+// cachedTypedHotArrayLeafPlan keeps a one-entry front cache for the repeated
+// short-array callback shape. The regular block-leaf cache remains the source
+// of truth; this only avoids its VM map lookup when the same nested Function
+// template is recreated by OpClosure on every outer iteration.
+func (vm *VM) cachedTypedHotArrayLeafPlan(fn *object.Function) (leafMethodPlan, bool) {
+	if vm == nil || fn == nil {
+		return leafMethodPlan{}, false
+	}
+	key := makeBlockLeafPlanCacheKey(fn)
+	if key.template != nil && vm.typedHotArrayLeafPlanReady && vm.typedHotArrayLeafPlanKey == key {
+		return vm.typedHotArrayLeafPlan, true
+	}
+	plan, found := vm.cachedBlockLeafPlan(fn)
+	if found && key.template != nil {
+		vm.typedHotArrayLeafPlanKey = key
+		vm.typedHotArrayLeafPlan = plan
+		vm.typedHotArrayLeafPlanReady = true
+	}
+	return plan, found
 }
 
 func (vm *VM) frameHasActiveRescue(frame *Frame) bool {
@@ -13866,7 +28117,10 @@ func rejectedPositionalForKeywordRestOnly(fn *object.Function, args []*object.Em
 	if fn == nil || !fn.KeywordRestOnly || len(args) == 0 {
 		return nil
 	}
-	if len(fn.Params) > 0 || fn.HasRestParam {
+	if fn.HasRestParam {
+		return nil
+	}
+	if len(fn.Params) > 0 {
 		if len(args) < 2 {
 			return nil
 		}
@@ -13918,10 +28172,20 @@ func hashHasNonSymbolKey(value *object.EmeraldValue) bool {
 	return false
 }
 
-func (vm *VM) keywordRestHash(kwargs map[*object.EmeraldValue]*object.EmeraldValue, explicit []object.KeywordParamInfo) *object.EmeraldValue {
+func (vm *VM) keywordRestHash(kwargs map[*object.EmeraldValue]*object.EmeraldValue, source *object.EmeraldValue, explicit []object.KeywordParamInfo) *object.EmeraldValue {
 	pairs := make(map[*object.EmeraldValue]*object.EmeraldValue)
 	keys := make([]*object.EmeraldValue, 0)
-	for key, value := range kwargs {
+	sourceKeys := orderedKeywordKeys(source)
+	if len(sourceKeys) == 0 {
+		sourceKeys = make([]*object.EmeraldValue, 0, len(kwargs))
+		for key := range kwargs {
+			sourceKeys = append(sourceKeys, key)
+		}
+		sort.Slice(sourceKeys, func(i, j int) bool {
+			return keywordDisplayName(sourceKeys[i]) < keywordDisplayName(sourceKeys[j])
+		})
+	}
+	for _, key := range sourceKeys {
 		if key == nil {
 			continue
 		}
@@ -13934,6 +28198,10 @@ func (vm *VM) keywordRestHash(kwargs map[*object.EmeraldValue]*object.EmeraldVal
 		}
 		if matched {
 			continue
+		}
+		value := kwargs[key]
+		if value == nil && source != nil {
+			value = executorHashValue(source, key)
 		}
 		pairs[key] = value
 		keys = append(keys, key)
@@ -14145,7 +28413,10 @@ func (vm *VM) instanceEvalBinding(receiver *object.EmeraldValue) *object.Emerald
 		path = "spec.rb"
 	}
 	if receiver == nil {
-		return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{Self: core.R.NilVal, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, Path: path, Line: 1}, Class: core.R.Classes["Binding"]}
+		return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             core.R.NilVal, Constants: map[string]*object.EmeraldValue{}, Path: path, Line: 1,
+		}, Class: core.R.Classes["Binding"]}
 	}
 	binding := core.CallMethod(receiver, "binding")
 	if binding != nil && binding.Type == object.ValueBinding {
@@ -14164,7 +28435,10 @@ func (vm *VM) instanceEvalBinding(receiver *object.EmeraldValue) *object.Emerald
 			return &object.EmeraldValue{Type: object.ValueBinding, Data: data, Class: core.R.Classes["Binding"]}
 		}
 	}
-	return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{Self: receiver, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, Path: path, Line: 1}, Class: core.R.Classes["Binding"]}
+	return &object.EmeraldValue{Type: object.ValueBinding, Data: &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+		Self:             receiver, Constants: map[string]*object.EmeraldValue{}, Path: path, Line: 1,
+	}, Class: core.R.Classes["Binding"]}
 }
 
 func (vm *VM) instanceEvalStringClassStack(receiver *object.EmeraldValue, callerStack []*object.EmeraldValue) []*object.EmeraldValue {
@@ -14207,23 +28481,129 @@ func receiverClassValue(receiver *object.EmeraldValue) *object.EmeraldValue {
 	return nil
 }
 
+func (vm *VM) compactFrameBinding(frame *Frame) *object.RBinding {
+	if frame == nil || frame.Fn == nil {
+		return vm.currentFrameBinding()
+	}
+	fn := frame.Fn
+	localCount := fn.NumLocals
+	for _, index := range fn.LocalNames {
+		if index >= localCount {
+			localCount = index + 1
+		}
+	}
+	if frame.CapturedLocalValues == nil {
+		frame.CapturedLocalValues = make([]*object.EmeraldValue, localCount)
+		for index := range frame.CapturedLocalValues {
+			slot := frame.Bp + 1 + index
+			if slot >= 0 && slot < vm.sp {
+				frame.CapturedLocalValues[index] = vm.stack[slot]
+			} else if index < len(frame.Args) {
+				frame.CapturedLocalValues[index] = frame.Args[index]
+			}
+		}
+	}
+	path := fn.SourcePath
+	if path == "" {
+		path = core.CurrentSpecFile
+	}
+	if path == "" {
+		path = "spec.rb"
+	}
+	line := int64(1)
+	if frame.Ip >= 0 {
+		line = vm.sourceLineForFrame(frame)
+	}
+	methodName := frame.MethodName
+	if methodName == "" && fn.Name != "" && fn.Name != "main" {
+		methodName = fn.Name
+	}
+	self := core.R.Main
+	if frame.Bp >= 0 && frame.Bp < vm.sp && vm.stack[frame.Bp] != nil {
+		self = vm.stack[frame.Bp]
+	}
+	binding := &object.RBinding{
+		Self:                    self,
+		Block:                   frame.Block,
+		AllowAnonymousBlockPass: fn.AnonymousBlockParam,
+		EvalReturnTargetID:      vm.evalReturnTargetID(),
+		Constants:               vm.rubyConsts,
+		Method:                  methodName,
+		BacktraceLabel:          vm.backtraceLabelForFrame(vm.fp),
+		ClassStack:              vm.currentClassStackSnapshot(),
+		Path:                    path,
+		Line:                    line,
+		CompactLocalIndices:     fn.LocalNames,
+		CompactLocalValues:      frame.CapturedLocalValues,
+		CompactImplicitIt:       fn.ImplicitItParameter,
+		CompactNumberedParams:   fn.NumberedParameters,
+		CompactLocals:           true,
+	}
+	if frame.Closure != nil {
+		binding.CompactFreeNames = fn.FreeVarNames
+		if frame.Closure.Binding != nil && (!fn.MethodBody || frame.DefinedByDefineMethod) {
+			binding.Parent = frame.Closure.Binding
+			// Keep the parent in its compact representation.  The shared-name
+			// scan below already understands both expanded and compact bindings;
+			// eagerly materializing here allocates a locals map for every nested
+			// closure even when no Binding API/eval path ever observes it.
+			binding.EnsureExpanded().SharedLocals = compactBindingLocalNames(binding.Parent)
+		} else {
+			binding.CompactFreeValues = frame.Closure.Free
+		}
+	}
+	if refinements, fixed := vm.currentFixedRefinements(); fixed {
+		binding.Refinements = append([]*object.EmeraldValue(nil), refinements...)
+	}
+	return binding
+}
+
+func compactBindingLocalNames(binding *object.RBinding) map[string]struct{} {
+	if binding == nil {
+		return nil
+	}
+	localNames := []string(nil)
+	locals := map[string]*object.EmeraldValue(nil)
+	if binding.RBindingExpanded != nil {
+		localNames = binding.LocalNames
+		locals = binding.Locals
+	}
+	capacity := len(localNames) + len(locals) + len(binding.CompactLocalIndices) + len(binding.CompactFreeNames)
+	if capacity == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, capacity)
+	for _, name := range localNames {
+		names[name] = struct{}{}
+	}
+	for name := range locals {
+		names[name] = struct{}{}
+	}
+	for name := range binding.CompactLocalIndices {
+		names[name] = struct{}{}
+	}
+	for _, name := range binding.CompactFreeNames {
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
+	return names
+}
+
 func (vm *VM) currentFrameBinding() *object.RBinding {
 	if vm.fp < 0 || vm.fp >= len(vm.frames) {
 		return &object.RBinding{
-			Self:         core.R.Main,
-			Locals:       map[string]*object.EmeraldValue{},
-			LocalNames:   nil,
-			Method:       "",
-			Constants:    vm.rubyConsts,
-			ClassStack:   vm.currentClassStackSnapshot(),
-			Path:         core.CurrentSpecFile,
-			Line:         1,
-			InstanceVars: map[string]*object.EmeraldValue{},
+			RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             core.R.Main, Method: "", Constants: vm.rubyConsts, ClassStack: vm.currentClassStackSnapshot(), Path: core.CurrentSpecFile, Line: 1,
 		}
 	}
 	frame := vm.frames[vm.fp]
-	locals := make(map[string]*object.EmeraldValue)
-	localNames := []string{}
+	localCapacity := 0
+	if frame != nil && frame.Fn != nil {
+		localCapacity = len(frame.Fn.LocalNames) + len(frame.Fn.FreeVarNames)
+	}
+	locals := make(map[string]*object.EmeraldValue, localCapacity)
+	localNames := make([]string, 0, localCapacity)
 	path := core.CurrentSpecFile
 	line := int64(1)
 	if frame != nil && frame.Ip >= 0 {
@@ -14234,45 +28614,31 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 			path = frame.Fn.SourcePath
 		}
 		if len(frame.Fn.LocalNames) > 0 {
-			namedLocals := make([]struct {
-				name  string
-				index int64
-			}, 0, len(frame.Fn.LocalNames))
-			for name, index := range frame.Fn.LocalNames {
-				namedLocals = append(namedLocals, struct {
-					name  string
-					index int64
-				}{name: name, index: int64(index)})
+			orderedNames := orderedFrameLocalNames(frame.Fn)
+			if inherited := frame.Fn.EvalInheritedLocals; inherited > 0 && inherited < len(orderedNames) {
+				orderedNames = append(append([]string{}, orderedNames[inherited:]...), orderedNames[:inherited]...)
 			}
-			sort.Slice(namedLocals, func(i, j int) bool {
-				return namedLocals[i].index < namedLocals[j].index
-			})
-			if inherited := frame.Fn.EvalInheritedLocals; inherited > 0 && inherited < len(namedLocals) {
-				namedLocals = append(append([]struct {
-					name  string
-					index int64
-				}{}, namedLocals[inherited:]...), namedLocals[:inherited]...)
-			}
-			for _, item := range namedLocals {
-				if frame.Fn.ImplicitItParameter && item.name == "it" || frame.Fn.NumberedParameters && numberedParameterMethodNamePattern.MatchString(item.name) {
+			for _, name := range orderedNames {
+				if name == "" || frame.Fn.ImplicitItParameter && name == "it" || frame.Fn.NumberedParameters && numberedParameterMethodNamePattern.MatchString(name) {
 					continue
 				}
-				slot := frame.Bp + 1 + int(item.index)
-				if item.index >= 0 && int(item.index) < len(frame.Fn.Params) {
+				index := frame.Fn.LocalNames[name]
+				slot := frame.Bp + 1 + index
+				if index >= 0 && index < len(frame.Fn.Params) {
 					if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
-						locals[item.name] = vm.stack[slot]
-						localNames = append(localNames, item.name)
+						locals[name] = vm.stack[slot]
+						localNames = append(localNames, name)
 						continue
 					}
-					if len(frame.Args) > int(item.index) {
-						locals[item.name] = frame.Args[int(item.index)]
-						localNames = append(localNames, item.name)
+					if len(frame.Args) > index {
+						locals[name] = frame.Args[index]
+						localNames = append(localNames, name)
 						continue
 					}
 				}
 				if slot >= 0 && slot < vm.sp && vm.stack[slot] != nil {
-					locals[item.name] = vm.stack[slot]
-					localNames = append(localNames, item.name)
+					locals[name] = vm.stack[slot]
+					localNames = append(localNames, name)
 				}
 			}
 		} else {
@@ -14327,16 +28693,12 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 		block = frame.Block
 		allowAnonymousBlockPass = frame.Fn != nil && frame.Fn.AnonymousBlockParam
 	}
-	seenNames := map[string]bool{}
-	for name := range locals {
-		seenNames[name] = true
-	}
 	if frame != nil && frame.Fn != nil && frame.Closure != nil && len(frame.Fn.FreeVarNames) > 0 && len(frame.Closure.Free) > 0 {
 		for idx, name := range frame.Fn.FreeVarNames {
 			if name == "" {
 				continue
 			}
-			if seenNames[name] {
+			if _, seen := locals[name]; seen {
 				continue
 			}
 			if idx >= len(frame.Closure.Free) {
@@ -14344,23 +28706,20 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 			}
 			locals[name] = frame.Closure.Free[idx]
 			localNames = append(localNames, name)
-			seenNames[name] = true
 		}
 	}
 	binding := &object.RBinding{
+		RBindingExpanded:        &object.RBindingExpanded{Locals: locals, LocalNames: localNames},
 		Self:                    self,
 		Block:                   block,
 		AllowAnonymousBlockPass: allowAnonymousBlockPass,
 		EvalReturnTargetID:      vm.evalReturnTargetID(),
-		Locals:                  locals,
-		LocalNames:              localNames,
 		Method:                  methodName,
 		BacktraceLabel:          backtraceLabel,
 		Constants:               vm.rubyConsts,
 		ClassStack:              vm.currentClassStackSnapshot(),
 		Path:                    path,
 		Line:                    line,
-		InstanceVars:            map[string]*object.EmeraldValue{},
 	}
 	if refinements, fixed := vm.currentFixedRefinements(); fixed {
 		binding.Refinements = append([]*object.EmeraldValue(nil), refinements...)
@@ -14368,6 +28727,7 @@ func (vm *VM) currentFrameBinding() *object.RBinding {
 	if frame != nil && frame.Closure != nil && frame.Closure.Binding != nil &&
 		(frame.Fn == nil || !frame.Fn.MethodBody || frame.DefinedByDefineMethod) {
 		binding.Parent = frame.Closure.Binding
+		binding.Parent.MaterializeLocals()
 		binding.SharedLocals = make(map[string]struct{}, len(binding.Parent.LocalNames)+len(binding.Parent.Locals))
 		for _, name := range binding.Parent.LocalNames {
 			binding.SharedLocals[name] = struct{}{}
@@ -14396,12 +28756,34 @@ func (vm *VM) evalReturnTargetID() int {
 }
 
 func (vm *VM) captureFrameBinding() *object.RBinding {
-	binding := vm.currentFrameBinding()
-	if binding != nil && vm.fp >= 0 && vm.fp < len(vm.frames) {
+	if vm.fp >= 0 && vm.fp < len(vm.frames) {
 		if frame := vm.frames[vm.fp]; frame != nil {
-			frame.CapturedBindings = append(frame.CapturedBindings, binding)
+			site := frame.Ip
+			if frame.ClosureBinding != nil && frame.ClosureBindingSite == site {
+				return frame.ClosureBinding
+			}
+			if binding := frame.ClosureBindings[site]; binding != nil {
+				return binding
+			}
+			binding := vm.compactFrameBinding(frame)
+			if binding != nil {
+				if frame.ClosureBinding == nil {
+					frame.ClosureBindingSite = site
+					frame.ClosureBinding = binding
+				} else {
+					if frame.ClosureBindings == nil {
+						frame.ClosureBindings = map[int]*object.RBinding{
+							frame.ClosureBindingSite: frame.ClosureBinding,
+						}
+					}
+					frame.ClosureBindings[site] = binding
+				}
+				frame.CapturedBindings = append(frame.CapturedBindings, binding)
+			}
+			return binding
 		}
 	}
+	binding := vm.currentFrameBinding()
 	return binding
 }
 
@@ -14426,6 +28808,15 @@ func (vm *VM) globalVariableNames() []string {
 }
 
 func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
+	return vm.currentBacktraceFramesWithPathResolution(true)
+}
+
+// currentBacktraceFramesWithPathResolution preserves the same frame/line
+// order for both normal backtraces and rescued exceptions.  Resolving every
+// source path through Abs/EvalSymlinks is expensive and unnecessary while an
+// exception is about to enter a rescue clause; Thread::Backtrace::Location
+// resolves an empty AbsolutePath lazily if Ruby code asks for it later.
+func (vm *VM) currentBacktraceFramesWithPathResolution(resolvePaths bool) []object.RBacktraceLocation {
 	frames := make([]object.RBacktraceLocation, 0, len(vm.frames))
 	ensureBlockIndex := vm.fp - 1
 	ensureBlockLine := int64(0)
@@ -14455,7 +28846,7 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 		}
 		line := vm.sourceLineForFrame(frame)
 		absolutePath := frame.Fn.SourceAbsolutePath
-		if !frame.Fn.EvalSource && path != "" && !strings.HasPrefix(path, "<") {
+		if resolvePaths && !frame.Fn.EvalSource && path != "" && !strings.HasPrefix(path, "<") {
 			if absolutePath == "" {
 				absolutePath = path
 				if abs, err := filepath.Abs(absolutePath); err == nil {
@@ -14482,7 +28873,7 @@ func (vm *VM) currentBacktraceFrames() []object.RBacktraceLocation {
 		})
 	}
 	if vm.parent != nil {
-		frames = append(frames, vm.parent.currentBacktraceFrames()...)
+		frames = append(frames, vm.parent.currentBacktraceFramesWithPathResolution(resolvePaths)...)
 	}
 	return frames
 }
@@ -14506,6 +28897,12 @@ func (vm *VM) backtraceLabelForFrame(index int) string {
 	}
 	if frame.LabelName != "" {
 		return frame.LabelName
+	}
+	if frame.BacktraceMethod != nil {
+		frame.LabelName = backtraceMethodLabel(frame.BacktraceReceiver, frame.BacktraceMethod, frame.BacktraceOwner, frame.MethodName)
+		if frame.LabelName != "" {
+			return frame.LabelName
+		}
 	}
 	if frame.MethodName != "" {
 		return frame.MethodName
@@ -14586,8 +28983,8 @@ func (vm *VM) backtraceBlockLabel(index int) string {
 		if frame.Fn.Name == "__block__" || frame.Fn.Name == "__lambda__" {
 			continue
 		}
-		if frame.LabelName != "" {
-			base = strings.TrimPrefix(frame.LabelName, "Object#")
+		if frame.BacktraceMethod != nil || frame.LabelName != "" {
+			base = strings.TrimPrefix(vm.backtraceLabelForFrame(i), "Object#")
 		} else if frame.MethodName != "" {
 			base = frame.MethodName
 		} else if frame.Fn.Name == "main" || frame.Fn.Name == "__main__" {
@@ -14623,24 +29020,40 @@ func (vm *VM) sourceLineForFrame(frame *Frame) int64 {
 		return 0
 	}
 	if frame.Fn != nil && len(frame.Fn.LineMap) > 0 {
-		bestPos := -1
-		bestLine := 0
-		for pos, line := range frame.Fn.LineMap {
-			if pos <= frame.Ip && pos > bestPos {
-				bestPos = pos
-				bestLine = line
+		lines, ok := vm.sourceLineCache[frame.Fn]
+		if !ok {
+			lines = make([]int64, len(frame.Fn.Instructions))
+			for position, line := range frame.Fn.LineMap {
+				if position >= 0 && position < len(lines) {
+					lines[position] = int64(line)
+				}
 			}
+			var current int64
+			for position, line := range lines {
+				if line > 0 {
+					current = line
+				} else if current > 0 {
+					lines[position] = current
+				}
+			}
+			vm.sourceLineCache[frame.Fn] = lines
 		}
-		if bestPos >= 0 {
-			return int64(bestLine)
+		if len(lines) > 0 {
+			position := frame.Ip
+			if position >= len(lines) {
+				position = len(lines) - 1
+			}
+			if lines[position] > 0 {
+				return lines[position]
+			}
 		}
 	}
 	return int64(frame.Ip + 1)
 }
 
-func (vm *VM) fireTracePointLine(frame *Frame, op compiler.Opcode) {
-	if frame == nil {
-		return
+func (vm *VM) fireTracePointLine(frame *Frame, op compiler.Opcode) bool {
+	if frame == nil || !core.TracePointEventActive("line") {
+		return false
 	}
 	line := frame.ExecutionLine
 	if frame.Fn != nil {
@@ -14652,26 +29065,24 @@ func (vm *VM) fireTracePointLine(frame *Frame, op compiler.Opcode) {
 		line = vm.sourceLineForFrame(frame)
 	}
 	frame.ExecutionLine = line
-	if !core.TracePointEventActive("line") {
-		return
-	}
 	if frame.Fn != nil && line == frame.Fn.DefinitionLine && (op == compiler.OpReturn || op == compiler.OpReturnValue || op == compiler.OpNonLocalReturnValue || op == compiler.OpBlockReturn) {
-		return
+		return true
 	}
 	if line <= 0 || line == frame.TraceLine {
-		return
+		return true
 	}
 	if frame.TraceLine == 0 && frame.Fn != nil && line == frame.Fn.DefinitionLine {
 		for position, laterLine := range frame.Fn.LineMap {
 			if position > frame.Ip && int64(laterLine) > line {
 				frame.TraceLine = line
-				return
+				return true
 			}
 		}
 	}
 	frame.TraceLine = line
 	binding := vm.currentFrameBinding()
 	core.FireTracePointLine(binding, frame.ID)
+	return true
 }
 
 func (vm *VM) fireTracePointReturn(frame *Frame, value *object.EmeraldValue) {
@@ -14721,6 +29132,7 @@ func hashLiteralKey(key *object.EmeraldValue) *object.EmeraldValue {
 		return key
 	}
 	copy := *key
+	copy.Cold = key.CloneColdData()
 	copy.Frozen = true
 	core.CopyStringEncoding(&copy, key)
 	return &copy
@@ -15064,13 +29476,16 @@ func (vm *VM) scopedConstantValue(receiver *object.EmeraldValue, constName strin
 		if class.PrivateConstants[constName] {
 			return vm.privateConstantAccessResult(receiver, constName), true
 		}
+		if constant, ok := class.Constants[constName]; ok {
+			return constant, true
+		}
+		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
+			return constant, true
+		}
 		if owner, found := privateConstantOwnerInClassLookup(class, constName); found {
 			return vm.privateConstantAccessResult(owner, constName), true
 		}
 		if constant, ok := scopedClassConstantLookup(class, constName); ok {
-			return constant, true
-		}
-		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
 			return constant, true
 		}
 		if constant, ok := vm.rubyConsts[qualifiedName]; ok {
@@ -15096,13 +29511,16 @@ func (vm *VM) scopedConstantValue(receiver *object.EmeraldValue, constName strin
 		if module.PrivateConstants[constName] {
 			return vm.privateConstantAccessResult(receiver, constName), true
 		}
+		if constant, ok := module.Constants[constName]; ok {
+			return constant, true
+		}
+		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
+			return constant, true
+		}
 		if owner, found := privateConstantOwnerInModuleLookup(module, constName); found {
 			return vm.privateConstantAccessResult(owner, constName), true
 		}
 		if constant, ok := moduleConstantLookup(module, constName); ok {
-			return constant, true
-		}
-		if constant, ok := vm.triggerAutoload(receiver, constName); ok {
 			return constant, true
 		}
 		if constant, ok := vm.rubyConsts[qualifiedName]; ok {

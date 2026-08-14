@@ -42,6 +42,19 @@ func TestEndMarkerPermanentlyEndsLexing(t *testing.T) {
 	}
 }
 
+func TestHashLabelsWithoutSpacesRemainColonTokens(t *testing.T) {
+	tokens := tokenizeClean(`{a:1,text:"x",items:[true,nil]}`)
+	var colons int
+	for _, token := range tokens {
+		if token.Type == COLON {
+			colons++
+		}
+	}
+	if colons != 3 {
+		t.Fatalf("expected three hash label colons, got %d in %v", colons, tokens)
+	}
+}
+
 func TestIntegerLiterals(t *testing.T) {
 	tests := []struct {
 		input   string
@@ -74,6 +87,13 @@ func TestIntegerLiterals(t *testing.T) {
 				t.Errorf("expected literal %q, got %q", tt.literal, toks[0].Literal)
 			}
 		})
+	}
+}
+
+func TestZeroRationalLiteral(t *testing.T) {
+	tokens := tokenizeClean("0r")
+	if len(tokens) != 1 || tokens[0].Type != RATIONAL || tokens[0].Literal != "0r" {
+		t.Fatalf("expected zero rational token, got %v", tokens)
 	}
 }
 
@@ -225,10 +245,49 @@ func TestHeredocInterpolationFlag(t *testing.T) {
 	}
 }
 
+func TestHeredocPreservesEscapedInterpolation(t *testing.T) {
+	toks := tokenizeClean("value = <<~TEXT\n  literal=\\#{missing}\nTEXT\n")
+	if len(toks) < 3 || toks[2].Type != STRING {
+		t.Fatalf("expected heredoc STRING token, got %v", toks)
+	}
+	if toks[2].Literal != "literal="+EscapedHashInterpolation+"{missing}\n" {
+		t.Fatalf("unexpected escaped heredoc interpolation: %q", toks[2].Literal)
+	}
+}
+
+func TestEmbeddedDocumentIsSkipped(t *testing.T) {
+	toks := tokenizeClean("before\n=begin\nnot ruby = ]\n=end\nafter\n")
+	expected := []TokenType{IDENT, IDENT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
 func TestQuotedHeredocIdentifierMustEndOnDeclarationLine(t *testing.T) {
 	tokens := tokenizeClean("<<\"HERE\n\"\nbody\nHERE\n")
 	if len(tokens) == 0 || tokens[0].Type != ILLEGAL {
 		t.Fatalf("expected illegal unterminated quoted heredoc identifier, got %v", tokens)
+	}
+}
+
+func TestQuotedHeredocIdentifierAllowsPunctuation(t *testing.T) {
+	toks := tokenizeClean("eval <<-'end;', __FILE__, __LINE__ + 1\n  value\nend;\n")
+	expected := []TokenType{IDENT, STRING, COMMA, IDENT, COMMA, IDENT, PLUS, INT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+	if toks[1].Literal != "  value\n" || toks[1].AllowsInterpolation {
+		t.Fatalf("expected literal single-quoted heredoc body, got %#v", toks[1])
 	}
 }
 
@@ -294,6 +353,29 @@ func TestHeredocMarkerSuffixIsSeparatedFromFollowingStatement(t *testing.T) {
 	t.Fatalf("expected RPAREN NEWLINE next_call token sequence, got %v", toks)
 }
 
+func TestHeredocWithoutMarkerSuffixSeparatesFollowingConditional(t *testing.T) {
+	toks := tokenize("help = <<-HELP\ntext\nHELP\nif enabled\nend\n")
+	for i := 0; i < len(toks)-1; i++ {
+		if toks[i].Type == STRING && toks[i+1].Type == NEWLINE {
+			return
+		}
+	}
+	t.Fatalf("expected STRING NEWLINE token sequence, got %v", toks)
+}
+
+func TestHeredocTerminatorAllowsNextLineFluentDot(t *testing.T) {
+	toks := tokenizeClean("value = <<~TEXT\ntext\nTEXT\n.codepoints\n")
+	expected := []TokenType{IDENT, ASSIGN, STRING, DOT, IDENT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
 func TestRegexpLiteral(t *testing.T) {
 	toks := tokenizeClean(`/foo/i`)
 	if len(toks) != 1 {
@@ -307,10 +389,53 @@ func TestRegexpLiteral(t *testing.T) {
 	}
 }
 
+func TestRegexpLiteralRemovesEscapedNewline(t *testing.T) {
+	toks := tokenizeClean(`/a\
+b/`)
+	if len(toks) != 1 || toks[0].Type != REGEXP || toks[0].Literal != `/ab/` {
+		t.Fatalf("expected continued regexp literal /ab/, got %v", toks)
+	}
+
+	toks = tokenizeClean(`%r{a\
+b}`)
+	if len(toks) != 1 || toks[0].Type != REGEXP || toks[0].Literal != `%r{ab}` {
+		t.Fatalf("expected continued percent regexp literal %%r{ab}, got %v", toks)
+	}
+}
+
+func TestRegexpBeginningWithEqualsAfterMatchOperator(t *testing.T) {
+	toks := tokenizeClean(`value =~ /=/; value /= 2`)
+	expected := []TokenType{IDENT, MATCH, REGEXP, SEMICOLON, IDENT, DIVIDE_ASSIGN, INT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s (%q)", i, typ, toks[i].Type, toks[i].Literal)
+		}
+	}
+}
+
 func TestPercentRegexpAllowsBackslashAsDelimiter(t *testing.T) {
 	toks := tokenizeClean(`%r\ foo \`)
 	if len(toks) != 1 || toks[0].Type != REGEXP || toks[0].Literal != `%r\ foo \` {
 		t.Fatalf("expected backslash-delimited regexp, got %v", toks)
+	}
+}
+
+func TestPercentCommandLiteralToken(t *testing.T) {
+	toks := tokenizeClean(`%x{printf 42}.to_i`)
+	expected := []TokenType{STRING, DOT, IDENT}
+	if len(toks) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(toks), toks)
+	}
+	for i, typ := range expected {
+		if toks[i].Type != typ {
+			t.Fatalf("token %d: expected %s, got %s", i, typ, toks[i].Type)
+		}
+	}
+	if !toks[0].CommandLiteral || toks[0].Literal != "printf 42" {
+		t.Fatalf("expected command literal, got %#v", toks[0])
 	}
 }
 
@@ -689,6 +814,20 @@ func TestSlashAfterNewlineCanStartRegexp(t *testing.T) {
 	}
 }
 
+func TestSlashAfterDefParametersCanStartRegexp(t *testing.T) {
+	toks := tokenizeClean(`def pattern(str) /([#{Regexp.escape(str)}])/n end`)
+	found := false
+	for _, tok := range toks {
+		if tok.Type == REGEXP && tok.Literal == `/([#{Regexp.escape(str)}])/n` {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected regexp after def parameters, got %v", toks)
+	}
+}
+
 func TestCompoundAssignmentTokens(t *testing.T) {
 	toks := tokenizeClean("a %= b; a |= b; a &= b; a ^= b; a >>= b; a <<= b")
 	expected := []TokenType{
@@ -719,6 +858,20 @@ func TestBarePercentEqualsStringAtExpressionStart(t *testing.T) {
 	}
 }
 
+func TestPercentBeforeParenthesisAfterDefIsModuloOperator(t *testing.T) {
+	toks := tokenizeClean(`def %(other); other; end`)
+	if len(toks) < 2 || toks[0].Type != DEF || toks[1].Type != MOD {
+		t.Fatalf("expected def followed by modulo method name, got %v", toks)
+	}
+}
+
+func TestSlashAfterDotIsDivisionMethodName(t *testing.T) {
+	toks := tokenizeClean(`Sequel./(left, right)`)
+	if len(toks) < 3 || toks[0].Type != CONSTANT || toks[1].Type != DOT || toks[2].Type != DIVIDE {
+		t.Fatalf("expected dotted division method name, got %v", toks)
+	}
+}
+
 func TestSlashAfterWhenCanStartRegexp(t *testing.T) {
 	toks := tokenizeClean("case value\nwhen /foo/\nend")
 	found := false
@@ -730,6 +883,20 @@ func TestSlashAfterWhenCanStartRegexp(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected regexp token, got %v", toks)
+	}
+}
+
+func TestSlashAfterAndKeywordCanStartRegexp(t *testing.T) {
+	toks := tokenizeClean(`value and /\Aq=([\d.]+)/ =~ value`)
+	found := false
+	for _, tok := range toks {
+		if tok.Type == REGEXP {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected regexp after and keyword, got %v", toks)
 	}
 }
 
@@ -1316,6 +1483,23 @@ func TestCharacterLiteral(t *testing.T) {
 	}
 }
 
+func TestQuestionAfterCallWithoutSpacesStartsTernary(t *testing.T) {
+	toks := tokenizeClean(`value.include?('"')?"'":'"'`)
+	questions := 0
+	colons := 0
+	for _, tok := range toks {
+		if tok.Type == QUESTION {
+			questions++
+		}
+		if tok.Type == COLON {
+			colons++
+		}
+	}
+	if questions != 1 || colons != 1 {
+		t.Fatalf("expected one ternary question and colon token, got %d and %d: %v", questions, colons, toks)
+	}
+}
+
 func TestControlAndMetaCharacterLiterals(t *testing.T) {
 	toks := tokenizeClean(`?\C-z ?\M-z ?\M-\C-z`)
 	expected := []string{"\x1a", "\xfa", "\x9a"}
@@ -1434,5 +1618,44 @@ func TestIdentifierBeforeNewlineKeepsStartingLine(t *testing.T) {
 	}
 	if tokens[4].Literal != "p" || tokens[4].Line != 2 {
 		t.Fatalf("expected p on line 2, got %q line %d", tokens[4].Literal, tokens[4].Line)
+	}
+}
+
+func TestUnicodePunctuationMethodIdentifier(t *testing.T) {
+	tokens := tokenizeClean("def self.❨╯°□°❩╯︵┻━┻; end")
+	found := false
+	for _, token := range tokens {
+		if token.Literal == "❨╯°□°❩╯︵┻━┻" {
+			found = true
+			if token.Type != IDENT {
+				t.Fatalf("expected Unicode method name to be IDENT, got %s", token.Type)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected Unicode punctuation method identifier")
+	}
+}
+
+func TestRegexpAfterCommentEndingInDotIsNotDivision(t *testing.T) {
+	tokens := tokenizeClean("false ||\n  # sentence ending in a dot.\n  /pattern/i")
+	if got := tokens[len(tokens)-1]; got.Type != REGEXP || got.Literal != "/pattern/i" {
+		t.Fatalf("expected regexp token, got %#v", got)
+	}
+}
+
+func TestRegexpCanFollowElseOnSameLine(t *testing.T) {
+	tokens := tokenizeClean("case value; when 1 then /one/; else /other/o; end")
+	found := false
+	for _, token := range tokens {
+		if token.Literal == "/other/o" {
+			found = true
+			if token.Type != REGEXP {
+				t.Fatalf("expected regexp after else, got %s", token.Type)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected regexp token after else")
 	}
 }

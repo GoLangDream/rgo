@@ -33,6 +33,7 @@ type uriData struct {
 
 var uriSchemePattern = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]*):(.*)$`)
 var uriExtractPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*:[^\s<>"]*`)
+var uriRegisteredSchemes map[string]*object.Class
 
 func uriStringPointer(value string) *string { return &value }
 
@@ -49,6 +50,14 @@ func installURIModule(objectClass *object.Class) {
 	module.DefineMethod("join", &object.Method{Name: "join", Fn: uriJoin, Arity: -1})
 	module.DefineMethod("extract", &object.Method{Name: "extract", Fn: uriExtract, Arity: -1})
 	module.DefineMethod("regexp", &object.Method{Name: "regexp", Fn: uriRegexp, Arity: -1})
+	module.DefineMethod("encode_www_form_component", &object.Method{Name: "encode_www_form_component", Fn: uriEncodeWWWFormComponent, Arity: -1})
+	module.DefineMethod("decode_www_form_component", &object.Method{Name: "decode_www_form_component", Fn: uriDecodeWWWFormComponent, Arity: -1})
+	module.DefineMethod("decode_www_form", &object.Method{Name: "decode_www_form", Fn: uriDecodeWWWForm, Arity: -1})
+	module.DefineMethod("register_scheme", &object.Method{Name: "register_scheme", Fn: uriRegisterScheme, Arity: 2})
+	uriRegisteredSchemes = make(map[string]*object.Class)
+	util := object.NewModule("URI::Util")
+	util.DefineMethod("make_components_hash", &object.Method{Name: "make_components_hash", Fn: uriMakeComponentsHash, Arity: 2})
+	module.Constants["Util"] = &object.EmeraldValue{Type: object.ValueModule, Data: util, Class: R.Classes["Module"]}
 
 	for _, name := range []string{"Error", "InvalidURIError", "InvalidComponentError", "BadURIError"} {
 		klass := object.NewClass("URI::" + name)
@@ -94,6 +103,8 @@ func installURIModule(objectClass *object.Class) {
 	parser.DefineMethod("join", &object.Method{Name: "join", Fn: uriJoin, Arity: -1})
 	parser.DefineMethod("extract", &object.Method{Name: "extract", Fn: uriExtract, Arity: -1})
 	parser.DefineMethod("make_regexp", &object.Method{Name: "make_regexp", Fn: uriRegexp, Arity: -1})
+	parser.DefineMethod("pattern", &object.Method{Name: "pattern", Fn: uriParserPattern, Arity: 0})
+	parser.DefineMethod("regexp", &object.Method{Name: "regexp", Fn: uriParserRegexp, Arity: 0})
 	parser.DefineMethod("escape", &object.Method{Name: "escape", Fn: uriEscape, Arity: -1})
 	parser.DefineMethod("unescape", &object.Method{Name: "unescape", Fn: uriUnescape, Arity: 1})
 	parser.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: uriParserInspect, Arity: 0})
@@ -103,7 +114,8 @@ func installURIModule(objectClass *object.Class) {
 	module.Constants["RFC2396_Parser"] = module.Constants["Parser"]
 	module.Constants["RFC3986_Parser"] = module.Constants["Parser"]
 	module.Constants["DEFAULT_PARSER"] = uriParserNew(module.Constants["Parser"])
-	module.Constants["VERSION"] = rubyString("1.0.4")
+	generic.DefineConstant("DEFAULT_PARSER", module.Constants["DEFAULT_PARSER"])
+	module.Constants["VERSION"] = rubyString("1.1.1")
 
 	moduleValue := &object.EmeraldValue{Type: object.ValueModule, Data: module, Class: R.Classes["Module"]}
 	objectClass.DefineConstant("URI", moduleValue)
@@ -114,6 +126,139 @@ func installURIModule(objectClass *object.Class) {
 		kernel.DefineMethod("URI", method)
 		kernel.DefineClassMethod("URI", &object.Method{Name: "URI", Fn: uriKernel, Arity: 1})
 	}
+}
+
+func uriEncodeWWWFormComponent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	source, raw, errVal := cgiStringArg(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	if len(args) == 2 {
+		if name := encodingName(args[1]); name == "" {
+			return NewArgumentError("unknown encoding name")
+		}
+	}
+	const hex = "0123456789ABCDEF"
+	var out strings.Builder
+	for i := 0; i < len(raw); i++ {
+		b := raw[i]
+		switch {
+		case (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '*' || b == '-' || b == '.' || b == '_':
+			out.WriteByte(b)
+		case b == ' ':
+			out.WriteByte('+')
+		default:
+			out.WriteByte('%')
+			out.WriteByte(hex[b>>4])
+			out.WriteByte(hex[b&0x0f])
+		}
+	}
+	result := rubyString(out.String())
+	if source != nil {
+		if enc := stringEncodingName(source); enc != "" {
+			result.Encoding = enc
+		}
+	}
+	return result
+}
+
+func uriDecodeWWWFormComponent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 1 || len(args) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	source, raw, errVal := cgiStringArg(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	normalized := rubyString(strings.ReplaceAll(raw, "+", " "))
+	if source != nil {
+		if enc := stringEncodingName(source); enc != "" {
+			normalized.Encoding = enc
+		}
+	}
+	decodeArgs := []*object.EmeraldValue{normalized}
+	if len(args) == 2 {
+		decodeArgs = append(decodeArgs, args[1])
+	}
+	return cgiUnescapeURIComponent(receiver, decodeArgs...)
+}
+
+func uriDecodeWWWForm(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) == 0 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	positional := args
+	var options *object.EmeraldValue
+	if last := args[len(args)-1]; last != nil && last.Type == object.ValueHash {
+		options = last
+		positional = args[:len(args)-1]
+	}
+	if len(positional) < 1 || len(positional) > 2 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	_, raw, errVal := cgiStringArg(positional[0])
+	if errVal != nil {
+		return errVal
+	}
+	if stringHasNonASCIIByte(raw) {
+		return NewArgumentError("the input of URI.decode_www_form must be ASCII only string")
+	}
+	separator := "&"
+	isIndex := false
+	if options != nil {
+		for key, value := range valueToHashMap(options) {
+			switch specName(key) {
+			case "separator":
+				_, separatorValue, conversionErr := cgiStringArg(value)
+				if conversionErr != nil {
+					return conversionErr
+				}
+				if separatorValue == "" {
+					return NewArgumentError("separator cannot be empty")
+				}
+				separator = separatorValue
+			case "isindex":
+				isIndex = isTruthy(value)
+			}
+		}
+	}
+	if raw == "" {
+		return &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{}, Class: R.Classes["Array"]}
+	}
+	encodingArgs := []*object.EmeraldValue{}
+	if len(positional) == 2 {
+		encodingArgs = append(encodingArgs, positional[1])
+	}
+	pairs := make([]*object.EmeraldValue, 0)
+	for index, field := range strings.Split(raw, separator) {
+		key, value, found := strings.Cut(field, "=")
+		if isIndex && index == 0 && !found {
+			key, value = "", key
+		}
+		decode := func(text string) *object.EmeraldValue {
+			componentArgs := []*object.EmeraldValue{rubyString(text)}
+			componentArgs = append(componentArgs, encodingArgs...)
+			return uriDecodeWWWFormComponent(receiver, componentArgs...)
+		}
+		decodedKey := decode(key)
+		if decodedKey != nil && decodedKey.Type == object.ValueException {
+			return decodedKey
+		}
+		decodedValue := decode(value)
+		if decodedValue != nil && decodedValue.Type == object.ValueException {
+			return decodedValue
+		}
+		pair := &object.EmeraldValue{
+			Type:  object.ValueArray,
+			Data:  []*object.EmeraldValue{decodedKey, decodedValue},
+			Class: R.Classes["Array"],
+		}
+		pairs = append(pairs, pair)
+	}
+	return &object.EmeraldValue{Type: object.ValueArray, Data: pairs, Class: R.Classes["Array"]}
 }
 
 func uriSubclass(name string, superclass *object.Class) *object.Class {
@@ -129,6 +274,7 @@ func installURIGenericMethods(klass *object.Class) {
 	klass.DefineClassMethod("build", &object.Method{Name: "build", Fn: uriClassBuild, Arity: 1})
 	klass.DefineClassMethod("build2", &object.Method{Name: "build2", Fn: uriClassBuild, Arity: 1})
 	klass.DefineClassMethod("component", &object.Method{Name: "component", Fn: uriClassComponent, Arity: 0})
+	klass.DefineMethod("initialize", &object.Method{Name: "initialize", Fn: uriInitialize, Arity: -1, Visibility: "private"})
 	klass.DefineMethod("to_s", &object.Method{Name: "to_s", Fn: uriToS, Arity: 0})
 	klass.DefineMethod("inspect", &object.Method{Name: "inspect", Fn: uriInspect, Arity: 0})
 	klass.DefineMethod("==", &object.Method{Name: "==", Fn: uriEqual, Arity: 1})
@@ -150,11 +296,13 @@ func installURIGenericMethods(klass *object.Class) {
 	klass.DefineMethod("relative?", &object.Method{Name: "relative?", Fn: uriRelative, Arity: 0})
 	klass.DefineMethod("hierarchical?", &object.Method{Name: "hierarchical?", Fn: uriHierarchical, Arity: 0})
 	klass.DefineMethod("request_uri", &object.Method{Name: "request_uri", Fn: uriRequestURI, Arity: 0})
+	klass.DefineMethod("find_proxy", &object.Method{Name: "find_proxy", Fn: uriFindProxy, Arity: 0})
 	klass.DefineMethod("scheme", &object.Method{Name: "scheme", Fn: uriScheme, Arity: 0})
 	klass.DefineMethod("userinfo", &object.Method{Name: "userinfo", Fn: uriUserinfo, Arity: 0})
 	klass.DefineMethod("user", &object.Method{Name: "user", Fn: uriUser, Arity: 0})
 	klass.DefineMethod("password", &object.Method{Name: "password", Fn: uriPassword, Arity: 0})
 	klass.DefineMethod("host", &object.Method{Name: "host", Fn: uriHost, Arity: 0})
+	klass.DefineMethod("hostname", &object.Method{Name: "hostname", Fn: uriHostname, Arity: 0})
 	klass.DefineMethod("port", &object.Method{Name: "port", Fn: uriPort, Arity: 0})
 	klass.DefineMethod("default_port", &object.Method{Name: "default_port", Fn: uriDefaultPort, Arity: 0})
 	klass.DefineMethod("path", &object.Method{Name: "path", Fn: uriPath, Arity: 0})
@@ -173,6 +321,110 @@ func installURIGenericMethods(klass *object.Class) {
 	klass.DefineMethod("fragment=", &object.Method{Name: "fragment=", Fn: uriSetFragment, Arity: 1})
 	klass.DefineMethod("registry=", &object.Method{Name: "registry=", Fn: uriSetRegistry, Arity: 1})
 	klass.DefineMethod("opaque=", &object.Method{Name: "opaque=", Fn: uriSetOpaque, Arity: 1})
+	klass.DefineMethod("hostname=", &object.Method{Name: "hostname=", Fn: uriSetHost, Arity: 1})
+	for name, fn := range map[string]func(*object.EmeraldValue, ...*object.EmeraldValue) *object.EmeraldValue{
+		"set_scheme":   uriSetScheme,
+		"set_userinfo": uriSetUserinfo,
+		"set_host":     uriSetHost,
+		"set_port":     uriSetPort,
+		"set_path":     uriSetPath,
+		"set_query":    uriSetQuery,
+		"set_fragment": uriSetFragment,
+		"set_opaque":   uriSetOpaque,
+	} {
+		klass.DefineMethod(name, &object.Method{Name: name, Fn: fn, Arity: 1, Visibility: "protected"})
+	}
+}
+
+func uriFindProxy(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	data, errValue := uriValueData(receiver)
+	if errValue != nil {
+		return errValue
+	}
+	scheme := strings.ToLower(uriPointerString(data.scheme))
+	host := strings.ToLower(uriPointerString(data.host))
+	noProxy, _ := EnvString("no_proxy")
+	upperNoProxy, _ := EnvString("NO_PROXY")
+	if uriHostBypassesProxy(host, noProxy) || uriHostBypassesProxy(host, upperNoProxy) {
+		return R.NilVal
+	}
+	proxy, _ := EnvString(scheme + "_proxy")
+	if proxy == "" && scheme != "http" {
+		proxy, _ = EnvString(strings.ToUpper(scheme) + "_PROXY")
+	}
+	requestMethod, _ := EnvString("REQUEST_METHOD")
+	if proxy == "" && scheme == "http" && requestMethod == "" {
+		proxy, _ = EnvString("HTTP_PROXY")
+	}
+	if proxy == "" {
+		return R.NilVal
+	}
+	if !strings.Contains(proxy, "://") {
+		proxy = "http://" + proxy
+	}
+	return uriParse(receiver, rubyString(proxy))
+}
+
+func uriHostBypassesProxy(host, configured string) bool {
+	if host == "" || configured == "" {
+		return false
+	}
+	for _, entry := range strings.Split(configured, ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "*" {
+			return true
+		}
+		if separator := strings.LastIndex(entry, ":"); separator > 0 && !strings.Contains(entry[separator+1:], ":") {
+			entry = entry[:separator]
+		}
+		entry = strings.TrimPrefix(entry, ".")
+		if entry != "" && (host == entry || strings.HasSuffix(host, "."+entry)) {
+			return true
+		}
+	}
+	return false
+}
+
+func uriInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) < 9 || len(args) > 11 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	receiver.Data = &uriData{}
+	call := CallMethodBypass
+	if call == nil {
+		call = CallMethod
+	}
+	if call == nil {
+		return receiver
+	}
+	components := []struct {
+		method string
+		value  *object.EmeraldValue
+	}{
+		{"set_scheme", args[0]},
+		{"set_userinfo", args[1]},
+		{"set_host", args[2]},
+		{"set_port", args[3]},
+		{"set_path", args[5]},
+		{"query=", args[7]},
+		{"set_opaque", args[6]},
+		{"fragment=", args[8]},
+	}
+	for _, component := range components {
+		if result := call(receiver, component.method, component.value); result != nil && result.Type == object.ValueException {
+			return result
+		}
+	}
+	data, _ := receiver.Data.(*uriData)
+	if args[4] != nil && args[4].Type != object.ValueNil {
+		return newRuntimeException(R.Classes["URI::InvalidURIError"], "URI does not accept registry part")
+	}
+	if data != nil && data.path == nil && data.opaque == nil {
+		if result := call(receiver, "set_path", rubyString("")); result != nil && result.Type == object.ValueException {
+			return result
+		}
+	}
+	return receiver
 }
 
 func uriKernel(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -238,9 +490,11 @@ func parseURIString(raw string) *object.EmeraldValue {
 		}
 		return uriValue(data, className)
 	}
-	if strings.HasPrefix(rest, "//") {
+	if scheme == "file" && strings.HasPrefix(strings.ToLower(rest), "//%2f") {
 		rest = rest[2:]
-		end := strings.IndexByte(rest, '/')
+	} else if strings.HasPrefix(rest, "//") {
+		rest = rest[2:]
+		end := strings.IndexAny(rest, "/?")
 		authority := rest
 		if end >= 0 {
 			authority, rest = rest[:end], rest[end:]
@@ -319,7 +573,30 @@ func parseURIAuthority(data *uriData, authority string) {
 }
 
 func uriValue(data *uriData, className string) *object.EmeraldValue {
-	return &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: R.Classes["URI::"+className]}
+	klass := R.Classes["URI::"+className]
+	if data != nil && data.scheme != nil {
+		if registered := uriRegisteredSchemes[strings.ToUpper(*data.scheme)]; registered != nil {
+			klass = registered
+		}
+	}
+	return &object.EmeraldValue{Type: object.ValueObject, Data: data, Class: klass}
+}
+
+func uriRegisterScheme(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	nameValue, name, errVal := cgiStringArg(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	_ = nameValue
+	if args[1] == nil || args[1].Type != object.ValueClass {
+		return typeError("class or module required")
+	}
+	klass, ok := args[1].Data.(*object.Class)
+	if !ok || klass == nil {
+		return typeError("class or module required")
+	}
+	uriRegisteredSchemes[strings.ToUpper(name)] = klass
+	return args[1]
 }
 
 func uriValueData(receiver *object.EmeraldValue) (*uriData, *object.EmeraldValue) {
@@ -468,7 +745,51 @@ func uriComponent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 }
 func uriClassComponent(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	klass, _ := receiver.Data.(*object.Class)
+	for current := klass; current != nil; current = current.SuperClass {
+		if component := current.Constants["COMPONENT"]; component != nil && component.Type == object.ValueArray {
+			return component
+		}
+	}
 	return uriNamesArray(uriComponentNames(&object.EmeraldValue{Class: klass}))
+}
+
+func uriMakeComponentsHash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if args[0] == nil || args[0].Type != object.ValueClass {
+		return typeError("expected Class")
+	}
+	klass, _ := args[0].Data.(*object.Class)
+	var result *object.EmeraldValue
+	switch {
+	case args[1] != nil && args[1].Type == object.ValueHash:
+		if CallMethodBypass != nil {
+			result = CallMethodBypass(args[1], "dup")
+		} else {
+			result = CallMethod(args[1], "dup")
+		}
+	case args[1] != nil && args[1].Type == object.ValueArray:
+		component := uriClassComponent(args[0])
+		names, _ := component.Data.([]*object.EmeraldValue)
+		values, _ := args[1].Data.([]*object.EmeraldValue)
+		if len(values) != len(names)-1 {
+			return NewArgumentError("expected Array of components")
+		}
+		result = emptyHashValue()
+		for i, value := range values {
+			hashIndexSet(result, names[i+1], value)
+		}
+	default:
+		return NewArgumentError("expected Array or Hash of components")
+	}
+	if result == nil || result.Type == object.ValueException {
+		return result
+	}
+	scheme := ""
+	if klass != nil {
+		parts := strings.Split(klass.Name, "::")
+		scheme = strings.ToLower(parts[len(parts)-1])
+	}
+	hashIndexSet(result, rubySymbol("scheme"), rubyString(scheme))
+	return result
 }
 func uriNamesArray(names []string) *object.EmeraldValue {
 	values := make([]*object.EmeraldValue, len(names))
@@ -543,72 +864,137 @@ func uriSelect(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 
 func uriScheme(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "scheme")
+	}
 	return uriPointerValue(d.scheme)
 }
 func uriUserinfo(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "userinfo")
+	}
 	return uriPointerValue(d.userinfo)
 }
 func uriHost(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "host")
+	}
 	return uriPointerValue(d.host)
+}
+func uriHostname(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
+	d, _ := r.Data.(*uriData)
+	if d == nil || d.host == nil {
+		return R.NilVal
+	}
+	return rubyString(strings.TrimSuffix(strings.TrimPrefix(*d.host, "["), "]"))
 }
 func uriPath(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "path")
+	}
 	return uriPointerValue(d.path)
 }
 func uriQuery(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "query")
+	}
 	return uriPointerValue(d.query)
 }
 func uriFragment(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "fragment")
+	}
 	return uriPointerValue(d.fragment)
 }
 func uriRegistry(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "registry")
+	}
 	return uriPointerValue(d.registry)
 }
 func uriOpaque(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "opaque")
+	}
 	return uriPointerValue(d.opaque)
 }
 func uriTypecode(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "typecode")
+	}
 	return uriPointerValue(d.typecode)
 }
 func uriDN(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "dn")
+	}
 	return uriPointerValue(d.dn)
 }
 func uriAttributes(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "attributes")
+	}
 	return uriPointerValue(d.attributes)
 }
 func uriScope(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "scope")
+	}
 	return uriPointerValue(d.scope)
 }
 func uriFilter(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "filter")
+	}
 	return uriPointerValue(d.filter)
 }
 func uriExtensions(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "extensions")
+	}
 	return uriPointerValue(d.extensions)
 }
 func uriTo(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "to")
+	}
 	return uriPointerValue(d.to)
 }
 
 func uriPort(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if d == nil {
+		return uriRubyComponent(r, "port")
+	}
 	if d.port != nil {
 		return newInt(*d.port)
 	}
 	if p, ok := uriDefaultPortNumber(d); ok {
 		return newInt(p)
+	}
+	return R.NilVal
+}
+
+func uriRubyComponent(receiver *object.EmeraldValue, name string) *object.EmeraldValue {
+	if receiver == nil {
+		return R.NilVal
+	}
+	if value := receiverInstanceVarMap(receiver)["@"+name]; value != nil {
+		return value
 	}
 	return R.NilVal
 }
@@ -697,6 +1083,10 @@ func uriSetRegistry(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.E
 }
 func uriSetOpaque(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d, _ := r.Data.(*uriData)
+	if a[0] == nil || a[0].Type == object.ValueNil {
+		d.opaque = nil
+		return R.NilVal
+	}
 	if d.host != nil || d.path != nil {
 		return uriInvalidSet("opaque")
 	}
@@ -764,6 +1154,11 @@ func uriSetPort(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.Emera
 		return uriInvalidSet("port")
 	}
 	d, _ := r.Data.(*uriData)
+	if a[0] == nil || a[0].Type == object.ValueNil {
+		d.port = nil
+		d.explicitPort = false
+		return R.NilVal
+	}
 	v, ok := valueToInteger(a[0])
 	if !ok {
 		return typeError("no implicit conversion into Integer")
@@ -1158,21 +1553,96 @@ func uriParserInspect(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	return rubyString("#<URI::RFC2396_Parser>")
 }
 
+func uriParserPattern(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	escaped := `%[a-fA-F\d]{2}`
+	unreserved := `\-_.!~*'()a-zA-Z\d`
+	reserved := `;/?:@&=+$,\[\]`
+	hostname := `(?:[a-zA-Z0-9\-.]|%\h\h)+`
+	ipv4 := `\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`
+	hex4 := `[a-fA-F\d]{1,4}`
+	lastPart := `(?:` + hex4 + `|` + ipv4 + `)`
+	hexSeq1 := `(?:` + hex4 + `:)*` + hex4
+	hexSeq2 := `(?:` + hex4 + `:)*` + lastPart
+	ipv6 := `(?:` + hexSeq2 + `|(?:` + hexSeq1 + `)?::(?:` + hexSeq2 + `)?)`
+	ipv6Ref := `\[` + ipv6 + `\]`
+	host := `(?:` + hostname + `|` + ipv4 + `|` + ipv6Ref + `)`
+
+	entries := map[string]string{
+		"ESCAPED":    escaped,
+		"UNRESERVED": unreserved,
+		"RESERVED":   reserved,
+		"HOSTNAME":   hostname,
+		"IPV4ADDR":   ipv4,
+		"IPV6ADDR":   ipv6,
+		"IPV6REF":    ipv6Ref,
+		"HOST":       host,
+		"PORT":       `\d*`,
+		"HOSTPORT":   host + `(?::\d*)?`,
+	}
+	hash := emptyHashValue()
+	data := hashData(hash)
+	for name, pattern := range entries {
+		key := rubySymbol(name)
+		data.Keys = append(data.Keys, key)
+		data.Pairs[key] = rubyString(pattern)
+	}
+	return hash
+}
+
+func uriParserRegexp(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	patterns := map[string]string{
+		"ABS_URI": `\A\s*[A-Za-z][A-Za-z0-9+.-]*:[^\s<>"]*\s*\z`,
+		"UNSAFE":  `[^-_.!~*'()A-Za-z0-9]`,
+	}
+	hash := emptyHashValue()
+	data := hashData(hash)
+	regexpClass := &object.EmeraldValue{Type: object.ValueClass, Data: R.Classes["Regexp"], Class: R.Classes["Class"]}
+	for name, pattern := range patterns {
+		key := rubySymbol(name)
+		data.Keys = append(data.Keys, key)
+		data.Pairs[key] = regexpClassNew(regexpClass, rubyString(pattern))
+	}
+	return hash
+}
+
 func uriClassBuild(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	klass, _ := receiver.Data.(*object.Class)
 	className := strings.TrimPrefix(klass.Name, "URI::")
 	if className == "MailTo" {
 		return uriMailToBuild(args[0])
 	}
-	data := &uriData{}
-	if className != "Generic" {
-		s := strings.ToLower(className)
-		if s == "mailto" {
-			s = "mailto"
-		}
-		data.scheme = &s
+	names := []string{"scheme", "userinfo", "host", "port", "registry", "path", "opaque", "query", "fragment"}
+	components := make([]*object.EmeraldValue, len(names))
+	for i := range components {
+		components[i] = R.NilVal
 	}
-	return uriValue(data, className)
+	switch {
+	case args[0] != nil && args[0].Type == object.ValueHash:
+		for i, name := range names {
+			components[i] = hashIndex(args[0], rubySymbol(name))
+		}
+	case args[0] != nil && args[0].Type == object.ValueArray:
+		values := args[0].Data.([]*object.EmeraldValue)
+		if len(values) != len(components) {
+			return NewArgumentError("expected Array of URI components")
+		}
+		copy(components, values)
+	default:
+		return NewArgumentError("expected Array or Hash of URI components")
+	}
+	if components[0] == nil || components[0].Type == object.ValueNil {
+		if className != "Generic" {
+			components[0] = rubyString(strings.ToLower(className))
+		}
+	}
+	call := CallMethodBypass
+	if call == nil {
+		call = CallMethod
+	}
+	if call == nil {
+		return R.NilVal
+	}
+	return call(receiver, "new", components...)
 }
 
 func uriMailToBuild(argument *object.EmeraldValue) *object.EmeraldValue {

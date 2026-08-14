@@ -13,7 +13,7 @@ func cgiResult(raw string, source *object.EmeraldValue) *object.EmeraldValue {
 	result := rubyString(raw)
 	if source != nil {
 		if encoding := stringEncodingName(source); encoding != "" {
-			stringEncodings[result] = encoding
+			result.Encoding = encoding
 		}
 	}
 	return result

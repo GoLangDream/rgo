@@ -255,6 +255,7 @@ func (r *RangeExpression) String() string {
 
 type BlockExpression struct {
 	Token             lexer.Token
+	ExplicitParams    bool
 	Params            []*Identifier
 	ParamPatterns     []*ParameterPattern
 	BlockLocals       []string
@@ -298,6 +299,7 @@ type IfExpression struct {
 	Alternative *BlockExpression
 	ElsIf       []*ElsIfExpression
 	IsUnless    bool
+	Modifier    bool
 }
 
 type ElsIfExpression struct {
@@ -463,6 +465,7 @@ type DefExpression struct {
 	KeywordParams    []*KeywordParam
 	Body             *BlockExpression
 	Receiver         Expression
+	Visibility       string
 }
 
 func (d *DefExpression) expressionNode()      {}
@@ -643,6 +646,7 @@ func (y *YieldExpression) String() string {
 type SuperExpression struct {
 	Token        lexer.Token
 	Args         []Expression
+	KeywordArgs  []*KeywordArg
 	Block        *BlockExpression
 	ImplicitArgs bool
 }
@@ -651,11 +655,20 @@ func (s *SuperExpression) expressionNode()      {}
 func (s *SuperExpression) TokenLiteral() string { return s.Token.Literal }
 func (s *SuperExpression) String() string {
 	out := "super"
-	if len(s.Args) > 0 {
+	if len(s.Args) > 0 || len(s.KeywordArgs) > 0 {
 		out += "("
 		for i, arg := range s.Args {
 			out += arg.String()
 			if i < len(s.Args)-1 {
+				out += ", "
+			}
+		}
+		if len(s.Args) > 0 && len(s.KeywordArgs) > 0 {
+			out += ", "
+		}
+		for i, arg := range s.KeywordArgs {
+			out += arg.String()
+			if i < len(s.KeywordArgs)-1 {
 				out += ", "
 			}
 		}
@@ -931,6 +944,8 @@ type RaiseExpression struct {
 	Token            lexer.Token
 	Error            Expression
 	Message          Expression
+	Backtrace        Expression
+	Keyword          Expression
 	MessageIsKeyword bool
 }
 
@@ -940,6 +955,13 @@ func (r *RaiseExpression) TokenLiteral() string { return r.Token.Literal }
 func (r *RaiseExpression) String() string {
 	if r.Error != nil {
 		if r.Message != nil {
+			if r.Backtrace != nil {
+				out := "raise " + r.Error.String() + ", " + r.Message.String() + ", " + r.Backtrace.String()
+				if r.Keyword != nil {
+					out += ", " + r.Keyword.String()
+				}
+				return out
+			}
 			return "raise " + r.Error.String() + ", " + r.Message.String()
 		}
 		return "raise " + r.Error.String()
@@ -948,10 +970,11 @@ func (r *RaiseExpression) String() string {
 }
 
 type CatchExpression struct {
-	Token    lexer.Token
-	Label    Expression
-	Body     *BlockExpression
-	HasBlock bool
+	Token     lexer.Token
+	Label     Expression
+	Body      *BlockExpression
+	BlockPass Expression
+	HasBlock  bool
 }
 
 func (c *CatchExpression) expressionNode()      {}
@@ -1033,6 +1056,7 @@ func (d *DefinedExpression) String() string       { return "defined?(" + d.Expre
 
 type ProcLiteral struct {
 	Token            lexer.Token
+	ExplicitParams   bool
 	Params           []*Identifier
 	ParamPatterns    []*ParameterPattern
 	ParamDefaults    []Expression

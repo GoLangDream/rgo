@@ -45,6 +45,7 @@ func installNetHTTP(objectClass *object.Class) {
 	if objectClass == nil {
 		return
 	}
+	installNetProtocol(objectClass)
 	if existing, ok := objectClass.Constants["Net"]; ok && existing != nil && existing.Type == object.ValueModule {
 		if existing.Data.(*object.Module).Constants["HTTP"] != nil {
 			return
@@ -82,7 +83,12 @@ func installNetHTTP(objectClass *object.Class) {
 	netModule.Constants["HTTPRequest"] = classEmeraldValue(requestClass)
 
 	httpClass := object.NewClass("Net::HTTP")
-	httpClass.SuperClass = objectClass
+	httpClass.SuperClass = R.Classes["Net::Protocol"]
+	if httpClass.SuperClass == nil {
+		httpClass.SuperClass = objectClass
+	}
+	httpClass.DefineConstant("VERSION", rubyString("0.9.1"))
+	httpClass.DefineConstant("HTTPVersion", rubyString("1.1"))
 	installHTTPClientMethods(httpClass)
 	R.Classes["Net::HTTP"] = httpClass
 	netModule.Constants["HTTP"] = classEmeraldValue(httpClass)
@@ -95,6 +101,52 @@ func installNetHTTP(objectClass *object.Class) {
 		objectClass.DefineConstant("Net", netValue)
 		AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "Net", netValue)
 	}
+}
+
+func installNetProtocol(objectClass *object.Class) {
+	if objectClass == nil {
+		return
+	}
+	netModule := object.NewModule("Net")
+	netValue := &object.EmeraldValue{Type: object.ValueModule, Data: netModule, Class: R.Classes["Module"]}
+	if existing := objectClass.Constants["Net"]; existing != nil && existing.Type == object.ValueModule {
+		netValue = existing
+		netModule, _ = existing.Data.(*object.Module)
+	} else {
+		objectClass.DefineConstant("Net", netValue)
+		AssignConstantName(classEmeraldValue(objectClass), "Net", netValue)
+	}
+	if netModule == nil {
+		return
+	}
+	defineClass := func(name string, superclass *object.Class) *object.Class {
+		fullName := "Net::" + name
+		if existing := R.Classes[fullName]; existing != nil {
+			return existing
+		}
+		class := object.NewClass(fullName)
+		class.SuperClass = superclass
+		value := classEmeraldValue(class)
+		R.Classes[fullName] = class
+		netModule.DefineConstant(name, value)
+		AssignConstantName(netValue, name, value)
+		return class
+	}
+	defineClass("Protocol", objectClass)
+	protocolError := defineClass("ProtocolError", R.Classes["StandardError"])
+	defineClass("ProtoServerError", protocolError)
+	defineClass("ProtoFatalError", protocolError)
+	defineClass("ProtoUnknownError", protocolError)
+	defineClass("ProtoSyntaxError", protocolError)
+	defineClass("ProtoCommandError", protocolError)
+	defineClass("ProtoAuthError", protocolError)
+	timeoutError := R.Classes["Timeout::Error"]
+	if timeoutError == nil {
+		timeoutError = R.Classes["RuntimeError"]
+	}
+	defineClass("OpenTimeout", timeoutError)
+	defineClass("ReadTimeout", timeoutError)
+	defineClass("WriteTimeout", timeoutError)
 }
 
 func installHTTPClientMethods(klass *object.Class) {
@@ -132,6 +184,33 @@ func installHTTPClientMethods(klass *object.Class) {
 		klass.DefineMethod(name, &object.Method{Name: name, Fn: definition.fn, Arity: definition.arity, Visibility: visibility})
 	}
 	klass.DefineMethod("use_ssl?", &object.Method{Name: "use_ssl?", Fn: httpClientUseSSL, Arity: 0})
+	klass.DefineMethod("do_start", &object.Method{Name: "do_start", Fn: httpClientDoStart, Arity: 0, Visibility: "private"})
+	klass.DefineMethod("do_finish", &object.Method{Name: "do_finish", Fn: httpClientDoFinish, Arity: 0, Visibility: "private"})
+	for _, name := range []string{
+		"use_ssl", "ssl_version", "ciphers", "verify_mode", "cert", "key",
+		"ca_file", "ca_path", "cert_store", "verify_callback",
+		"read_timeout", "open_timeout", "write_timeout", "keep_alive_timeout",
+	} {
+		optionName := name
+		klass.DefineMethod(optionName, &object.Method{
+			Name: optionName,
+			Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+				if value := dynamicInstanceVar(receiver, "@"+optionName); value != nil {
+					return value
+				}
+				return R.NilVal
+			},
+			Arity: 0,
+		})
+		klass.DefineMethod(optionName+"=", &object.Method{
+			Name: optionName + "=",
+			Fn: func(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+				receiverInstanceVarMap(receiver)["@"+optionName] = args[0]
+				return args[0]
+			},
+			Arity: 1,
+		})
+	}
 }
 
 func httpClientVersion11(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -153,7 +232,21 @@ func httpClientSetVersion12(receiver *object.EmeraldValue, args ...*object.Emera
 }
 
 func httpClientUseSSL(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if value := dynamicInstanceVar(receiver, "@use_ssl"); value != nil {
+		return boolValue(value.IsTruthy())
+	}
 	return R.FalseVal
+}
+
+func httpClientDoStart(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	httpClientDataOf(receiver).started = true
+	return receiver
+}
+
+func httpClientDoFinish(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	httpClientDataOf(receiver).started = false
+	receiverInstanceVarMap(receiver)["@socket"] = R.NilVal
+	return R.NilVal
 }
 
 func httpClientNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -426,10 +519,6 @@ func httpClientTrace(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.
 	return httpClientVerb(a, "TRACE", -1, false)
 }
 func httpClientClassGet(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
-	path := httpClientPath(a[0])
-	if len(a) > 1 {
-		path = httpClientPath(a[1])
-	}
 	if len(a) > 1 && valueStringForHTTP(a[0]) == "127.0.0.1" && InThreadBlock != nil && InThreadBlock() && SuspendCurrentThread != nil {
 		if data := threadValueData(currentThread); data != nil && data.block != nil {
 			data.stopped = true
@@ -442,14 +531,63 @@ func httpClientClassGet(r *object.EmeraldValue, a ...*object.EmeraldValue) *obje
 			}
 		}
 	}
-	return httpResponseBody(httpClientResponse("GET", path, "", nil))
+	response := httpClientClassGetResponse(r, a...)
+	if response != nil && response.Type == object.ValueException {
+		return response
+	}
+	if CallMethod != nil {
+		return CallMethod(response, "body")
+	}
+	return httpResponseBody(response)
 }
 func httpClientClassGetResponse(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
-	path := httpClientPath(a[0])
-	if len(a) > 1 {
-		path = httpClientPath(a[1])
+	if len(a) == 0 || len(a) > 3 {
+		return NewArgumentError("wrong number of arguments")
 	}
-	return httpClientResponse("GET", path, "", nil)
+	target := a[0]
+	var host *object.EmeraldValue
+	var port *object.EmeraldValue
+	var headers *object.EmeraldValue
+	if uri, ok := target.Data.(*uriData); ok {
+		host = uriPointerValue(uri.host)
+		port = uriPort(target)
+		if len(a) > 1 && a[1] != nil && a[1].Type != object.ValueNil {
+			headers = a[1]
+		}
+	} else {
+		host = target
+		if len(a) < 2 {
+			return NewArgumentError("wrong number of arguments")
+		}
+		target = a[1]
+		if len(a) > 2 && a[2] != nil && a[2].Type != object.ValueNil {
+			port = a[2]
+		} else {
+			port = newInt(80)
+		}
+	}
+	client := httpClientNew(r, host, port)
+	if client != nil && client.Type == object.ValueException {
+		return client
+	}
+	requestClass := classEmeraldValue(R.Classes["Net::HTTP::Get"])
+	if class, ok := r.Data.(*object.Class); ok {
+		if value, found := class.GetConstant("Get"); found {
+			requestClass = value
+		}
+	}
+	requestArgs := []*object.EmeraldValue{target}
+	if headers != nil {
+		requestArgs = append(requestArgs, headers)
+	}
+	if CallMethod == nil {
+		return httpClientResponse("GET", httpClientPath(target), "", headers)
+	}
+	request := CallMethod(requestClass, "new", requestArgs...)
+	if request != nil && request.Type == object.ValueException {
+		return request
+	}
+	return CallMethod(client, "request", request)
 }
 func httpClientClassPost(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	var headers *object.EmeraldValue
@@ -594,6 +732,7 @@ func installHTTPRequestTypes(httpClass, requestClass *object.Class) {
 func installHTTPGenericRequestMethods(klass *object.Class) {
 	klass.DefineMethod("method", &object.Method{Name: "method", Fn: httpRequestMethod, Arity: 0})
 	klass.DefineMethod("path", &object.Method{Name: "path", Fn: httpRequestPath, Arity: 0})
+	klass.DefineMethod("uri", &object.Method{Name: "uri", Fn: httpRequestURI, Arity: 0})
 	klass.DefineMethod("body", &object.Method{Name: "body", Fn: httpRequestBody, Arity: 0})
 	klass.DefineMethod("body=", &object.Method{Name: "body=", Fn: httpRequestSetBody, Arity: 1})
 	klass.DefineMethod("body_stream", &object.Method{Name: "body_stream", Fn: httpRequestBodyStream, Arity: 0})
@@ -627,6 +766,9 @@ func httpGenericRequestNew(receiver *object.EmeraldValue, args ...*object.Emeral
 		klass = R.Classes["Net::HTTPGenericRequest"]
 	}
 	value := &object.EmeraldValue{Type: object.ValueObject, Data: &httpRequestData{header: newHTTPHeaderData(), method: method, path: requestPath, requestBody: requestBody, responseBody: responseBody}, Class: klass}
+	if _, ok := args[3].Data.(*uriData); ok {
+		value.Data.(*httpRequestData).uri = args[3]
+	}
 	for _, headerArg := range args[4:] {
 		if headerArg == nil || headerArg.Type == object.ValueNil {
 			continue
@@ -676,6 +818,11 @@ func httpRequestInitialize(receiver *object.EmeraldValue, args ...*object.Emeral
 		return errVal
 	}
 	data.path = pathValue
+	if _, ok := args[0].Data.(*uriData); ok {
+		data.uri = args[0]
+	} else {
+		data.uri = nil
+	}
 	if receiver.Class != nil {
 		if value, ok := receiver.Class.GetConstant("METHOD"); ok && value.Type == object.ValueString {
 			data.method = stringRawValue(value)
@@ -715,10 +862,31 @@ func httpRequestDataOf(receiver *object.EmeraldValue) *httpRequestData {
 	return data
 }
 func httpRequestMethod(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
-	return rubyString(httpRequestDataOf(r).method)
+	if data := httpRequestDataOf(r); data != nil && data.method != "" {
+		return rubyString(data.method)
+	}
+	if value := dynamicInstanceVar(r, "@method"); value != nil {
+		return value
+	}
+	return R.NilVal
 }
 func httpRequestPath(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
-	return rubyString(httpRequestDataOf(r).path)
+	if data := httpRequestDataOf(r); data != nil && data.path != "" {
+		return rubyString(data.path)
+	}
+	if value := dynamicInstanceVar(r, "@path"); value != nil {
+		return value
+	}
+	return R.NilVal
+}
+func httpRequestURI(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := httpRequestDataOf(r); data != nil && data.uri != nil {
+		return data.uri
+	}
+	if value := dynamicInstanceVar(r, "@uri"); value != nil {
+		return value
+	}
+	return R.NilVal
 }
 func httpRequestBody(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	d := httpRequestDataOf(r)
@@ -874,14 +1042,14 @@ func httpHeaderSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		delete(data.fields, key)
 		return R.NilVal
 	}
-	_, raw, e := cgiStringArg(args[1])
+	values, e := httpHeaderFieldValues(args[1])
 	if e != nil {
 		return e
 	}
 	if _, ok := data.fields[key]; !ok {
 		data.order = append(data.order, key)
 	}
-	data.fields[key] = []string{raw}
+	data.fields[key] = values
 	return args[1]
 }
 func httpHeaderAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -889,7 +1057,7 @@ func httpHeaderAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if e != nil {
 		return e
 	}
-	_, raw, e := cgiStringArg(args[1])
+	values, e := httpHeaderFieldValues(args[1])
 	if e != nil {
 		return e
 	}
@@ -897,8 +1065,47 @@ func httpHeaderAdd(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if _, ok := data.fields[key]; !ok {
 		data.order = append(data.order, key)
 	}
-	data.fields[key] = append(data.fields[key], raw)
+	data.fields[key] = append(data.fields[key], values...)
 	return args[1]
+}
+
+func httpHeaderFieldValues(value *object.EmeraldValue) ([]string, *object.EmeraldValue) {
+	if value != nil && value.Type == object.ValueArray {
+		values := []string{}
+		for _, element := range value.Data.([]*object.EmeraldValue) {
+			parts, errVal := httpHeaderFieldValues(element)
+			if errVal != nil {
+				return nil, errVal
+			}
+			values = append(values, parts...)
+		}
+		return values, nil
+	}
+	if value != nil && value.Type != object.ValueString && CallMethod != nil && receiverHasCallableMethod(value, "to_a") {
+		array := CallMethod(value, "to_a")
+		if array != nil && array.Type == object.ValueException {
+			return nil, array
+		}
+		if array != nil && array.Type == object.ValueArray && array != value {
+			return httpHeaderFieldValues(array)
+		}
+	}
+	text := ""
+	if value != nil && CallMethod != nil {
+		converted := CallMethod(value, "to_s")
+		if converted != nil && converted.Type == object.ValueException {
+			return nil, converted
+		}
+		if converted != nil && converted.Type == object.ValueString {
+			text = stringRawValue(converted)
+		} else if converted != nil {
+			return nil, typeError("can't convert header field value to String")
+		}
+	}
+	if strings.ContainsAny(text, "\r\n") {
+		return nil, NewArgumentError("header field value cannot include CR/LF")
+	}
+	return []string{text}, nil
 }
 func httpHeaderGetFields(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	key, e := httpHeaderKeyName(args[0])
@@ -1376,14 +1583,16 @@ func installHTTPResponseClasses(netModule *object.Module, objectClass *object.Cl
 	base.Include(headerModule)
 	base.DefineClassMethod("new", &object.Method{Name: "new", Fn: httpResponseNew, Arity: 3})
 	base.DefineClassMethod("read_new", &object.Method{Name: "read_new", Fn: httpResponseReadNew, Arity: 1})
+	base.DefineClassMethod("response_class", &object.Method{Name: "response_class", Fn: httpResponseClassForCode, Arity: 1, Visibility: "private"})
 	for name, def := range map[string]struct {
 		fn    interface{}
 		arity int
-	}{"http_version": {httpResponseVersion, 0}, "code": {httpResponseCode, 0}, "message": {httpResponseMessage, 0}, "msg": {httpResponseMessage, 0}, "body": {httpResponseBody, 0}, "entity": {httpResponseBody, 0}, "response": {httpResponseSelf, 0}, "header": {httpResponseSelf, 0}, "inspect": {httpResponseInspect, 0}, "value": {httpResponseValue, 0}, "error!": {httpResponseErrorBang, 0}, "code_type": {httpResponseCodeType, 0}, "error_type": {httpResponseErrorType, 0}, "reading_body": {httpResponseReadingBody, 2}, "read_body": {httpResponseReadBody, -1}} {
+	}{"http_version": {httpResponseVersion, 0}, "code": {httpResponseCode, 0}, "message": {httpResponseMessage, 0}, "msg": {httpResponseMessage, 0}, "body": {httpResponseBody, 0}, "entity": {httpResponseBody, 0}, "uri": {httpResponseURI, 0}, "uri=": {httpResponseSetURI, 1}, "response": {httpResponseSelf, 0}, "header": {httpResponseSelf, 0}, "inspect": {httpResponseInspect, 0}, "value": {httpResponseValue, 0}, "error!": {httpResponseErrorBang, 0}, "code_type": {httpResponseCodeType, 0}, "error_type": {httpResponseErrorType, 0}, "reading_body": {httpResponseReadingBody, 2}, "read_body": {httpResponseReadBody, -1}} {
 		base.DefineMethod(name, &object.Method{Name: name, Fn: def.fn, Arity: def.arity})
 	}
 	R.Classes["Net::HTTPResponse"] = base
 	netModule.Constants["HTTPResponse"] = classEmeraldValue(base)
+	categoryClasses := make(map[string]*object.Class)
 	categories := []struct {
 		name  string
 		super *object.Class
@@ -1393,6 +1602,7 @@ func installHTTPResponseClasses(netModule *object.Module, objectClass *object.Cl
 		klass.SuperClass = entry.super
 		klass.DefineClassMethod("new", &object.Method{Name: "new", Fn: httpResponseNew, Arity: 3})
 		R.Classes[klass.Name] = klass
+		categoryClasses[entry.name] = klass
 		netModule.Constants[entry.name] = classEmeraldValue(klass)
 		exceptionClass := R.Classes["Net::HTTPError"]
 		switch entry.name {
@@ -1411,6 +1621,41 @@ func installHTTPResponseClasses(netModule *object.Module, objectClass *object.Cl
 	okClass.DefineClassMethod("new", &object.Method{Name: "new", Fn: httpResponseNew, Arity: 3})
 	R.Classes["Net::HTTPOK"] = okClass
 	netModule.Constants["HTTPOK"] = classEmeraldValue(okClass)
+	statusClasses := map[string]*object.Class{"200": okClass}
+	for _, status := range []struct {
+		code, name, category string
+	}{
+		{"300", "HTTPMultipleChoices", "HTTPRedirection"},
+		{"408", "HTTPRequestTimeout", "HTTPClientError"},
+		{"413", "HTTPPayloadTooLarge", "HTTPClientError"},
+		{"414", "HTTPURITooLong", "HTTPClientError"},
+		{"416", "HTTPRangeNotSatisfiable", "HTTPClientError"},
+		{"504", "HTTPGatewayTimeout", "HTTPServerError"},
+	} {
+		klass := object.NewClass("Net::" + status.name)
+		klass.SuperClass = categoryClasses[status.category]
+		klass.DefineClassMethod("new", &object.Method{Name: "new", Fn: httpResponseNew, Arity: 3})
+		R.Classes[klass.Name] = klass
+		netModule.Constants[status.name] = classEmeraldValue(klass)
+		statusClasses[status.code] = klass
+	}
+	codeClassToObject := emptyHashValue()
+	for code, name := range map[string]string{
+		"0": "HTTPUnknownResponse",
+		"1": "HTTPInformation",
+		"2": "HTTPSuccess",
+		"3": "HTTPRedirection",
+		"4": "HTTPClientError",
+		"5": "HTTPServerError",
+	} {
+		StoreHashValue(codeClassToObject, rubyString(code), classEmeraldValue(categoryClasses[name]))
+	}
+	codeToObject := emptyHashValue()
+	for code, klass := range statusClasses {
+		StoreHashValue(codeToObject, rubyString(code), classEmeraldValue(klass))
+	}
+	base.DefineConstant("CODE_CLASS_TO_OBJ", codeClassToObject)
+	base.DefineConstant("CODE_TO_OBJ", codeToObject)
 	adapter := object.NewClass("Net::ReadAdapter")
 	adapter.SuperClass = objectClass
 	R.Classes["Net::ReadAdapter"] = adapter
@@ -1432,6 +1677,38 @@ func httpResponseNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	klass, _ := receiver.Data.(*object.Class)
 	return &object.EmeraldValue{Type: object.ValueObject, Data: &httpResponseData{header: newHTTPHeaderData(), httpVersion: version, code: code, message: message}, Class: klass}
 }
+
+func httpResponseClassForCode(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	code, errVal := httpString(args[0])
+	if errVal != nil {
+		return errVal
+	}
+	base := R.Classes["Net::HTTPResponse"]
+	if base != nil {
+		for _, lookup := range []struct {
+			name string
+			key  string
+		}{
+			{"CODE_TO_OBJ", code},
+			{"CODE_CLASS_TO_OBJ", func() string {
+				if code == "" {
+					return ""
+				}
+				return code[:1]
+			}()},
+		} {
+			if table, ok := base.GetConstant(lookup.name); ok {
+				if value, found := hashLookup(valueToHashMap(table), rubyString(lookup.key)); found {
+					return value
+				}
+			}
+		}
+	}
+	return classEmeraldValue(R.Classes["Net::HTTPUnknownResponse"])
+}
 func httpResponseDataOf(r *object.EmeraldValue) *httpResponseData {
 	d, _ := r.Data.(*httpResponseData)
 	return d
@@ -1450,10 +1727,31 @@ func httpResponseBody(r *object.EmeraldValue, a ...*object.EmeraldValue) *object
 	if d.body != nil {
 		return d.body
 	}
+	if value := dynamicInstanceVar(r, "@body"); value != nil {
+		return value
+	}
 	if d.bodyContext && d.bodyAllowed && (d.bodySocket != nil || d.pendingBody != "") {
 		return httpResponseConsumeBody(r)
 	}
 	return R.NilVal
+}
+func httpResponseURI(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
+	if data := httpResponseDataOf(r); data != nil && data.uri != nil {
+		return data.uri
+	}
+	if value := dynamicInstanceVar(r, "@uri"); value != nil {
+		return value
+	}
+	return R.NilVal
+}
+func httpResponseSetURI(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(a) != 1 {
+		return NewArgumentError("wrong number of arguments")
+	}
+	if data := httpResponseDataOf(r); data != nil {
+		data.uri = a[0]
+	}
+	return a[0]
 }
 func httpResponseSelf(r *object.EmeraldValue, a ...*object.EmeraldValue) *object.EmeraldValue {
 	return r

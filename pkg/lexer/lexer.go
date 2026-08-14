@@ -113,6 +113,33 @@ func (l *Lexer) skipComment() {
 	}
 }
 
+func (l *Lexer) embeddedDocumentStart() bool {
+	if l.ch != '=' || l.column != 1 || !strings.HasPrefix(l.input[l.position:], "=begin") {
+		return false
+	}
+	end := l.position + len("=begin")
+	return end == len(l.input) || l.input[end] == '\n' || l.input[end] == '\r' || l.input[end] == ' ' || l.input[end] == '\t'
+}
+
+func (l *Lexer) skipEmbeddedDocument() bool {
+	for l.ch != 0 {
+		if l.column == 1 && strings.HasPrefix(l.input[l.position:], "=end") {
+			end := l.position + len("=end")
+			if end == len(l.input) || l.input[end] == '\n' || l.input[end] == '\r' || l.input[end] == ' ' || l.input[end] == '\t' {
+				for l.ch != '\n' && l.ch != 0 {
+					l.readChar()
+				}
+				if l.ch == '\n' {
+					l.readChar()
+				}
+				return true
+			}
+		}
+		l.readChar()
+	}
+	return false
+}
+
 func (l *Lexer) skipWhitespaceAndCommentLines() {
 	for {
 		l.skipWhitespace()
@@ -146,6 +173,14 @@ func (l *Lexer) NextToken() Token {
 	}
 
 	l.skipWhitespace()
+	if l.embeddedDocumentStart() {
+		line, column := l.line, l.column
+		if !l.skipEmbeddedDocument() {
+			return Token{Type: ILLEGAL, Literal: "embedded document meets end of file", Line: line, Column: column}
+		}
+		l.skipWhitespaceAndCommentLines()
+		return Token{Type: NEWLINE, Literal: "\n", Line: line, Column: column}
+	}
 
 	// Skip inline comments
 	if l.ch == '#' {
@@ -204,6 +239,14 @@ func (l *Lexer) NextToken() Token {
 	case ';':
 		tok = newToken(SEMICOLON, l.ch)
 	case ':':
+		if l.peekChar() == ':' {
+			tok = l.readSymbolOrColon()
+			return tok
+		}
+		if l.previousAdjacentCharCanEndExpression() {
+			tok = newToken(COLON, l.ch)
+			break
+		}
 		tok = l.readSymbolOrColon()
 		return tok // readSymbolOrColon already advanced past content
 	case '.':
@@ -254,10 +297,10 @@ func (l *Lexer) NextToken() Token {
 			tok = l.readPercentString()
 			return tok // readPercentString already advanced past content
 		} else if (l.peekChar() == '(' || l.peekChar() == '[' || l.peekChar() == '{' || l.peekChar() == '<') &&
-			!l.previousNonWhitespaceCharIsDot() {
+			!l.previousNonWhitespaceCharIsDot() && !l.percentFollowsDefKeyword() {
 			tok = l.readPercentString()
 			return tok
-		} else if isBarePercentDelimiter(l.peekChar()) && !l.previousNonWhitespaceCharIsDot() {
+		} else if isBarePercentDelimiter(l.peekChar()) && !l.previousNonWhitespaceCharIsDot() && !l.percentFollowsDefKeyword() {
 			tok = l.readPercentString()
 			return tok
 		} else {
@@ -349,7 +392,8 @@ func (l *Lexer) NextToken() Token {
 	case '~':
 		tok = newToken(BIT_NOT, l.ch)
 	case '?':
-		if l.peekChar() != 0 && l.peekChar() != ' ' && l.peekChar() != '\t' && l.peekChar() != '\r' && l.peekChar() != '\n' {
+		if l.peekChar() != 0 && l.peekChar() != ' ' && l.peekChar() != '\t' && l.peekChar() != '\r' && l.peekChar() != '\n' &&
+			!l.previousAdjacentCharCanEndExpression() {
 			tok = l.readCharacterLiteral()
 			return tok
 		}
@@ -379,7 +423,7 @@ func (l *Lexer) NextToken() Token {
 			return tok // readIdentifier already advanced past content
 		}
 	default:
-		if isLetter(l.ch) {
+		if isIdentifierStart(l.ch) {
 			tok = l.readIdentifier()
 			return tok
 		} else if isDigit(l.ch) {
@@ -453,7 +497,7 @@ func (l *Lexer) readIdentifier() Token {
 	position := l.position
 	line := l.line
 	column := l.column
-	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+	for isVariableNameChar(l.ch) {
 		l.readChar()
 	}
 
@@ -605,6 +649,9 @@ func (l *Lexer) readNumber() Token {
 		}
 		if isDigit(l.ch) {
 			return l.readDecimalNumber(position)
+		}
+		if token, ok := l.readNumericSuffix(position); ok {
+			return token
 		}
 
 		tok.Literal = "0"
@@ -1183,6 +1230,10 @@ func (l *Lexer) readPercentString() Token {
 		kind = 'r'
 		delimiter = l.peekChar()
 		l.readChar()
+	case 'x':
+		kind = 'x'
+		delimiter = l.peekChar()
+		l.readChar()
 	case 's':
 		kind = 's'
 		delimiter = l.peekChar()
@@ -1190,7 +1241,7 @@ func (l *Lexer) readPercentString() Token {
 	}
 
 	openDelimiter := delimiter
-	interpolates := kind == 0 || kind == 'Q' || kind == 'W' || kind == 'I' || kind == 'r'
+	interpolates := kind == 0 || kind == 'Q' || kind == 'W' || kind == 'I' || kind == 'r' || kind == 'x'
 	pairedDelimiter := true
 	if delimiter == '(' {
 		delimiter = ')'
@@ -1295,6 +1346,7 @@ func (l *Lexer) readPercentString() Token {
 	}
 	if kind == 'r' {
 		tokenType = REGEXP
+		lit = removeRegexpLineContinuations(lit)
 		lit = "%r" + string(openDelimiter) + lit + string(closeDelimiter) + options
 	}
 	if kind == 's' {
@@ -1305,6 +1357,7 @@ func (l *Lexer) readPercentString() Token {
 		Type:                tokenType,
 		Literal:             lit,
 		AllowsInterpolation: interpolates,
+		CommandLiteral:      kind == 'x',
 		Line:                l.line,
 		Column:              l.column,
 	}
@@ -1322,10 +1375,10 @@ func isBarePercentDelimiter(ch rune) bool {
 func (l *Lexer) readSlashOrRegexp() Token {
 	startLine := l.line
 	startColumn := l.column
-	canStartRegexp := l.slashCanStartRegexp()
+	canStartRegexp := !l.previousNonWhitespaceCharIsDot() && (l.slashCanStartRegexp() || l.slashFollowsDefParameters())
 	l.readChar()
 
-	if l.ch == '=' {
+	if l.ch == '=' && (!canStartRegexp || !l.hasClosingRegexpSlash()) {
 		l.readChar()
 		return Token{
 			Type:    DIVIDE_ASSIGN,
@@ -1372,6 +1425,7 @@ func (l *Lexer) readSlashOrRegexp() Token {
 	}
 
 	lit := l.input[position : l.position+1]
+	lit = removeRegexpLineContinuations(lit)
 	lit = strings.ReplaceAll(lit, `\c#{`, `\c`+EscapedHashInterpolation+"{")
 	l.readChar()
 
@@ -1388,6 +1442,43 @@ func (l *Lexer) readSlashOrRegexp() Token {
 		Line:                startLine,
 		Column:              startColumn,
 	}
+}
+
+func (l *Lexer) slashFollowsDefParameters() bool {
+	lineStart := strings.LastIndexByte(l.input[:l.position], '\n') + 1
+	prefix := strings.TrimSpace(l.input[lineStart:l.position])
+	if strings.Contains(prefix, ";") ||
+		(!strings.HasPrefix(prefix, "def ") && !strings.HasPrefix(prefix, "def\t")) {
+		return false
+	}
+	return strings.HasSuffix(prefix, ")")
+}
+
+func removeRegexpLineContinuations(literal string) string {
+	literal = strings.ReplaceAll(literal, "\\\r\n", "")
+	return strings.ReplaceAll(literal, "\\\n", "")
+}
+
+func (l *Lexer) hasClosingRegexpSlash() bool {
+	escaped := false
+	for pos := l.position + 1; pos < len(l.input); pos++ {
+		ch := l.input[pos]
+		if ch == '\n' || ch == '\r' {
+			return false
+		}
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '/' {
+			return true
+		}
+	}
+	return false
 }
 
 func containsUnescapedInterpolation(lit string) bool {
@@ -1424,7 +1515,7 @@ func (l *Lexer) slashCanStartRegexp() bool {
 				start -= prevSize
 			}
 			switch l.input[start:end] {
-			case "when", "case", "if", "unless", "elsif", "return", "raise", "rescue", "in", "do", "then":
+			case "when", "case", "if", "unless", "elsif", "else", "return", "raise", "rescue", "in", "do", "then", "and", "or", "not":
 				return true
 			default:
 				return false
@@ -1449,6 +1540,26 @@ func (l *Lexer) percentCanStartString() bool {
 		return !(isLetter(r) || isDigit(r) || r == '_' || r == ')' || r == ']' || r == '}')
 	}
 	return true
+}
+
+func (l *Lexer) percentFollowsDefKeyword() bool {
+	pos := l.position
+	for pos > 0 {
+		r, size := utf8.DecodeLastRuneInString(l.input[:pos])
+		if r != ' ' && r != '\t' && r != '\r' && r != '\n' {
+			break
+		}
+		pos -= size
+	}
+	end := pos
+	for pos > 0 {
+		r, size := utf8.DecodeLastRuneInString(l.input[:pos])
+		if !isLetter(r) && !isDigit(r) && r != '_' {
+			break
+		}
+		pos -= size
+	}
+	return l.input[pos:end] == "def"
 }
 
 func (l *Lexer) backtickCanStartMethodName() bool {
@@ -1525,14 +1636,25 @@ func (l *Lexer) previousCharCanEndExpression() bool {
 		case ' ', '\t', '\r', '\n':
 			continue
 		}
-		return isLetter(ch) || isDigit(ch) || ch == '_' || ch == ')' || ch == ']' || ch == '}'
+		return isLetter(ch) || isDigit(ch) || ch == '_' || ch == ')' || ch == ']' || ch == '}' || ch == '\'' || ch == '"'
 	}
 	return false
 }
 
+func (l *Lexer) previousAdjacentCharCanEndExpression() bool {
+	if l.position <= 0 {
+		return false
+	}
+	ch, _ := utf8.DecodeLastRuneInString(l.input[:l.position])
+	return isLetter(ch) || isDigit(ch) || ch == '_' || ch == ')' || ch == ']' || ch == '}' || ch == '\'' || ch == '"'
+}
+
 func (l *Lexer) previousNonWhitespaceCharIsDot() bool {
 	for pos := l.position - 1; pos >= 0; {
-		if l.input[pos] == ' ' || l.input[pos] == '\t' || l.input[pos] == '\r' || l.input[pos] == '\n' {
+		if l.input[pos] == '\n' {
+			return false
+		}
+		if l.input[pos] == ' ' || l.input[pos] == '\t' || l.input[pos] == '\r' {
 			if pos == 0 {
 				return false
 			}
@@ -1559,24 +1681,33 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 		l.readChar()
 	}
 
+	if quote != 0 {
+		start := l.position
+		for l.ch != quote && l.ch != '\n' && l.ch != 0 {
+			l.readChar()
+		}
+		delimiter := l.input[start:l.position]
+		if l.ch != quote {
+			return Token{Type: ILLEGAL, Literal: "unterminated quoted heredoc identifier", Line: line, Column: column}
+		}
+		l.readChar()
+		return l.readHeredocBody(line, column, delimiter, quote, allowIndentedTerminator, squiggly)
+	}
+
 	start := l.position
 	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
 		l.readChar()
 	}
 	delimiter := l.input[start:l.position]
-	if quote != 0 {
-		if l.ch != quote {
-			return Token{Type: ILLEGAL, Literal: "unterminated quoted heredoc identifier", Line: line, Column: column}
-		}
-		l.readChar()
-	}
+	return l.readHeredocBody(line, column, delimiter, quote, allowIndentedTerminator, squiggly)
+}
 
+func (l *Lexer) readHeredocBody(line, column int, delimiter string, quote rune, allowIndentedTerminator, squiggly bool) Token {
 	suffixStart := l.position
 	for l.ch != '\n' && l.ch != 0 {
 		l.readChar()
 	}
 	markerSuffix := l.input[suffixStart:l.position]
-	hasMarkerSuffix := strings.TrimSpace(markerSuffix) != ""
 	l.queueHeredocMarkerSuffix(markerSuffix, line)
 	if l.ch == '\n' {
 		l.readChar()
@@ -1606,11 +1737,15 @@ func (l *Lexer) readHeredoc(line, column int) Token {
 	}
 	if quote != '\'' {
 		lit = decodeHeredocEscapes(lit)
+		lit = strings.ReplaceAll(lit, `\#{`, EscapedHashInterpolation+"{")
+		lit = strings.ReplaceAll(lit, `\#$`, EscapedHashInterpolation+"$")
+		lit = strings.ReplaceAll(lit, `\#@`, EscapedHashInterpolation+"@")
 	}
 	if l.ch == '\n' {
 		l.readChar()
 	}
-	if hasMarkerSuffix {
+	continuesOnNextLine := l.ch == '.' || (l.ch == '&' && l.peekChar() == '.')
+	if !continuesOnNextLine {
 		l.pendingTokens = append(l.pendingTokens, Token{
 			Type:    NEWLINE,
 			Literal: "\n",
@@ -1735,6 +1870,10 @@ func (l *Lexer) readSymbolOrColon() Token {
 		}
 	}
 
+	if l.colonFollowsIdentifier() {
+		return newToken(COLON, ':')
+	}
+
 	if isLetter(l.ch) || l.ch == '_' {
 		position := l.position
 		for isVariableNameChar(l.ch) {
@@ -1816,10 +1955,6 @@ func (l *Lexer) readSymbolOrColon() Token {
 		}
 	}
 
-	if l.colonFollowsIdentifier() && (l.ch == '|' || l.ch == ',' || l.ch == ')' || l.ch == '}' || l.ch == '\n' || l.ch == 0) {
-		return newToken(COLON, ':')
-	}
-
 	if l.ch == '[' && l.peekChar() == ']' {
 		position := l.position
 		l.readChar()
@@ -1883,6 +2018,10 @@ func endsWith(s, suffix string) bool {
 
 func isLetter(ch rune) bool {
 	return unicode.IsLetter(ch) || ch == '_'
+}
+
+func isIdentifierStart(ch rune) bool {
+	return isLetter(ch) || ch >= 128
 }
 
 func isVariableNameChar(ch rune) bool {

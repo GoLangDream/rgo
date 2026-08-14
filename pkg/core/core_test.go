@@ -2,6 +2,9 @@ package core
 
 import (
 	"math"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,8 +40,200 @@ func TestSmallIntegerValuesAreCanonicalWithinRuntime(t *testing.T) {
 	if NewIntegerValue(4097) != NewIntegerValue(4097) {
 		t.Fatal("expected lazily paged Integer values to be canonical")
 	}
+	if NewIntegerValue(-4096) != NewIntegerValue(-4096) {
+		t.Fatal("expected common negative Integer values to be canonical")
+	}
+	if NewIntegerValue(-4097) == NewIntegerValue(-4097) {
+		t.Fatal("expected values below the immediate cache to remain independently allocated")
+	}
 	if NewIntegerValue(65536) == NewIntegerValue(65536) {
 		t.Fatal("expected values outside the immediate cache to remain independently allocated")
+	}
+}
+
+func TestIntegerToSReusesOnlyImmutablePayload(t *testing.T) {
+	Init()
+	first := intToS(NewIntegerValue(7))
+	second := intToS(NewIntegerValue(7))
+	if first == nil || second == nil || first == second || first.Data != "7" || second.Data != "7" {
+		t.Fatalf("unexpected Integer#to_s values: first=%#v second=%#v", first, second)
+	}
+	if got := stringConcatOne(first, NewStringValue("x")); got != first || first.Data != "7x" || second.Data != "7" {
+		t.Fatalf("Integer#to_s payload sharing leaked through String mutation: first=%s second=%s", first.Inspect(), second.Inspect())
+	}
+	if got := IntegerToSRawBuiltin(70000); got != "70000" {
+		t.Fatalf("uncached Integer#to_s payload = %q", got)
+	}
+}
+
+func TestIntegerToSLengthRawBuiltinMatchesDecimalFormatting(t *testing.T) {
+	for _, value := range []int64{
+		math.MinInt64, -1_000_000_000_000_000_000, -100, -10, -1, 0, 1, 9, 10, 99,
+		100, 999, 1_000, 1_000_000_000_000_000_000, math.MaxInt64,
+	} {
+		want := len(strconv.FormatInt(value, 10))
+		if got := IntegerToSLengthRawBuiltin(value); got != want {
+			t.Fatalf("Integer#to_s length for %d = %d, want %d", value, got, want)
+		}
+	}
+}
+
+func TestAppendASCIIBytePatternWritesAndDeclinesOverflow(t *testing.T) {
+	Init()
+	value := &object.EmeraldValue{Type: object.ValueString, Data: "", Class: R.Classes["String"]}
+	result, handled := AppendASCIIBytePattern(value, 97, 26, 0, 1, 52)
+	if !handled || result != value {
+		t.Fatalf("ASCII byte pattern was not handled: handled=%v result=%p want=%p", handled, result, value)
+	}
+	if got := value.Data.(string); got != "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" {
+		t.Fatalf("unexpected ASCII byte pattern result: %q", got)
+	}
+	long := &object.EmeraldValue{Type: object.ValueString, Data: "", Class: R.Classes["String"]}
+	if _, handled = AppendASCIIBytePattern(long, 97, 26, 0, 1, 12000); !handled {
+		t.Fatal("long ASCII byte pattern was not handled")
+	}
+	wantLong := strings.Repeat("abcdefghijklmnopqrstuvwxyz", 461) + "abcdefghijklmn"
+	if got := long.Data.(string); got != wantLong {
+		t.Fatalf("long ASCII byte pattern crossed chunk boundary incorrectly: got tail %q want tail %q", got[len(got)-16:], wantLong[len(wantLong)-16:])
+	}
+	stepped := &object.EmeraldValue{Type: object.ValueString, Data: "seed", Class: R.Classes["String"]}
+	if _, handled = AppendASCIIBytePattern(stepped, 65, 5, -1, 2, 7); !handled {
+		t.Fatal("stepped ASCII byte pattern was not handled")
+	}
+	if got := stepped.Data.(string); got != "seedEBDACEB" {
+		t.Fatalf("unexpected stepped ASCII byte pattern result: %q", got)
+	}
+	overflow := &object.EmeraldValue{Type: object.ValueString, Data: "seed", Class: R.Classes["String"]}
+	if _, handled = AppendASCIIBytePattern(overflow, 97, 26, math.MaxInt64, 1, 1); handled {
+		t.Fatal("overflowing ASCII byte pattern must decline")
+	}
+	if overflow.Data.(string) != "seed" {
+		t.Fatalf("overflow decline mutated String: %q", overflow.Data.(string))
+	}
+}
+
+func TestDuplicateStringDoesNotShareColdSidecar(t *testing.T) {
+	Init()
+	receiver := NewStringValue("abc")
+	builder := &strings.Builder{}
+	builder.WriteString("abc")
+	receiver.SetStringBuilder(builder)
+
+	duplicate := duplicateStringValue(receiver, false, false)
+	if receiver.StringBuilderValue() != builder {
+		t.Fatal("source StringBuilder changed while duplicating String")
+	}
+	if duplicate.StringBuilderValue() != nil {
+		t.Fatal("String#dup retained the source StringBuilder")
+	}
+	duplicate.SetStringBuilder(&strings.Builder{})
+	if receiver.StringBuilderValue() != builder {
+		t.Fatal("mutating duplicate StringBuilder changed source sidecar")
+	}
+}
+
+func TestIntegerArithmeticUsesCheckedInt64FastPath(t *testing.T) {
+	Init()
+	left := NewIntegerValue(120)
+	right := NewIntegerValue(7)
+	if got := intAdd(left, right); got != NewIntegerValue(127) || got.BigIntValue() != nil {
+		t.Fatalf("integer addition did not use canonical int64 result: %s", got.Inspect())
+	}
+	if got := intSub(left, right); got != NewIntegerValue(113) || got.BigIntValue() != nil {
+		t.Fatalf("integer subtraction did not use canonical int64 result: %s", got.Inspect())
+	}
+	if got := intMul(left, right); got != NewIntegerValue(840) || got.BigIntValue() != nil {
+		t.Fatalf("integer multiplication did not use canonical int64 result: %s", got.Inspect())
+	}
+	if got := intMod(NewIntegerValue(-5), NewIntegerValue(3)); got != NewIntegerValue(1) {
+		t.Fatalf("floor modulo = %s, want 1", got.Inspect())
+	}
+	if got := intMod(NewIntegerValue(5), NewIntegerValue(-3)); got != NewIntegerValue(-1) {
+		t.Fatalf("negative-divisor modulo = %s, want -1", got.Inspect())
+	}
+
+	overflow := intAdd(NewIntegerValue(math.MaxInt64), NewIntegerValue(1))
+	if overflow.BigIntValue() == nil || overflow.Inspect() != "9223372036854775808" {
+		t.Fatalf("addition overflow lost arbitrary precision: %s", overflow.Inspect())
+	}
+	underflow := intSub(NewIntegerValue(math.MinInt64), NewIntegerValue(1))
+	if underflow.BigIntValue() == nil || underflow.Inspect() != "-9223372036854775809" {
+		t.Fatalf("subtraction underflow lost arbitrary precision: %s", underflow.Inspect())
+	}
+	productOverflow := intMul(NewIntegerValue(math.MinInt64), NewIntegerValue(-1))
+	if productOverflow.BigIntValue() == nil || productOverflow.Inspect() != "9223372036854775808" {
+		t.Fatalf("multiplication overflow lost arbitrary precision: %s", productOverflow.Inspect())
+	}
+}
+
+func TestJSONQuotedStringFastPathKeepsEscapingSlowPath(t *testing.T) {
+	for _, value := range []string{"ruby", "<ruby>", "你好"} {
+		if !jsonStringNeedsNoEscape(value) {
+			t.Fatalf("ordinary UTF-8 JSON string %q should use the no-escape path", value)
+		}
+	}
+	for _, value := range []string{"line\nfeed", `quote"`, `slash\\`, "\u2028", string([]byte{0xff})} {
+		if jsonStringNeedsNoEscape(value) {
+			t.Fatalf("JSON string %q must use the escaping slow path", value)
+		}
+	}
+	if got := jsonQuotedString("ruby"); got != `"ruby"` {
+		t.Fatalf("ordinary JSON quoting = %q, want %q", got, `"ruby"`)
+	}
+}
+
+func TestNormalizeEncodingNameForIOAvoidsCopyForCanonicalName(t *testing.T) {
+	if got := normalizeEncodingNameForIO("UTF-8"); got != "UTF-8" {
+		t.Fatalf("unexpected canonical encoding: %q", got)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = normalizeEncodingNameForIO("UTF-8")
+	}); allocations != 0 {
+		t.Fatalf("canonical encoding normalization allocated %v times", allocations)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = normalizeEncodingNameForIO("windows-1252")
+		_ = normalizeEncodingNameForIO("utf-8")
+	}); allocations != 0 {
+		t.Fatalf("common encoding alias normalization allocated %v times", allocations)
+	}
+	for input, expected := range map[string]string{
+		"ascii_8bit":   "ASCII-8BIT",
+		"bom|utf-8":    "UTF-8",
+		"Shift_JIS":    "SHIFT-JIS",
+		"Windows-1252": "WINDOWS-1252",
+	} {
+		if got := normalizeEncodingNameForIO(input); got != expected {
+			t.Fatalf("normalizeEncodingNameForIO(%q) = %q, want %q", input, got, expected)
+		}
+	}
+}
+
+func TestBCryptHashWithSettingMatchesReferenceVector(t *testing.T) {
+	const setting = "$2a$10$XajjQvNhvvRt5GSeFk1xFe"
+	const expected = "$2a$10$XajjQvNhvvRt5GSeFk1xFeyqRrsxkhBkUiQeg0dt.wU1qD4aFDcga"
+
+	actual, err := bcryptHashWithSetting([]byte("allmine"), setting)
+	if err != nil {
+		t.Fatalf("bcrypt hash failed: %v", err)
+	}
+	if actual != expected {
+		t.Fatalf("bcrypt hash mismatch:\nactual:   %s\nexpected: %s", actual, expected)
+	}
+}
+
+func TestBCryptHashWithSettingChangesForWrongPassword(t *testing.T) {
+	const setting = "$2a$04$XajjQvNhvvRt5GSeFk1xFe"
+	correct, err := bcryptHashWithSetting([]byte("allmine"), setting)
+	if err != nil {
+		t.Fatalf("bcrypt correct-password hash failed: %v", err)
+	}
+	wrong, err := bcryptHashWithSetting([]byte("notmine"), setting)
+	if err != nil {
+		t.Fatalf("bcrypt wrong-password hash failed: %v", err)
+	}
+	if correct == wrong {
+		t.Fatal("bcrypt produced the same hash for different passwords")
 	}
 }
 
@@ -93,6 +288,179 @@ func TestHashBucketsTrackInsertLookupAndDelete(t *testing.T) {
 	}
 	if data.BucketSize != 500 {
 		t.Fatalf("expected rebuilt bucket size 500, got %d", data.BucketSize)
+	}
+}
+
+func TestIntegerHashBatchPreservesOrderAndDuplicateAssignments(t *testing.T) {
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	hashIndexSet(hash, mkInt(0), mkInt(99))
+	keys := []*object.EmeraldValue{mkInt(0), mkInt(1), mkInt(0)}
+	values := []*object.EmeraldValue{mkInt(7), mkInt(11), mkInt(13)}
+	if !IntegerHashBatchAvailable(hash) {
+		t.Fatal("expected plain integer-key Hash to admit batch storage")
+	}
+	if !StoreIntegerHashBatch(hash, keys, values) {
+		t.Fatal("integer hash batch storage failed")
+	}
+	data := hashData(hash)
+	if len(data.Pairs) != 2 || len(data.Keys) != 2 {
+		t.Fatalf("expected two keys after duplicate assignment, pairs=%d keys=%d", len(data.Pairs), len(data.Keys))
+	}
+	assertInt(t, hashIndex(hash, mkInt(0)), 13)
+	assertInt(t, hashIndex(hash, mkInt(1)), 11)
+	if data.Keys[0].Data.(int64) != 0 || data.Keys[1].Data.(int64) != 1 {
+		t.Fatalf("batch changed insertion order: %#v", data.Keys)
+	}
+
+	nonInteger := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	hashIndexSet(nonInteger, mkStr("key"), mkInt(1))
+	if IntegerHashBatchAvailable(nonInteger) {
+		t.Fatal("non-integer-key Hash must remain on the generic path")
+	}
+}
+
+func TestIntegerHashBatchCanonicalKeysUpdatesInPlace(t *testing.T) {
+	Init()
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	keys := []*object.EmeraldValue{NewIntegerValue(0), NewIntegerValue(1), NewIntegerValue(0)}
+	values := []*object.EmeraldValue{NewIntegerValue(7), NewIntegerValue(11), NewIntegerValue(13)}
+	if !StoreIntegerHashBatch(hash, keys, values) {
+		t.Fatal("canonical integer hash batch storage failed")
+	}
+	data := hashData(hash)
+	if len(data.Pairs) != 2 || len(data.Keys) != 2 || data.Keys[0] != keys[0] || data.Keys[1] != keys[1] {
+		t.Fatalf("canonical batch changed order or key identity: pairs=%d keys=%#v", len(data.Pairs), data.Keys)
+	}
+	assertInt(t, hashIndex(hash, NewIntegerValue(0)), 13)
+	assertInt(t, hashIndex(hash, NewIntegerValue(1)), 11)
+}
+
+func TestIntegerHashBatchGroupedPreservesExistingOrderAndDuplicates(t *testing.T) {
+	Init()
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	seed := NewIntegerValue(0)
+	hashIndexSet(hash, seed, NewIntegerValue(99))
+	keys := make([]*object.EmeraldValue, 4097)
+	values := make([]*object.EmeraldValue, 4097)
+	for index := range keys[:4096] {
+		integer := int64(index % 997)
+		keys[index] = NewIntegerValue(integer)
+		values[index] = NewIntegerValue(int64(index))
+	}
+	keys[4096] = NewIntegerValue(0)
+	values[4096] = NewIntegerValue(777)
+	if !StoreIntegerHashBatch(hash, keys, values) {
+		t.Fatal("grouped canonical integer hash batch storage failed")
+	}
+	data := hashData(hash)
+	if len(data.Pairs) != 997 || len(data.Keys) != 997 || data.Keys[0] != seed {
+		t.Fatalf("grouped batch changed key order or count: pairs=%d keys=%d first=%p want=%p", len(data.Pairs), len(data.Keys), data.Keys[0], seed)
+	}
+	assertInt(t, hashIndex(hash, NewIntegerValue(0)), 777)
+	assertInt(t, hashIndex(hash, NewIntegerValue(1)), 3989)
+}
+
+func TestIntegerHashRawBatchPreservesExistingOrderAndDuplicates(t *testing.T) {
+	Init()
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	seed := NewIntegerValue(0)
+	hashIndexSet(hash, seed, NewIntegerValue(99))
+	keys := make([]int64, 4097)
+	values := make([]*object.EmeraldValue, 4097)
+	for index := range keys[:4096] {
+		keys[index] = int64(index % 997)
+		values[index] = NewIntegerValue(int64(index))
+	}
+	keys[4096] = 0
+	values[4096] = NewIntegerValue(777)
+	if !StoreIntegerHashRawBatchTrustedCanonical(hash, keys, values) {
+		t.Fatal("raw grouped canonical integer hash batch storage failed")
+	}
+	data := hashData(hash)
+	if len(data.Pairs) != 997 || len(data.Keys) != 997 || data.Keys[0] != seed {
+		t.Fatalf("raw grouped batch changed key order or count: pairs=%d keys=%d first=%p want=%p", len(data.Pairs), len(data.Keys), data.Keys[0], seed)
+	}
+	assertInt(t, hashIndex(hash, NewIntegerValue(0)), 777)
+	assertInt(t, hashIndex(hash, NewIntegerValue(1)), 3989)
+}
+
+func TestIntegerHashLinearBatchPreservesOrderAndOverflowFallback(t *testing.T) {
+	Init()
+	hash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	next, ok := StoreIntegerHashLinearBatch(hash, 2, 2, 3, 4)
+	if !ok || next != 10 {
+		t.Fatalf("linear batch failed: ok=%v next=%d", ok, next)
+	}
+	region, ok := DirectHashLinearRegion(hash)
+	if !ok || region.Start != 2 || region.Step != 2 || region.ValueOffset != 3 || region.Count != 4 {
+		t.Fatalf("linear region metadata missing or incorrect: ok=%v region=%#v", ok, region)
+	}
+	if raw, ok := hash.Data.(*object.RHash); !ok || raw.Pairs != nil {
+		t.Fatalf("linear batch should defer pointer-map materialization: %#v", hash.Data)
+	}
+	if value, ok := DirectHashLinearValue(region, NewIntegerValue(2)); !ok || value != 5 {
+		t.Fatalf("linear direct value mismatch: ok=%v value=%d", ok, value)
+	}
+	if _, ok := DirectHashLinearValue(region, NewIntegerValue(math.MaxInt64)); ok {
+		t.Fatal("linear direct value must reject checked-add overflow")
+	}
+	if key, value, ok := DirectHashLinearPairAt(region, 2); !ok || key != 6 || value != 9 {
+		t.Fatalf("linear direct pair mismatch: ok=%v key=%d value=%d", ok, key, value)
+	}
+	if _, _, ok := DirectHashLinearPairAt(region, region.Count); ok {
+		t.Fatal("linear direct pair must reject an out-of-range index")
+	}
+	data := hashData(hash)
+	if len(data.Keys) != 4 || data.Keys[0].Data.(int64) != 2 || data.Keys[3].Data.(int64) != 8 {
+		t.Fatalf("linear batch changed insertion order: %#v", data.Keys)
+	}
+	assertInt(t, hashIndex(hash, NewIntegerValue(2)), 5)
+	assertInt(t, hashIndex(hash, NewIntegerValue(8)), 11)
+	if _, ok := DirectHashLinearRegion(hash); ok {
+		t.Fatal("general Hash lookup must consume lazy linear region")
+	}
+	mutated := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	if _, ok := StoreIntegerHashLinearBatch(mutated, 0, 1, 1, 4); !ok {
+		t.Fatal("linear mutation fixture failed")
+	}
+	if !StoreHashValue(mutated, NewIntegerValue(1), NewIntegerValue(99)) {
+		t.Fatal("Hash mutation fixture failed")
+	}
+	if _, ok := DirectHashLinearRegion(mutated); ok {
+		t.Fatal("general Hash mutation must consume lazy linear region")
+	}
+	assertInt(t, hashIndex(mutated, NewIntegerValue(1)), 99)
+	overflow := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	if _, ok := StoreIntegerHashLinearBatch(overflow, math.MaxInt64, 1, 0, 2); ok {
+		t.Fatal("overflowing linear batch must decline before mutating Hash")
+	}
+	if data := hashData(overflow); len(data.Keys) != 0 || len(data.Pairs) != 0 {
+		t.Fatalf("overflow fallback mutated Hash: %#v", data)
+	}
+
+	prefixHash := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	seed := NewIntegerValue(0)
+	hashIndexSet(prefixHash, seed, NewIntegerValue(99))
+	next, ok = StoreIntegerHashLinearBatch(prefixHash, 1, 1, 10, 3)
+	if !ok || next != 4 {
+		t.Fatalf("linear batch with prefix failed: ok=%v next=%d", ok, next)
+	}
+	prefixData := hashData(prefixHash)
+	if len(prefixData.Keys) != 4 || prefixData.Keys[0] != seed {
+		t.Fatalf("linear batch with prefix changed insertion order: %#v", prefixData.Keys)
+	}
+	assertInt(t, hashIndex(prefixHash, NewIntegerValue(0)), 99)
+	assertInt(t, hashIndex(prefixHash, NewIntegerValue(1)), 11)
+	affinePrefix := mkRHash(make(map[*object.EmeraldValue]*object.EmeraldValue))
+	hashIndexSet(affinePrefix, NewIntegerValue(0), NewIntegerValue(1))
+	if _, ok := StoreIntegerHashLinearBatch(affinePrefix, 1, 1, 1, 3); !ok {
+		t.Fatal("affine prefix linear batch failed")
+	}
+	if region, ok := DirectHashLinearRegion(affinePrefix); !ok || region.Count != 4 {
+		t.Fatalf("affine prefix should remain lazy: ok=%v region=%#v", ok, region)
+	}
+	if raw, ok := affinePrefix.Data.(*object.RHash); !ok || raw.Pairs != nil {
+		t.Fatal("affine prefix should defer pointer-map materialization")
 	}
 }
 
@@ -356,6 +724,46 @@ func TestStringAdd(t *testing.T) {
 	assertStr(t, callMethod(t, mkStr("hello"), "+", mkStr(" world")), "hello world")
 }
 
+func TestStringValueBatchKeepsStringInterfaceAlive(t *testing.T) {
+	batch := NewStringValueBatchWithByteCapacity(2, 16)
+	first := batch.New("first")
+	second := batch.NewInteger(42)
+	runtime.GC()
+
+	if first == nil || second == nil || first == second {
+		t.Fatal("StringValueBatch did not return distinct values")
+	}
+	if got, ok := first.Data.(string); !ok || got != "first" {
+		t.Fatalf("first batch value = %#v, want string %q", first.Data, "first")
+	}
+	if got, ok := second.Data.(string); !ok || got != "42" {
+		t.Fatalf("second batch value = %#v, want string %q", second.Data, "42")
+	}
+	smallIntegerBatch := NewStringValueBatchWithByteCapacity(1, 8)
+	smallInteger := smallIntegerBatch.NewInteger(7)
+	if got, ok := smallInteger.Data.(string); !ok || got != "7" {
+		t.Fatalf("single-digit NewInteger = %#v, want string %q", smallInteger.Data, "7")
+	}
+
+	formatBatch := NewStringValueBatchWithByteCapacity(5, 64)
+	for _, tc := range []struct {
+		value  int64
+		suffix string
+		want   string
+	}{
+		{value: -9, suffix: "!", want: "-9!"},
+		{value: -1, suffix: "", want: "-1"},
+		{value: 0, suffix: "!", want: "0!"},
+		{value: 9, suffix: "!", want: "9!"},
+		{value: 10, suffix: "!", want: "10!"},
+	} {
+		got := formatBatch.NewIntegerSuffix(tc.value, tc.suffix)
+		if actual, ok := got.Data.(string); !ok || actual != tc.want {
+			t.Fatalf("NewIntegerSuffix(%d, %q) = %#v, want %q", tc.value, tc.suffix, got.Data, tc.want)
+		}
+	}
+}
+
 func TestStringConcatWithNonStringRaisesTypeErrorWithoutPanicking(t *testing.T) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -448,6 +856,18 @@ func TestStringToS(t *testing.T) {
 	result := callMethod(t, s, "to_s")
 	if result != s {
 		t.Error("to_s should return self for strings")
+	}
+}
+
+func TestBuiltinFormatFixedFiveFloatMatchesGeneralFormatter(t *testing.T) {
+	format := mkStr("%.5f")
+	values := []*object.EmeraldValue{mkInt(1), mkFloat(1.25), mkFloat(-0.0), mkFloat(math.NaN()), mkFloat(math.Inf(1))}
+	for _, value := range values {
+		got := builtinFormat(nil, format, value)
+		want := rubyString(rubySprintfEncoded("%.5f", stringEncodingName(format), value))
+		if got == nil || got.Type != object.ValueString || got.Data != want.Data {
+			t.Fatalf("fixed float format mismatch for %#v: got %#v want %#v", value, got, want)
+		}
 	}
 }
 
@@ -763,5 +1183,35 @@ func TestRegexpBinaryAndWindowsDotMatchOneByte(t *testing.T) {
 		if !ok || len(data.Matches) != 1 || data.Matches[0] != "\xc3" {
 			t.Fatalf("/%s dot expected first byte, got %s", option, result.Inspect())
 		}
+	}
+}
+
+func TestCompileRubyRegexpSharesCompiledPatternAcrossObjects(t *testing.T) {
+	first, err := compileRubyRegexp(&object.RRegexp{Pattern: `\A[a-z]+\z`, Options: "i"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := compileRubyRegexp(&object.RRegexp{Pattern: `\A[a-z]+\z`, Options: "i"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("equivalent Ruby regexps did not share the compiled regexp")
+	}
+}
+
+func TestStringScannerRegexpSharesCompiledPattern(t *testing.T) {
+	firstValue := &object.EmeraldValue{Type: object.ValueRegexp, Data: &object.RRegexp{Pattern: `(?<word>[a-z]+)`}}
+	secondValue := &object.EmeraldValue{Type: object.ValueRegexp, Data: &object.RRegexp{Pattern: `(?<word>[a-z]+)`}}
+	first, _, errVal := stringScannerRegexp(firstValue)
+	if errVal != nil || first == nil {
+		t.Fatalf("first StringScanner regexp compile failed: %v", errVal)
+	}
+	second, _, errVal := stringScannerRegexp(secondValue)
+	if errVal != nil || second == nil {
+		t.Fatalf("second StringScanner regexp compile failed: %v", errVal)
+	}
+	if first != second {
+		t.Fatal("equivalent StringScanner regexps did not share the compiled regexp")
 	}
 }

@@ -39,6 +39,7 @@ const (
 	OpArray
 	OpArrayAppend
 	OpHash
+	OpHashMerge
 	OpMarkKeywordHash
 
 	OpIndex
@@ -70,6 +71,7 @@ const (
 	OpDefinedInstanceVar
 
 	OpGetClassVar
+	OpGetClassVarOrNil
 	OpSetClassVar
 	OpDefinedClassVar
 	OpDefinedGlobal
@@ -162,6 +164,7 @@ const (
 	OpEnsure
 	OpEndEnsure
 	OpCatch
+	OpEndCatch
 
 	OpExtend
 	OpPrepend
@@ -206,6 +209,7 @@ const (
 	OpRaiseNoMatchingPattern
 	OpGetMatchCapture
 	OpSetStringEncoding
+	OpGetLocalFast
 )
 
 type Definition struct {
@@ -250,9 +254,10 @@ var definitions = map[Opcode]Definition{
 	OpFlipFlopGet:   {"OpFlipFlopGet", []int{2}},
 	OpFlipFlopSet:   {"OpFlipFlopSet", []int{2, 1}},
 
-	OpArray:           {"OpArray", []int{2}},
+	OpArray:           {"OpArray", []int{4}},
 	OpArrayAppend:     {"OpArrayAppend", []int{1}},
 	OpHash:            {"OpHash", []int{2}},
+	OpHashMerge:       {"OpHashMerge", []int{}},
 	OpMarkKeywordHash: {"OpMarkKeywordHash", []int{}},
 
 	OpIndex:                    {"OpIndex", []int{}},
@@ -283,10 +288,11 @@ var definitions = map[Opcode]Definition{
 	OpSetInstanceVar:     {"OpSetInstanceVar", []int{2}},
 	OpDefinedInstanceVar: {"OpDefinedInstanceVar", []int{2}},
 
-	OpGetClassVar:     {"OpGetClassVar", []int{2}},
-	OpSetClassVar:     {"OpSetClassVar", []int{2}},
-	OpDefinedClassVar: {"OpDefinedClassVar", []int{2}},
-	OpDefinedGlobal:   {"OpDefinedGlobal", []int{2}},
+	OpGetClassVar:      {"OpGetClassVar", []int{2}},
+	OpGetClassVarOrNil: {"OpGetClassVarOrNil", []int{2}},
+	OpSetClassVar:      {"OpSetClassVar", []int{2}},
+	OpDefinedClassVar:  {"OpDefinedClassVar", []int{2}},
+	OpDefinedGlobal:    {"OpDefinedGlobal", []int{2}},
 
 	OpGetConstant:       {"OpGetConstant", []int{2}},
 	OpSetConstant:       {"OpSetConstant", []int{2, 1}},
@@ -371,12 +377,13 @@ var definitions = map[Opcode]Definition{
 	OpEnsure:      {"OpEnsure", []int{}},
 	OpEndEnsure:   {"OpEndEnsure", []int{}},
 	OpCatch:       {"OpCatch", []int{2}},
+	OpEndCatch:    {"OpEndCatch", []int{}},
 
 	OpExtend:  {"OpExtend", []int{}},
 	OpPrepend: {"OpPrepend", []int{}},
 
 	OpAlias: {"OpAlias", []int{}},
-	OpUndef: {"OpUndef", []int{}},
+	OpUndef: {"OpUndef", []int{2}},
 
 	OpDefined:                {"OpDefined", []int{2}},
 	OpDefinedConstant:        {"OpDefinedConstant", []int{2}},
@@ -407,6 +414,7 @@ var definitions = map[Opcode]Definition{
 	OpRaiseNoMatchingPattern: {"OpRaiseNoMatchingPattern", []int{}},
 	OpGetMatchCapture:        {"OpGetMatchCapture", []int{2}},
 	OpSetStringEncoding:      {"OpSetStringEncoding", []int{2}},
+	OpGetLocalFast:           {"OpGetLocalFast", []int{1}},
 }
 
 func Lookup(op byte) (Definition, bool) {

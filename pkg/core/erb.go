@@ -27,7 +27,9 @@ func installERBClass(objectClass *object.Class) {
 	klass := object.NewClass("ERB")
 	klass.SuperClass = objectClass
 	klass.DefineClassMethod("new", &object.Method{Name: "new", Fn: erbClassNew, Arity: -1})
+	klass.DefineClassMethod("version", &object.Method{Name: "version", Fn: erbVersion, Arity: 0})
 	klass.DefineMethod("result", &object.Method{Name: "result", Fn: erbResult, Arity: -1})
+	klass.DefineMethod("result_with_hash", &object.Method{Name: "result_with_hash", Fn: erbResultWithHash, Arity: 1})
 	klass.DefineMethod("run", &object.Method{Name: "run", Fn: erbRun, Arity: -1})
 	klass.DefineMethod("src", &object.Method{Name: "src", Fn: erbSrc, Arity: 0})
 	klass.DefineMethod("filename", &object.Method{Name: "filename", Fn: erbFilename, Arity: 0})
@@ -35,7 +37,7 @@ func installERBClass(objectClass *object.Class) {
 	klass.DefineMethod("def_method", &object.Method{Name: "def_method", Fn: erbDefMethod, Arity: -1})
 	klass.DefineMethod("def_module", &object.Method{Name: "def_module", Fn: erbDefModule, Arity: -1})
 	klass.DefineMethod("def_class", &object.Method{Name: "def_class", Fn: erbDefClass, Arity: -1})
-	klass.DefineConstant("VERSION", frozenRubyConstantString("5.0.0"))
+	klass.DefineConstant("VERSION", frozenRubyConstantString("6.0.6"))
 	util := object.NewModule("ERB::Util")
 	util.DefineMethod("html_escape", &object.Method{Name: "html_escape", Fn: erbHTMLescape, Arity: 1})
 	util.DefineMethod("h", &object.Method{Name: "h", Fn: erbHTMLescape, Arity: 1})
@@ -47,6 +49,10 @@ func installERBClass(objectClass *object.Class) {
 	value := &object.EmeraldValue{Type: object.ValueClass, Data: klass, Class: R.Classes["Class"]}
 	objectClass.DefineConstant("ERB", value)
 	AssignConstantName(&object.EmeraldValue{Type: object.ValueClass, Data: objectClass, Class: R.Classes["Class"]}, "ERB", value)
+}
+
+func erbVersion(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	return rubyString("6.0.6")
 }
 
 func erbClassNew(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
@@ -199,7 +205,11 @@ func erbBinding(args []*object.EmeraldValue) (*object.RBinding, *object.EmeraldV
 			return binding, nil
 		}
 	}
-	return &object.RBinding{Self: R.Main, Locals: map[string]*object.EmeraldValue{}, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}}, nil
+	return &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{Locals: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}},
+		Self:             R.Main,
+		Constants:        map[string]*object.EmeraldValue{},
+	}, nil
 }
 func erbEvaluate(data *erbData, binding *object.RBinding) *object.EmeraldValue {
 	if EvalSourceWithBinding == nil {
@@ -235,6 +245,40 @@ func erbResult(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 	return erbEvaluate(data, binding)
 }
+
+func erbResultWithHash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
+	if len(args) != 1 {
+		return NewArgumentError(fmt.Sprintf("wrong number of arguments (given %d, expected 1)", len(args)))
+	}
+	if args[0] == nil || args[0].Type != object.ValueHash {
+		return NewTypeError("wrong argument type")
+	}
+	data, errVal := erbValue(receiver)
+	if errVal != nil {
+		return errVal
+	}
+	keys, pairs := hashOrderedKeysFromValue(args[0])
+	locals := make(map[string]*object.EmeraldValue, len(keys))
+	localNames := make([]string, 0, len(keys))
+	for _, key := range keys {
+		name := ""
+		switch key.Type {
+		case object.ValueString, object.ValueSymbol:
+			name = key.Data.(string)
+		default:
+			return NewTypeError("wrong argument type")
+		}
+		locals[name] = pairs[key]
+		localNames = append(localNames, name)
+	}
+	binding := &object.RBinding{
+		RBindingExpanded: &object.RBindingExpanded{Locals: locals, LocalNames: localNames, InstanceVars: map[string]*object.EmeraldValue{}},
+		Self:             R.Main,
+		Constants:        map[string]*object.EmeraldValue{},
+	}
+	return erbEvaluate(data, binding)
+}
+
 func erbRun(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *object.EmeraldValue {
 	result := erbResult(receiver, args...)
 	if result == nil || result.Type == object.ValueException {
@@ -345,7 +389,10 @@ func erbDefineOn(target *object.EmeraldValue, data *erbData, signature string) *
 				locals[argName] = R.NilVal
 			}
 		}
-		binding := &object.RBinding{Self: receiver, Locals: locals, LocalNames: names, Constants: map[string]*object.EmeraldValue{}, InstanceVars: map[string]*object.EmeraldValue{}, Method: name, Path: data.filename, Line: 1}
+		binding := &object.RBinding{
+			RBindingExpanded: &object.RBindingExpanded{Locals: locals, LocalNames: names, InstanceVars: map[string]*object.EmeraldValue{}},
+			Self:             receiver, Constants: map[string]*object.EmeraldValue{}, Method: name, Path: data.filename, Line: 1,
+		}
 		return erbEvaluate(data, binding)
 	}}
 	switch target.Type {

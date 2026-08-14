@@ -24,6 +24,11 @@ rgo-spec
 rgo-test
 rgo_test
 
+# Local benchmark/build artifacts
+.rgo-go-cache*/
+.rgo-*.pprof
+/bench/ruby/*.go
+
 # Local git worktrees
 .worktrees/
 

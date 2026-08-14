@@ -2,7 +2,45 @@ package object
 
 import (
 	"testing"
+	"unsafe"
 )
+
+func TestScalarEqualsDoesNotAllocateCycleMap(t *testing.T) {
+	left := &EmeraldValue{Type: ValueString, Data: "value"}
+	right := &EmeraldValue{Type: ValueString, Data: "value"}
+	if !left.Equals(right) {
+		t.Fatal("equal scalar values did not compare equal")
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = left.Equals(right)
+	}); allocations != 0 {
+		t.Fatalf("scalar equality allocated %v times", allocations)
+	}
+}
+
+func TestCompactBindingKeepsExpandedStateLazy(t *testing.T) {
+	binding := &RBinding{CompactLocals: true}
+	if binding.RBindingExpanded != nil {
+		t.Fatal("compact binding unexpectedly allocated expanded state")
+	}
+	binding.MaterializeLocals()
+	if binding.RBindingExpanded == nil {
+		t.Fatal("materializing locals did not allocate expanded state")
+	}
+	if size := unsafe.Sizeof(RBinding{}); size > 248 {
+		t.Fatalf("compact binding grew beyond 248 bytes: %d", size)
+	}
+}
+
+func TestEmeraldValueKeepsColdStateOutOfHotHeader(t *testing.T) {
+	if size := unsafe.Sizeof(EmeraldValue{}); size > 72 {
+		t.Fatalf("EmeraldValue hot header grew beyond 72 bytes: %d", size)
+	}
+	value := NewValue(ValueInteger, int64(1), nil)
+	if value.Cold != nil {
+		t.Fatal("ordinary value eagerly allocated cold sidecar")
+	}
+}
 
 func TestNewValue(t *testing.T) {
 	v := NewValue(ValueInteger, int64(42), nil)
@@ -243,6 +281,41 @@ func TestObjectInstanceVars(t *testing.T) {
 	// Non-existent var returns nil
 	if obj.GetInstanceVar("@age") != nil {
 		t.Error("expected nil for non-existent var")
+	}
+}
+
+func TestHotIntegerInstanceVarFlushPreservesObjectSemantics(t *testing.T) {
+	class := NewClass("Counter")
+	integerClass := NewClass("Integer")
+	obj := NewObject(class)
+	obj.SetInstanceVar("@value", &EmeraldValue{Type: ValueInteger, Data: int64(10), Class: integerClass})
+
+	slot, ok := obj.PrepareHotIntegerInstanceVar("@value")
+	if !ok || !obj.SetHotIntegerInstanceVar(slot, 42, integerClass) {
+		t.Fatal("failed to prepare hot integer slot")
+	}
+	got := obj.GetInstanceVar("@value")
+	if got == nil || got.Type != ValueInteger || got.Data.(int64) != 42 || got.Class != integerClass {
+		t.Fatalf("hot value did not flush correctly: %#v", got)
+	}
+	if _, stillHot := obj.HotIntegerInstanceVar(slot); stillHot {
+		t.Fatal("generic read left the hot scalar unflushed")
+	}
+
+	if !obj.SetHotIntegerInstanceVar(slot, 99, integerClass) {
+		t.Fatal("failed to publish second hot value")
+	}
+	vars := obj.InstanceVarMap()
+	if vars["@value"] == nil || vars["@value"].Data.(int64) != 99 {
+		t.Fatalf("reflection map did not flush hot value: %#v", vars["@value"])
+	}
+
+	if !obj.SetHotIntegerInstanceVar(slot, 123, integerClass) {
+		t.Fatal("failed to publish third hot value")
+	}
+	obj.SetInstanceVar("@other", &EmeraldValue{Type: ValueString, Data: "ok"})
+	if got := obj.GetInstanceVar("@value"); got == nil || got.Data.(int64) != 123 {
+		t.Fatalf("generic write did not flush hot value: %#v", got)
 	}
 }
 

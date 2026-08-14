@@ -37,6 +37,45 @@ const (
 	ValueException
 )
 
+// AllocationMetadata is cold ObjectSpace tracing state. Ordinary Ruby values
+// do not need it; keeping it behind a lazy pointer avoids putting source
+// locations and weak-tracing bookkeeping in every hot EmeraldValue header.
+type AllocationMetadata struct {
+	Owner      *EmeraldValue
+	Traced     bool
+	Generation int64
+	SourceFile string
+	SourceLine int64
+	ClassPath  string
+	MethodID   string
+}
+
+// ValueColdData keeps rarely-used arbitrary-precision and mutable-string
+// state away from the hot EmeraldValue header. The sidecar is allocated only
+// when a value actually needs one of these fields.
+type ValueColdData struct {
+	BigInt        *big.Int
+	StringBuilder *strings.Builder
+	Allocation    *AllocationMetadata
+	LazyArray     *LazyArrayRegion
+}
+
+// LazyArrayRegion is a deliberately small escape hatch for a proven VM
+// producer. The ordinary Array representation remains []*EmeraldValue; a
+// region may postpone that materialization until an operation needs actual
+// elements. Payload is owned by the producer and is opaque to object.
+// Materialize must return the exact Ruby elements in order and must not be
+// called more than once for the same EmeraldValue.
+type LazyArrayRegion struct {
+	Length      int
+	Payload     any
+	Materialize func() []*EmeraldValue
+	// ElementAt may serve a single indexed read without committing the whole
+	// region.  A nil function keeps the historical full-materialization path.
+	ElementAt        func(index int) (*EmeraldValue, bool)
+	MethodGeneration uint64
+}
+
 type EmeraldValue struct {
 	Type            ValueType
 	Data            interface{}
@@ -45,8 +84,119 @@ type EmeraldValue struct {
 	TemporaryLocked bool
 	Chilled         bool
 	Literal         bool
-	BigInt          *big.Int
+	Ruby2Keywords   bool
 	Encoding        string
+	InstanceVars    map[string]*EmeraldValue
+	Cold            *ValueColdData
+}
+
+// CloneColdData copies the sidecar container while preserving the historical
+// shallow-copy behavior of the values it contains.  EmeraldValue copies must
+// not share the container itself: setters on one copy must not rewrite the
+// other copy's BigInt or StringBuilder field.
+func (v *EmeraldValue) CloneColdData() *ValueColdData {
+	if v == nil || v.Cold == nil {
+		return nil
+	}
+	clone := *v.Cold
+	return &clone
+}
+
+func (v *EmeraldValue) BigIntValue() *big.Int {
+	if v == nil || v.Cold == nil {
+		return nil
+	}
+	return v.Cold.BigInt
+}
+
+func (v *EmeraldValue) SetBigInt(value *big.Int) {
+	if v == nil {
+		return
+	}
+	if value == nil && v.Cold == nil {
+		return
+	}
+	if v.Cold == nil {
+		v.Cold = &ValueColdData{}
+	}
+	v.Cold.BigInt = value
+}
+
+func (v *EmeraldValue) StringBuilderValue() *strings.Builder {
+	if v == nil || v.Cold == nil {
+		return nil
+	}
+	return v.Cold.StringBuilder
+}
+
+func (v *EmeraldValue) SetStringBuilder(value *strings.Builder) {
+	if v == nil {
+		return
+	}
+	if value == nil && v.Cold == nil {
+		return
+	}
+	if v.Cold == nil {
+		v.Cold = &ValueColdData{}
+	}
+	v.Cold.StringBuilder = value
+}
+
+func (v *EmeraldValue) AllocationMetadataValue() *AllocationMetadata {
+	if v == nil || v.Cold == nil {
+		return nil
+	}
+	return v.Cold.Allocation
+}
+
+func (v *EmeraldValue) SetAllocationMetadata(value *AllocationMetadata) {
+	if v == nil {
+		return
+	}
+	if value == nil && v.Cold == nil {
+		return
+	}
+	if v.Cold == nil {
+		v.Cold = &ValueColdData{}
+	}
+	v.Cold.Allocation = value
+}
+
+func (v *EmeraldValue) LazyArrayRegionValue() *LazyArrayRegion {
+	if v == nil || v.Cold == nil {
+		return nil
+	}
+	return v.Cold.LazyArray
+}
+
+func (v *EmeraldValue) SetLazyArrayRegion(region *LazyArrayRegion) {
+	if v == nil {
+		return
+	}
+	if region == nil && v.Cold == nil {
+		return
+	}
+	if v.Cold == nil {
+		v.Cold = &ValueColdData{}
+	}
+	v.Cold.LazyArray = region
+}
+
+// MaterializeLazyArray commits a deferred Array region to the ordinary slice
+// representation. The caller can use the returned slice for generic Array
+// operations; a false result means that the value was not a lazy Array.
+func (v *EmeraldValue) MaterializeLazyArray() ([]*EmeraldValue, bool) {
+	if v == nil || v.Type != ValueArray || v.Cold == nil || v.Cold.LazyArray == nil {
+		return nil, false
+	}
+	region := v.Cold.LazyArray
+	if region.Materialize == nil {
+		return nil, false
+	}
+	elements := region.Materialize()
+	v.Data = elements
+	v.Cold.LazyArray = nil
+	return elements, true
 }
 
 func NewValue(t ValueType, data interface{}, class *Class) *EmeraldValue {
@@ -84,8 +234,8 @@ func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
 		}
 		return "false"
 	case ValueInteger:
-		if v.BigInt != nil {
-			return v.BigInt.String()
+		if bigInteger := v.BigIntValue(); bigInteger != nil {
+			return bigInteger.String()
 		}
 		return fmt.Sprintf("%d", v.Data)
 	case ValueFloat:
@@ -103,7 +253,10 @@ func (v *EmeraldValue) inspectWithSeen(seen map[*EmeraldValue]bool) string {
 		}
 		seen[v] = true
 		defer delete(seen, v)
-		arr := v.Data.([]*EmeraldValue)
+		arr, ok := v.Data.([]*EmeraldValue)
+		if !ok {
+			arr, _ = v.MaterializeLazyArray()
+		}
 		str := "["
 		for i, e := range arr {
 			str += e.inspectElementWithSeen(seen)
@@ -385,6 +538,12 @@ func (v *EmeraldValue) Equals(other *EmeraldValue) bool {
 	if v == nil || other == nil {
 		return v == other
 	}
+	if v.Type != other.Type {
+		return false
+	}
+	if v.Type != ValueArray && v.Type != ValueHash {
+		return v.equals(other, nil)
+	}
 	return v.equals(other, make(map[[2]*EmeraldValue]bool))
 }
 
@@ -591,6 +750,34 @@ type Function struct {
 	FlipFlopStates        map[int]bool
 	ImplicitItParameter   bool
 	NumberedParameters    bool
+	DefinitionVisibility  string
+	// SimpleArgumentShapeChecked/Eligible are immutable compiler-shape
+	// metadata used by VM block/method fast paths. Keeping the proof on the
+	// Function avoids a per-VM map lookup for every callback invocation.
+	SimpleArgumentShapeChecked  bool
+	SimpleArgumentShapeEligible bool
+	// SimpleBlockPatternChecked/Eligible cache the immutable named-parameter
+	// pattern proof used by the zero-frame and reusable block entries.
+	SimpleBlockPatternChecked  bool
+	SimpleBlockPatternEligible bool
+	// CachedPositionalArgumentShapeChecked/Eligible are the corresponding proof
+	// for the cached bytecode entry. Unlike the block shape, this proof permits
+	// positional defaults; the normal bytecode prologue still evaluates any
+	// omitted default expression.
+	CachedPositionalArgumentShapeChecked  bool
+	CachedPositionalArgumentShapeEligible bool
+	// CallerBlockObservationChecked/Safe cache the bytecode proof used when a
+	// fixed-arity method is invoked from inside another block. The instruction
+	// stream is immutable after compilation, so repeating the opcode scan at
+	// every cached send is unnecessary.
+	CallerBlockObservationChecked bool
+	CallerBlockObservationSafe    bool
+	// ArrayBytecodeBlockReuseChecked/Eligible cache the immutable opcode proof
+	// for the reusable Array callback entry. The VM may inspect the same block
+	// thousands of times through Array#each/map; do not rescan its bytecode on
+	// every native iterator call.
+	ArrayBytecodeBlockReuseChecked  bool
+	ArrayBytecodeBlockReuseEligible bool
 }
 
 type BuiltinFunction struct {
@@ -614,10 +801,13 @@ type Method struct {
 	DynamicMissing        bool
 	EnforceArity          bool
 	DefinedByDefineMethod bool
+	AttrReaderName        string
+	AttrWriterName        string
 }
 
 type Proc struct {
 	Origin           *Proc
+	CachedClosure    *Closure
 	Fn               *Function
 	Env              []*EmeraldValue
 	Block            *EmeraldValue
@@ -655,10 +845,18 @@ type Closure struct {
 	ClassStack       []*EmeraldValue
 	Refinements      []*EmeraldValue
 	RefinementsFixed bool
-	AutoSplat        bool
-	BreakOwnerID     int
-	ReturnOwnerID    int
-	FlipFlopStates   map[int]bool
+	// Refinement checks are performed at many speculative block/method
+	// call-sites.  The VM caches the result against the method hierarchy
+	// generation; callers that mutate this view clear the generation before
+	// the next probe.  Keeping the metadata on the closure avoids a VM-global
+	// map lookup on every callback.
+	RefinementCheckGeneration uint64
+	RefinementCheckResult     bool
+	RefinementCheckValid      bool
+	AutoSplat                 bool
+	BreakOwnerID              int
+	ReturnOwnerID             int
+	FlipFlopStates            map[int]bool
 }
 
 type RInteger struct {
@@ -682,11 +880,22 @@ type RHash struct {
 	Keys              []*EmeraldValue
 	Hashes            map[*EmeraldValue]int64
 	Buckets           map[int64][]*EmeraldValue
+	Linear            *RHashLinearRegion
 	BucketSize        int
 	Default           *EmeraldValue
 	DefaultProc       *EmeraldValue
 	CompareByIdentity bool
 	InstanceVars      map[string]*EmeraldValue
+}
+
+// RHashLinearRegion is a private lazy representation for a completed affine
+// integer fill. It is valid only until a general Hash API materializes or
+// mutates the ordinary pointer map.
+type RHashLinearRegion struct {
+	Start       int64
+	Step        int64
+	ValueOffset int64
+	Count       int
 }
 
 type RSymbol struct {
@@ -698,6 +907,9 @@ type RRegexp struct {
 	Options    string
 	Timeout    float64
 	HasTimeout bool
+
+	CompiledPattern string
+	Compiled        any
 }
 
 type RRange struct {
@@ -752,23 +964,118 @@ type RBacktraceLocation struct {
 	EvalSource   bool
 }
 
+type RBindingExpanded struct {
+	Locals         map[string]*EmeraldValue
+	LocalNames     []string
+	InstanceVars   map[string]*EmeraldValue
+	SharedLocals   map[string]struct{}
+	ShareAllLocals bool
+}
+
 type RBinding struct {
+	*RBindingExpanded
 	Self                    *EmeraldValue
 	Block                   *EmeraldValue
-	AllowAnonymousBlockPass bool
 	EvalReturnTargetID      int
-	Locals                  map[string]*EmeraldValue
-	LocalNames              []string
 	Constants               map[string]*EmeraldValue
 	Method                  string
 	BacktraceLabel          string
-	InstanceVars            map[string]*EmeraldValue
 	ClassStack              []*EmeraldValue
 	ClassVarScope           *EmeraldValue
 	Refinements             []*EmeraldValue
 	Path                    string
 	Line                    int64
-	ShareAllLocals          bool
 	Parent                  *RBinding
-	SharedLocals            map[string]struct{}
+	CompactLocalIndices     map[string]int
+	CompactLocalValues      []*EmeraldValue
+	CompactFreeNames        []string
+	CompactFreeValues       []*EmeraldValue
+	AllowAnonymousBlockPass bool
+	CompactImplicitIt       bool
+	CompactNumberedParams   bool
+	CompactLocals           bool
+}
+
+func (binding *RBinding) EnsureExpanded() *RBindingExpanded {
+	if binding.RBindingExpanded == nil {
+		binding.RBindingExpanded = &RBindingExpanded{}
+	}
+	return binding.RBindingExpanded
+}
+
+type BindingCell interface {
+	BindingValue() *EmeraldValue
+}
+
+func DereferenceBindingValue(value *EmeraldValue) *EmeraldValue {
+	seen := map[BindingCell]struct{}{}
+	for value != nil {
+		cell, ok := value.Data.(BindingCell)
+		if !ok {
+			return value
+		}
+		if _, cycle := seen[cell]; cycle {
+			return nil
+		}
+		seen[cell] = struct{}{}
+		value = cell.BindingValue()
+	}
+	return nil
+}
+
+func (binding *RBinding) MaterializeLocals() {
+	if binding == nil || !binding.CompactLocals {
+		return
+	}
+	binding.EnsureExpanded()
+	capacity := len(binding.CompactLocalIndices) + len(binding.CompactFreeNames)
+	if binding.Locals == nil {
+		binding.Locals = make(map[string]*EmeraldValue, capacity)
+	}
+	ordered := make([]string, len(binding.CompactLocalValues))
+	for name, index := range binding.CompactLocalIndices {
+		if index >= 0 && index < len(ordered) {
+			ordered[index] = name
+		}
+	}
+	for index, name := range ordered {
+		if binding.compactLocalHidden(name) || binding.compactFreeLocal(name) || index >= len(binding.CompactLocalValues) {
+			continue
+		}
+		if value := binding.CompactLocalValues[index]; value != nil {
+			binding.Locals[name] = value
+			binding.LocalNames = append(binding.LocalNames, name)
+		}
+	}
+	for index, name := range binding.CompactFreeNames {
+		if name == "" || index >= len(binding.CompactFreeValues) {
+			continue
+		}
+		if _, exists := binding.Locals[name]; exists {
+			continue
+		}
+		binding.Locals[name] = binding.CompactFreeValues[index]
+		binding.LocalNames = append(binding.LocalNames, name)
+	}
+	binding.CompactLocalIndices = nil
+	binding.CompactLocalValues = nil
+	binding.CompactFreeNames = nil
+	binding.CompactFreeValues = nil
+	binding.CompactLocals = false
+}
+
+func (binding *RBinding) compactLocalHidden(name string) bool {
+	if name == "" || binding.CompactImplicitIt && name == "it" {
+		return true
+	}
+	return binding.CompactNumberedParams && len(name) == 2 && name[0] == '_' && name[1] >= '1' && name[1] <= '9'
+}
+
+func (binding *RBinding) compactFreeLocal(name string) bool {
+	for _, freeName := range binding.CompactFreeNames {
+		if freeName == name {
+			return true
+		}
+	}
+	return false
 }
