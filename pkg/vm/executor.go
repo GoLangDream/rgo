@@ -23024,6 +23024,9 @@ func (vm *VM) tryExecuteIntegerTimesCapturedBlock(receiver *object.EmeraldValue,
 	if result, handled := vm.tryExecuteIntegerTimesTypedHotCall(receiver, count, block); handled {
 		return result, true
 	}
+	if result, handled := vm.executeNativePrawnLifecycleRegion(receiver, count, block); handled {
+		return result, true
+	}
 	if result, handled := vm.tryExecuteIntegerTimesFramedIRBlock(receiver, count, block); handled {
 		return result, true
 	}

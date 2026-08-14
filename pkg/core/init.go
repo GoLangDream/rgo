@@ -26144,6 +26144,18 @@ func StringLengthUsesBuiltinImplementation() bool {
 	return classMethodUsesBuiltin(R.Classes["String"], "length", BuiltinMethod(stringLength))
 }
 
+// StringStartWithUsesBuiltinImplementation and StringEndWithUsesBuiltinImplementation
+// guard the immutable prefix/suffix checks used by a typed caller region. A
+// Ruby override must invalidate that region instead of being replaced by a Go
+// strings.HasPrefix/HasSuffix operation.
+func StringStartWithUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "start_with?", BuiltinMethod(stringStartWith))
+}
+
+func StringEndWithUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "end_with?", BuiltinMethod(stringEndWith))
+}
+
 // ArrayEachUsesBuiltinImplementation is the generation-safe guard used by
 // VM loop kernels that inline the concrete Array#each callback protocol.
 func ArrayEachUsesBuiltinImplementation() bool {

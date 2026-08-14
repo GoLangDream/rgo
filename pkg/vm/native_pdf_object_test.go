@@ -66,6 +66,20 @@ func TestNativePDFRenderWriterMatchesObjectSerializer(t *testing.T) {
 	}
 }
 
+func TestNativePDFRenderValuePlanKeepsStrictStringGuard(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	invalid := &object.EmeraldValue{Type: object.ValueString, Data: string([]byte{0xff}), Class: core.R.Classes["String"]}
+	array := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{invalid}, Class: core.R.Classes["Array"]}
+	plans := make(map[*object.EmeraldValue]nativePDFRenderValuePlan)
+	if !nativePDFRenderValueShape(array, true, make(map[*object.EmeraldValue]bool), referenceClass, plans) {
+		t.Fatal("content-stream shape should allow the byte string")
+	}
+	if nativePDFRenderValueShape(array, false, make(map[*object.EmeraldValue]bool), referenceClass, plans) {
+		t.Fatal("cached content-stream proof must not bypass strict UTF-8 validation")
+	}
+}
+
 func TestNativePDFObjectTextRejectsUnsupportedStringSubclassAndCycles(t *testing.T) {
 	core.InitWithMspec()
 	subclass := object.NewClass("PDF::CustomString")
@@ -82,17 +96,24 @@ func TestNativePDFObjectTextRejectsUnsupportedStringSubclassAndCycles(t *testing
 
 func TestNativePDFRenderHashWithLengthUsesRubyDictionaryShape(t *testing.T) {
 	core.InitWithMspec()
-	text, ok := nativePDFRenderHashWithLength(nativePDFEmptyHash(), 7, nil)
+	text, ok := nativePDFRenderHashWithLength(nativePDFEmptyHash(), 7, make(map[*object.EmeraldValue]bool), nil)
 	if !ok {
 		t.Fatal("expected empty dictionary to accept stream length")
 	}
 	if want := "<< /Length 7\n>>"; text != want {
 		t.Fatalf("stream dictionary = %q, want %q", text, want)
 	}
+	var output strings.Builder
+	if !nativePDFRenderWriteHashWithLength(&output, nativePDFEmptyHash(), 7, make(map[*object.EmeraldValue]bool), nil) {
+		t.Fatal("direct stream dictionary writer rejected empty dictionary")
+	}
+	if got := output.String(); got != text {
+		t.Fatalf("direct stream dictionary = %q, want %q", got, text)
+	}
 
 	lengthKey := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Length", Class: core.R.Classes["Symbol"]}
 	data := nativePDFHashValue([2]*object.EmeraldValue{lengthKey, core.NewIntegerValue(1)})
-	if _, ok := nativePDFRenderHashWithLength(data, 7, nil); ok {
+	if _, ok := nativePDFRenderHashWithLength(data, 7, make(map[*object.EmeraldValue]bool), nil); ok {
 		t.Fatal("expected an existing Length key to deopt instead of duplicating Ruby Hash#merge")
 	}
 }

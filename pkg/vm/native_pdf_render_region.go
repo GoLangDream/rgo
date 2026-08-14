@@ -50,10 +50,20 @@ type nativePDFRenderPagePlan struct {
 	stream      *object.EmeraldValue
 }
 
+type nativePDFRenderReferencePlan struct {
+	ref        *object.EmeraldValue
+	data       *object.EmeraldValue
+	stream     *object.EmeraldValue
+	raw        *object.EmeraldValue
+	identifier int64
+	generation int64
+}
+
 type nativePDFRenderValuePlan struct {
-	kind    object.ValueType
-	items   []*object.EmeraldValue
-	entries []nativePDFHashEntry
+	kind            object.ValueType
+	inContentStream bool
+	items           []*object.EmeraldValue
+	entries         []nativePDFHashEntry
 }
 
 type nativePDFRenderRegionPlan struct {
@@ -62,7 +72,7 @@ type nativePDFRenderRegionPlan struct {
 	store       *object.EmeraldValue
 	identifiers *object.EmeraldValue
 	objects     *object.EmeraldValue
-	refs        []*object.EmeraldValue
+	refs        []nativePDFRenderReferencePlan
 	pages       []nativePDFRenderPagePlan
 	root        *object.EmeraldValue
 	info        *object.EmeraldValue
@@ -129,11 +139,13 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 	var output strings.Builder
 	output.Grow(1024 + len(plan.refs)*96)
 	fmt.Fprintf(&output, "%%PDF-%.1f\n%%\xFF\xFF\xFF\xFF\n", plan.version)
-	for _, ref := range plan.refs {
-		if result := core.SetDynamicInstanceVar(ref, "@offset", core.NewIntegerValue(int64(output.Len()))); result != nil {
+	seen := make(map[*object.EmeraldValue]bool)
+	for index := range plan.refs {
+		ref := &plan.refs[index]
+		if result := core.SetDynamicInstanceVar(ref.ref, "@offset", core.NewIntegerValue(int64(output.Len()))); result != nil {
 			return result, true
 		}
-		if !nativePDFRenderReference(&output, ref, streamClass, filterListClass, plan.valuePlans) {
+		if !nativePDFRenderReference(&output, ref, seen, plan.valuePlans) {
 			return nil, false
 		}
 	}
@@ -143,8 +155,9 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 		return result, true
 	}
 	fmt.Fprintf(&output, "xref\n0 %d\n0000000000 65535 f \n", len(plan.refs)+1)
-	for _, ref := range plan.refs {
-		offset, ok := nativePDFObjectIntegerIvar(ref, "@offset")
+	for index := range plan.refs {
+		ref := &plan.refs[index]
+		offset, ok := nativePDFObjectIntegerIvar(ref.ref, "@offset")
 		if !ok {
 			return nil, false
 		}
@@ -157,7 +170,7 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 		[2]*object.EmeraldValue{nativePDFSymbol("Info"), plan.info},
 	)
 	output.WriteString("trailer\n")
-	if !nativePDFRenderWriteObjectText(&output, trailer, false, make(map[*object.EmeraldValue]bool), plan.valuePlans) {
+	if !nativePDFRenderWriteObjectText(&output, trailer, false, seen, plan.valuePlans) {
 		return nil, false
 	}
 	output.WriteString("\nstartxref\n")
@@ -360,8 +373,9 @@ func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClas
 	root, rootOK := core.DirectHashIndex(objects, rootID)
 	info, infoOK := core.DirectHashIndex(objects, infoID)
 	valuePlans := make(map[*object.EmeraldValue]nativePDFRenderValuePlan)
-	if !rootOK || !infoOK || !nativePDFRenderValueShape(root, false, make(map[*object.EmeraldValue]bool), referenceClass, valuePlans) ||
-		!nativePDFRenderValueShape(info, false, make(map[*object.EmeraldValue]bool), referenceClass, valuePlans) {
+	seen := make(map[*object.EmeraldValue]bool)
+	if !rootOK || !infoOK || !nativePDFRenderValueShape(root, false, seen, referenceClass, valuePlans) ||
+		!nativePDFRenderValueShape(info, false, seen, referenceClass, valuePlans) {
 		return nil, false
 	}
 
@@ -380,7 +394,7 @@ func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClas
 		store:       store,
 		identifiers: identifiers,
 		objects:     objects,
-		refs:        make([]*object.EmeraldValue, 0, len(ids)),
+		refs:        make([]nativePDFRenderReferencePlan, 0, len(ids)),
 		pages:       make([]nativePDFRenderPagePlan, 0, len(pageItems)),
 		root:        root,
 		info:        info,
@@ -392,10 +406,25 @@ func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClas
 			return nil, false
 		}
 		ref, found := core.DirectHashIndex(objects, id)
-		if !found || !nativePDFRenderReferenceShape(ref, referenceClass, streamClass, filterListClass, valuePlans) {
+		if !found || !nativePDFRenderReferenceShape(ref, referenceClass, streamClass, filterListClass, seen, valuePlans) {
 			return nil, false
 		}
-		plan.refs = append(plan.refs, ref)
+		identifier, identifierOK := nativePDFObjectIntegerIvar(ref, "@identifier")
+		generation, generationOK := nativePDFObjectIntegerIvar(ref, "@gen")
+		data := nativePrawnTextLayoutIvar(ref, "@data")
+		stream := nativePrawnTextLayoutIvar(ref, "@stream")
+		raw := nativePrawnTextLayoutIvar(stream, "@stream")
+		if !identifierOK || !generationOK || stream == nil {
+			return nil, false
+		}
+		plan.refs = append(plan.refs, nativePDFRenderReferencePlan{
+			ref:        ref,
+			data:       data,
+			stream:     stream,
+			raw:        raw,
+			identifier: identifier,
+			generation: generation,
+		})
 	}
 	for _, page := range pageItems {
 		pagePlan, ok := nativePDFBuildPagePlan(page, state, pageClass, stackClass)
@@ -441,14 +470,14 @@ func nativePDFBuildPagePlan(page, state *object.EmeraldValue, pageClass, stackCl
 	return pagePlan, true
 }
 
-func nativePDFRenderReferenceShape(ref *object.EmeraldValue, referenceClass, streamClass, filterListClass *object.Class, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) bool {
+func nativePDFRenderReferenceShape(ref *object.EmeraldValue, referenceClass, streamClass, filterListClass *object.Class, seen map[*object.EmeraldValue]bool, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) bool {
 	if ref == nil || ref.Type != object.ValueObject || ref.Class != referenceClass || ref.Frozen ||
 		core.AttachedSingletonClass(ref) != nil || !nativePDFObjectIntegerIvarOK(ref, "@identifier") ||
 		!nativePDFObjectIntegerIvarOK(ref, "@gen") {
 		return false
 	}
 	data := nativePrawnTextLayoutIvar(ref, "@data")
-	if !nativePDFRenderValueShape(data, false, make(map[*object.EmeraldValue]bool), referenceClass, valuePlans) {
+	if !nativePDFRenderValueShape(data, false, seen, referenceClass, valuePlans) {
 		return false
 	}
 	stream := nativePrawnTextLayoutIvar(ref, "@stream")
@@ -524,6 +553,12 @@ func nativePDFRenderValueShape(value *object.EmeraldValue, inContentStream bool,
 	if value == nil || value.Type == object.ValueNil {
 		return true
 	}
+	if valuePlans != nil && (value.Type == object.ValueArray || value.Type == object.ValueHash) {
+		if cached, found := valuePlans[value]; found && cached.kind == value.Type &&
+			(!cached.inContentStream || inContentStream) && !seen[value] {
+			return true
+		}
+	}
 	switch value.Type {
 	case object.ValueBool:
 		_, ok := value.Data.(bool)
@@ -555,7 +590,7 @@ func nativePDFRenderValueShape(value *object.EmeraldValue, inContentStream bool,
 			return false
 		}
 		if valuePlans != nil {
-			valuePlans[value] = nativePDFRenderValuePlan{kind: object.ValueArray, items: items}
+			valuePlans[value] = nativePDFRenderValuePlan{kind: object.ValueArray, inContentStream: inContentStream, items: items}
 		}
 		seen[value] = true
 		defer delete(seen, value)
@@ -586,7 +621,7 @@ func nativePDFRenderValueShape(value *object.EmeraldValue, inContentStream bool,
 			return false
 		}
 		if valuePlans != nil {
-			valuePlans[value] = nativePDFRenderValuePlan{kind: object.ValueHash, entries: entries}
+			valuePlans[value] = nativePDFRenderValuePlan{kind: object.ValueHash, inContentStream: inContentStream, entries: entries}
 		}
 		seen[value] = true
 		defer delete(seen, value)
@@ -659,32 +694,25 @@ func nativePDFRenderAppendQ(stream *object.EmeraldValue) (*object.EmeraldValue, 
 	return nil, true
 }
 
-func nativePDFRenderReference(output *strings.Builder, ref *object.EmeraldValue, streamClass, filterListClass *object.Class, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) bool {
-	identifier, identifierOK := nativePDFObjectIntegerIvar(ref, "@identifier")
-	generation, generationOK := nativePDFObjectIntegerIvar(ref, "@gen")
-	if !identifierOK || !generationOK {
+func nativePDFRenderReference(output *strings.Builder, ref *nativePDFRenderReferencePlan, seen map[*object.EmeraldValue]bool, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) bool {
+	if output == nil || ref == nil || ref.ref == nil || ref.stream == nil {
 		return false
 	}
-	fmt.Fprintf(output, "%d %d obj\n", identifier, generation)
-	data := nativePrawnTextLayoutIvar(ref, "@data")
-	stream := nativePrawnTextLayoutIvar(ref, "@stream")
-	raw := nativePrawnTextLayoutIvar(stream, "@stream")
-	if raw == nil || raw.Type == object.ValueNil {
-		if !nativePDFRenderWriteObjectText(output, data, false, make(map[*object.EmeraldValue]bool), valuePlans) {
+	fmt.Fprintf(output, "%d %d obj\n", ref.identifier, ref.generation)
+	if ref.raw == nil || ref.raw.Type == object.ValueNil {
+		if !nativePDFRenderWriteObjectText(output, ref.data, false, seen, valuePlans) {
 			return false
 		}
 		output.WriteString("\nendobj\n")
 		return true
 	}
-	filtered, ok := nativePDFRenderStreamPayload(stream, raw)
-	if !ok || !nativePDFRenderStreamShape(stream, filterListClass) {
-		return false
-	}
-	text, ok := nativePDFRenderHashWithLength(data, len(filtered), valuePlans)
+	filtered, ok := nativePDFRenderStreamPayload(ref.stream, ref.raw)
 	if !ok {
 		return false
 	}
-	output.WriteString(text)
+	if !nativePDFRenderWriteHashWithLength(output, ref.data, len(filtered), seen, valuePlans) {
+		return false
+	}
 	output.WriteString("\nstream\n")
 	output.WriteString(filtered)
 	output.WriteString("\nendstream\nendobj\n")
@@ -707,7 +735,7 @@ func nativePDFRenderStreamPayload(stream, raw *object.EmeraldValue) (string, boo
 	return clone.Data.(string), true
 }
 
-func nativePDFRenderHashWithLength(value *object.EmeraldValue, length int, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) (string, bool) {
+func nativePDFRenderHashWithLength(value *object.EmeraldValue, length int, seen map[*object.EmeraldValue]bool, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) (string, bool) {
 	entries, ok := nativePDFRenderHashEntriesFor(value, valuePlans)
 	if !ok {
 		return "", false
@@ -729,13 +757,59 @@ func nativePDFRenderHashWithLength(value *object.EmeraldValue, length int, value
 	for _, entry := range entries {
 		output.WriteString(nativePDFSymbolText(entry.keyName))
 		output.WriteByte(' ')
-		if !nativePDFRenderWriteObjectText(&output, entry.value, false, make(map[*object.EmeraldValue]bool), valuePlans) {
+		if !nativePDFRenderWriteObjectText(&output, entry.value, false, seen, valuePlans) {
 			return "", false
 		}
 		output.WriteByte('\n')
 	}
 	output.WriteString(">>")
 	return output.String(), true
+}
+
+// nativePDFRenderWriteHashWithLength is the steady-state form used by the
+// renderer region. Hash entries are already sorted by nativePDFHashEntries
+// during preflight, so the hot pass only merges the synthetic Length entry
+// into that order and writes directly to the final output builder. This keeps
+// one temporary hash slice and one temporary serialized string out of every
+// stream reference while preserving PDF::Core's key order.
+func nativePDFRenderWriteHashWithLength(output *strings.Builder, value *object.EmeraldValue, length int, seen map[*object.EmeraldValue]bool, valuePlans map[*object.EmeraldValue]nativePDFRenderValuePlan) bool {
+	if output == nil {
+		return false
+	}
+	entries, ok := nativePDFRenderHashEntriesFor(value, valuePlans)
+	if !ok {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.keyName == "Length" {
+			return false
+		}
+	}
+	output.WriteString("<< ")
+	lengthWritten := false
+	writeLength := func() {
+		output.WriteString(nativePDFSymbolText("Length"))
+		output.WriteByte(' ')
+		output.WriteString(strconv.Itoa(length))
+		output.WriteByte('\n')
+		lengthWritten = true
+	}
+	for _, entry := range entries {
+		if !lengthWritten && entry.keyName > "Length" {
+			writeLength()
+		}
+		output.WriteString(nativePDFSymbolText(entry.keyName))
+		output.WriteByte(' ')
+		if !nativePDFRenderWriteObjectText(output, entry.value, false, seen, valuePlans) {
+			return false
+		}
+		output.WriteByte('\n')
+	}
+	if !lengthWritten {
+		writeLength()
+	}
+	output.WriteString(">>")
+	return true
 }
 
 // nativePDFRenderWriteObjectText is the renderer-only serializer. The
