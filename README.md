@@ -101,7 +101,10 @@ cycle guard；
 任何输出参数、回调、压缩、加密、非 ASCII content stream、循环/子类/自定义 trailer 或
 重定义都会 side-exit 到 Ruby。可用 `RGO_DISABLE_NATIVE_PDF_RENDER_REGION=1` 回退。
 这不是固定 PDF 模板 serializer，而是对真实对象图的统一 guarded pass；两页默认文档的
-SHA-256 与 Ruby fallback 保持一致。
+SHA-256 与 Ruby fallback 保持一致。布局模板还缓存稳定类指针与字面量形状，采用 epoch
+绑定和 trusted writer；同一 PDF 的 100,000 次 render 在单核低负载样本中约为 `0.74–0.77s`
+（f8d19d3 基线约 `0.97s`），这只是该稳定对象图的约 `1.3x`，不代表通用 Prawn 或稳定
+`3–10x`。
 
 本轮进一步把 Renderer 的对象图预检拆成可复用的 typed layout template：首个对象图完成完整
 cycle/class/dictionary proof 后，按 reference 数和页数缓存带结构签名的节点布局；后续 render

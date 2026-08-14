@@ -245,3 +245,90 @@ func TestNativePDFRenderRealTextMatchesRubyNumberShape(t *testing.T) {
 		}
 	}
 }
+
+func TestNativePDFRenderLayoutTemplateGuardsStaticFloatDrift(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Value", Class: core.R.Classes["Symbol"]}
+	floatValue := func(value float64) *object.EmeraldValue {
+		return &object.EmeraldValue{Type: object.ValueFloat, Data: value, Class: core.R.Classes["Float"]}
+	}
+	data := nativePDFHashValue([2]*object.EmeraldValue{key, floatValue(1.25)})
+	info := nativePDFEmptyHash()
+	ref := &object.EmeraldValue{Type: object.ValueObject, Class: referenceClass, Data: &object.Object{Class: referenceClass}}
+	plan := &nativePDFRenderRegionPlan{
+		root:  data,
+		info:  info,
+		refs:  []nativePDFRenderReferencePlan{{ref: ref, data: data}},
+		pages: []nativePDFRenderPagePlan{{}},
+	}
+	template := nativePDFRenderLayoutTemplateFor(plan, referenceClass)
+	if template == nil {
+		t.Fatal("static-float layout template was not built")
+	}
+	stable := nativePDFHashValue([2]*object.EmeraldValue{key, floatValue(1.25)})
+	if _, ok := nativePDFRenderBindLayoutTemplate(template, stable, info, []*object.EmeraldValue{stable}, referenceClass); !ok {
+		t.Fatal("unchanged static float should bind")
+	}
+	drifted := nativePDFHashValue([2]*object.EmeraldValue{key, floatValue(2.5)})
+	if _, ok := nativePDFRenderBindLayoutTemplate(template, drifted, info, []*object.EmeraldValue{drifted}, referenceClass); ok {
+		t.Fatal("changed static float must side-exit the cached layout")
+	}
+}
+
+func TestNativePDFRenderLayoutTemplateGuardsASCIIStringDrift(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Value", Class: core.R.Classes["Symbol"]}
+	stringValue := func(value string) *object.EmeraldValue {
+		return &object.EmeraldValue{Type: object.ValueString, Data: value, Class: core.R.Classes["String"]}
+	}
+	data := nativePDFHashValue([2]*object.EmeraldValue{key, stringValue("A")})
+	info := nativePDFEmptyHash()
+	ref := &object.EmeraldValue{Type: object.ValueObject, Class: referenceClass, Data: &object.Object{Class: referenceClass}}
+	plan := &nativePDFRenderRegionPlan{
+		root:  data,
+		info:  info,
+		refs:  []nativePDFRenderReferencePlan{{ref: ref, data: data}},
+		pages: []nativePDFRenderPagePlan{{}},
+	}
+	template := nativePDFRenderLayoutTemplateFor(plan, referenceClass)
+	if template == nil {
+		t.Fatal("ASCII-string layout template was not built")
+	}
+	stable := nativePDFHashValue([2]*object.EmeraldValue{key, stringValue("B")})
+	if _, ok := nativePDFRenderBindLayoutTemplate(template, stable, info, []*object.EmeraldValue{stable}, referenceClass); !ok {
+		t.Fatal("another ASCII string should bind")
+	}
+	nonASCII := nativePDFHashValue([2]*object.EmeraldValue{key, stringValue("é")})
+	if _, ok := nativePDFRenderBindLayoutTemplate(template, nonASCII, info, []*object.EmeraldValue{nonASCII}, referenceClass); ok {
+		t.Fatal("non-ASCII string must side-exit the ASCII layout")
+	}
+}
+
+func TestNativePDFRenderLayoutTrailerUsesTypedReferences(t *testing.T) {
+	template := &nativePDFRenderLayoutTemplate{
+		rootNode: 0,
+		infoNode: 1,
+		nodes: []nativePDFRenderLayoutNode{
+			{kind: object.ValueObject},
+			{kind: object.ValueObject},
+		},
+	}
+	bound := &nativePDFRenderBoundLayout{
+		template:    template,
+		values:      []*object.EmeraldValue{{Type: object.ValueObject}, {Type: object.ValueObject}},
+		bound:       []uint32{1, 1},
+		epoch:       1,
+		boundCount:  2,
+		identifiers: []int64{7, 2},
+		generations: []int64{0, 3},
+	}
+	var output strings.Builder
+	if !nativePDFRenderWriteLayoutTrailer(&output, bound, 8) {
+		t.Fatal("typed trailer writer rejected guarded references")
+	}
+	if got, want := output.String(), "<< /Info 2 3 R\n/Root 7 0 R\n/Size 8\n>>"; got != want {
+		t.Fatalf("typed trailer = %q, want %q", got, want)
+	}
+}
