@@ -103,6 +103,20 @@ cycle guard；
 这不是固定 PDF 模板 serializer，而是对真实对象图的统一 guarded pass；两页默认文档的
 SHA-256 与 Ruby fallback 保持一致。
 
+本轮进一步把 Renderer 的对象图预检拆成可复用的 typed layout template：首个对象图完成完整
+cycle/class/dictionary proof 后，按 reference 数和页数缓存带结构签名的节点布局；后续 render
+只绑定当前 Ruby 对象到线性 typed node graph，直接复用 array/hash 边和 reference 数据节点，
+不再为每次 render 重建递归 value-plan/cycle map。Hash key、共享边、stream filtered cache、
+reference generation 或方法/常量代际不匹配时立即 side-exit；布局缓存随 ABI generation 失效，
+较大 composite 仍使用原有 compiler/serializer 路径。该模板只改变 proven hot region，不放宽
+自定义 trailer、回调、压缩/加密、子类或非 ASCII guard。
+
+在同一台机器的 20,000 次重复 `Renderer#render` 低负载单核样本中，模板路径两次约
+`0.34–0.35s`，模板接入前二进制约 `0.38–0.39s`；关闭整个 Renderer region 约 `1.8s`。
+这说明 renderer serialization 子路径有约 `1.1x` 的增量和约 `5x` 的 Ruby-region 差距，
+但新建三页动态文档 5000 次仍约 `0.88–0.89s`，关闭 region 约 `1.40s`，文档构建/VM
+dispatch 仍占主要成本；因此不把该结果外推为通用稳定 `3–10x`。
+
 低负载单核复测（500 个两页默认文档，关闭自动 source-AOT）中，render region 为
 `0.178–0.183s`，同一二进制关闭 region 为 `0.229–0.314s`；profile 确认 500 次
 `Renderer#render` Ruby 调用被消除。与 MRI `0.334s` 相比，当前真实对象图 VM 已约

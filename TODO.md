@@ -1,5 +1,6 @@
 # RGo 待办事项
 
+- [x] 2026-08-15：将完整 `PDF::Core::Renderer#render` 的 per-render object graph proof 收敛为可复用 typed layout template：首次完整预检记录 root/info/reference data 的节点、数组边、排序 dictionary key 和 raw/filtered stream 状态；同一 ABI generation 后续 render 以线性 typed binder 绑定新对象，保留共享边、Hash key、cycle、reference `@gen` 和 stream cache guard，失败即回到原完整路径。新增布局模板/绑定/循环/键漂移语义测试；20,000 次同一 PDF render 低负载样本约 `0.34–0.35s`，模板接入前约 `0.38–0.39s`，关闭 Renderer region 约 `1.8s`；动态三页 5000 次输出仍为 `8933358`、约 `0.88–0.89s` 对 `1.40s`，只记录为 renderer 子路径收益，不宣称稳定 `3–10x`。
 - [x] 2026-08-15：profile 显示 native PDF 构造路径的 ObjectSpace weak-list 每 4096 个对象就全表扫描，单核 5000 次样本约占 29% CPU；将普通注册与已有 batch 路径统一到 65536 阈值，并按 reference 数预留 Renderer per-render layout map。ObjectSpace 仍逐对象保留 weak handle，显式 GC 仍立即 compact；定向回归通过，5000 次输出保持 `8933358`，低负载单核样本约 `0.91s`。
 - [x] 2026-08-15：合并 Renderer reference preflight 时误反写 stream dictionary 的 `/Length` guard，导致完整 render 每次 side-exit；已由 5000 次 profile 定位并修正为“已有 Length 才回退”，随后补跑 PDF 定向回归。
 - [x] 2026-08-15：将 reference 的 identifier/data/stream/filter cache 读取合并为单次 typed layout plan，并让已完成 cycle preflight 的 writer 使用 trusted nil-seen 路径；同时把 composite compiler admission 从 8 收紧到 16 项，避免普通 dictionary 的预编译成本。5000 次输出保持 `8933358`，profile 中 compiler 热点消失；一次低负载旧/新样本为 `1.314s/1.207s`，约 `8%`，仅记录为样本收益。

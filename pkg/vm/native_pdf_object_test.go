@@ -168,3 +168,53 @@ func TestNativePDFRenderHashWithLengthUsesRubyDictionaryShape(t *testing.T) {
 		t.Fatal("expected an existing Length key to deopt instead of duplicating Ruby Hash#merge")
 	}
 }
+
+func TestNativePDFRenderLayoutTemplateBindsTypedGraphAndRejectsShapeDrift(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Value", Class: core.R.Classes["Symbol"]}
+	data := nativePDFHashValue([2]*object.EmeraldValue{key, core.NewIntegerValue(42)})
+	info := nativePDFEmptyHash()
+	ref := &object.EmeraldValue{Type: object.ValueObject, Class: referenceClass, Data: &object.Object{Class: referenceClass}}
+	plan := &nativePDFRenderRegionPlan{
+		root:  data,
+		info:  info,
+		refs:  []nativePDFRenderReferencePlan{{ref: ref, data: data}},
+		pages: []nativePDFRenderPagePlan{{}},
+	}
+	template := nativePDFRenderLayoutTemplateFor(plan, referenceClass)
+	if template == nil || len(template.nodes) < 3 || len(template.refs) != 1 {
+		t.Fatalf("layout template = %#v", template)
+	}
+	newData := nativePDFHashValue([2]*object.EmeraldValue{key, core.NewIntegerValue(99)})
+	bound, ok := nativePDFRenderBindLayoutTemplate(template, newData, nativePDFEmptyHash(), []*object.EmeraldValue{newData}, referenceClass)
+	if !ok {
+		t.Fatal("fresh graph should bind to the cached layout")
+	}
+	var output strings.Builder
+	if !nativePDFRenderWriteLayoutNode(&output, bound, template.rootNode, false) {
+		t.Fatal("typed layout writer rejected bound graph")
+	}
+	want, ok := nativePDFObjectText(newData, false, make(map[*object.EmeraldValue]bool))
+	if !ok || output.String() != want {
+		t.Fatalf("typed layout = %q, generic = %q, generic ok=%t", output.String(), want, ok)
+	}
+
+	wrongKey := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Other", Class: core.R.Classes["Symbol"]}
+	wrongData := nativePDFHashValue([2]*object.EmeraldValue{wrongKey, core.NewIntegerValue(99)})
+	if _, ok := nativePDFRenderBindLayoutTemplate(template, wrongData, nativePDFEmptyHash(), []*object.EmeraldValue{wrongData}, referenceClass); ok {
+		t.Fatal("changed dictionary key must side-exit the cached layout")
+	}
+
+	cycle := &object.EmeraldValue{Type: object.ValueArray, Class: core.R.Classes["Array"]}
+	cycle.Data = []*object.EmeraldValue{cycle}
+	cyclePlan := &nativePDFRenderRegionPlan{
+		root:  cycle,
+		info:  nativePDFEmptyHash(),
+		refs:  []nativePDFRenderReferencePlan{{ref: ref, data: cycle}},
+		pages: []nativePDFRenderPagePlan{{}},
+	}
+	if nativePDFRenderLayoutTemplateFor(cyclePlan, referenceClass) != nil {
+		t.Fatal("cyclic graph must not produce a typed layout template")
+	}
+}
