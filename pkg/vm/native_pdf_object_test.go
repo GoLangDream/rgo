@@ -272,6 +272,41 @@ func TestNativePDFRenderObjectLayoutGenerationIsFieldScoped(t *testing.T) {
 	}
 }
 
+func TestNativePDFRenderCachedBookkeepingPreservesObjectLayouts(t *testing.T) {
+	core.InitWithMspec()
+	stateClass := object.NewClass("PDF::Core::State")
+	if !stateClass.PrepareBatchInstanceVarLayout([]string{"@page"}) {
+		t.Fatal("expected the state bookkeeping slot to fit the compact layout")
+	}
+	state := stateClass.NewInstance()
+	if err := nativePDFRenderSetCachedBookkeeping(state, "@page", core.R.TrueVal); err != nil {
+		t.Fatalf("inline bookkeeping write failed: %#v", err)
+	}
+	if got := core.DynamicInstanceVar(state, "@page"); got != core.R.TrueVal {
+		t.Fatalf("inline bookkeeping value = %#v, want true", got)
+	}
+
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	reference := referenceClass.NewInstance()
+	if err := core.SetDynamicInstanceVar(reference, "@offset", core.NewIntegerValue(1)); err != nil {
+		t.Fatalf("initial map bookkeeping write failed: %#v", err)
+	}
+	if err := nativePDFRenderSetCachedMapBookkeeping(reference, "@offset", core.NewIntegerValue(2)); err != nil {
+		t.Fatalf("existing map bookkeeping write failed: %#v", err)
+	}
+	if got := core.DynamicInstanceVar(reference, "@offset"); got == nil || got.Data != int64(2) {
+		t.Fatalf("existing map bookkeeping value = %#v, want 2", got)
+	}
+
+	missing := referenceClass.NewInstance()
+	if err := nativePDFRenderSetCachedMapBookkeeping(missing, "@offset", core.NewIntegerValue(3)); err != nil {
+		t.Fatalf("missing map bookkeeping side-exit failed: %#v", err)
+	}
+	if got := core.DynamicInstanceVar(missing, "@offset"); got == nil || got.Data != int64(3) {
+		t.Fatalf("side-exit bookkeeping value = %#v, want 3", got)
+	}
+}
+
 func TestNativePDFRenderRealTextMatchesRubyNumberShape(t *testing.T) {
 	tests := []struct {
 		value float64

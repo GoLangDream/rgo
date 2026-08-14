@@ -42,6 +42,21 @@ type nativePDFRenderRegionABIPlan struct {
 	renderMethod       *object.Method
 	valid              bool
 	layoutTemplates    map[nativePDFRenderLayoutTemplateKey][]*nativePDFRenderLayoutTemplate
+	inputCache         nativePDFRenderRegionInputCache
+}
+
+// nativePDFRenderRegionInputCache keeps the immutable half of a renderer
+// graph guard out of the repeated render call. It is invalidated by the same
+// conservative Ruby-visible mutation epoch used by the serialized output
+// cache, so a changed state/store/page container always re-enters the full
+// input proof.
+type nativePDFRenderRegionInputCache struct {
+	valid              bool
+	mutationGeneration uint64
+	receiver           *object.EmeraldValue
+	stateClass         *object.Class
+	storeClass         *object.Class
+	inputs             nativePDFRenderRegionInputs
 }
 
 type nativePDFRenderPagePlan struct {
@@ -416,25 +431,77 @@ func (vm *VM) nativePDFRenderReplayCachedOutput(plan *nativePDFRenderRegionPlan,
 		return nil, false
 	}
 	for _, page := range plan.cachedOutputPages {
-		if result := core.SetDynamicInstanceVar(plan.state, "@page", page.page); result != nil {
+		if result := nativePDFRenderSetCachedBookkeeping(plan.state, "@page", page.page); result != nil {
 			return result, true
 		}
 	}
-	if result := core.SetDynamicInstanceVar(receiver, "@page_number", core.NewIntegerValue(int64(len(plan.cachedOutputPages)))); result != nil {
+	if result := nativePDFRenderSetCachedBookkeeping(receiver, "@page_number", core.NewIntegerValue(int64(len(plan.cachedOutputPages)))); result != nil {
 		return result, true
 	}
 	for index, ref := range plan.cachedOutputRefs {
 		if ref == nil {
 			return nil, false
 		}
-		if result := core.SetDynamicInstanceVar(ref, "@offset", core.NewIntegerValue(plan.cachedOutputOffsets[index])); result != nil {
+		if result := nativePDFRenderSetCachedMapBookkeeping(ref, "@offset", core.NewIntegerValue(plan.cachedOutputOffsets[index])); result != nil {
 			return result, true
 		}
 	}
-	if result := core.SetDynamicInstanceVar(receiver, "@xref_offset", core.NewIntegerValue(plan.cachedOutputXrefOffset)); result != nil {
+	if result := nativePDFRenderSetCachedBookkeeping(receiver, "@xref_offset", core.NewIntegerValue(plan.cachedOutputXrefOffset)); result != nil {
 		return result, true
 	}
 	return &object.EmeraldValue{Type: object.ValueString, Data: plan.cachedOutputText, Class: core.R.Classes["String"], Encoding: "ASCII-8BIT"}, true
+}
+
+// nativePDFRenderSetCachedBookkeeping updates only fields that the renderer
+// epilogue itself owns. The output-cache guard has already proved these exact
+// objects are ordinary, unfrozen PDF objects. Map-backed fields can therefore
+// skip the generic type/frozen/class lookup; a prepared inline slot keeps its
+// generation and map mirror coherent. Any unexpected representation goes
+// through the ordinary Ruby-visible setter and remains a safe side-exit.
+func nativePDFRenderSetCachedBookkeeping(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Frozen || receiver.Type != object.ValueObject {
+		return core.SetDynamicInstanceVar(receiver, name, value)
+	}
+	data, ok := receiver.Data.(*object.Object)
+	if !ok || data == nil || data.SingletonClass != nil {
+		return core.SetDynamicInstanceVar(receiver, name, value)
+	}
+	if data.HotIntegerInstanceVarMask != 0 {
+		data.FlushHotIntegerInstanceVars()
+	}
+	if data.Class != nil {
+		if slot, exists := data.Class.InstanceVarSlots[name]; exists && int(slot) < len(data.InlineInstanceVars) {
+			data.SetInlineInstanceVarFast(int(slot), name, value)
+			return nil
+		}
+	}
+	if data.InstanceVars != nil {
+		if _, exists := data.InstanceVars[name]; exists {
+			data.InstanceVars[name] = value
+			return nil
+		}
+	}
+	return core.SetDynamicInstanceVar(receiver, name, value)
+}
+
+// Reference#@offset is deliberately outside the four promoted Reference
+// fields used by the typed layout, so a proven cached Reference keeps this
+// field in its ordinary map. Avoid the class-slot probe in the per-reference
+// loop while retaining the existence check needed by remove_instance_variable
+// side-exits.
+func nativePDFRenderSetCachedMapBookkeeping(receiver *object.EmeraldValue, name string, value *object.EmeraldValue) *object.EmeraldValue {
+	if receiver == nil || receiver.Frozen || receiver.Type != object.ValueObject {
+		return core.SetDynamicInstanceVar(receiver, name, value)
+	}
+	data, ok := receiver.Data.(*object.Object)
+	if !ok || data == nil || data.SingletonClass != nil || data.HotIntegerInstanceVarMask != 0 || data.InstanceVars == nil {
+		return core.SetDynamicInstanceVar(receiver, name, value)
+	}
+	if _, exists := data.InstanceVars[name]; !exists {
+		return core.SetDynamicInstanceVar(receiver, name, value)
+	}
+	data.InstanceVars[name] = value
+	return nil
 }
 
 // nativePDFRenderWriteLayoutTrailer is the fixed trailer shape produced by
@@ -616,7 +683,7 @@ func nativePDFRenderCorePDFObject(vm *VM) bool {
 }
 
 func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClass, storeClass, referenceClass, streamClass, filterListClass, pageClass, stackClass *object.Class) (*nativePDFRenderRegionPlan, bool) {
-	inputs, ok := nativePDFRenderRegionInputsFor(receiver, stateClass, storeClass)
+	inputs, ok := vm.nativePDFRenderRegionCachedInputsFor(receiver, stateClass, storeClass)
 	if !ok {
 		return nil, false
 	}
@@ -682,6 +749,30 @@ func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClas
 		nativePDFRenderInstallLayoutTemplate(vm, template)
 	}
 	return plan, true
+}
+
+func (vm *VM) nativePDFRenderRegionCachedInputsFor(receiver *object.EmeraldValue, stateClass, storeClass *object.Class) (nativePDFRenderRegionInputs, bool) {
+	if vm == nil {
+		return nativePDFRenderRegionInputs{}, false
+	}
+	cache := &vm.nativePDFRenderRegionABIPlan.inputCache
+	generation := object.CurrentRenderMutationGeneration()
+	if cache.valid && cache.mutationGeneration == generation && cache.receiver == receiver &&
+		cache.stateClass == stateClass && cache.storeClass == storeClass {
+		return cache.inputs, true
+	}
+	inputs, ok := nativePDFRenderRegionInputsFor(receiver, stateClass, storeClass)
+	if !ok {
+		cache.valid = false
+		return nativePDFRenderRegionInputs{}, false
+	}
+	cache.valid = true
+	cache.mutationGeneration = object.CurrentRenderMutationGeneration()
+	cache.receiver = receiver
+	cache.stateClass = stateClass
+	cache.storeClass = storeClass
+	cache.inputs = inputs
+	return inputs, true
 }
 
 func nativePDFRenderRegionInputsFor(receiver *object.EmeraldValue, stateClass, storeClass *object.Class) (nativePDFRenderRegionInputs, bool) {

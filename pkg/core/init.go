@@ -8233,6 +8233,7 @@ func methodFreeze(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	result := receiver
 	if receiver != nil {
 		receiver.Frozen = true
+		object.BumpRenderMutationGeneration()
 		if receiver.Type == object.ValueString && receiver.Literal && len(receiver.InstanceVars) == 0 {
 			result = deduplicateFrozenString(receiver)
 		}
@@ -8764,6 +8765,7 @@ func SingletonClass(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if class.SuperClass == nil {
 		class.SuperClass = R.Classes["Class"]
 	}
+	object.BumpRenderMutationGeneration()
 	result := &object.EmeraldValue{Type: object.ValueClass, Data: class, Class: R.Classes["Class"], Frozen: class.Frozen}
 	trackObjectSpaceValue(result)
 	return result
@@ -9147,6 +9149,7 @@ func methodRemoveInstanceVariable(receiver *object.EmeraldValue, args ...*object
 	vars := receiverInstanceVarMap(receiver)
 	if value, ok := vars[name]; ok {
 		delete(vars, name)
+		object.BumpRenderMutationGeneration()
 		return value
 	}
 	return NewNameError("instance variable " + name + " not defined")
