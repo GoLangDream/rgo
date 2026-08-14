@@ -300,6 +300,19 @@ type Object struct {
 	StructValues                 []*EmeraldValue
 }
 
+// renderLayoutInstanceVarMutation reports ivars that are overwritten by the
+// native PDF render epilogue itself. They affect Ruby-visible bookkeeping but
+// not the serialized object graph, so changing them must not evict an output
+// cache on every otherwise-identical render.
+func renderLayoutInstanceVarMutation(name string) bool {
+	switch name {
+	case "@offset", "@page", "@page_number", "@xref_offset":
+		return false
+	default:
+		return true
+	}
+}
+
 // objectValuePair keeps the Ruby value header and its ordinary object payload
 // in one Go allocation. The historical path allocated the EmeraldValue and
 // Object separately, which dominates tight `Class.new` loops once method
@@ -397,6 +410,9 @@ func (o *Object) SetInstanceVar(name string, value *EmeraldValue) {
 			}
 			o.InstanceVarGeneration++
 			o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
+			if renderLayoutInstanceVarMutation(name) {
+				BumpRenderMutationGeneration()
+			}
 			return
 		}
 	}
@@ -417,6 +433,9 @@ func (o *Object) SetInstanceVar(name string, value *EmeraldValue) {
 	if o.Class != nil {
 		if index, ok := o.Class.instanceVarSlot(name); ok && index < inlineInstanceVarSlots {
 			o.InstanceVarGeneration++
+			if renderLayoutInstanceVarMutation(name) {
+				BumpRenderMutationGeneration()
+			}
 		}
 	}
 }
@@ -465,6 +484,9 @@ func (o *Object) SetHotIntegerInstanceVar(index int, value int64, integerClass *
 	if o.Class != nil {
 		if slot, ok := o.Class.instanceVarSlot(o.HotIntegerInstanceVarNames[index]); ok && slot < inlineInstanceVarSlots {
 			o.InstanceVarGeneration++
+			if renderLayoutInstanceVarMutation(o.HotIntegerInstanceVarNames[index]) {
+				BumpRenderMutationGeneration()
+			}
 		}
 	}
 	return true
@@ -485,6 +507,7 @@ func (o *Object) flushHotIntegerInstanceVars() {
 		o.InstanceVars = make(map[string]*EmeraldValue)
 	}
 	layoutChanged := false
+	renderLayoutChanged := false
 	for index, name := range o.HotIntegerInstanceVarNames {
 		bit := uint8(1 << index)
 		if name == "" || o.HotIntegerInstanceVarMask&bit == 0 {
@@ -503,11 +526,17 @@ func (o *Object) flushHotIntegerInstanceVars() {
 		if o.Class != nil {
 			if slot, ok := o.Class.instanceVarSlot(name); ok && slot < inlineInstanceVarSlots {
 				layoutChanged = true
+				if renderLayoutInstanceVarMutation(name) {
+					renderLayoutChanged = true
+				}
 			}
 		}
 	}
 	if layoutChanged {
 		o.InstanceVarGeneration++
+		if renderLayoutChanged {
+			BumpRenderMutationGeneration()
+		}
 	}
 }
 
@@ -536,6 +565,9 @@ func (o *Object) SetInlineInstanceVar(index int, name string, value *EmeraldValu
 	}
 	o.InstanceVarGeneration++
 	o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
+	if renderLayoutInstanceVarMutation(name) {
+		BumpRenderMutationGeneration()
+	}
 	return true
 }
 
@@ -564,6 +596,9 @@ func (o *Object) SetInlineInstanceVarFast(index int, name string, value *Emerald
 	}
 	o.InstanceVarGeneration++
 	o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
+	if renderLayoutInstanceVarMutation(name) {
+		BumpRenderMutationGeneration()
+	}
 }
 
 // InstanceVarMap materializes the compact slots only for APIs that require a

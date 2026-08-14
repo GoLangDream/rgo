@@ -140,6 +140,7 @@ func (vm *VM) executeNativePDFRendererFinalize(methodObj *object.Method, receive
 			}
 			items = items[:len(items)-1]
 			values.Data = items
+			object.BumpRenderMutationGeneration()
 		}
 	}
 	core.SetDynamicInstanceVar(receiver, "@page_number", core.NewIntegerValue(int64(len(pageItems))))

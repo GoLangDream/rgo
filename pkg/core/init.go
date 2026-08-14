@@ -26854,6 +26854,7 @@ func AppendArrayValues(receiver *object.EmeraldValue, values []*object.EmeraldVa
 		return false
 	}
 	receiver.Data = append(elements, values...)
+	object.BumpRenderMutationGeneration()
 	return true
 }
 
@@ -26870,6 +26871,7 @@ func AppendArrayValue(receiver, value *object.EmeraldValue) bool {
 		return false
 	}
 	receiver.Data = append(elements, value)
+	object.BumpRenderMutationGeneration()
 	return true
 }
 
@@ -33201,6 +33203,7 @@ func stringEncodingName(receiver *object.EmeraldValue) string {
 func SetStringEncoding(value *object.EmeraldValue, encoding string) {
 	if value != nil && value.Type == object.ValueString && encoding != "" {
 		value.Encoding = encoding
+		object.BumpRenderMutationGeneration()
 	}
 }
 
@@ -33314,6 +33317,7 @@ func stringForceEncoding(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		name = canonical
 	}
 	receiver.Encoding = name
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -34456,10 +34460,12 @@ func arrayInitialize(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if err != nil {
 		if contents.values != nil {
 			receiver.Data = contents.values
+			object.BumpRenderMutationGeneration()
 		}
 		return err
 	}
 	receiver.Data = contents.values
+	object.BumpRenderMutationGeneration()
 	if lazyRegion != nil {
 		receiver.SetLazyArrayRegion(lazyRegion)
 		RegisterLazyArrayRegion(receiver)
@@ -34571,6 +34577,7 @@ func arrayReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		return typeError("no implicit conversion of " + args[0].TypeName() + " into Array")
 	}
 	receiver.Data = append([]*object.EmeraldValue(nil), replacement...)
+	object.BumpRenderMutationGeneration()
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
 	}
@@ -34637,6 +34644,7 @@ func arrayPush(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	}
 	arr, _ := valueToArray(receiver)
 	receiver.Data = append(arr, args...)
+	object.BumpRenderMutationGeneration()
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
 	}
@@ -34667,6 +34675,7 @@ func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 		result := make([]*object.EmeraldValue, n)
 		copy(result, arr[start:])
 		receiver.Data = arr[:start]
+		object.BumpRenderMutationGeneration()
 		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 	}
 	if len(arr) == 0 {
@@ -34674,6 +34683,7 @@ func arrayPop(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obje
 	}
 	result := arr[len(arr)-1]
 	receiver.Data = arr[:len(arr)-1]
+	object.BumpRenderMutationGeneration()
 	return result
 }
 
@@ -34884,6 +34894,7 @@ func arrayReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		arr[i], arr[j] = arr[j], arr[i]
 	}
 	receiver.Data = arr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -35351,6 +35362,7 @@ func hashSetDefault(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	if len(args) == 0 {
 		return R.NilVal
 	}
+	object.BumpRenderMutationGeneration()
 	h := hashData(receiver)
 	if h == nil {
 		return args[0]
@@ -35372,6 +35384,7 @@ func hashCompareByIdentity(receiver *object.EmeraldValue, args ...*object.Emeral
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	h := hashData(receiver)
 	if h != nil {
 		if !h.CompareByIdentity {
@@ -35418,6 +35431,7 @@ func hashRehash(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return receiver
@@ -35466,6 +35480,7 @@ func hashSetDefaultProc(receiver *object.EmeraldValue, args ...*object.EmeraldVa
 	if len(args) == 0 {
 		return R.NilVal
 	}
+	object.BumpRenderMutationGeneration()
 	original := args[0]
 	procValue := original
 	if procValue != nil && procValue.Type != object.ValueNil && procValue.Type != object.ValueProc {
@@ -35766,6 +35781,7 @@ func hashIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	if len(args) < 2 {
 		return R.NilVal
 	}
+	object.BumpRenderMutationGeneration()
 	if receiver == envObject {
 		key, errVal := envCoerceKey(args[0])
 		if errVal != nil {
@@ -39446,6 +39462,7 @@ func stringSliceBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 				source := stringRawValue(receiver)
 				if start >= 0 && end >= start && end <= len(source) {
 					receiver.Data = source[:start] + source[end:]
+					object.BumpRenderMutationGeneration()
 					return removed
 				}
 			}
@@ -39956,6 +39973,7 @@ func stringUnicodeNormalizeBang(receiver *object.EmeraldValue, args ...*object.E
 		return result
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -40004,6 +40022,7 @@ func stringScrubBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return result
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -40556,6 +40575,7 @@ func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 						}
 						current[i] = value
 						receiver.Data = current
+						object.BumpRenderMutationGeneration()
 					}
 					if LastException != nil {
 						return LastException
@@ -40594,6 +40614,7 @@ func arrayMapBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 		if i < len(current) {
 			current[i] = value
 			receiver.Data = current
+			object.BumpRenderMutationGeneration()
 		}
 	}
 	return receiver
@@ -43300,6 +43321,7 @@ func arraySelectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return R.NilVal
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -43342,6 +43364,7 @@ func newArrayKeepIfEnumerator(receiver *object.EmeraldValue) *object.EmeraldValu
 				}
 			}
 			receiver.Data = newArr
+			object.BumpRenderMutationGeneration()
 			return enum
 		}
 	}
@@ -44204,6 +44227,7 @@ func arrayConcat(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		arr = append(arr, values...)
 	}
 	receiver.Data = arr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -44690,6 +44714,7 @@ func arrayDeleteAt(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	newArr = append(newArr, arr[:idx]...)
 	newArr = append(newArr, arr[idx+1:]...)
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return result
 }
 
@@ -50730,6 +50755,7 @@ func arrayShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		result := make([]*object.EmeraldValue, n)
 		copy(result, arr[:n])
 		receiver.Data = arr[n:]
+		object.BumpRenderMutationGeneration()
 		return &object.EmeraldValue{Type: object.ValueArray, Data: result, Class: R.Classes["Array"]}
 	}
 	if len(arr) == 0 {
@@ -50737,6 +50763,7 @@ func arrayShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	}
 	result := arr[0]
 	receiver.Data = arr[1:]
+	object.BumpRenderMutationGeneration()
 	return result
 }
 
@@ -50867,6 +50894,7 @@ func arrayUnshift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *
 	newArr = append(newArr, args...)
 	newArr = append(newArr, arr...)
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -51070,6 +51098,7 @@ func arrayClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 		return frozenError("can't modify frozen array")
 	}
 	receiver.Data = make([]*object.EmeraldValue, 0)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -51243,6 +51272,7 @@ func hashDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *ob
 	if len(args) < 1 {
 		return R.NilVal
 	}
+	object.BumpRenderMutationGeneration()
 	deleteKey := args[0]
 	if receiver == envObject {
 		key, errVal := envCoerceKey(args[0])
@@ -51278,6 +51308,7 @@ func hashClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	if h := hashData(receiver); h != nil {
 		h.Pairs = make(map[*object.EmeraldValue]*object.EmeraldValue)
 		h.Keys = []*object.EmeraldValue{}
@@ -51317,6 +51348,7 @@ func hashCompactBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return R.NilVal
@@ -51550,6 +51582,7 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		updated = append(updated, replacement...)
 		updated = append(updated, arr[start+count:]...)
 		receiver.Data = updated
+		object.BumpRenderMutationGeneration()
 		return args[1]
 	}
 	if len(args) >= 3 {
@@ -51591,6 +51624,7 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		updated = append(updated, replacement...)
 		updated = append(updated, arr[idx+count:]...)
 		receiver.Data = updated
+		object.BumpRenderMutationGeneration()
 		return args[2]
 	}
 	idx, err := arrayIndexIntArg(args[0])
@@ -51608,6 +51642,7 @@ func arrayIndexSet(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	}
 	arr[idx] = args[1]
 	receiver.Data = arr
+	object.BumpRenderMutationGeneration()
 	return args[1]
 }
 
@@ -51853,6 +51888,7 @@ func arrayDelete(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		return frozenError("can't modify frozen array")
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	if receiver == loadedFeaturesGlobal() {
 		syncRequiredFeaturesFromLoadedFeatures()
 	}
@@ -51889,6 +51925,7 @@ func arrayDeleteIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 			current = receiver.Data.([]*object.EmeraldValue)
 			newArr = append(newArr, current[index:]...)
 			receiver.Data = newArr
+			object.BumpRenderMutationGeneration()
 			if LastException != nil && LastException != previousException {
 				return LastException
 			}
@@ -51899,6 +51936,7 @@ func arrayDeleteIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		}
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -51924,6 +51962,7 @@ func arrayKeepIf(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		}
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -51960,6 +51999,7 @@ func arrayCompactBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		return R.NilVal
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -51995,6 +52035,7 @@ func arrayFlattenBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		return R.NilVal
 	}
 	receiver.Data = flat
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -53589,6 +53630,7 @@ func arrayUniqBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return R.NilVal
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -53646,6 +53688,7 @@ func arraySortBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return err
 	}
 	receiver.Data = arr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -54644,6 +54687,7 @@ func stringGsubBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	}
 	receiver.Data = stringRawValue(result)
 	receiver.Encoding = stringEncodingName(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -54664,6 +54708,7 @@ func stringSubBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	}
 	receiver.Data = stringRawValue(result)
 	receiver.Encoding = stringEncodingName(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -55887,6 +55932,7 @@ func stringChompBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -55899,6 +55945,7 @@ func stringChopBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -55930,6 +55977,7 @@ func stringCaseConvertBang(receiver *object.EmeraldValue, operation string, args
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -55938,6 +55986,7 @@ func stringReverseBang(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return frozenError("can't modify frozen String")
 	}
 	receiver.Data = stringRawValue(stringReverse(receiver))
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -55994,6 +56043,7 @@ func appendStringValue(receiver, value *object.EmeraldValue) *object.EmeraldValu
 	builder.WriteString(stringRawValue(value))
 	receiver.Data = builder.String()
 	SetStringEncoding(receiver, encoding)
+	object.BumpRenderMutationGeneration()
 	return nil
 }
 
@@ -56096,6 +56146,7 @@ func AppendASCIIBytePattern(receiver *object.EmeraldValue, base, modulus, counte
 	}
 	receiver.Data = builder.String()
 	SetStringEncoding(receiver, stringEncodingName(receiver))
+	object.BumpRenderMutationGeneration()
 	return receiver, true
 }
 
@@ -56125,6 +56176,7 @@ func appendASCIIBytes(receiver *object.EmeraldValue, raw string, rawBytes []byte
 	}
 	receiver.Data = builder.String()
 	SetStringEncoding(receiver, encoding)
+	object.BumpRenderMutationGeneration()
 	return nil
 }
 
@@ -56634,6 +56686,7 @@ func stringSetByte(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	}
 	bytes[index] = byte(value)
 	receiver.Data = string(bytes)
+	object.BumpRenderMutationGeneration()
 	return newInt(value)
 }
 
@@ -56663,6 +56716,7 @@ func stringAppendAsBytes(receiver *object.EmeraldValue, args ...*object.EmeraldV
 		return typeError("wrong argument type " + typeName + " (expected String or Integer)")
 	}
 	receiver.Data = string(bytes)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -57191,6 +57245,7 @@ func stringSuccBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	}
 	result := stringSucc(receiver)
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -57328,6 +57383,7 @@ func hashMergeBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 	if len(args) < 1 {
 		return receiver
 	}
+	object.BumpRenderMutationGeneration()
 	if receiver == envObject {
 		return envMergeBang(receiver, args...)
 	}
@@ -71478,6 +71534,7 @@ func stringStripBangSide(receiver *object.EmeraldValue, left, right bool) *objec
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -71496,6 +71553,7 @@ func stringReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) 
 		return conversionTypeErrorToStringForMode(args[0], viaToStr)
 	}
 	receiver.Data = newStr
+	object.BumpRenderMutationGeneration()
 	if args[0] != nil && args[0].Type == object.ValueString {
 		CopyStringEncoding(receiver, args[0])
 	} else {
@@ -71519,6 +71577,7 @@ func stringClear(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 		return frozenError("can't modify frozen String")
 	}
 	receiver.Data = ""
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -71616,6 +71675,7 @@ func stringDeleteBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -71663,6 +71723,7 @@ func stringDeleteEdgeBang(receiver *object.EmeraldValue, value *object.EmeraldVa
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -71686,6 +71747,7 @@ func stringSqueezeBang(receiver *object.EmeraldValue, args ...*object.EmeraldVal
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -71780,6 +71842,7 @@ func stringTranslateBang(receiver *object.EmeraldValue, squeeze bool, args ...*o
 		return R.NilVal
 	}
 	receiver.Data = stringRawValue(result)
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -89686,6 +89749,7 @@ func arrayInsert(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	}
 	newArr = append(newArr, arr[idx:]...)
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -89760,6 +89824,7 @@ func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 				filled := CallBlock(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(idx), Class: R.Classes["Integer"]})
 				if filled != nil && filled.Type == object.ValueException {
 					receiver.Data = arr
+					object.BumpRenderMutationGeneration()
 					return filled
 				}
 				arr[idx] = filled
@@ -89768,6 +89833,7 @@ func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			}
 		}
 		receiver.Data = arr
+		object.BumpRenderMutationGeneration()
 		return receiver
 	}
 
@@ -89833,6 +89899,7 @@ func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 			filled := CallBlock(&object.EmeraldValue{Type: object.ValueInteger, Data: int64(i), Class: R.Classes["Integer"]})
 			if filled != nil && filled.Type == object.ValueException {
 				receiver.Data = arr
+				object.BumpRenderMutationGeneration()
 				return filled
 			}
 			arr[i] = filled
@@ -89841,6 +89908,7 @@ func arrayFill(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 		}
 	}
 	receiver.Data = arr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -90152,6 +90220,7 @@ func arraySliceBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue)
 	}
 	if length > 0 {
 		receiver.Data = append(arr[:start], arr[start+length:]...)
+		object.BumpRenderMutationGeneration()
 	}
 	return result
 }
@@ -90627,6 +90696,7 @@ func arrayRotateBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return typeError("can't convert rotated array")
 	}
 	receiver.Data = rotatedArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -90657,6 +90727,7 @@ func arrayShuffleBang(receiver *object.EmeraldValue, args ...*object.EmeraldValu
 	}
 	shuffled := arrayShuffle(receiver, args...).Data.([]*object.EmeraldValue)
 	receiver.Data = shuffled
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -90801,6 +90872,7 @@ func arrayRejectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		if val != nil && val.Type == object.ValueException {
 			newArr = append(newArr, arr[i:]...)
 			receiver.Data = newArr
+			object.BumpRenderMutationGeneration()
 			return val
 		}
 		if val.IsTruthy() {
@@ -90813,6 +90885,7 @@ func arrayRejectBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return R.NilVal
 	}
 	receiver.Data = newArr
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -91130,6 +91203,7 @@ func arraySortByBang(receiver *object.EmeraldValue, args ...*object.EmeraldValue
 		return control
 	}
 	receiver.Data = result
+	object.BumpRenderMutationGeneration()
 	return receiver
 }
 
@@ -91361,6 +91435,7 @@ func hashSelectBangApply(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return R.NilVal
@@ -91485,6 +91560,7 @@ func hashRejectBangApply(receiver *object.EmeraldValue, nilWhenUnchanged bool) *
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return receiver
@@ -91560,6 +91636,7 @@ func hashKeepIfApply(receiver *object.EmeraldValue) *object.EmeraldValue {
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return receiver
@@ -91718,6 +91795,7 @@ func hashTransformMappedKey(mapping, key *object.EmeraldValue) *object.EmeraldVa
 }
 
 func hashTransformKeysCommit(receiver, result *object.EmeraldValue) {
+	object.BumpRenderMutationGeneration()
 	target := hashData(receiver)
 	source := hashData(result)
 	if target == nil || source == nil {
@@ -91817,6 +91895,7 @@ func hashTransformValuesBangApply(receiver *object.EmeraldValue) *object.Emerald
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	data := hashData(receiver)
 	if data == nil {
 		return receiver
@@ -91928,6 +92007,7 @@ func hashShift(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *obj
 	if receiver != nil && receiver.Frozen {
 		return frozenError("can't modify frozen Hash")
 	}
+	object.BumpRenderMutationGeneration()
 	keys, hash := hashOrderedKeysFromValue(receiver)
 	if len(keys) == 0 || hash == nil {
 		return R.NilVal
@@ -91985,6 +92065,7 @@ func hashReplace(receiver *object.EmeraldValue, args ...*object.EmeraldValue) *o
 	if len(args) < 1 {
 		return receiver
 	}
+	object.BumpRenderMutationGeneration()
 	if receiver == envObject {
 		return envReplace(receiver, args...)
 	}

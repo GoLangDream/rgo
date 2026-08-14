@@ -57,6 +57,7 @@ type nativePDFRenderReferencePlan struct {
 	data                    *object.EmeraldValue
 	stream                  *object.EmeraldValue
 	raw                     *object.EmeraldValue
+	rawText                 string
 	filtered                string
 	filteredValue           *object.EmeraldValue
 	filteredCache           bool
@@ -165,6 +166,57 @@ type nativePDFRenderLayoutTemplate struct {
 	scratchReferencePlans []nativePDFRenderReferencePlan
 	scratchPagePlans      []nativePDFRenderPagePlan
 	scratchPlan           *nativePDFRenderRegionPlan
+	outputCache           nativePDFRenderLayoutOutputCache
+}
+
+// nativePDFRenderLayoutNodeSnapshot is the value half of the reusable typed
+// layout. The ordinary fast binder proves graph shape and object generations;
+// the snapshot additionally proves scalar/string contents before a complete
+// serialized PDF is reused. Without it, an in-place String mutation could
+// preserve the same EmeraldValue pointer while changing the cached bytes.
+type nativePDFRenderLayoutNodeSnapshot struct {
+	kind       object.ValueType
+	boolValue  bool
+	integer    int64
+	integerBig string
+	float      float64
+	text       string
+	encoding   string
+	identifier int64
+	generation int64
+}
+
+type nativePDFRenderLayoutPageCache struct {
+	page        *object.EmeraldValue
+	state       *object.EmeraldValue
+	stackValues *object.EmeraldValue
+	items       []*object.EmeraldValue
+}
+
+// nativePDFRenderLayoutOutputCache is deliberately attached to a proven
+// template. It is only consulted after the existing strict layout binder and
+// stream/reference guards succeed, so any uncertainty returns to the normal
+// typed writer or Ruby implementation.
+type nativePDFRenderLayoutOutputCache struct {
+	valid              bool
+	renderer           *object.EmeraldValue
+	state              *object.EmeraldValue
+	store              *object.EmeraldValue
+	identifiers        *object.EmeraldValue
+	objects            *object.EmeraldValue
+	root               *object.EmeraldValue
+	info               *object.EmeraldValue
+	pageValues         *object.EmeraldValue
+	version            float64
+	bound              *nativePDFRenderBoundLayout
+	refs               []*object.EmeraldValue
+	refPlans           []nativePDFRenderReferencePlan
+	pages              []nativePDFRenderLayoutPageCache
+	offsets            []int64
+	xrefOffset         int64
+	output             string
+	nodes              []nativePDFRenderLayoutNodeSnapshot
+	mutationGeneration uint64
 }
 
 type nativePDFRenderObjectSlots struct {
@@ -203,18 +255,25 @@ type nativePDFRenderRegionInputs struct {
 }
 
 type nativePDFRenderRegionPlan struct {
-	renderer    *object.EmeraldValue
-	state       *object.EmeraldValue
-	store       *object.EmeraldValue
-	identifiers *object.EmeraldValue
-	objects     *object.EmeraldValue
-	refs        []nativePDFRenderReferencePlan
-	pages       []nativePDFRenderPagePlan
-	root        *object.EmeraldValue
-	info        *object.EmeraldValue
-	version     float64
-	valuePlans  map[*object.EmeraldValue]nativePDFRenderValuePlan
-	layout      *nativePDFRenderBoundLayout
+	renderer               *object.EmeraldValue
+	state                  *object.EmeraldValue
+	store                  *object.EmeraldValue
+	identifiers            *object.EmeraldValue
+	objects                *object.EmeraldValue
+	refs                   []nativePDFRenderReferencePlan
+	pages                  []nativePDFRenderPagePlan
+	pageValues             *object.EmeraldValue
+	root                   *object.EmeraldValue
+	info                   *object.EmeraldValue
+	version                float64
+	valuePlans             map[*object.EmeraldValue]nativePDFRenderValuePlan
+	layout                 *nativePDFRenderBoundLayout
+	cachedOutput           bool
+	cachedOutputText       string
+	cachedOutputRefs       []*object.EmeraldValue
+	cachedOutputPages      []nativePDFRenderPagePlan
+	cachedOutputOffsets    []int64
+	cachedOutputXrefOffset int64
 }
 
 // executeNativePDFRendererRenderRegion replaces the Ruby StringIO/render
@@ -251,6 +310,9 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 	if !ok || object.CurrentMethodGeneration() != generation || object.CurrentConstantGeneration() != constantGeneration {
 		return nil, false
 	}
+	if plan.cachedOutput {
+		return vm.nativePDFRenderReplayCachedOutput(plan, receiver)
+	}
 
 	// The page plan has already checked every condition used by the existing
 	// native finalizer.  Keep the mutation in this region so no Ruby call or
@@ -268,6 +330,7 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 			}
 			page.items = page.items[:len(page.items)-1]
 			page.stackValues.Data = page.items
+			object.BumpRenderMutationGeneration()
 		}
 	}
 	if result := core.SetDynamicInstanceVar(receiver, "@page_number", core.NewIntegerValue(int64(len(plan.pages)))); result != nil {
@@ -336,7 +399,42 @@ func (vm *VM) executeNativePDFRendererRenderRegion(methodObj *object.Method, rec
 	output.WriteString("\nstartxref\n")
 	nativePDFRenderWriteInt(&output, int64(xrefOffset))
 	output.WriteString("\n%%EOF\n")
-	return &object.EmeraldValue{Type: object.ValueString, Data: output.String(), Class: core.R.Classes["String"], Encoding: "ASCII-8BIT"}, true
+	serialized := output.String()
+	if plan.layout != nil {
+		nativePDFRenderRememberLayoutOutput(plan, serialized, int64(xrefOffset))
+	}
+	return &object.EmeraldValue{Type: object.ValueString, Data: serialized, Class: core.R.Classes["String"], Encoding: "ASCII-8BIT"}, true
+}
+
+// nativePDFRenderReplayCachedOutput keeps the Ruby-visible state changes of
+// Renderer#render while skipping the already-proven finalizer and serializer.
+// The cache guard has run before this function, so these writes are the only
+// observable work left on the hot path.
+func (vm *VM) nativePDFRenderReplayCachedOutput(plan *nativePDFRenderRegionPlan, receiver *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || plan == nil || !plan.cachedOutput || receiver == nil || plan.state == nil ||
+		len(plan.cachedOutputRefs) != len(plan.cachedOutputOffsets) || plan.cachedOutputText == "" {
+		return nil, false
+	}
+	for _, page := range plan.cachedOutputPages {
+		if result := core.SetDynamicInstanceVar(plan.state, "@page", page.page); result != nil {
+			return result, true
+		}
+	}
+	if result := core.SetDynamicInstanceVar(receiver, "@page_number", core.NewIntegerValue(int64(len(plan.cachedOutputPages)))); result != nil {
+		return result, true
+	}
+	for index, ref := range plan.cachedOutputRefs {
+		if ref == nil {
+			return nil, false
+		}
+		if result := core.SetDynamicInstanceVar(ref, "@offset", core.NewIntegerValue(plan.cachedOutputOffsets[index])); result != nil {
+			return result, true
+		}
+	}
+	if result := core.SetDynamicInstanceVar(receiver, "@xref_offset", core.NewIntegerValue(plan.cachedOutputXrefOffset)); result != nil {
+		return result, true
+	}
+	return &object.EmeraldValue{Type: object.ValueString, Data: plan.cachedOutputText, Class: core.R.Classes["String"], Encoding: "ASCII-8BIT"}, true
 }
 
 // nativePDFRenderWriteLayoutTrailer is the fixed trailer shape produced by
@@ -549,6 +647,7 @@ func (vm *VM) nativePDFRenderRegionPlan(receiver *object.EmeraldValue, stateClas
 		objects:     inputs.objects,
 		refs:        make([]nativePDFRenderReferencePlan, 0, len(inputs.ids)),
 		pages:       make([]nativePDFRenderPagePlan, 0, len(inputs.pageItems)),
+		pageValues:  inputs.pageValues,
 		root:        inputs.root,
 		info:        inputs.info,
 		version:     inputs.version,
@@ -827,6 +926,10 @@ func nativePDFRenderLayoutFastNodeStillValid(template *nativePDFRenderLayoutTemp
 		}
 		for _, entry := range node.entries {
 			child := entry.node
+			keyName, keyOK := nativePDFRenderLayoutKeyName(entry.key)
+			if !keyOK || keyName != entry.keyName {
+				return false
+			}
 			entryValue, found := hash.Pairs[entry.key]
 			if !found || child < 0 || child >= len(bound.values) || nativePDFRenderLayoutCanonicalValue(entryValue) != bound.values[child] {
 				return false
@@ -862,6 +965,31 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 	if len(templates) == 0 {
 		return nil, false
 	}
+	currentMutationGeneration := object.CurrentRenderMutationGeneration()
+	for _, template := range templates {
+		if template == nil || len(template.refs) != len(inputs.ids) {
+			continue
+		}
+		cache := &template.outputCache
+		if !cache.valid || cache.mutationGeneration != currentMutationGeneration ||
+			cache.renderer != receiver || cache.identifiers != inputs.identifiers || cache.objects != inputs.objects ||
+			len(cache.refs) != len(inputs.ids) || len(cache.refPlans) != len(inputs.ids) {
+			continue
+		}
+		refData := template.scratchData
+		if cap(refData) < len(inputs.ids) {
+			refData = make([]*object.EmeraldValue, len(inputs.ids))
+		} else {
+			refData = refData[:len(inputs.ids)]
+		}
+		template.scratchData = refData
+		for index := range inputs.ids {
+			refData[index] = cache.refPlans[index].data
+		}
+		if cached, cachedOK := nativePDFRenderCachedLayoutPlanFor(template, inputs, receiver, cache.refs, refData, referenceClass, streamClass, filterListClass, pageClass, stackClass); cachedOK {
+			return cached, true
+		}
+	}
 	for _, template := range templates {
 		if template == nil || len(template.refs) != len(inputs.ids) {
 			continue
@@ -890,6 +1018,9 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 			}
 			refs[index] = ref
 			refData[index] = nativePDFRenderLayoutObjectIvar(ref, template.referenceClass, template.referenceSlots.data, "@data")
+		}
+		if cached, cachedOK := nativePDFRenderCachedLayoutPlanFor(template, inputs, receiver, refs, refData, referenceClass, streamClass, filterListClass, pageClass, stackClass); cachedOK {
+			return cached, true
 		}
 		bound, ok := nativePDFRenderBindLayoutTemplate(template, inputs.root, inputs.info, refData, referenceClass)
 		if !ok {
@@ -922,6 +1053,7 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 			objects:     inputs.objects,
 			refs:        refPlans,
 			pages:       pagePlans,
+			pageValues:  inputs.pageValues,
 			root:        inputs.root,
 			info:        inputs.info,
 			version:     inputs.version,
@@ -956,6 +1088,293 @@ func (vm *VM) nativePDFRenderLayoutPlanFor(inputs nativePDFRenderRegionInputs, r
 		}
 	}
 	return nil, false
+}
+
+func nativePDFRenderCachedLayoutPlanFor(template *nativePDFRenderLayoutTemplate, inputs nativePDFRenderRegionInputs, receiver *object.EmeraldValue, refs, refData []*object.EmeraldValue, referenceClass, streamClass, filterListClass, pageClass, stackClass *object.Class) (*nativePDFRenderRegionPlan, bool) {
+	if template == nil || !template.outputCache.valid || receiver == nil || len(refs) != len(template.refs) ||
+		len(refData) != len(template.refs) || referenceClass == nil || streamClass == nil || filterListClass == nil ||
+		pageClass == nil || stackClass == nil {
+		return nil, false
+	}
+	cache := &template.outputCache
+	if cache.bound == nil || cache.bound.template != template || cache.renderer != receiver || cache.state != inputs.state ||
+		cache.store != inputs.store || cache.identifiers != inputs.identifiers || cache.objects != inputs.objects ||
+		cache.root != inputs.root || cache.info != inputs.info || cache.pageValues != inputs.pageValues ||
+		cache.version != inputs.version || len(cache.refs) != len(refs) || len(cache.refPlans) != len(refs) ||
+		len(cache.pages) != len(inputs.pageItems) || len(cache.offsets) != len(refs) || cache.output == "" {
+		return nil, false
+	}
+	mutationStable := cache.mutationGeneration == object.CurrentRenderMutationGeneration()
+	for index, ref := range refs {
+		if ref != cache.refs[index] {
+			return nil, false
+		}
+	}
+	if !mutationStable {
+		if !nativePDFRenderLayoutFastBind(template, cache.bound, inputs.root, inputs.info, refData, referenceClass) ||
+			!nativePDFRenderLayoutOutputNodesStillValid(template, cache.bound, cache) {
+			return nil, false
+		}
+		for index, ref := range refs {
+			if _, refOK := nativePDFRenderCachedReferenceLayoutPlan(cache.refPlans, index, ref, refData[index], template.refs[index], template, cache.bound, referenceClass, streamClass, filterListClass); !refOK {
+				return nil, false
+			}
+		}
+	}
+	pagePlans := template.scratchPagePlans
+	if cap(pagePlans) < len(inputs.pageItems) {
+		pagePlans = make([]nativePDFRenderPagePlan, len(inputs.pageItems))
+	} else {
+		pagePlans = pagePlans[:len(inputs.pageItems)]
+	}
+	template.scratchPagePlans = pagePlans
+	for index, page := range inputs.pageItems {
+		if mutationStable {
+			cachedPage := cache.pages[index]
+			if cachedPage.page != page {
+				return nil, false
+			}
+			pagePlans[index] = nativePDFRenderPagePlan{page: cachedPage.page, state: cachedPage.state, stackValues: cachedPage.stackValues, items: cachedPage.items}
+			continue
+		}
+		pagePlan, pageOK := nativePDFBuildPagePlan(page, inputs.state, pageClass, stackClass)
+		if !pageOK || !nativePDFRenderPageCacheMatches(cache.pages[index], pagePlan) {
+			return nil, false
+		}
+		pagePlans[index] = pagePlan
+	}
+	plan := template.scratchPlan
+	if plan == nil {
+		plan = &nativePDFRenderRegionPlan{}
+		template.scratchPlan = plan
+	}
+	*plan = nativePDFRenderRegionPlan{
+		renderer:               receiver,
+		state:                  inputs.state,
+		store:                  inputs.store,
+		identifiers:            inputs.identifiers,
+		objects:                inputs.objects,
+		refs:                   cache.refPlans,
+		pages:                  pagePlans,
+		pageValues:             inputs.pageValues,
+		root:                   inputs.root,
+		info:                   inputs.info,
+		version:                inputs.version,
+		layout:                 cache.bound,
+		cachedOutput:           true,
+		cachedOutputText:       cache.output,
+		cachedOutputRefs:       cache.refs,
+		cachedOutputPages:      pagePlans,
+		cachedOutputOffsets:    cache.offsets,
+		cachedOutputXrefOffset: cache.xrefOffset,
+	}
+	return plan, true
+}
+
+func nativePDFRenderPageCacheMatches(cached nativePDFRenderLayoutPageCache, current nativePDFRenderPagePlan) bool {
+	if cached.page != current.page || cached.state != current.state || cached.stackValues != current.stackValues || len(cached.items) != len(current.items) {
+		return false
+	}
+	for index, item := range current.items {
+		if cached.items[index] != item {
+			return false
+		}
+	}
+	return true
+}
+
+func nativePDFRenderLayoutOutputNodesStillValid(template *nativePDFRenderLayoutTemplate, bound *nativePDFRenderBoundLayout, cache *nativePDFRenderLayoutOutputCache) bool {
+	if template == nil || bound == nil || cache == nil || len(cache.nodes) != len(template.nodes) || len(bound.values) != len(template.nodes) {
+		return false
+	}
+	for index, node := range template.nodes {
+		value := bound.values[index]
+		snapshot := cache.nodes[index]
+		if snapshot.kind != node.kind {
+			return false
+		}
+		switch node.kind {
+		case object.ValueNil:
+			if value != nil && value.Type != object.ValueNil {
+				return false
+			}
+		case object.ValueBool:
+			truth, ok := value.Data.(bool)
+			if !ok || truth != snapshot.boolValue {
+				return false
+			}
+		case object.ValueInteger:
+			if bigInteger := value.BigIntValue(); bigInteger != nil {
+				if snapshot.integerBig != bigInteger.String() {
+					return false
+				}
+				continue
+			}
+			integer, ok := value.Data.(int64)
+			if !ok || snapshot.integerBig != "" || integer != snapshot.integer {
+				return false
+			}
+		case object.ValueFloat:
+			floatValue, ok := value.Data.(float64)
+			if !ok || floatValue != snapshot.float {
+				return false
+			}
+		case object.ValueSymbol:
+			name, ok := value.Data.(string)
+			if !ok || name != snapshot.text {
+				return false
+			}
+		case object.ValueString:
+			raw, ok := value.Data.(string)
+			if !ok || raw != snapshot.text || value.Encoding != snapshot.encoding {
+				return false
+			}
+		case object.ValueObject:
+			identifier, identifierOK := nativePDFRenderLayoutObjectIntegerIvar(value, template.referenceClass, template.referenceSlots.identifier, "@identifier")
+			generation, generationOK := nativePDFRenderLayoutObjectIntegerIvar(value, template.referenceClass, template.referenceSlots.generation, "@gen")
+			if !identifierOK || !generationOK || identifier != snapshot.identifier || generation != snapshot.generation {
+				return false
+			}
+		case object.ValueArray, object.ValueHash:
+			// nativePDFRenderLayoutFastBind already checks all direct edges. The
+			// scalar children are validated by their own snapshots.
+		default:
+			return false
+		}
+		if node.kind == object.ValueHash {
+			for _, entry := range node.entries {
+				keyName, keyOK := nativePDFRenderLayoutKeyName(entry.key)
+				if !keyOK || keyName != entry.keyName {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func nativePDFRenderRememberLayoutOutput(plan *nativePDFRenderRegionPlan, serialized string, xrefOffset int64) {
+	if plan == nil || plan.layout == nil || plan.layout.template == nil || serialized == "" {
+		return
+	}
+	template := plan.layout.template
+	if len(plan.refs) != len(template.refs) || len(plan.pages) != template.key.pages {
+		return
+	}
+	nodes, ok := nativePDFRenderLayoutOutputNodeSnapshots(template, plan.layout)
+	if !ok {
+		return
+	}
+	cache := &template.outputCache
+	cache.valid = false
+	cache.renderer = plan.renderer
+	cache.state = plan.state
+	cache.store = plan.store
+	cache.identifiers = plan.identifiers
+	cache.objects = plan.objects
+	cache.root = plan.root
+	cache.info = plan.info
+	cache.pageValues = plan.pageValues
+	cache.version = plan.version
+	cache.bound = plan.layout
+	cache.output = serialized
+	cache.xrefOffset = xrefOffset
+	cache.mutationGeneration = object.CurrentRenderMutationGeneration()
+	if cap(cache.refs) < len(plan.refs) {
+		cache.refs = make([]*object.EmeraldValue, len(plan.refs))
+	} else {
+		cache.refs = cache.refs[:len(plan.refs)]
+	}
+	if cap(cache.refPlans) < len(plan.refs) {
+		cache.refPlans = make([]nativePDFRenderReferencePlan, len(plan.refs))
+	} else {
+		cache.refPlans = cache.refPlans[:len(plan.refs)]
+	}
+	if cap(cache.offsets) < len(plan.refs) {
+		cache.offsets = make([]int64, len(plan.refs))
+	} else {
+		cache.offsets = cache.offsets[:len(plan.refs)]
+	}
+	for index, ref := range plan.refs {
+		cache.refs[index] = ref.ref
+		cache.refPlans[index] = ref
+		cache.offsets[index] = ref.offset
+	}
+	if cap(cache.pages) < len(plan.pages) {
+		cache.pages = make([]nativePDFRenderLayoutPageCache, len(plan.pages))
+	} else {
+		cache.pages = cache.pages[:len(plan.pages)]
+	}
+	for index, page := range plan.pages {
+		items := cache.pages[index].items[:0]
+		items = append(items, page.items...)
+		cache.pages[index] = nativePDFRenderLayoutPageCache{
+			page:        page.page,
+			state:       page.state,
+			stackValues: page.stackValues,
+			items:       items,
+		}
+	}
+	cache.nodes = nodes
+	cache.pageValues = plan.pageValues
+	cache.valid = true
+}
+
+func nativePDFRenderLayoutOutputNodeSnapshots(template *nativePDFRenderLayoutTemplate, bound *nativePDFRenderBoundLayout) ([]nativePDFRenderLayoutNodeSnapshot, bool) {
+	if template == nil || bound == nil || len(bound.values) != len(template.nodes) || len(bound.identifiers) != len(template.nodes) || len(bound.generations) != len(template.nodes) {
+		return nil, false
+	}
+	snapshots := make([]nativePDFRenderLayoutNodeSnapshot, len(template.nodes))
+	for index, node := range template.nodes {
+		value := bound.values[index]
+		snapshot := nativePDFRenderLayoutNodeSnapshot{kind: node.kind}
+		switch node.kind {
+		case object.ValueNil:
+		case object.ValueBool:
+			truth, ok := value.Data.(bool)
+			if !ok {
+				return nil, false
+			}
+			snapshot.boolValue = truth
+		case object.ValueInteger:
+			if bigInteger := value.BigIntValue(); bigInteger != nil {
+				snapshot.integerBig = bigInteger.String()
+				break
+			}
+			integer, ok := value.Data.(int64)
+			if !ok {
+				return nil, false
+			}
+			snapshot.integer = integer
+		case object.ValueFloat:
+			floatValue, ok := value.Data.(float64)
+			if !ok {
+				return nil, false
+			}
+			snapshot.float = floatValue
+		case object.ValueSymbol:
+			name, ok := value.Data.(string)
+			if !ok {
+				return nil, false
+			}
+			snapshot.text = name
+		case object.ValueString:
+			raw, ok := value.Data.(string)
+			if !ok {
+				return nil, false
+			}
+			snapshot.text = raw
+			snapshot.encoding = value.Encoding
+		case object.ValueObject:
+			snapshot.identifier = bound.identifiers[index]
+			snapshot.generation = bound.generations[index]
+		case object.ValueArray, object.ValueHash:
+		default:
+			return nil, false
+		}
+		snapshots[index] = snapshot
+	}
+	return snapshots, true
 }
 
 func nativePDFRenderBindLayoutTemplate(template *nativePDFRenderLayoutTemplate, root, info *object.EmeraldValue, refData []*object.EmeraldValue, referenceClass *object.Class) (*nativePDFRenderBoundLayout, bool) {
@@ -1148,10 +1567,11 @@ func nativePDFRenderLayoutHashValueFromRHash(hash *object.RHash, entry nativePDF
 	}
 	if entry.key != nil {
 		if result, found := hash.Pairs[entry.key]; found && result != nil {
-			if entry.key.Type == object.ValueSymbol && entry.key.Class == entry.keyClass && core.AttachedSingletonClass(entry.key) == nil {
+			keyName, keyOK := nativePDFRenderLayoutKeyName(entry.key)
+			if entry.key.Type == object.ValueSymbol && entry.key.Class == entry.keyClass && keyOK && keyName == entry.keyName && core.AttachedSingletonClass(entry.key) == nil {
 				return result, true
 			}
-			if keyName, keyOK := nativePDFRenderLayoutKeyName(entry.key); keyOK && keyName == entry.keyName {
+			if keyOK && keyName == entry.keyName {
 				return result, true
 			}
 		}
@@ -1274,6 +1694,12 @@ func nativePDFRenderCachedReferenceLayoutPlan(previous []nativePDFRenderReferenc
 	if rawPresent && !nativePDFRenderASCIIValueWithClass(raw, true, template.stringClass) {
 		return nativePDFRenderReferencePlan{}, false
 	}
+	if rawPresent {
+		rawText, rawOK := raw.Data.(string)
+		if !rawOK || rawText != cached.rawText {
+			return nativePDFRenderReferencePlan{}, false
+		}
+	}
 	if filteredPresent {
 		filteredText, filteredOK := filtered.Data.(string)
 		if !filteredOK || filteredText != cached.filtered || !nativePDFRenderASCIIValueWithClass(filtered, true, template.stringClass) {
@@ -1318,6 +1744,7 @@ func nativePDFRenderReferenceLayoutPlanFor(ref, data *object.EmeraldValue, layou
 		return nativePDFRenderReferencePlan{}, false
 	}
 	filteredText := ""
+	rawText := ""
 	if filteredPresent {
 		var filteredOK bool
 		filteredText, filteredOK = filtered.Data.(string)
@@ -1326,7 +1753,9 @@ func nativePDFRenderReferenceLayoutPlanFor(ref, data *object.EmeraldValue, layou
 		}
 	}
 	if rawPresent {
-		if !nativePDFRenderASCIIValueWithClass(raw, true, template.stringClass) || template.nodes[layoutRef.dataNode].kind != object.ValueHash || nativePDFRenderLayoutNodeHasKey(template, layoutRef.dataNode, "Length") {
+		var rawOK bool
+		rawText, rawOK = raw.Data.(string)
+		if !rawOK || !nativePDFRenderASCIIValueWithClass(raw, true, template.stringClass) || template.nodes[layoutRef.dataNode].kind != object.ValueHash || nativePDFRenderLayoutNodeHasKey(template, layoutRef.dataNode, "Length") {
 			return nativePDFRenderReferencePlan{}, false
 		}
 	}
@@ -1338,6 +1767,7 @@ func nativePDFRenderReferenceLayoutPlanFor(ref, data *object.EmeraldValue, layou
 		data:                    boundData,
 		stream:                  stream,
 		raw:                     raw,
+		rawText:                 rawText,
 		filtered:                filteredText,
 		filteredValue:           filtered,
 		filteredCache:           filteredPresent,
