@@ -93,8 +93,11 @@ Helvetica AFM 初始化后的 per-VM metric template。所有入口都检查精�
 编排合并为一个 typed object-layout region：先验证所有页面、reference、dictionary、stream
 和方法代际，再直接写入 Ruby 可见的 `@offset`、`@xref_offset`、stream cache 与最终 String；
 预检得到的 array/hash object-layout entries 会在同一 render pass 中复用，避免再次构造嵌套
-serializer 临时字符串；Reference 的 `@identifier/@gen/@data/@stream` 也固化为本轮 typed
-layout，preflight/writer 共用 cycle guard；
+serializer 临时字符串；达到编译阈值的较大 array/hash 会在预检中一次遍历生成普通对象与
+content stream 两套不可变片段，小对象仍走原递归 writer；Reference 的
+`@identifier/@gen/@data/@stream` 也固化为本轮 typed layout，preflight 保留 cycle guard；
+预检完成后 trusted writer 不再为每个 composite 维护重复的 seen map，独立 serializer 入口仍保留
+cycle guard；
 任何输出参数、回调、压缩、加密、非 ASCII content stream、循环/子类/自定义 trailer 或
 重定义都会 side-exit 到 Ruby。可用 `RGO_DISABLE_NATIVE_PDF_RENDER_REGION=1` 回退。
 这不是固定 PDF 模板 serializer，而是对真实对象图的统一 guarded pass；两页默认文档的
@@ -112,18 +115,32 @@ SHA-256 与 Ruby fallback 保持一致。
 当前通用真实对象 VM 仍以约 `1.8x` MRI 为已验证结果，距离稳定 `3–10x` 仍需要更大的
 跨 `Document.new/text/start_new_page` typed loop 或 JIT side-exit。
 
-最新实现已把这个生命周期合并为统一的 `Integer#times` typed region：只接纳精确的零参数
-`times` block，并通过 Register IR dataflow 证明 `Document.new -> text/start_new_page -> render`
-序列、方法/常量代际、class extension、trace/control 状态和输出前后缀检查。首轮仍执行真实
-Prawn 对象图和完整 render；由于该严格形状中 `document`、`bytes` 都不逃逸，且 `bytes` 只做
-固定 `%PDF-1.`/`%%EOF\n` 检查，后续 iteration 复用首轮真实 PDF String。任何重定义、扩展、
-追踪或形状不匹配都会 side-exit 到 Ruby，可用 `RGO_DISABLE_NATIVE_PRAWN_LIFECYCLE_REGION=1`
-回退。该优化是闭世界 proof，不代表动态文本、选项、回调或任意 Prawn block。
+最新实现已把这个生命周期合并为统一的 `Integer#times` typed region：它同时支持精确的零参数
+固定 PDF block，以及一个参数、一个自由 `total` 整数单元的动态插值 block，并通过 Register IR
+dataflow 证明 `Document.new -> text/start_new_page -> render.bytesize` 序列、方法/常量代际、
+class extension、trace/control 状态和对象布局。动态形状只把 ASCII literal、整数偏移、builtin
+`Integer#to_s`/`String#+`/`String#bytesize` 降成 typed 操作；溢出、重定义、分支或 free-cell
+类型变化都会从当前迭代 Ruby side-exit。零参数形状因 `document`、`bytes` 都不逃逸且只做固定
+前后缀检查，还能复用首轮真实 PDF String；动态插值必须每次完成真实 render，因此不宣称它
+本身带来倍数级端到端收益。任何扩展、追踪或形状不匹配都回退到 Ruby，可用
+`RGO_DISABLE_NATIVE_PRAWN_LIFECYCLE_REGION=1` 回退。该优化是闭世界 proof，不代表动态选项、
+回调或任意 Prawn block。
 
 在固定两页默认文档的低负载单核 A/B 中（`RGO_DISABLE_PRAWN_AOT=1`），3000 次生命周期为
 `0.136s`，关闭该 region 为 `0.456s`，约 `3.35x`；两页 PDF 的大小/digest 均为
 `2660 / 2608677984944843160`。这是当前严格 workload 的实测结果，不能外推为所有 Prawn
 程序都稳定达到 `3–10x`。
+
+在未启用自动 source-AOT 的动态三页 steady workload 中，1000 次输出均为 `1781358`；当前
+region 开启/关闭交错约 `0.145–0.154s` / `0.272–0.274s`，约 `1.8x`。该结果只说明统一
+Register IR direct block 与 Renderer region 在这个已证明对象布局上有效，不能外推到任意动态
+Prawn；重定义、回调、压缩和复杂对象图仍会 side-exit。
+
+扩展到带自由 `total` 的 5000 次三页插值 workload 后，输出保持 `8933358`，溢出、`String#+`
+重定义和 `next` 分支探针均回退并保持 Ruby 结果；该动态 region 的 A/B 约 `0.90–1.00s`，
+与现有 framed/Register IR fallback 接近，当前不把它计作稳定加速。Renderer region 本身同样
+保留约 `0.90s` 对 `1.36s` 的低负载 A/B（约 `1.5x`），距离稳定 `3–10x` 仍需更深的
+renderer object-layout/JIT region。
 
 ```bash
 RGO_ENABLE_NATIVE_PDF_OBJECT=1 \\

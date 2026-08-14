@@ -549,11 +549,12 @@ var objectSpaceTotalAllocated int64
 var objectSpaceTrackedSinceCompact int
 var lazyArrayRegions []weak.Pointer[object.EmeraldValue]
 
-// Batch VM allocators append thousands of weak entries at once. Keeping the
-// normal small threshold for individual allocations is useful for long-lived
-// compatibility code, but scanning the whole weak list after every compiled
-// constructor batch dominates the hot path. ObjectSpace enumeration already
-// skips cleared weak pointers, and explicit GC still compacts immediately.
+// VM allocators can append thousands of weak entries during one native
+// constructor/render region. Scanning the whole weak list after every 4096
+// individual allocations dominates that hot path. ObjectSpace enumeration
+// already skips cleared weak pointers, and explicit GC still compacts
+// immediately, so ordinary registration can use the same larger threshold as
+// the batch path without changing what ObjectSpace observes.
 const objectSpaceBatchCompactionThreshold = 65536
 
 var objectSpaceFinalizers map[*object.EmeraldValue][]*object.EmeraldValue
@@ -8801,7 +8802,7 @@ func trackObjectSpaceValue(value *object.EmeraldValue) {
 	objectSpaceTracked = append(objectSpaceTracked, weak.Make(value))
 	objectSpaceTotalAllocated++
 	objectSpaceTrackedSinceCompact++
-	if objectSpaceTrackedSinceCompact >= 4096 {
+	if objectSpaceTrackedSinceCompact >= objectSpaceBatchCompactionThreshold {
 		compactObjectSpaceTracked()
 	}
 }
@@ -8817,7 +8818,7 @@ func TrackObjectSpaceAllocation(value *object.EmeraldValue, path string, line in
 	objectSpaceTracked = append(objectSpaceTracked, weak.Make(value))
 	objectSpaceTotalAllocated++
 	objectSpaceTrackedSinceCompact++
-	if objectSpaceTrackedSinceCompact >= 4096 {
+	if objectSpaceTrackedSinceCompact >= objectSpaceBatchCompactionThreshold {
 		compactObjectSpaceTracked()
 	}
 	return value
@@ -26142,6 +26143,14 @@ func StringIndexUsesBuiltinImplementation() bool {
 // ASCII String#length shortcut used by the VM trusted native tier.
 func StringLengthUsesBuiltinImplementation() bool {
 	return classMethodUsesBuiltin(R.Classes["String"], "length", BuiltinMethod(stringLength))
+}
+
+// StringBytesizeUsesBuiltinImplementation is the generation-safe guard for
+// typed callers that replace String#bytesize with the raw byte length of an
+// exact String value. Ruby can redefine bytesize independently of length, so
+// the two guards must remain separate.
+func StringBytesizeUsesBuiltinImplementation() bool {
+	return classMethodUsesBuiltin(R.Classes["String"], "bytesize", BuiltinMethod(stringByteSize))
 }
 
 // StringStartWithUsesBuiltinImplementation and StringEndWithUsesBuiltinImplementation

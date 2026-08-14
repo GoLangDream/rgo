@@ -1430,9 +1430,12 @@ func registerIRPlanSafeForDirectNoFrameWithOptionsUncached(plan *registerIRPlan,
 			}
 		case registerIRSetStringEncoding:
 			// Encoding is a value-preserving mutation of the result string. It is
-			// safe without a Frame only when it is the terminal operation, so a
-			// later guard miss can never replay after mutating user-visible state.
-			if !registerIRDirectTerminalMutationAt(plan, index, instruction.left) {
+			// safe without a Frame when it is terminal or immediately follows a
+			// proven builtin String#+ result. The latter is a fresh temporary that
+			// has not escaped; allowing it removes a frame from typed string-building
+			// blocks while a branch or an older user value still side-exits.
+			if !registerIRDirectTerminalMutationAt(plan, index, instruction.left) &&
+				!registerIRFreshStringEncodingSafe(plan, index, instruction.left) {
 				return false
 			}
 		case registerIRStoreInstanceVar:
@@ -1468,6 +1471,14 @@ func registerIRPlanSafeForDirectNoFrameWithOptionsUncached(plan *registerIRPlan,
 		}
 	}
 	return true
+}
+
+func registerIRFreshStringEncodingSafe(plan *registerIRPlan, index int, resultRegister uint8) bool {
+	if plan == nil || plan.hasBranches || index <= 0 || index >= len(plan.instructions) {
+		return false
+	}
+	previous := plan.instructions[index-1]
+	return previous.op == registerIRBinary && previous.opcode == compiler.OpAdd && previous.dst == resultRegister
 }
 
 // registerIRAggressivePlanSafe describes the larger, frame-free graph tier

@@ -47,7 +47,7 @@ func TestNativePDFObjectTextPrimitiveAndCollectionShapes(t *testing.T) {
 
 func TestNativePDFRenderWriterMatchesObjectSerializer(t *testing.T) {
 	core.InitWithMspec()
-	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Value", Class: core.R.Classes["Symbol"]}
+	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "A B", Class: core.R.Classes["Symbol"]}
 	value := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{
 		core.NewIntegerValue(42),
 		&object.EmeraldValue{Type: object.ValueString, Data: "hi", Class: core.R.Classes["String"]},
@@ -64,6 +64,13 @@ func TestNativePDFRenderWriterMatchesObjectSerializer(t *testing.T) {
 	if got := output.String(); got != want {
 		t.Fatalf("renderer serializer = %q, generic serializer = %q", got, want)
 	}
+	var trustedOutput strings.Builder
+	if !nativePDFRenderWriteObjectText(&trustedOutput, hash, false, nil, nil) {
+		t.Fatal("trusted renderer serializer rejected test hash")
+	}
+	if got := trustedOutput.String(); got != want {
+		t.Fatalf("trusted renderer serializer = %q, generic serializer = %q", got, want)
+	}
 }
 
 func TestNativePDFRenderValuePlanKeepsStrictStringGuard(t *testing.T) {
@@ -77,6 +84,50 @@ func TestNativePDFRenderValuePlanKeepsStrictStringGuard(t *testing.T) {
 	}
 	if nativePDFRenderValueShape(array, false, make(map[*object.EmeraldValue]bool), referenceClass, plans) {
 		t.Fatal("cached content-stream proof must not bypass strict UTF-8 validation")
+	}
+}
+
+func TestNativePDFRenderCompilesLargeCompositeWithContextVariants(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	items := make([]*object.EmeraldValue, nativePDFRenderCompileMinEntries)
+	for index := range items {
+		items[index] = &object.EmeraldValue{Type: object.ValueString, Data: "A", Class: core.R.Classes["String"]}
+	}
+	array := &object.EmeraldValue{Type: object.ValueArray, Data: items, Class: core.R.Classes["Array"]}
+	plans := make(map[*object.EmeraldValue]nativePDFRenderValuePlan)
+	if !nativePDFRenderValueShape(array, false, make(map[*object.EmeraldValue]bool), referenceClass, plans) {
+		t.Fatal("large array should compile in ordinary object context")
+	}
+	ordinary := plans[array].serialized
+	wantOrdinary := "[" + strings.Repeat("<feff0041> ", len(items)-1) + "<feff0041>]"
+	if ordinary != wantOrdinary {
+		t.Fatalf("ordinary compiled array = %q", ordinary)
+	}
+	if !nativePDFRenderValueShape(array, true, make(map[*object.EmeraldValue]bool), referenceClass, plans) {
+		t.Fatal("large array should compile in content-stream context")
+	}
+	wantContent := "[" + strings.Repeat("<41> ", len(items)-1) + "<41>]"
+	if got := plans[array].contentSerialized; got != wantContent {
+		t.Fatalf("content compiled array = %q", got)
+	}
+	var output strings.Builder
+	if !nativePDFRenderWriteObjectText(&output, array, true, make(map[*object.EmeraldValue]bool), plans) {
+		t.Fatal("compiled content array should write")
+	}
+	if output.String() != plans[array].contentSerialized {
+		t.Fatalf("compiled writer = %q, want %q", output.String(), plans[array].contentSerialized)
+	}
+
+	cycleItems := make([]*object.EmeraldValue, nativePDFRenderCompileMinEntries)
+	cycle := &object.EmeraldValue{Type: object.ValueArray, Class: core.R.Classes["Array"]}
+	cycleItems[0] = cycle
+	for index := 1; index < len(cycleItems); index++ {
+		cycleItems[index] = core.NewIntegerValue(int64(index))
+	}
+	cycle.Data = cycleItems
+	if nativePDFRenderValueShape(cycle, false, make(map[*object.EmeraldValue]bool), referenceClass, make(map[*object.EmeraldValue]nativePDFRenderValuePlan)) {
+		t.Fatal("large cyclic array must side-exit")
 	}
 }
 

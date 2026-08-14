@@ -33210,6 +33210,72 @@ values = 20.times.map { object.value("fix") }
 	}
 }
 
+func TestRegisterIRDirectNoFrameFreshStringEncodingAdmission(t *testing.T) {
+	makePlan := func(instructions []byte) *registerIRPlan {
+		fn := &object.Function{
+			Instructions:      instructions,
+			Constants:         []*object.EmeraldValue{{Type: object.ValueString, Data: "ascii", Class: core.R.Classes["String"]}, {Type: object.ValueString, Data: "US-ASCII", Class: core.R.Classes["String"]}},
+			Params:            []string{"left", "right"},
+			ParamLocalIndices: []int{0, 1},
+			NumLocals:         2,
+		}
+		plan, ok := compileRegisterIR(fn)
+		if !ok {
+			t.Fatal("expected Register IR plan")
+		}
+		return plan
+	}
+
+	fresh := compiler.Make(compiler.OpGetLocalFast, 0)
+	fresh = append(fresh, compiler.Make(compiler.OpGetLocalFast, 1)...)
+	fresh = append(fresh, compiler.Make(compiler.OpAdd)...)
+	fresh = append(fresh, compiler.Make(compiler.OpSetStringEncoding, 1)...)
+	fresh = append(fresh, compiler.Make(compiler.OpReturnValue)...)
+	if plan := makePlan(fresh); !registerIRPlanSafeForDirectNoFrameUncached(plan) {
+		t.Fatal("fresh String#+ result should admit direct encoding mutation")
+	}
+
+	oldValue := compiler.Make(compiler.OpGetLocalFast, 0)
+	oldValue = append(oldValue, compiler.Make(compiler.OpSetStringEncoding, 1)...)
+	oldValue = append(oldValue, compiler.Make(compiler.OpPop)...)
+	oldValue = append(oldValue, compiler.Make(compiler.OpGetLocalFast, 0)...)
+	oldValue = append(oldValue, compiler.Make(compiler.OpGetLocalFast, 1)...)
+	oldValue = append(oldValue, compiler.Make(compiler.OpAdd)...)
+	oldValue = append(oldValue, compiler.Make(compiler.OpReturnValue)...)
+	if plan := makePlan(oldValue); registerIRPlanSafeForDirectNoFrameUncached(plan) {
+		t.Fatal("encoding mutation of an older value must remain framed")
+	}
+}
+
+func TestRegisterIRDirectNoFrameInterpolatedEncodingDeoptimizes(t *testing.T) {
+	result, _ := runRuby(t, `class RegisterIRInterpolatedStringFixture
+  attr_reader :prefix
+  def initialize
+    @prefix = "pre"
+  end
+  def value(suffix)
+    "#{prefix}#{suffix}"
+  end
+end
+object = RegisterIRInterpolatedStringFixture.new
+warm = 20.times.map { object.value("fix") }
+class String
+  alias_method :rgo_original_plus_for_interpolated_encoding_test, :+
+  def +(other)
+    "changed"
+  end
+end
+changed = object.value("fix")
+class String
+  alias_method :+, :rgo_original_plus_for_interpolated_encoding_test
+  remove_method :rgo_original_plus_for_interpolated_encoding_test
+end
+[warm.first, warm.last, changed]`)
+	if result.Inspect() != `["prefix", "prefix", "changed"]` {
+		t.Fatalf("unexpected interpolated encoding side-exit result: %s", result.Inspect())
+	}
+}
+
 func TestRegisterIRDirectIntegerStringBranchPreservesValueAndRedefinition(t *testing.T) {
 	result, _ := runRuby(t, `class RegisterIRIntegerStringBranchFixture
   def initialize

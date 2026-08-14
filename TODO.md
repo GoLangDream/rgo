@@ -1,5 +1,12 @@
 # RGo 待办事项
 
+- [x] 2026-08-15：profile 显示 native PDF 构造路径的 ObjectSpace weak-list 每 4096 个对象就全表扫描，单核 5000 次样本约占 29% CPU；将普通注册与已有 batch 路径统一到 65536 阈值，并按 reference 数预留 Renderer per-render layout map。ObjectSpace 仍逐对象保留 weak handle，显式 GC 仍立即 compact；定向回归通过，5000 次输出保持 `8933358`，低负载单核样本约 `0.91s`。
+- [x] 2026-08-15：合并 Renderer reference preflight 时误反写 stream dictionary 的 `/Length` guard，导致完整 render 每次 side-exit；已由 5000 次 profile 定位并修正为“已有 Length 才回退”，随后补跑 PDF 定向回归。
+- [x] 2026-08-15：将 reference 的 identifier/data/stream/filter cache 读取合并为单次 typed layout plan，并让已完成 cycle preflight 的 writer 使用 trusted nil-seen 路径；同时把 composite compiler admission 从 8 收紧到 16 项，避免普通 dictionary 的预编译成本。5000 次输出保持 `8933358`，profile 中 compiler 热点消失；一次低负载旧/新样本为 `1.314s/1.207s`，约 `8%`，仅记录为样本收益。
+- [x] 2026-08-15：Renderer composite-value compiler 首次定向编译发现 helper 名称误写为 `nativePDFHashEntriesFor`；已记录后改为统一的 `nativePDFRenderHashEntriesFor`，继续执行定向回归。
+- [x] 2026-08-15：Renderer 大型 array/hash 已接入统一一次遍历 compiler：预检同时生成普通对象与 content-stream 序列化片段，writer 直接复用；小 composite 保持旧递归路径，避免增加固定热点开销。6 个文档串行低负载 A/B 为 `0.107s/0.121s`，总大小 `206868`、SHA-256 完全一致；收益约 `1.13x`，不外推为稳定跨 workload 倍率。
+- [x] 2026-08-15：Register IR `OpSetStringEncoding` 仅在紧邻已证明 builtin `String#+` 的新结果时进入无栈 direct region；旧值、分支和代际变化仍 side-exit。动态三页 steady 1000 次输出 `1781358`，region 开启/关闭交错约 `0.145–0.154s/0.272–0.274s`，约 `1.8x`；新增 admission/重定义语义测试通过。
+- [x] 2026-08-15：将 Prawn lifecycle region 扩展到一个参数、一个自由 `total` cell 的动态插值 block：Register IR 证明 literal prefix、整数偏移、builtin `Integer#to_s`/`String#+`/`String#bytesize`、真实 Document/page/render ABI，并在方法代际、free-cell 类型、整数溢出或控制流变化时按迭代 Ruby side-exit。5000 次三页输出保持 `8933358`；BigInt、`String#+` 重定义、`next` 分支回归通过。动态 region 的 `0.90–1.00s` A/B 接近现有 fallback，未宣称额外端到端倍数收益。
 - [x] 2026-08-14：Renderer seen-map 复用后 `nativePDFRenderHashWithLength` 单测需要补充共享 seen 参数；已同步调用并通过定向测试。
 - [x] 2026-08-14：Renderer value-plan 改造后旧单测仍使用二参数 `nativePDFRenderHashWithLength`，导致测试编译失败；已同步为无缓存 `nil` plan 调用并通过定向测试。
 - [x] 2026-08-14：Renderer ABI plan 首次编译发现旧的 `rendererClass` 局部变量在缓存化后未使用；已做最小清理并通过构建。

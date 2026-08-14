@@ -1,9 +1,11 @@
 package vm
 
 import (
+	"math/big"
 	"os"
 	"strings"
 
+	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/object"
 )
@@ -276,6 +278,273 @@ func nativePrawnLifecyclePlanFor(vm *VM, block *object.EmeraldValue) (*nativePra
 	}, true
 }
 
+// nativePrawnDynamicLifecycleText is the typed form of one interpolated
+// document.text call. The compiler emits two literal concatenations around a
+// single Integer#to_s; keeping the prefix and offset here lets the hot region
+// produce the exact String without rebuilding a Ruby Frame or dispatching the
+// three small sends on every iteration.
+type nativePrawnDynamicLifecycleText struct {
+	prefix       string
+	offset       int64
+	encoding     string
+	startNewPage bool
+}
+
+// nativePrawnDynamicLifecyclePlan is the free-cell variant of the lifecycle
+// region. Unlike the fixed plan above, it proves the entire Register IR graph
+// for a block shaped like:
+//
+//	document = Prawn::Document.new
+//	document.text "prefix #{index + offset}"
+//	document.start_new_page
+//	total += document.render.bytesize
+//
+// The plan is intentionally structural and closed-world. It does not lower
+// arbitrary Ruby expressions; all unsupported control flow, argument shapes,
+// aliases, and method changes remain on the normal block path.
+type nativePrawnDynamicLifecyclePlan struct {
+	fn                 *object.Function
+	register           *registerIRPlan
+	generation         uint64
+	constantGeneration uint64
+	documentClassValue *object.EmeraldValue
+	documentClass      *object.Class
+	classNew           *object.Method
+	text               *object.Method
+	startNewPage       *object.Method
+	render             *object.Method
+	steps              []nativePrawnDynamicLifecycleText
+	freeIndex          uint8
+	paramLocal         uint8
+	documentLocal      uint8
+}
+
+func nativePrawnLifecycleExactInteger(value *object.EmeraldValue) (int64, bool) {
+	if value == nil || value.Type != object.ValueInteger || value.Class != core.R.Classes["Integer"] ||
+		value.BigIntValue() != nil || core.AttachedSingletonClass(value) != nil {
+		return 0, false
+	}
+	integer, ok := value.Data.(int64)
+	return integer, ok
+}
+
+func nativePrawnLifecycleDynamicSend(instruction registerIRInstruction, name string, argc uint8) bool {
+	return instruction.op == registerIRSend && instruction.name == name && instruction.argc == argc &&
+		instruction.opcode == compiler.OpSend && instruction.splatIndex == 255 && !instruction.blockPresent &&
+		!instruction.implicit
+}
+
+func nativePrawnLifecycleDynamicParameterLoad(instruction registerIRInstruction, paramLocal uint8) bool {
+	return instruction.op == registerIRLoadParam && instruction.param == 0 ||
+		instruction.op == registerIRLoadLocal && instruction.param == paramLocal
+}
+
+func nativePrawnDynamicLifecycleTextStep(instructions []registerIRInstruction, position int, documentLocal, paramLocal uint8) (nativePrawnDynamicLifecycleText, int, bool) {
+	var step nativePrawnDynamicLifecycleText
+	if position >= len(instructions) || instructions[position].op != registerIRLoadLocal ||
+		instructions[position].param != documentLocal {
+		return step, position, false
+	}
+	documentRegister := instructions[position].dst
+	position++
+	if position+2 >= len(instructions) {
+		return step, position, false
+	}
+	first := instructions[position]
+	firstLiteral, firstOK := nativePrawnLifecycleLiteral(first)
+	if !firstOK {
+		return step, position, false
+	}
+	position++
+	second := instructions[position]
+	secondLiteral, secondOK := nativePrawnLifecycleLiteral(second)
+	if !secondOK {
+		return step, position, false
+	}
+	position++
+	firstAdd := instructions[position]
+	if firstAdd.op != registerIRBinary || firstAdd.opcode != compiler.OpAdd || firstAdd.left != first.dst ||
+		firstAdd.right != second.dst {
+		return step, position, false
+	}
+	prefixRegister := firstAdd.dst
+	position++
+	if position >= len(instructions) || !nativePrawnLifecycleDynamicParameterLoad(instructions[position], paramLocal) {
+		return step, position, false
+	}
+	indexRegister := instructions[position].dst
+	position++
+	offset := int64(0)
+	if position+1 < len(instructions) {
+		candidate := instructions[position]
+		if candidate.op == registerIRLoadLiteral || candidate.op == registerIRLoadConstantValue || candidate.op == registerIRLoadFrozenString {
+			if literal, literalOK := nativePrawnLifecycleIntegerLiteral(candidate); literalOK {
+				position++
+				indexAdd := instructions[position]
+				if indexAdd.op != registerIRBinary || indexAdd.opcode != compiler.OpAdd || indexAdd.dst != indexRegister ||
+					indexAdd.left != indexRegister || indexAdd.right != candidate.dst {
+					return step, position, false
+				}
+				offset = literal
+				position++
+			}
+		}
+	}
+	if position >= len(instructions) || !nativePrawnLifecycleDynamicSend(instructions[position], "to_s", 0) ||
+		instructions[position].left != indexRegister {
+		return step, position, false
+	}
+	toSRegister := instructions[position].dst
+	position++
+	secondAdd := instructions[position]
+	if secondAdd.op != registerIRBinary || secondAdd.opcode != compiler.OpAdd || secondAdd.dst != prefixRegister ||
+		secondAdd.left != prefixRegister || secondAdd.right != toSRegister {
+		return step, position, false
+	}
+	position++
+	if position < len(instructions) && instructions[position].op == registerIRSetStringEncoding {
+		encoding := instructions[position]
+		if encoding.dst != prefixRegister || encoding.left != prefixRegister || encoding.name != "UTF-8" {
+			return step, position, false
+		}
+		step.encoding = encoding.name
+		position++
+	}
+	if position >= len(instructions) || !nativePrawnLifecycleDynamicSend(instructions[position], "text", 1) ||
+		instructions[position].left != documentRegister || instructions[position].args[0] != prefixRegister {
+		return step, position, false
+	}
+	step.prefix = firstLiteral + secondLiteral
+	step.offset = offset
+	return step, position + 1, true
+}
+
+func nativePrawnLifecycleIntegerLiteral(instruction registerIRInstruction) (int64, bool) {
+	if instruction.op != registerIRLoadLiteral && instruction.op != registerIRLoadConstantValue && instruction.op != registerIRLoadFrozenString {
+		return 0, false
+	}
+	return nativePrawnLifecycleExactInteger(instruction.value)
+}
+
+func nativePrawnDynamicLifecyclePlanFor(vm *VM, block *object.EmeraldValue) (*nativePrawnDynamicLifecyclePlan, bool) {
+	if vm == nil || !nativePrawnLifecycleRegionEnabled || block == nil || block.Type != object.ValueClosure || blockBindingSelf(block) == nil {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || closureUsesRefinements(closure) || closure.Fn == nil || closure.BreakOwnerID > 0 {
+		return nil, false
+	}
+	fn := closure.Fn
+	if fn.Name != "__block__" || len(fn.Params) != 1 || len(fn.ParamLocalIndices) != 1 || fn.ParamLocalIndices[0] < 0 || fn.ParamLocalIndices[0] >= 64 ||
+		fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) != 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly ||
+		fn.NumLocals > 16 || len(closure.Free) != 1 || !simpleBlockParameterPatterns(fn) || closure.AutoSplat && blockWantsDestructuring(fn) {
+		return nil, false
+	}
+	for _, defaultValue := range fn.ParamDefaults {
+		if defaultValue != nil {
+			return nil, false
+		}
+	}
+	leaf, found := vm.cachedBlockLeafPlan(fn)
+	if !found || leaf.kind != leafMethodRegisterIR || leaf.registerIR == nil {
+		return nil, false
+	}
+	register := leaf.registerIR
+	if !register.blockReturn || register.hasBranches || register.hasImplicitSends || register.hasExplicitReturn ||
+		register.sendCount < 6 || len(register.instructions) < 16 || registerIRPlanMayDeopt(register) {
+		return nil, false
+	}
+	instructions := register.instructions
+	if len(instructions) < 4 || instructions[0].op != registerIRLoadConstant || instructions[0].name != "Prawn" ||
+		instructions[1].op != registerIRLoadScopedConstant || instructions[1].name != "Document" ||
+		instructions[1].dst != instructions[0].dst || !nativePrawnLifecycleDynamicSend(instructions[2], "new", 0) ||
+		instructions[2].left != instructions[1].dst || instructions[3].op != registerIRStoreLocal ||
+		instructions[3].left != instructions[2].dst || instructions[3].param >= 64 {
+		return nil, false
+	}
+	documentLocal := instructions[3].param
+	paramLocal := uint8(fn.ParamLocalIndices[0])
+	position := 4
+	steps := make([]nativePrawnDynamicLifecycleText, 0, 4)
+	startCount := 0
+	for {
+		step, next, stepOK := nativePrawnDynamicLifecycleTextStep(instructions, position, documentLocal, paramLocal)
+		if !stepOK {
+			return nil, false
+		}
+		position = next
+		if position+1 < len(instructions) && instructions[position].op == registerIRLoadLocal &&
+			instructions[position].param == documentLocal && nativePrawnLifecycleDynamicSend(instructions[position+1], "start_new_page", 0) &&
+			instructions[position+1].left == instructions[position].dst {
+			step.startNewPage = true
+			steps = append(steps, step)
+			position += 2
+			startCount++
+			continue
+		}
+		steps = append(steps, step)
+		break
+	}
+	if len(steps) < 2 || startCount == 0 || position+7 != len(instructions) {
+		return nil, false
+	}
+	freeLoad := instructions[position]
+	if freeLoad.op != registerIRLoadFree || int(freeLoad.param) >= len(closure.Free) {
+		return nil, false
+	}
+	documentLoad := instructions[position+1]
+	renderSend := instructions[position+2]
+	bytesizeSend := instructions[position+3]
+	if documentLoad.op != registerIRLoadLocal || documentLoad.param != documentLocal ||
+		!nativePrawnLifecycleDynamicSend(renderSend, "render", 0) || renderSend.left != documentLoad.dst ||
+		!nativePrawnLifecycleDynamicSend(bytesizeSend, "bytesize", 0) || bytesizeSend.left != renderSend.dst {
+		return nil, false
+	}
+	update := instructions[position+4]
+	storeFree := instructions[position+5]
+	if update.op != registerIRBinary || update.opcode != compiler.OpAdd || update.dst != freeLoad.dst ||
+		update.left != freeLoad.dst || update.right != bytesizeSend.dst || storeFree.op != registerIRStoreFree ||
+		storeFree.left != freeLoad.dst || storeFree.param != freeLoad.param || instructions[position+6].op != registerIRReturn ||
+		instructions[position+6].explicitReturn {
+		return nil, false
+	}
+	documentClassValue, found := vm.qualifiedConstantValue("Prawn::Document")
+	if !found || documentClassValue == nil || documentClassValue.Type != object.ValueClass {
+		return nil, false
+	}
+	documentClass, ok := documentClassValue.Data.(*object.Class)
+	if !ok || documentClass == nil || !nativePrawnClassExtensionsEmpty(documentClass) {
+		return nil, false
+	}
+	classNew, _, fallback := vm.lookupMethodForSend(documentClassValue, "new", nil, false, true)
+	if fallback != nil || classNew == nil || !core.IsBuiltinClassNewMethod(classNew) {
+		return nil, false
+	}
+	textMethod, textOK := nativePrawnLifecycleMethod(documentClass, "text", "/prawn/text.rb")
+	startMethod, startOK := nativePrawnLifecycleMethod(documentClass, "start_new_page", "/prawn/document.rb")
+	renderMethod, renderOK := nativePrawnLifecycleMethod(documentClass, "render", "/prawn/document.rb")
+	if !textOK || !startOK || !renderOK || !core.IntegerPlusUsesBuiltinImplementation() ||
+		!core.IntegerToSUsesBuiltinImplementation() || !core.StringPlusUsesBuiltinImplementation() ||
+		!core.StringBytesizeUsesBuiltinImplementation() {
+		return nil, false
+	}
+	return &nativePrawnDynamicLifecyclePlan{
+		fn: fn, register: register, generation: object.CurrentMethodGeneration(), constantGeneration: object.CurrentConstantGeneration(),
+		documentClassValue: documentClassValue, documentClass: documentClass, classNew: classNew, text: textMethod,
+		startNewPage: startMethod, render: renderMethod, steps: steps, freeIndex: freeLoad.param, paramLocal: paramLocal,
+		documentLocal: documentLocal,
+	}, true
+}
+
+func (plan *nativePrawnDynamicLifecyclePlan) guardsHold() bool {
+	// The builtin identity proof is established while the plan is built. Any
+	// class method replacement bumps the global method generation, so checking
+	// the generation is sufficient inside the loop and avoids four reflect-based
+	// function-pointer probes on every document.
+	return plan != nil && plan.fn != nil && plan.register != nil && object.CurrentMethodGeneration() == plan.generation &&
+		object.CurrentConstantGeneration() == plan.constantGeneration
+}
+
 func (plan *nativePrawnLifecyclePlan) guardsHold() bool {
 	return plan != nil && plan.fn != nil && plan.register != nil &&
 		object.CurrentMethodGeneration() == plan.generation && object.CurrentConstantGeneration() == plan.constantGeneration &&
@@ -298,12 +567,176 @@ func nativePrawnLifecycleExecutionGuardsHold(vm *VM) bool {
 		vm.pendingReturnTargetID == 0 && vm.pendingBreakTargetID == 0
 }
 
+func (vm *VM) executeNativePrawnDynamicLifecycleRegion(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || receiver.Type != object.ValueInteger || receiver.Class != core.R.Classes["Integer"] ||
+		core.AttachedSingletonClass(receiver) != nil || count < 2 || !nativePrawnLifecycleExecutionGuardsHold(vm) {
+		return nil, false
+	}
+	plan, ok := nativePrawnDynamicLifecyclePlanFor(vm, block)
+	if !ok {
+		return nil, false
+	}
+	closure, ok := block.Data.(*object.Closure)
+	if !ok || closure == nil || int(plan.freeIndex) >= len(closure.Free) || blockBindingSelf(block) == nil {
+		return nil, false
+	}
+	if _, ok := nativePrawnLifecycleExactInteger(derefClosureValue(closure.Free[plan.freeIndex])); !ok {
+		return nil, false
+	}
+	self := blockBindingSelf(block)
+	previousBlock := vm.currentBlock
+	previousClassStack := vm.classStack
+	vm.currentBlock = nil
+	if closure.ClassStack != nil {
+		vm.classStack = closure.ClassStack
+	}
+	cleanup := func() {
+		vm.currentBlock = previousBlock
+		vm.classStack = previousClassStack
+	}
+	sideExit := func(start int64) (*object.EmeraldValue, bool) {
+		cleanup()
+		args := [1]*object.EmeraldValue{}
+		for index := start; index < count; index++ {
+			core.LastBlockResult = nil
+			args[0] = core.NewIntegerValue(index)
+			result := vm.callBlockWithSelfArgs(block, self, args[:])
+			if result != nil && result.Type == object.ValueException {
+				return result, true
+			}
+			if core.LastBlockResult != nil {
+				breakResult := core.LastBlockResult
+				core.LastBlockResult = nil
+				return breakResult, true
+			}
+		}
+		core.LastBlockResult = nil
+		return receiver, true
+	}
+	core.LastBlockResult = nil
+	textArgs := [1]*object.EmeraldValue{}
+	for index := int64(0); index < count; index++ {
+		if !plan.guardsHold() || !nativePrawnLifecycleExecutionGuardsHold(vm) || !nativePrawnClassExtensionsEmpty(plan.documentClass) {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		document, handled := vm.executeNativePrawnDocumentClassNew(plan.documentClassValue)
+		if !handled {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		if document != nil && document.Type == object.ValueException {
+			cleanup()
+			return document, true
+		}
+		for _, step := range plan.steps {
+			value, valueOK := checkedIntegerAdd(index, step.offset)
+			if !valueOK {
+				if index == 0 {
+					cleanup()
+					return nil, false
+				}
+				return sideExit(index)
+			}
+			text := core.NewStringValue(step.prefix + core.IntegerToSRawBuiltin(value))
+			if step.encoding != "" {
+				core.SetStringEncoding(text, step.encoding)
+			}
+			textArgs[0] = text
+			result, textHandled := vm.executeNativePrawnDirectText(plan.text, document, textArgs[:])
+			if !textHandled {
+				if index == 0 {
+					cleanup()
+					return nil, false
+				}
+				return sideExit(index)
+			}
+			if result != nil && result.Type == object.ValueException {
+				cleanup()
+				return result, true
+			}
+			if step.startNewPage {
+				result, pageHandled := vm.executeNativePrawnStartNewPage(plan.startNewPage, document, nil, false)
+				if !pageHandled {
+					if index == 0 {
+						cleanup()
+						return nil, false
+					}
+					return sideExit(index)
+				}
+				if result != nil && result.Type == object.ValueException {
+					cleanup()
+					return result, true
+				}
+			}
+		}
+		bytes, renderHandled := vm.executeNativePrawnRenderFast(plan.render, document, nil, false)
+		if !renderHandled {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		if bytes != nil && bytes.Type == object.ValueException {
+			cleanup()
+			return bytes, true
+		}
+		if bytes == nil || bytes.Type != object.ValueString || bytes.Class != core.R.Classes["String"] ||
+			core.AttachedSingletonClass(bytes) != nil {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		raw, rawOK := bytes.Data.(string)
+		if !rawOK {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		current, currentOK := nativePrawnLifecycleExactInteger(derefClosureValue(closure.Free[plan.freeIndex]))
+		if !currentOK {
+			if index == 0 {
+				cleanup()
+				return nil, false
+			}
+			return sideExit(index)
+		}
+		updated, fits := checkedIntegerAdd(current, int64(len(raw)))
+		if fits {
+			setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerValue(updated))
+			continue
+		}
+		bigTotal := new(big.Int).Add(big.NewInt(current), big.NewInt(int64(len(raw))))
+		setClosureValue(&closure.Free[plan.freeIndex], core.NewIntegerFromBigInt(bigTotal))
+		if index+1 < count {
+			return sideExit(index + 1)
+		}
+	}
+	cleanup()
+	core.LastBlockResult = nil
+	return receiver, true
+}
+
 func (vm *VM) executeNativePrawnLifecycleRegion(receiver *object.EmeraldValue, count int64, block *object.EmeraldValue) (*object.EmeraldValue, bool) {
 	if vm == nil || !nativePrawnLifecycleRegionEnabled || receiver == nil || receiver.Type != object.ValueInteger || count < 2 ||
 		block == nil || block.Type != object.ValueClosure || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
 		core.ObjectSpaceAllocationTracing() || vm.threadDepth > 0 || len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 ||
 		len(vm.pendingEnsures) != 0 || vm.ensureActive || vm.pendingReturnTargetID > 0 || vm.pendingBreakTargetID > 0 {
 		return nil, false
+	}
+	if result, handled := vm.executeNativePrawnDynamicLifecycleRegion(receiver, count, block); handled {
+		return result, true
 	}
 	plan, ok := nativePrawnLifecyclePlanFor(vm, block)
 	if !ok {
