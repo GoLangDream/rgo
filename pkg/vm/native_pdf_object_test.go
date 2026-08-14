@@ -207,6 +207,22 @@ func TestNativePDFRenderLayoutTemplateBindsTypedGraphAndRejectsShapeDrift(t *tes
 	if programOutput.String() != want {
 		t.Fatalf("compiled typed layout = %q, generic = %q", programOutput.String(), want)
 	}
+	if rebound, ok := nativePDFRenderBindLayoutTemplate(template, newData, nativePDFEmptyHash(), []*object.EmeraldValue{newData}, referenceClass); !ok || rebound != bound {
+		t.Fatal("unchanged graph should use the trusted same-layout bind")
+	}
+	newDataHash, ok := newData.Data.(*object.RHash)
+	if !ok || newDataHash == nil {
+		t.Fatal("typed test hash payload is missing")
+	}
+	newDataHash.Pairs[key] = core.NewIntegerValue(100)
+	changedBound, ok := nativePDFRenderBindLayoutTemplate(template, newData, nativePDFEmptyHash(), []*object.EmeraldValue{newData}, referenceClass)
+	if !ok {
+		t.Fatal("changed hash value should fall back to the full binder")
+	}
+	var changedOutput strings.Builder
+	if !nativePDFRenderWriteLayoutProgram(&changedOutput, changedBound, template.writePrograms[template.rootNode], 0) || !strings.Contains(changedOutput.String(), "100") {
+		t.Fatalf("changed hash value was not rebound: %q", changedOutput.String())
+	}
 
 	wrongKey := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Other", Class: core.R.Classes["Symbol"]}
 	wrongData := nativePDFHashValue([2]*object.EmeraldValue{wrongKey, core.NewIntegerValue(99)})
@@ -224,6 +240,35 @@ func TestNativePDFRenderLayoutTemplateBindsTypedGraphAndRejectsShapeDrift(t *tes
 	}
 	if nativePDFRenderLayoutTemplateFor(cyclePlan, referenceClass) != nil {
 		t.Fatal("cyclic graph must not produce a typed layout template")
+	}
+}
+
+func TestNativePDFRenderObjectLayoutGenerationIsFieldScoped(t *testing.T) {
+	core.InitWithMspec()
+	referenceClass := object.NewClass("PDF::Core::Reference")
+	slots := nativePDFRenderObjectSlotsFor(referenceClass, "@identifier", "@gen", "@data", "@stream")
+	value := referenceClass.NewInstance()
+	data, ok := value.Data.(*object.Object)
+	if !ok || data == nil {
+		t.Fatal("reference object payload is missing")
+	}
+	data.SetInstanceVar("@data", core.NewIntegerValue(1))
+	first := nativePDFRenderLayoutObjectIvar(value, referenceClass, slots.data, "@data")
+	if first == nil || first.BigIntValue() != nil || first.Data != int64(1) {
+		t.Fatalf("initial inline read = %#v", first)
+	}
+	generation := data.InstanceVarGeneration
+	data.SetInstanceVar("@offset", core.NewIntegerValue(7))
+	if data.InstanceVarGeneration != generation {
+		t.Fatalf("overflow ivar changed layout generation: got %d want %d", data.InstanceVarGeneration, generation)
+	}
+	if cached := nativePDFRenderLayoutObjectIvar(value, referenceClass, slots.data, "@data"); cached != first {
+		t.Fatal("unrelated overflow ivar invalidated the promoted field cache")
+	}
+	data.SetInstanceVar("@data", core.NewIntegerValue(2))
+	updated := nativePDFRenderLayoutObjectIvar(value, referenceClass, slots.data, "@data")
+	if updated == nil || updated.BigIntValue() != nil || updated.Data != int64(2) {
+		t.Fatalf("updated inline read = %#v", updated)
 	}
 }
 

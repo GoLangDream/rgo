@@ -271,13 +271,20 @@ func (c *Class) NewInstance() *EmeraldValue {
 }
 
 type Object struct {
-	Class                  *Class
-	InstanceVars           map[string]*EmeraldValue
-	InstanceVarOrder       []string
-	InlineInstanceVarNames [inlineInstanceVarSlots]string
-	InlineInstanceVarCount uint8
-	InlineInstanceVars     [inlineInstanceVarSlots]*EmeraldValue
-	InlineInstanceVarMask  uint8
+	Class        *Class
+	InstanceVars map[string]*EmeraldValue
+	// InstanceVarGeneration is bumped when a field in the class's promoted
+	// inline layout changes. A closed-world native region may use it to
+	// validate promoted fields without redoing string-keyed map lookups. Writes
+	// to overflow/map-only fields deliberately do not invalidate unrelated
+	// promoted slots.
+	InstanceVarGeneration        uint64
+	InstanceVarOrder             []string
+	InlineInstanceVarNames       [inlineInstanceVarSlots]string
+	InlineInstanceVarCount       uint8
+	InlineInstanceVars           [inlineInstanceVarSlots]*EmeraldValue
+	InlineInstanceVarMask        uint8
+	InlineInstanceVarGenerations [inlineInstanceVarSlots]uint64
 	// HotIntegerInstanceVars is a lazy, per-object scalar sidecar used by a
 	// proven VM region. It keeps the current int64 out of the boxed/map ABI
 	// while no Ruby code can observe the intermediate value. The historical
@@ -388,6 +395,8 @@ func (o *Object) SetInstanceVar(name string, value *EmeraldValue) {
 			if o.InstanceVars != nil {
 				o.InstanceVars[name] = value
 			}
+			o.InstanceVarGeneration++
+			o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
 			return
 		}
 	}
@@ -405,6 +414,11 @@ func (o *Object) SetInstanceVar(name string, value *EmeraldValue) {
 		o.InstanceVarOrder = append(o.InstanceVarOrder, name)
 	}
 	o.InstanceVars[name] = value
+	if o.Class != nil {
+		if index, ok := o.Class.instanceVarSlot(name); ok && index < inlineInstanceVarSlots {
+			o.InstanceVarGeneration++
+		}
+	}
 }
 
 // PrepareHotIntegerInstanceVar reserves a small per-object scalar slot for a
@@ -448,6 +462,11 @@ func (o *Object) SetHotIntegerInstanceVar(index int, value int64, integerClass *
 	o.HotIntegerInstanceVarValues[index] = value
 	o.HotIntegerInstanceVarClasses[index] = integerClass
 	o.HotIntegerInstanceVarMask |= uint8(1 << index)
+	if o.Class != nil {
+		if slot, ok := o.Class.instanceVarSlot(o.HotIntegerInstanceVarNames[index]); ok && slot < inlineInstanceVarSlots {
+			o.InstanceVarGeneration++
+		}
+	}
 	return true
 }
 
@@ -465,6 +484,7 @@ func (o *Object) flushHotIntegerInstanceVars() {
 	if o.InstanceVars == nil {
 		o.InstanceVars = make(map[string]*EmeraldValue)
 	}
+	layoutChanged := false
 	for index, name := range o.HotIntegerInstanceVarNames {
 		bit := uint8(1 << index)
 		if name == "" || o.HotIntegerInstanceVarMask&bit == 0 {
@@ -480,6 +500,14 @@ func (o *Object) flushHotIntegerInstanceVars() {
 		}
 		o.HotIntegerInstanceVarMask &^= bit
 		o.HotIntegerInstanceVarClasses[index] = nil
+		if o.Class != nil {
+			if slot, ok := o.Class.instanceVarSlot(name); ok && slot < inlineInstanceVarSlots {
+				layoutChanged = true
+			}
+		}
+	}
+	if layoutChanged {
+		o.InstanceVarGeneration++
 	}
 }
 
@@ -506,6 +534,8 @@ func (o *Object) SetInlineInstanceVar(index int, name string, value *EmeraldValu
 	if o.InstanceVars != nil {
 		o.InstanceVars[name] = value
 	}
+	o.InstanceVarGeneration++
+	o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
 	return true
 }
 
@@ -532,6 +562,8 @@ func (o *Object) SetInlineInstanceVarFast(index int, name string, value *Emerald
 	if o.InstanceVars != nil {
 		o.InstanceVars[name] = value
 	}
+	o.InstanceVarGeneration++
+	o.InlineInstanceVarGenerations[index] = o.InstanceVarGeneration
 }
 
 // InstanceVarMap materializes the compact slots only for APIs that require a
