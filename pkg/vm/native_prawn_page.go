@@ -15,36 +15,37 @@ import (
 var nativePrawnStartNewPageEnabled = os.Getenv("RGO_DISABLE_NATIVE_PRAWN_START_NEW_PAGE") == ""
 var nativePrawnRenderFastEnabled = os.Getenv("RGO_DISABLE_NATIVE_PRAWN_RENDER_FAST") == ""
 
-// executeNativePrawnRenderFast removes only Document#render's empty repeater
-// walk. The actual serialization remains PDF::Core::Renderer#render, so PDF
-// callbacks, finalization, object ordering, and output errors keep their Ruby
-// implementation and observable behavior.
-func (vm *VM) executeNativePrawnRenderFast(methodObj *object.Method, receiver *object.EmeraldValue, args []*object.EmeraldValue, keywordSyntax bool) (*object.EmeraldValue, bool) {
+// nativePrawnRenderFastTarget proves the Document#render wrapper and returns
+// the exact Renderer#render edge. The ordinary fast path may still dispatch
+// that edge through Ruby's method cache; the typed Integer#times region uses
+// the returned method only when the Renderer native region itself handles the
+// call, so a Ruby fallback can never be mistaken for a side-effect-free leaf.
+func (vm *VM) nativePrawnRenderFastTarget(methodObj *object.Method, receiver *object.EmeraldValue, args []*object.EmeraldValue, keywordSyntax bool) (*object.EmeraldValue, *object.Method, bool) {
 	if vm == nil || !nativePrawnRenderFastEnabled || !nativePDFObjectEnabled || methodObj == nil ||
 		methodObj.DispatchOwner != nil || methodObj.Visibility != "" && methodObj.Visibility != "public" ||
 		receiver == nil || receiver.Type != object.ValueObject || receiver.Class == nil ||
 		core.AttachedSingletonClass(receiver) != nil || len(args) != 0 || keywordSyntax ||
 		vm.currentBlock != nil || vm.instructionLimit != 0 || DevMode || core.AnyTracePointActive() ||
 		core.ObjectSpaceAllocationTracing() || len(vm.catchStack) != 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	documentClassValue, found := vm.qualifiedConstantValue("Prawn::Document")
 	if !found || documentClassValue == nil || documentClassValue.Type != object.ValueClass {
-		return nil, false
+		return nil, nil, false
 	}
 	documentClass, ok := documentClassValue.Data.(*object.Class)
 	if !ok || documentClass == nil || receiver.Class != documentClass || !nativePrawnClassExtensionsEmpty(documentClass) {
-		return nil, false
+		return nil, nil, false
 	}
 	renderMethod, owner, found := documentClass.GetMethodWithOwner("render")
 	if !found || renderMethod == nil || owner != documentClass || renderMethod != methodObj {
-		return nil, false
+		return nil, nil, false
 	}
 	fn, ok := renderMethod.Fn.(*object.Function)
 	if !ok || fn == nil || fn.Name != "render" || !strings.HasSuffix(fn.SourcePath, "/prawn/document.rb") ||
 		len(fn.Params) != 0 || !fn.HasRestParam || fn.HasBlockParam || len(fn.KeywordParams) != 0 ||
 		fn.KeywordRestParam != "" || fn.KeywordRestOnly || fn.RejectBlock {
-		return nil, false
+		return nil, nil, false
 	}
 
 	state := core.DynamicInstanceVar(receiver, "@state")
@@ -57,20 +58,25 @@ func (vm *VM) executeNativePrawnRenderFast(methodObj *object.Method, receiver *o
 		core.DynamicInstanceVar(renderer, "@state") != state ||
 		!nativePrawnExactMethodSource(rendererClass, "render", "/renderer.rb") ||
 		!nativePrawnExactMethodSource(documentClass, "repeaters", "/prawn/repeater.rb") {
-		return nil, false
+		return nil, nil, false
+	}
+	rendererMethod, rendererOwner, rendererFound := rendererClass.GetMethodWithOwner("render")
+	if !rendererFound || rendererMethod == nil || rendererOwner != rendererClass || rendererMethod.DispatchOwner != nil ||
+		rendererMethod.Visibility != "" && rendererMethod.Visibility != "public" {
+		return nil, nil, false
 	}
 	pages := core.DynamicInstanceVar(state, "@pages")
 	pageItems, pagesOK := nativePDFArrayItems(pages)
 	if !pagesOK || pages == nil || pages.Type != object.ValueArray || pages.Class != core.R.Classes["Array"] ||
 		core.AttachedSingletonClass(pages) != nil || len(pageItems) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	repeaters := core.DynamicInstanceVar(receiver, "@repeaters")
 	if repeaters != nil && repeaters.Type != object.ValueNil {
 		repeaterItems, repeatersOK := nativePDFArrayItems(repeaters)
 		if !repeatersOK || repeaters.Type != object.ValueArray || repeaters.Class != core.R.Classes["Array"] ||
 			core.AttachedSingletonClass(repeaters) != nil || len(repeaterItems) != 0 {
-			return nil, false
+			return nil, nil, false
 		}
 	} else {
 		// Document#render calls repeaters before Renderer#render, which creates
@@ -78,7 +84,7 @@ func (vm *VM) executeNativePrawnRenderFast(methodObj *object.Method, receiver *o
 		// side effect before taking the shorter path.
 		repeaters = nativePDFArrayValue()
 		if core.SetDynamicInstanceVar(receiver, "@repeaters", repeaters) != nil {
-			return nil, false
+			return nil, nil, false
 		}
 	}
 
@@ -87,6 +93,18 @@ func (vm *VM) executeNativePrawnRenderFast(methodObj *object.Method, receiver *o
 	// performs the same finalization over state.pages, so only mirror the
 	// document-level page number here.
 	core.SetDynamicInstanceVar(receiver, "@page_number", core.NewIntegerValue(int64(len(pageItems))))
+	return renderer, rendererMethod, true
+}
+
+// executeNativePrawnRenderFast removes only Document#render's empty repeater
+// walk. The actual serialization remains PDF::Core::Renderer#render, so PDF
+// callbacks, finalization, object ordering, and output errors keep their Ruby
+// implementation and observable behavior.
+func (vm *VM) executeNativePrawnRenderFast(methodObj *object.Method, receiver *object.EmeraldValue, args []*object.EmeraldValue, keywordSyntax bool) (*object.EmeraldValue, bool) {
+	renderer, _, handled := vm.nativePrawnRenderFastTarget(methodObj, receiver, args, keywordSyntax)
+	if !handled {
+		return nil, false
+	}
 	return vm.sendWithCallInfo(renderer, "render", nil, false), true
 }
 

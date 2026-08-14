@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoLangDream/rgo/pkg/compiler"
 	"github.com/GoLangDream/rgo/pkg/core"
 	"github.com/GoLangDream/rgo/pkg/object"
 )
@@ -304,6 +305,31 @@ func TestNativePDFRenderCachedBookkeepingPreservesObjectLayouts(t *testing.T) {
 	}
 	if got := core.DynamicInstanceVar(missing, "@offset"); got == nil || got.Data != int64(3) {
 		t.Fatalf("side-exit bookkeeping value = %#v, want 3", got)
+	}
+}
+
+func TestNativePDFRenderTimesBlockShapeRequiresExactGraph(t *testing.T) {
+	fn := &object.Function{}
+	plan := &registerIRPlan{
+		blockReturn: true,
+		sendCount:   2,
+		instructions: []registerIRInstruction{
+			{op: registerIRLoadFree, dst: 0, param: 0},
+			{op: registerIRLoadFree, dst: 1, param: 1},
+			{op: registerIRSend, dst: 1, left: 1, name: "render", opcode: compiler.OpSend, splatIndex: 255},
+			{op: registerIRSend, dst: 1, left: 1, name: "bytesize", opcode: compiler.OpSend, splatIndex: 255},
+			{op: registerIRBinary, dst: 0, left: 0, right: 1, opcode: compiler.OpAdd},
+			{op: registerIRStoreFree, left: 0, param: 0},
+			{op: registerIRReturn, left: 0},
+		},
+	}
+	shape, ok := nativePDFRenderTimesBlockShapeFor(fn, plan)
+	if !ok || shape.pdfFree != 1 || shape.totalFree != 0 {
+		t.Fatalf("exact render.bytesize shape = %#v, ok=%t", shape, ok)
+	}
+	plan.instructions[3].name = "length"
+	if _, ok := nativePDFRenderTimesBlockShapeFor(fn, plan); ok {
+		t.Fatal("non-bytesize callback must not enter the typed region")
 	}
 }
 
