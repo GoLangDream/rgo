@@ -40,7 +40,7 @@ func nativePDFDispatchCandidateForMethod(receiver *object.EmeraldValue, methodOb
 	case "PDF::Core::Stream":
 		return methodObj.Name == "<<" || methodObj.Name == "filtered_stream"
 	case "PDF::Core::Renderer":
-		return methodObj.Name == "add_content" || methodObj.Name == "graphic_state" || methodObj.Name == "finalize_all_page_contents"
+		return methodObj.Name == "add_content" || methodObj.Name == "graphic_state" || methodObj.Name == "finalize_all_page_contents" || methodObj.Name == "render"
 	case "PDF::Core::ObjectStore":
 		return methodObj.Name == "push" || methodObj.Name == "ref" || methodObj.Name == "each" || methodObj.Name == "[]"
 	case "Prawn::Document":
@@ -84,6 +84,11 @@ func (vm *VM) executeNativePDFDispatch(methodObj *object.Method, receiver *objec
 		return vm.executeNativePDFStreamAppend(methodObj, receiver, args)
 	case "PDF::Core::Renderer":
 		if len(args) == 0 {
+			if methodObj.Name == "render" {
+				if result, executed := vm.executeNativePDFRendererRenderRegion(methodObj, receiver, args); executed {
+					return result, true
+				}
+			}
 			if methodObj.Name == "finalize_all_page_contents" {
 				if result, executed := vm.executeNativePDFRendererFinalize(methodObj, receiver, args); executed {
 					return result, true

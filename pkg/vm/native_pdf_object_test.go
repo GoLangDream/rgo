@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/GoLangDream/rgo/pkg/core"
@@ -44,6 +45,27 @@ func TestNativePDFObjectTextPrimitiveAndCollectionShapes(t *testing.T) {
 	}
 }
 
+func TestNativePDFRenderWriterMatchesObjectSerializer(t *testing.T) {
+	core.InitWithMspec()
+	key := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Value", Class: core.R.Classes["Symbol"]}
+	value := &object.EmeraldValue{Type: object.ValueArray, Data: []*object.EmeraldValue{
+		core.NewIntegerValue(42),
+		&object.EmeraldValue{Type: object.ValueString, Data: "hi", Class: core.R.Classes["String"]},
+	}, Class: core.R.Classes["Array"]}
+	hash := nativePDFHashValue([2]*object.EmeraldValue{key, value})
+	want, ok := nativePDFObjectText(hash, false, make(map[*object.EmeraldValue]bool))
+	if !ok {
+		t.Fatal("generic serializer rejected test hash")
+	}
+	var output strings.Builder
+	if !nativePDFRenderWriteObjectText(&output, hash, false, make(map[*object.EmeraldValue]bool), nil) {
+		t.Fatal("renderer serializer rejected test hash")
+	}
+	if got := output.String(); got != want {
+		t.Fatalf("renderer serializer = %q, generic serializer = %q", got, want)
+	}
+}
+
 func TestNativePDFObjectTextRejectsUnsupportedStringSubclassAndCycles(t *testing.T) {
 	core.InitWithMspec()
 	subclass := object.NewClass("PDF::CustomString")
@@ -55,5 +77,22 @@ func TestNativePDFObjectTextRejectsUnsupportedStringSubclassAndCycles(t *testing
 	cycle.Data = []*object.EmeraldValue{cycle}
 	if _, ok := nativePDFObjectText(cycle, false, make(map[*object.EmeraldValue]bool)); ok {
 		t.Fatal("expected cyclic Array to deopt")
+	}
+}
+
+func TestNativePDFRenderHashWithLengthUsesRubyDictionaryShape(t *testing.T) {
+	core.InitWithMspec()
+	text, ok := nativePDFRenderHashWithLength(nativePDFEmptyHash(), 7, nil)
+	if !ok {
+		t.Fatal("expected empty dictionary to accept stream length")
+	}
+	if want := "<< /Length 7\n>>"; text != want {
+		t.Fatalf("stream dictionary = %q, want %q", text, want)
+	}
+
+	lengthKey := &object.EmeraldValue{Type: object.ValueSymbol, Data: "Length", Class: core.R.Classes["Symbol"]}
+	data := nativePDFHashValue([2]*object.EmeraldValue{lengthKey, core.NewIntegerValue(1)})
+	if _, ok := nativePDFRenderHashWithLength(data, 7, nil); ok {
+		t.Fatal("expected an existing Length key to deopt instead of duplicating Ruby Hash#merge")
 	}
 }

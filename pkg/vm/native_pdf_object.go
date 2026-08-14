@@ -404,7 +404,7 @@ func nativePDFReferenceText(value *object.EmeraldValue) (string, bool) {
 }
 
 func nativePDFObjectIntegerIvar(value *object.EmeraldValue, name string) (int64, bool) {
-	item := core.DynamicInstanceVar(value, name)
+	item := nativePrawnTextLayoutIvar(value, name)
 	if item == nil || item.Type != object.ValueInteger || item.BigIntValue() != nil {
 		return 0, false
 	}

@@ -228,10 +228,8 @@ func (vm *VM) executeNativePrawnDirectText(methodObj *object.Method, receiver *o
 		len(vm.catchStack) != 0 || len(vm.activeRescues) != 0 || len(vm.pendingEnsures) != 0 || vm.ensureActive {
 		return nil, false
 	}
-	fn, ok := methodObj.Fn.(*object.Function)
-	if !ok || fn == nil || fn.Name != "text" || !strings.HasSuffix(fn.SourcePath, "/prawn/text.rb") ||
-		len(fn.Params) != 2 || len(fn.ParamDefaults) != 2 || fn.HasRestParam || fn.HasBlockParam ||
-		len(fn.KeywordParams) != 0 || fn.KeywordRestParam != "" || fn.KeywordRestOnly {
+	plan, planOK := vm.nativePrawnTextLayoutPlanFor(methodObj, receiver.Class)
+	if !planOK {
 		return nil, false
 	}
 	if args[0] == nil || args[0].Type != object.ValueString || args[0].Class != core.R.Classes["String"] ||
@@ -242,83 +240,69 @@ func (vm *VM) executeNativePrawnDirectText(methodObj *object.Method, receiver *o
 	if !asciiOK {
 		return nil, false
 	}
-	documentClassValue, found := vm.qualifiedConstantValue("Prawn::Document")
-	if !found || documentClassValue == nil || documentClassValue.Type != object.ValueClass ||
-		documentClassValue.Data != receiver.Class {
+	if result, executed := vm.executeNativePrawnDirectTextHot(methodObj, receiver, text, plan); executed {
+		return result, true
+	}
+	if !nativePrawnClassExtensionsEmpty(plan.boxClass) || !nativePrawnClassExtensionsEmpty(plan.formattedBoxClass) {
 		return nil, false
 	}
-	boxValue, found := vm.qualifiedConstantValue("Prawn::Document::BoundingBox")
-	if !found || boxValue == nil || boxValue.Type != object.ValueClass {
-		return nil, false
-	}
-	boxClass, ok := boxValue.Data.(*object.Class)
-	if !ok || boxClass == nil || !nativePrawnClassExtensionsEmpty(boxClass) {
-		return nil, false
-	}
-	formattedBoxValue, found := vm.qualifiedConstantValue("Prawn::Text::Formatted::Box")
-	if !found || formattedBoxValue == nil || formattedBoxValue.Type != object.ValueClass {
-		return nil, false
-	}
-	formattedBoxClass, ok := formattedBoxValue.Data.(*object.Class)
-	if !ok || formattedBoxClass == nil || !nativePrawnClassExtensionsEmpty(formattedBoxClass) {
-		return nil, false
-	}
-	state := core.DynamicInstanceVar(receiver, "@state")
-	page := core.DynamicInstanceVar(state, "@page")
-	boundingBox := core.DynamicInstanceVar(receiver, "@bounding_box")
-	if !nativePDFExactObject(state, "PDF::Core::DocumentState") || !nativePDFExactObject(page, "PDF::Core::Page") ||
+	state := nativePrawnTextLayoutIvar(receiver, "@state")
+	page := nativePrawnTextLayoutIvar(state, "@page")
+	boundingBox := nativePrawnTextLayoutIvar(receiver, "@bounding_box")
+	if state == nil || state.Type != object.ValueObject || state.Class != plan.stateClass ||
+		page == nil || page.Type != object.ValueObject || page.Class != plan.pageClass ||
 		!nativePDFPageHasGraphicState(page) || !nativePrawnDefaultGraphicState(page) || boundingBox == nil || boundingBox.Type != object.ValueObject ||
-		boundingBox.Class != boxClass || core.AttachedSingletonClass(boundingBox) != nil {
+		boundingBox.Class != plan.boxClass || core.AttachedSingletonClass(boundingBox) != nil {
 		return nil, false
 	}
-	boxX, boxXOK := nativePrawnNumericValue(core.DynamicInstanceVar(boundingBox, "@x"))
-	boxY, boxYOK := nativePrawnNumericValue(core.DynamicInstanceVar(boundingBox, "@y"))
-	boxWidth, boxWidthOK := nativePrawnNumericValue(core.DynamicInstanceVar(boundingBox, "@width"))
-	boxHeight, boxHeightOK := nativePrawnNumericValue(core.DynamicInstanceVar(boundingBox, "@height"))
-	currentY, currentYOK := nativePrawnNumericValue(core.DynamicInstanceVar(receiver, "@y"))
+	boxX, boxXOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(boundingBox, "@x"))
+	boxY, boxYOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(boundingBox, "@y"))
+	boxWidth, boxWidthOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(boundingBox, "@width"))
+	boxHeight, boxHeightOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(boundingBox, "@height"))
+	currentY, currentYOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(receiver, "@y"))
 	if !boxXOK || !boxYOK || !boxWidthOK || !boxHeightOK || !currentYOK || boxX != 36 || boxY != 756 || boxWidth != 540 || boxHeight != 720 ||
-		core.DynamicInstanceVar(receiver, "@margin_box") != boundingBox {
+		nativePrawnTextLayoutIvar(receiver, "@margin_box") != boundingBox {
 		return nil, false
 	}
-	fontSizeValue := core.DynamicInstanceVar(receiver, "@font_size")
+	fontSizeValue := nativePrawnTextLayoutIvar(receiver, "@font_size")
 	fontSize, fontSizeOK := nativePrawnNumericValue(fontSizeValue)
 	if !fontSizeOK || fontSize != 12 {
 		return nil, false
 	}
-	if stateValue := core.DynamicInstanceVar(receiver, "@text_rendering_mode"); stateValue != nil && stateValue.Type != object.ValueNil {
+	if stateValue := nativePrawnTextLayoutIvar(receiver, "@text_rendering_mode"); stateValue != nil && stateValue.Type != object.ValueNil {
 		if stateValue.Type != object.ValueSymbol || stateValue.Data != "fill" {
 			return nil, false
 		}
 	}
-	if spacing := core.DynamicInstanceVar(receiver, "@character_spacing"); spacing != nil && spacing.Type != object.ValueNil {
+	if spacing := nativePrawnTextLayoutIvar(receiver, "@character_spacing"); spacing != nil && spacing.Type != object.ValueNil {
 		value, valid := nativePrawnNumericValue(spacing)
 		if !valid || value != 0 {
 			return nil, false
 		}
 	}
-	if kerningDefault := core.DynamicInstanceVar(receiver, "@default_kerning"); kerningDefault != nil && kerningDefault.Type != object.ValueNil {
+	if kerningDefault := nativePrawnTextLayoutIvar(receiver, "@default_kerning"); kerningDefault != nil && kerningDefault.Type != object.ValueNil {
 		if kerningDefault.Type != object.ValueBool || kerningDefault.Data != true {
 			return nil, false
 		}
 	}
-	if direction := core.DynamicInstanceVar(receiver, "@text_direction"); direction != nil && direction.Type != object.ValueNil {
+	if direction := nativePrawnTextLayoutIvar(receiver, "@text_direction"); direction != nil && direction.Type != object.ValueNil {
 		if direction.Type != object.ValueSymbol || direction.Data != "ltr" {
 			return nil, false
 		}
 	}
-	if fallback := core.DynamicInstanceVar(receiver, "@fallback_fonts"); fallback != nil && fallback.Type != object.ValueNil {
+	if fallback := nativePrawnTextLayoutIvar(receiver, "@fallback_fonts"); fallback != nil && fallback.Type != object.ValueNil {
 		items, valid := nativePDFArrayItems(fallback)
 		if fallback.Type != object.ValueArray || fallback.Class != core.R.Classes["Array"] || !valid || len(items) != 0 {
 			return nil, false
 		}
 	}
-	if indent := core.DynamicInstanceVar(receiver, "@indent_paragraphs"); indent != nil && indent.Type != object.ValueNil {
+	if indent := nativePrawnTextLayoutIvar(receiver, "@indent_paragraphs"); indent != nil && indent.Type != object.ValueNil {
 		return nil, false
 	}
 
-	font := core.DynamicInstanceVar(receiver, "@font")
+	font := nativePrawnTextLayoutIvar(receiver, "@font")
 	if font == nil || font.Type == object.ValueNil {
-		if cachedFont, cached := vm.nativePrawnDefaultAFMFont(receiver); cached {
+		if cachedFont, cached := vm.nativePrawnDefaultAFMFont(receiver, plan); cached {
 			font = cachedFont
 		} else {
 			font = vm.sendBypassVisibility(receiver, "font", nil)
@@ -327,19 +311,25 @@ func (vm *VM) executeNativePrawnDirectText(methodObj *object.Method, receiver *o
 			return font, true
 		}
 	}
-	fontClassValue, fontClassFound := vm.qualifiedConstantValue("Prawn::Fonts::AFM")
-	fontClass, fontClassOK := (*object.Class)(nil), false
-	if fontClassFound && fontClassValue != nil && fontClassValue.Type == object.ValueClass {
-		fontClass, fontClassOK = fontClassValue.Data.(*object.Class)
-	}
-	fontName := core.DynamicInstanceVar(font, "@name")
-	if !fontClassOK || font == nil || font.Type != object.ValueObject || font.Class != fontClass ||
+	fontName := nativePrawnTextLayoutIvar(font, "@name")
+	if font == nil || font.Type != object.ValueObject || font.Class != plan.fontClass ||
 		core.AttachedSingletonClass(font) != nil || fontName == nil || fontName.Type != object.ValueString ||
 		fontName.Data != "Helvetica" {
 		return nil, false
 	}
+	result, handled := vm.nativePrawnEmitDirectText(receiver, page, font, text, boxX, currentY, fontSizeValue, plan)
+	if handled && result == core.R.NilVal {
+		vm.rememberNativePrawnTextHotState(methodObj, receiver, state, page, boundingBox, font, boxX, boxY, boxWidth, boxHeight)
+	}
+	return result, handled
+}
+
+func (vm *VM) nativePrawnEmitDirectText(receiver, page, font *object.EmeraldValue, text string, boxX, currentY float64, fontSizeValue *object.EmeraldValue, plan *nativePrawnTextLayoutRegionPlan) (*object.EmeraldValue, bool) {
+	if vm == nil || receiver == nil || page == nil || font == nil || fontSizeValue == nil || plan == nil {
+		return nil, false
+	}
 	vm.nativePrawnRememberDefaultAFMTemplate(font)
-	payloadText, fontIdentifierText, kerning, encodedOK := vm.nativePrawnDirectAFMText(font, receiver, page, text)
+	payloadText, fontIdentifierText, kerning, encodedOK := vm.nativePrawnDirectAFMText(font, receiver, page, text, plan)
 	if !encodedOK {
 		return nil, false
 	}
@@ -398,36 +388,21 @@ func (vm *VM) executeNativePrawnDirectText(methodObj *object.Method, receiver *o
 // the standard mutable Hash implementation and the exact Prawn source
 // methods.  A modified font, page resource hash, or PDF core method simply
 // returns false and lets the ordinary VM execute the call.
-func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue, raw string) (string, string, bool, bool) {
+func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue, raw string, plan *nativePrawnTextLayoutRegionPlan) (string, string, bool, bool) {
 	if vm == nil || font == nil || document == nil || page == nil ||
 		font.Type != object.ValueObject || document.Type != object.ValueObject || page.Type != object.ValueObject ||
 		font.Class == nil || core.AttachedSingletonClass(font) != nil || core.AttachedSingletonClass(document) != nil ||
-		core.AttachedSingletonClass(page) != nil || !core.HashIndexUsesBuiltinImplementation() ||
-		!core.HashStoreUsesBuiltinImplementation() {
+		core.AttachedSingletonClass(page) != nil || plan == nil || !plan.valid || !plan.hashBuiltinsOK ||
+		font.Class != plan.fontClass || document.Class != plan.documentClass || page.Class != plan.pageClass {
 		return "", "", false, false
 	}
 	if _, asciiOK := nativePrawnSimpleASCII(raw); !asciiOK {
 		return "", "", false, false
 	}
-	if !nativeAFMMethodSource(font.Class, "normalize_encoding", "/prawn/fonts/afm.rb") ||
-		!nativeAFMMethodSource(font.Class, "has_kerning_data?", "/prawn/fonts/afm.rb") ||
-		!nativeAFMMethodSource(font.Class, "encode_text", "/prawn/fonts/afm.rb") ||
-		!nativeAFMMethodSource(font.Class, "register", "/prawn/fonts/afm.rb") ||
-		!nativeAFMMethodSource(font.Class, "symbolic?", "/prawn/fonts/afm.rb") ||
-		!nativeAFMMethodSource(font.Class, "add_to_current_page", "/prawn/font.rb") ||
-		!nativeAFMMethodSource(font.Class, "identifier_for", "/prawn/font.rb") {
-		return "", "", false, false
-	}
-	if document.Class == nil || document.Class.Name != "Prawn::Document" ||
-		page.Class != vm.nativePDFConstructorClass("PDF::Core::Page") ||
-		!nativeAFMMethodSource(page.Class, "resources", "/page.rb") ||
-		!nativeAFMMethodSource(page.Class, "fonts", "/page.rb") {
-		return "", "", false, false
-	}
-	fontName := core.DynamicInstanceVar(font, "@name")
-	identifier := core.DynamicInstanceVar(font, "@identifier")
-	fullEmbedding := core.DynamicInstanceVar(font, "@full_font_embedding")
-	attributes := core.DynamicInstanceVar(font, "@attributes")
+	fontName := nativePrawnTextLayoutIvar(font, "@name")
+	identifier := nativePrawnTextLayoutIvar(font, "@identifier")
+	fullEmbedding := nativePrawnTextLayoutIvar(font, "@full_font_embedding")
+	attributes := nativePrawnTextLayoutIvar(font, "@attributes")
 	if fontName == nil || fontName.Type != object.ValueString || fontName.Class != core.R.Classes["String"] ||
 		fontName.Data != "Helvetica" || core.AttachedSingletonClass(fontName) != nil ||
 		identifier == nil || identifier.Type != object.ValueSymbol || identifier.Class != core.R.Classes["Symbol"] ||
@@ -439,7 +414,7 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 	// `has_kerning_data?` is @kern_pairs.any?.  Keep that observable decision
 	// separate from the parsed byte-pair table: a non-empty AFM pair hash still
 	// produces a TJ array even when a particular input contains no pair.
-	kernPairsValue := core.DynamicInstanceVar(font, "@kern_pairs")
+	kernPairsValue := nativePrawnTextLayoutIvar(font, "@kern_pairs")
 	kernPairs, kernPairsOK := nativePrawnDirectHashHeader(kernPairsValue)
 	if !kernPairsOK {
 		return "", "", false, false
@@ -450,8 +425,8 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 		return "", "", false, false
 	}
 
-	referencesValue := core.DynamicInstanceVar(font, "@references")
-	cacheValue := core.DynamicInstanceVar(font, "@subset_name_cache")
+	referencesValue := nativePrawnTextLayoutIvar(font, "@references")
+	cacheValue := nativePrawnTextLayoutIvar(font, "@subset_name_cache")
 	if _, ok := nativePrawnDirectHashShape(referencesValue); !ok {
 		return "", "", false, false
 	}
@@ -466,16 +441,15 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 	if !identifierValid {
 		return "", "", false, false
 	}
-	state := core.DynamicInstanceVar(document, "@state")
-	store := core.DynamicInstanceVar(state, "@store")
-	objects := core.DynamicInstanceVar(store, "@objects")
-	identifiers := core.DynamicInstanceVar(store, "@identifiers")
-	storeClass := vm.nativePDFConstructorClass("PDF::Core::ObjectStore")
-	referenceClass := vm.nativePDFConstructorClass("PDF::Core::Reference")
-	streamClass := vm.nativePDFConstructorClass("PDF::Core::Stream")
-	filterClass := vm.nativePDFConstructorClass("PDF::Core::FilterList")
-	if !nativePDFExactObject(state, "PDF::Core::DocumentState") ||
-		state.Class != vm.nativePDFConstructorClass("PDF::Core::DocumentState") ||
+	state := nativePrawnTextLayoutIvar(document, "@state")
+	store := nativePrawnTextLayoutIvar(state, "@store")
+	objects := nativePrawnTextLayoutIvar(store, "@objects")
+	identifiers := nativePrawnTextLayoutIvar(store, "@identifiers")
+	storeClass := plan.storeClass
+	referenceClass := plan.referenceClass
+	streamClass := plan.streamClass
+	filterClass := plan.filterListClass
+	if state == nil || state.Type != object.ValueObject || state.Class != plan.stateClass ||
 		storeClass == nil || referenceClass == nil || streamClass == nil || filterClass == nil ||
 		store == nil || store.Type != object.ValueObject || store.Class != storeClass ||
 		objects == nil || !nativePDFStandardHash(objects) || identifiers == nil || identifiers.Type != object.ValueArray ||
@@ -486,7 +460,7 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 		return "", "", false, false
 	}
 
-	pageDictionaryID := core.DynamicInstanceVar(page, "@dictionary")
+	pageDictionaryID := nativePrawnTextLayoutIvar(page, "@dictionary")
 	if pageDictionaryID == nil || pageDictionaryID.Type != object.ValueInteger || pageDictionaryID.Class != core.R.Classes["Integer"] ||
 		core.AttachedSingletonClass(pageDictionaryID) != nil {
 		return "", "", false, false
@@ -496,7 +470,7 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 		core.AttachedSingletonClass(dictionary) != nil {
 		return "", "", false, false
 	}
-	dictionaryData := core.DynamicInstanceVar(dictionary, "@data")
+	dictionaryData := nativePrawnTextLayoutIvar(dictionary, "@data")
 	if _, dictionaryDataOK := nativePrawnDirectHashShape(dictionaryData); !dictionaryDataOK {
 		return "", "", false, false
 	}
@@ -556,7 +530,7 @@ func (vm *VM) nativePrawnDirectAFMText(font, document, page *object.EmeraldValue
 			return "", "", false, false
 		}
 	}
-	fontReferenceID := core.DynamicInstanceVar(reference, "@identifier")
+	fontReferenceID := nativePrawnTextLayoutIvar(reference, "@identifier")
 	if fontReferenceID == nil || fontReferenceID.Type != object.ValueInteger || fontReferenceID.Class != core.R.Classes["Integer"] ||
 		core.AttachedSingletonClass(fontReferenceID) != nil {
 		return "", "", false, false
@@ -789,8 +763,8 @@ func nativePrawnRealText(value float64) string {
 }
 
 func nativePrawnDefaultGraphicState(page *object.EmeraldValue) bool {
-	stack := core.DynamicInstanceVar(page, "@stack")
-	values := core.DynamicInstanceVar(stack, "@stack")
+	stack := nativePrawnTextLayoutIvar(page, "@stack")
+	values := nativePrawnTextLayoutIvar(stack, "@stack")
 	items, ok := nativePDFArrayItems(values)
 	if !ok || len(items) == 0 {
 		return false
@@ -799,11 +773,11 @@ func nativePrawnDefaultGraphicState(page *object.EmeraldValue) bool {
 	if !nativePDFExactObject(state, "PDF::Core::GraphicState") || core.AttachedSingletonClass(state) != nil {
 		return false
 	}
-	fillColor := core.DynamicInstanceVar(state, "@fill_color")
-	strokeColor := core.DynamicInstanceVar(state, "@stroke_color")
-	lineWidth := core.DynamicInstanceVar(state, "@line_width")
-	capStyle := core.DynamicInstanceVar(state, "@cap_style")
-	joinStyle := core.DynamicInstanceVar(state, "@join_style")
+	fillColor := nativePrawnTextLayoutIvar(state, "@fill_color")
+	strokeColor := nativePrawnTextLayoutIvar(state, "@stroke_color")
+	lineWidth := nativePrawnTextLayoutIvar(state, "@line_width")
+	capStyle := nativePrawnTextLayoutIvar(state, "@cap_style")
+	joinStyle := nativePrawnTextLayoutIvar(state, "@join_style")
 	if fillColor == nil || fillColor.Type != object.ValueString || fillColor.Data != "000000" ||
 		strokeColor == nil || strokeColor.Type != object.ValueString || strokeColor.Data != "000000" ||
 		lineWidth == nil || lineWidth.Type != object.ValueInteger || lineWidth.Data != int64(1) ||
@@ -811,7 +785,7 @@ func nativePrawnDefaultGraphicState(page *object.EmeraldValue) bool {
 		joinStyle == nil || joinStyle.Type != object.ValueSymbol || joinStyle.Data != "miter" {
 		return false
 	}
-	colorSpace := core.DynamicInstanceVar(state, "@color_space")
+	colorSpace := nativePrawnTextLayoutIvar(state, "@color_space")
 	entries, entriesOK := nativePDFHashEntries(colorSpace)
 	return nativePDFStandardHash(colorSpace) && entriesOK && len(entries) == 0
 }
@@ -820,17 +794,17 @@ func nativePrawnFontMetrics(font *object.EmeraldValue) (float64, float64, float6
 	if font == nil {
 		return 0, 0, 0, false
 	}
-	ascender, ascenderOK := nativePrawnNumericValue(core.DynamicInstanceVar(font, "@ascender"))
-	descender, descenderOK := nativePrawnNumericValue(core.DynamicInstanceVar(font, "@descender"))
-	lineGap, lineGapOK := nativePrawnNumericValue(core.DynamicInstanceVar(font, "@line_gap"))
+	ascender, ascenderOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(font, "@ascender"))
+	descender, descenderOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(font, "@descender"))
+	lineGap, lineGapOK := nativePrawnNumericValue(nativePrawnTextLayoutIvar(font, "@line_gap"))
 	if !ascenderOK || !descenderOK || !lineGapOK {
 		return 0, 0, 0, false
 	}
-	document := core.DynamicInstanceVar(font, "@document")
+	document := nativePrawnTextLayoutIvar(font, "@document")
 	if document == nil {
 		return 0, 0, 0, false
 	}
-	sizeValue := core.DynamicInstanceVar(document, "@font_size")
+	sizeValue := nativePrawnTextLayoutIvar(document, "@font_size")
 	size, sizeOK := nativePrawnNumericValue(sizeValue)
 	if !sizeOK {
 		return 0, 0, 0, false
@@ -846,7 +820,7 @@ func nativePrawnAppendDirectContent(page *object.EmeraldValue, content string) (
 	if !nativePDFExactObject(stream, "PDF::Core::Stream") {
 		return nil, false
 	}
-	streamData := core.DynamicInstanceVar(stream, "@stream")
+	streamData := nativePrawnTextLayoutIvar(stream, "@stream")
 	if streamData == nil || streamData.Type == object.ValueNil {
 		streamData = &object.EmeraldValue{Type: object.ValueString, Data: "", Class: core.R.Classes["String"], Encoding: "UTF-8"}
 	}

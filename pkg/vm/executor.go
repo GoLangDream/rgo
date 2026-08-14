@@ -767,6 +767,9 @@ type VM struct {
 	nativePrawnLineWrapProofGeneration          uint64
 	nativePrawnLineWrapConstantsChecked         bool
 	nativePrawnLineWrapConstantsOK              bool
+	nativePrawnTextLayoutPlan                   nativePrawnTextLayoutRegionPlan
+	nativePrawnTextHotStates                    map[*object.EmeraldValue]*nativePrawnTextHotState
+	nativePDFRenderRegionABIPlan                nativePDFRenderRegionABIPlan
 	nativePrawnFragmentProcessTextProofs        map[*object.Method]nativePrawnFragmentProcessTextProof
 	nativePrawnFragmentProcessTextGeneration    uint64
 	nativeAFMGlyphTables                        map[*object.EmeraldValue][]int64
@@ -1033,6 +1036,7 @@ func newVM(bytecode *compiler.Bytecode, parent *VM) *VM {
 		typedSSABatchCallTemplates:           make(map[*object.Function]typedSSABatchCallTemplate),
 		typedHashDirectPlans:                 make(map[*object.Function]*registerIRPlan),
 		nativePrawnSimpleStates:              make(map[*object.EmeraldValue]*nativePrawnSimpleState),
+		nativePrawnTextHotStates:             make(map[*object.EmeraldValue]*nativePrawnTextHotState),
 		nativePrawnLineWrapProofs:            make(map[*object.Method]nativePrawnLineWrapMethodProof),
 		nativePrawnFragmentProcessTextProofs: make(map[*object.Method]nativePrawnFragmentProcessTextProof),
 		nativeAFMGlyphTables:                 make(map[*object.EmeraldValue][]int64),

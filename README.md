@@ -79,6 +79,8 @@ ruby 4.0.0 (rgo) [linux-amd64]
 
 普通 VM 对真实 Prawn 对象的默认 ASCII、默认布局 `Document#text` 也有严格 source/class/layout guard 的 Go 直达 ABI；不满足证明的文本、选项或文档状态仍回退 Ruby。可用 `RGO_DISABLE_NATIVE_PRAWN_DIRECT_TEXT=1` 做兼容性/性能对照。该入口只覆盖已证明的 Prawn 闭世界形状，不能代表任意 Ruby 文本调用都能获得同样收益。
 
+`Document#text` 的不可变证明已合并为 per-VM typed object-layout plan：class/constant/method source/builtin 只在 method/constant generation 改变时重建，普通 map-backed 对象的热 ivar 读直接走已证明的对象布局；compact layout、hot scalar sidecar 和可变文档状态仍使用完整读取/flush 语义。任何 generation、class extension、字体/页面资源或参数 guard 失败都会 side-exit 到原 Ruby/ABI。可用 `RGO_DISABLE_NATIVE_PRAWN_TEXT_LAYOUT_REGION=1` 做兼容性/性能对照。
+
 在同一套真实对象图上，普通 VM 还默认启用几条更窄的 Prawn/PDF ABI：默认参数的
 `Document#start_new_page`、无 repeater 的 `Document#render`、无过滤器的
 `Stream#filtered_stream`、未压缩页面的 `Renderer#finalize_all_page_contents`，以及首个标准
@@ -87,7 +89,27 @@ Helvetica AFM 初始化后的 per-VM metric template。所有入口都检查精�
 `RGO_DISABLE_NATIVE_PDF_STREAM_FILTERED`、`RGO_DISABLE_NATIVE_PDF_RENDERER_FINALIZE`、
 `RGO_DISABLE_NATIVE_PRAWN_FONT_TEMPLATE`。这组 ABI 保留真实 Prawn/PDF 对象和 Ruby 可见状态，不是通用 Prawn 替代实现。
 
-低负载单核复测（500 个两页默认文档，关闭自动 source-AOT）为 RGo `0.220s`、同环境 MRI `0.334s`，约 `1.52x`；关闭 Helvetica template 的 RGo 为 `0.279s`。普通 CLI 自动 AOT 对这个严格 source shape 为 `0.009s`，但那是闭世界编译 profile，不能外推到动态 Prawn 或普通 Ruby。可用 `RGO_DISABLE_AUTO_AOT=1` 获得解释器/ABI 基线。
+在上述条件都满足时，普通 VM 还会把完整的 `PDF::Core::Renderer#render` body/xref/trailer
+编排合并为一个 typed object-layout region：先验证所有页面、reference、dictionary、stream
+和方法代际，再直接写入 Ruby 可见的 `@offset`、`@xref_offset`、stream cache 与最终 String；
+预检得到的 array/hash object-layout entries 会在同一 render pass 中复用，避免再次构造嵌套
+serializer 临时字符串；
+任何输出参数、回调、压缩、加密、非 ASCII content stream、循环/子类/自定义 trailer 或
+重定义都会 side-exit 到 Ruby。可用 `RGO_DISABLE_NATIVE_PDF_RENDER_REGION=1` 回退。
+这不是固定 PDF 模板 serializer，而是对真实对象图的统一 guarded pass；两页默认文档的
+SHA-256 与 Ruby fallback 保持一致。
+
+低负载单核复测（500 个两页默认文档，关闭自动 source-AOT）中，render region 为
+`0.178–0.183s`，同一二进制关闭 region 为 `0.229–0.314s`；profile 确认 500 次
+`Renderer#render` Ruby 调用被消除。与 MRI `0.334s` 相比，当前真实对象图 VM 已约
+`1.8x` 更快；单轮墙钟仍有启动/GC 抖动，不能把该样本外推为稳定 `3–10x`。普通 CLI
+自动 AOT 对这个严格 source shape 为 `0.009s`，但那是闭世界编译 profile，不能外推到
+动态 Prawn 或普通 Ruby。可用 `RGO_DISABLE_AUTO_AOT=1` 获得解释器/ABI 基线。
+
+同一基准的只构建阶段在低负载单核下约为 `0.160s`；关闭 text layout plan 的一次对照为
+`0.182s`。该差值用于确认统一 proof/object-layout 方向有效，不作为跨机器稳定倍率承诺；
+当前通用真实对象 VM 仍以约 `1.8x` MRI 为已验证结果，距离稳定 `3–10x` 仍需要更大的
+跨 `Document.new/text/start_new_page` typed loop 或 JIT side-exit。
 
 ```bash
 RGO_ENABLE_NATIVE_PDF_OBJECT=1 \\

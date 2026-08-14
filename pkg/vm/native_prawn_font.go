@@ -24,6 +24,11 @@ func (vm *VM) nativePrawnRememberDefaultAFMTemplate(font *object.EmeraldValue) {
 		core.AttachedSingletonClass(name) != nil {
 		return
 	}
+	if vm.nativePrawnDefaultAFMTemplate != nil && vm.nativePrawnDefaultAFMTemplateClass == font.Class &&
+		vm.nativePrawnDefaultAFMTemplateGeneration == object.CurrentMethodGeneration() &&
+		nativePrawnAFMTemplateStaticFieldsMatch(font, vm.nativePrawnDefaultAFMTemplate) {
+		return
+	}
 	template := nativePrawnCopyObjectInstanceVars(font, font.Class)
 	if template == nil {
 		return
@@ -37,25 +42,79 @@ func (vm *VM) nativePrawnRememberDefaultAFMTemplate(font *object.EmeraldValue) {
 	vm.nativePrawnDefaultAFMTemplateGeneration = object.CurrentMethodGeneration()
 }
 
-func (vm *VM) nativePrawnDefaultAFMFont(document *object.EmeraldValue) (*object.EmeraldValue, bool) {
+// nativePrawnAFMTemplateStaticFieldsMatch keeps the per-VM metric template
+// immutable across documents without hiding a Ruby mutation.  The fields
+// below are intentionally the document/registration state that each new Font
+// receives independently; every other object-layout slot must still point at
+// the same value as the cached Helvetica template.  A mismatch rebuilds the
+// template from the current Ruby-visible font before the direct ABI continues.
+func nativePrawnAFMTemplateStaticFieldsMatch(font, template *object.EmeraldValue) bool {
+	if font == nil || template == nil || font.Type != object.ValueObject || template.Type != object.ValueObject ||
+		font.Class != template.Class {
+		return false
+	}
+	fontObject, fontOK := font.Data.(*object.Object)
+	templateObject, templateOK := template.Data.(*object.Object)
+	if !fontOK || !templateOK || fontObject == nil || templateObject == nil {
+		return false
+	}
+	for name, value := range fontObject.InstanceVars {
+		if nativePrawnAFMTemplateMutableField(name) {
+			continue
+		}
+		cached, found := templateObject.InstanceVars[name]
+		if !found || cached != value {
+			return false
+		}
+	}
+	for name := range templateObject.InstanceVars {
+		if nativePrawnAFMTemplateMutableField(name) {
+			continue
+		}
+		if _, found := fontObject.InstanceVars[name]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func nativePrawnAFMTemplateMutableField(name string) bool {
+	switch name {
+	case "@document", "@identifier", "@references", "@subset_name_cache":
+		return true
+	default:
+		return false
+	}
+}
+
+func (vm *VM) nativePrawnDefaultAFMFont(document *object.EmeraldValue, plans ...*nativePrawnTextLayoutRegionPlan) (*object.EmeraldValue, bool) {
 	if vm == nil || !nativePrawnDefaultAFMTemplateEnabled || document == nil ||
 		document.Type != object.ValueObject || document.Class == nil || document.Class.Name != "Prawn::Document" ||
 		core.AttachedSingletonClass(document) != nil || vm.nativePrawnDefaultAFMTemplate == nil ||
 		vm.nativePrawnDefaultAFMTemplateGeneration != object.CurrentMethodGeneration() {
 		return nil, false
 	}
-	fontClassValue, found := vm.qualifiedConstantValue("Prawn::Fonts::AFM")
-	if !found || fontClassValue == nil || fontClassValue.Type != object.ValueClass {
-		return nil, false
-	}
-	fontClass, ok := fontClassValue.Data.(*object.Class)
-	if !ok || fontClass == nil || fontClass != vm.nativePrawnDefaultAFMTemplateClass ||
-		!nativeAFMMethodSource(document.Class, "font", "/prawn/font.rb") ||
-		!nativeAFMMethodSource(document.Class, "find_font", "/prawn/font.rb") ||
-		!nativeAFMMethodSource(document.Class, "font_registry", "/prawn/font.rb") ||
-		!nativeAFMMethodSource(document.Class, "font_families", "/prawn/font.rb") ||
-		!nativeAFMMethodSource(document.Class, "set_font", "/prawn/font.rb") {
-		return nil, false
+	fontClass := vm.nativePrawnDefaultAFMTemplateClass
+	if len(plans) > 0 && plans[0] != nil {
+		plan := plans[0]
+		if !plan.valid || !plan.defaultFontReady || plan.documentClass != document.Class || plan.fontClass != fontClass {
+			return nil, false
+		}
+	} else {
+		fontClassValue, found := vm.qualifiedConstantValue("Prawn::Fonts::AFM")
+		if !found || fontClassValue == nil || fontClassValue.Type != object.ValueClass {
+			return nil, false
+		}
+		var ok bool
+		fontClass, ok = fontClassValue.Data.(*object.Class)
+		if !ok || fontClass == nil || fontClass != vm.nativePrawnDefaultAFMTemplateClass ||
+			!nativeAFMMethodSource(document.Class, "font", "/prawn/font.rb") ||
+			!nativeAFMMethodSource(document.Class, "find_font", "/prawn/font.rb") ||
+			!nativeAFMMethodSource(document.Class, "font_registry", "/prawn/font.rb") ||
+			!nativeAFMMethodSource(document.Class, "font_families", "/prawn/font.rb") ||
+			!nativeAFMMethodSource(document.Class, "set_font", "/prawn/font.rb") {
+			return nil, false
+		}
 	}
 	currentFont := core.DynamicInstanceVar(document, "@font")
 	if currentFont != nil && currentFont.Type != object.ValueNil {
